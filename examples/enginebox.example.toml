@@ -1,0 +1,52 @@
+# DESIGN EXAMPLE ONLY: the current runtime does not parse this file.
+# Secrets and provider login state never belong here.
+schema_version = 1
+
+[host]
+transport = "ssh" # ssh | local
+target = "my-server" # SSH configuration alias
+data_dir = "/srv/enginebox"
+
+[incus]
+project = "enginebox"
+profile = "enginebox"
+
+[storage]
+mode = "existing" # existing | development-loop
+pool = "workspace-pool"
+# A development-loop configuration must specify its bounded size explicitly.
+
+[network]
+mode = "existing" # existing | managed
+name = "workspace-net"
+# Managed mode must specify a non-conflicting subnet in the final schema.
+
+[workspace]
+image = "images:ubuntu/24.04/cloud"
+cpu = 4
+memory = "4GiB"
+disk = "30GiB"
+user = "agent"
+uid = 1001
+gid = 1001
+home = "/home/agent"
+path = "/workspace"
+
+[agents]
+install = ["codex", "cursor", "claude"]
+# Installation recipes resolve supported version/update options per provider.
+
+[modules]
+desktop = false
+operator_mcp = true
+guest_computer_mcp = false # requires desktop
+ci = false
+
+# Optional reference mount. Source availability is checked by doctor.
+[[mounts]]
+name = "repositories"
+backend = "existing-nfs"
+source = "storage.internal:/repositories"
+target = "/repositories"
+access = "read-only"
+trust_domain = "owner"

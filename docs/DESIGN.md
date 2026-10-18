@@ -1,0 +1,126 @@
+# Portable self-hosted environment design
+
+Status: proposed implementation design, October 18, 2026. The repository already contains an extracted Incus runtime; the bootstrap, image preparation and CI interfaces described below are planned unless explicitly identified as available.
+
+## Outcome
+
+An owner connects a Linux server, prepares a workspace once, signs into the official Codex, Cursor Agent or Claude Code client, and works through the ordinary terminal. Files, compatible dependencies and caches remain available. Optional CI uses the same preparation contracts to return reliable build/test results sooner.
+
+Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Agent delegation, a new model gateway and a replacement CI scheduler are outside this product.
+
+## Components
+
+```mermaid
+flowchart TD
+  O[Owner: CLI or operator MCP] --> T[SSH or local transport]
+  T --> C[Environment control and configuration]
+  C --> I[Incus backend]
+  I --> A[Private agent workspace VM]
+  A --> N[Native Codex / Cursor / Claude]
+  A --> D[Optional guest desktop MCP]
+  I --> B[Optional separate CI workspace]
+  G[GitHub Actions] --> B
+  A --> S[Eligible cache and reference storage]
+  B --> S
+  R[Versioned preparation recipes] --> A
+  R --> B
+```
+
+The core owns environment lifecycle, preparation manifests, storage/mount interfaces and resource limits. The native-client recipe installs official binaries and configures supported local tools; it does not sit between the harness and provider. The CI module owns runner registration, job preparation, cache mappings and CI measurements. A workspace remains usable without GitHub or a runner.
+
+The first backend is Incus. Keep backend-specific operations behind a small internal interface, but implement only this backend until another real deployment requires more. Local and SSH transports should support the same operations.
+
+## Initial support contract
+
+| Area | Initial target and evidence |
+|---|---|
+| Operator | Python 3.11+ and OpenSSH on macOS/Linux; other clients need testing. |
+| Host | Linux x86_64 with `/dev/kvm`, sufficient disk/RAM and administrator access. Reference prototype: Ubuntu 26.04, Incus 6.0.5, QEMU 10.2. |
+| Guest | Ubuntu 24.04 x86_64, configurable non-root user and workspace paths. |
+| Server provider | Dedicated hardware, or a VM exposing usable KVM; provider-independent configuration. |
+| Deferred | ARM, Windows guests, GPU editor support, cross-host live migration, hostile tenancy and automatic fleet scheduling. |
+
+Publish a tested host/kernel/Incus/QEMU matrix. Current upstream [Incus requirements](https://linuxcontainers.org/incus/docs/main/requirements/) must not be confused with the requirements of the specific release tested in the prototype. Do not install a moving package stream and claim support for every Ubuntu host.
+
+## Configuration and bootstrap
+
+Use a versioned, secret-free TOML file parsed with Python's standard library. [The example](../examples/enginebox.example.toml) is a proposed schema, not an input supported by the current runtime. The runtime currently uses explicit environment variables.
+
+Configuration describes transport/host, Incus project/profile, existing or managed network, storage pool, guest resources/identity, native-client selection, optional modules and mount/cache policies. Credentials belong in native clients or short-lived setup input, never this file.
+
+Proposed commands:
+
+| Command | Contract |
+|---|---|
+| `ebox init` | Write an example config; no host access or mutation. |
+| `ebox doctor` | Read-only capability and conflict checks; readable and JSON results. |
+| `ebox plan` | Show desired/observed differences, ownership, operations, resource impact and conflicts. |
+| `ebox apply` | Apply a validated plan with a host lock, recheck relevant state, record progress and verify postconditions. |
+| `ebox image prepare` | Create a credential-free base and manifest of image fingerprint, recipe revision and installed versions. |
+| `ebox module ci ...` | Explicit optional runner setup and maintenance; core bootstrap never registers runners implicitly. |
+
+Existing runtime commands (`list`, `shell`, `exec`, `pause`, `resume`, `hibernate`, `stop`, `snapshot`, `fork`, `restore`) will consume the same config after migration, while retaining documented environment-variable overrides.
+
+Bootstrap stages:
+
+1. Inspect OS/architecture, KVM, Incus/QEMU compatibility, available resources, storage, networks, routes and existing services. Check stateful-VM capability and device compatibility when memory restoration is requested; reserve sufficient memory-state storage (`size.state`) for configured RAM plus overhead and include it in disk-reserve calculations.
+2. Resolve a plan. Reject conflicting names/subnets/ports and insufficient resources before package or network changes.
+3. Install supported packages only when requested; record versions. Reuse a compatible existing installation.
+4. Create owned storage/network/profile resources, or explicitly adopt selected existing ones. Names alone do not establish ownership.
+5. Launch and prepare a guest, install selected official clients as its user, and verify versions and tools without signing in.
+6. Create a clean base, write a preparation manifest and show the native login/access instructions.
+
+A second apply should be a no-op when desired state is unchanged. An interrupted apply should resume from verified state; it must not assume an earlier step succeeded. Do not automatically retry destructive operations. Removal targets only owned resources and requires an explicit data-deletion action for user disks.
+
+## Storage, cache and network model
+
+Prefer an existing compatible storage pool. Offer bounded loop-backed storage as an explicit development option; never automatically repartition a disk. [Incus documents storage backend tradeoffs](https://linuxcontainers.org/incus/docs/main/explanation/storage/).
+
+| Data | Handling |
+|---|---|
+| Writable project and installed dependency tree | Private VM disk; snapshot/fork uses the backend's copy-on-write facilities where supported. |
+| Large repository and asset references | Versioned read-only mounts near compute; each workspace gets independent writable state. |
+| Download/build caches | Tool-supported reuse, separated by trust domain, OS/architecture and relevant toolchain/input keys. |
+| Provider and Git account state | Private guest identity; never shared in a cache or credential-free base. |
+| External data | Its own backup and versioning policy; not implicitly captured by a VM snapshot. |
+
+The prototype used guest NFS because its Incus version rejected direct shared devices with stateful migration enabled. Generalize this as an optional mount backend. Initially use an existing suitable NFS endpoint or an isolated, explicitly provisioned service. Do not disable unrelated rpcbind/statd services, replace global NFS bindings or claim arbitrary shared mounts support memory restoration.
+
+Detect UFW/nftables/Docker policies and subnet overlaps. Plan narrow, owned rules; preserve unrelated workloads. Desktop access must be authenticated and inaccessible to unrelated guests, even on a private bridge. A private IP is not an authentication mechanism.
+
+## Lifecycle and identity
+
+- Pause retains RAM and consumes host memory. Resume continues that process tree.
+- Hibernate writes memory to storage and frees running memory; time depends on memory contents and storage. Connections can expire while suspended.
+- A disk-only fork boots fresh. It does not continue the source process tree.
+- A running private checkpoint may contain disk, RAM, provider tokens and conversation history. Keep it within the owner's access boundary.
+- A reusable base is built before login. Template preparation must handle machine identity, hostname and host keys in addition to unique network identity.
+- Snapshot retention and off-host backup are separate functions. Test export/restore; a same-pool snapshot does not survive losing the pool. [Incus backup semantics](https://linuxcontainers.org/incus/docs/main/howto/instances_backup/)
+
+Lifecycle changes need serialized operations and state rechecks. Reject conflicting operations. Host reboot recovery, saved-state compatibility after upgrades, disk reserve and failed-restore recovery belong in release acceptance. Do not promise instant hibernation or GPU memory restoration.
+
+## Native clients and MCP
+
+Codex, Cursor Agent and Claude Code run unmodified in the guest. Native installation recipes record selected and resolved versions, installation source and update policy. Where providers cannot pin a release, say so and record what was installed rather than promising byte-for-byte reproducibility.
+
+The owner completes each native sign-in. Subscription availability, refresh and quota behavior must be validated per provider and account mode. Installation and `--version` checks do not establish successful inference. See [native-client design](NATIVE-CLIENTS.md).
+
+Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes computer tools only and receives no host keys or Incus socket. Its restricted tool list is not itself an authorization boundary; actual isolation depends on credentials and host/guest permissions. Installing an MCP server does not disable the native harness's approval policy. Desktop is optional and should be provisioned only when requested; guest computer MCP requires it, while operator MCP can be enabled independently.
+
+[Incus administrator access](https://linuxcontainers.org/incus/docs/main/explanation/security/) is host-level authority. The initial product is for trusted owners. Running native agents in private VMs does not make the operator control plane or existing privileged CI runner suitable for hostile tenants.
+
+## Optional CI module
+
+Keep GitHub Actions workflows, scheduling, checks and logs. The module supplies prepared execution environments, runner lifecycle integration, persistent cache policies, resource limits and measurements. Model account credentials are not required for ordinary build/test CI or for this OSS repository's tests.
+
+The owner currently has one retained runner on their server; preserve that capacity decision for the first integration. A portable setup should put new CI execution in a separate VM/service boundary, with no default host Docker socket or writable agent home. Drain jobs before runner maintenance. Moving an existing privileged host runner is an explicit migration, not a bootstrap side effect.
+
+Agent and CI jobs can reuse compatible recipes and eligible caches. They must use separate working directories and validate a precise commit. Untrusted pull-request jobs cannot write caches later used by privileged jobs or authenticated agents. Shared compiler outputs need tool-supported concurrency or serialized writers.
+
+Existing private workflow patterns include a persistent pnpm store, mounted Cargo/build caches and serialization of heavy builds. Their performance has not been benchmarked here. First measure cold/warm setup and build/test times, queue delay, cache behavior, correctness, resource contention and cost per successful validation.
+
+## Open-source boundary
+
+The foundation, usable generic workspace recipe and reusable optional modules belong in this Apache-2.0 repository. Managed operations and original specialized workspace recipes may be maintained separately. User code remains the user's. Do not import proprietary recipes, provider binaries or engine source into this repository.
+
+Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate workload candidates. They do not block a useful native-agent environment or require expanding the core into orchestration.

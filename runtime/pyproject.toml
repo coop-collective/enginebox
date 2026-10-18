@@ -1,0 +1,22 @@
+[project]
+name = "enginebox-runtime"
+version = "0.1.0"
+description = "Environment lifecycle and computer tools; native agent clients stay native"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = ["mcp==2.3.0"]
+
+[project.urls]
+Repository = "https://github.com/coop-collective/enginebox"
+Issues = "https://github.com/coop-collective/enginebox/issues"
+
+[project.scripts]
+ebox = "enginebox:main"
+enginebox-mcp = "mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["enginebox", "mcp_server"]
