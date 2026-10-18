@@ -1,0 +1,19 @@
+schema_version = 1
+
+[[hosts]]
+id = "primary"
+label = "My server"
+target = "my-server" # SSH alias or local
+project = "enginebox"
+pool = "enginebox"
+reserve_cpu = 2
+reserve_memory_gib = 4
+reserve_disk_gib = 10
+disk_gib = 30
+max_instances = 16
+
+[[hosts.templates]]
+id = "native-agents"
+label = "Codex, Cursor and Claude with browser"
+source = "ebox-base"
+snapshot = "prepared-REPLACE" # Use the exact snapshot returned by ebox apply.

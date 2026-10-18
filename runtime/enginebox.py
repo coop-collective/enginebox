@@ -21,15 +21,15 @@ def guest_mode() -> bool:
     return value == "1"
 
 
-def configured_id(variable: str) -> int:
-    value = os.environ.get(variable, "1001")
+def configured_id(variable: str, values=None) -> int:
+    value = (os.environ if values is None else values).get(variable, "1001")
     if not re.fullmatch(r"[0-9]{1,10}", value) or not 1 <= int(value) <= 4294967294:
         raise ValueError(f"{variable} must be a non-root numeric UID/GID (1–4294967294).")
     return int(value)
 
 
-def configured_path(variable: str, default: str) -> str:
-    value = os.environ.get(variable, default)
+def configured_path(variable: str, default: str, values=None) -> str:
+    value = (os.environ if values is None else values).get(variable, default)
     if (not value.startswith("/") or ".." in PurePosixPath(value).parts
             or any(ord(char) < 32 or ord(char) == 127 for char in value)):
         raise ValueError(f"{variable} must be an absolute guest path without '..' or control characters.")
@@ -47,15 +47,19 @@ class GuestConfig:
 
     @classmethod
     def from_env(cls) -> GuestConfig:
-        user = os.environ.get("ENGINEBOX_GUEST_USER", "agent")
+        return cls.from_mapping(os.environ)
+
+    @classmethod
+    def from_mapping(cls, values) -> GuestConfig:
+        user = values.get("ENGINEBOX_GUEST_USER", "agent")
         if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) or user == "root":
             raise ValueError("ENGINEBOX_GUEST_USER must be a non-root Linux username.")
-        display = os.environ.get("ENGINEBOX_GUEST_DISPLAY", ":99")
+        display = values.get("ENGINEBOX_GUEST_DISPLAY", ":99")
         if not re.fullmatch(r":[0-9]{1,5}(?:\.[0-9]{1,5})?", display):
             raise ValueError("ENGINEBOX_GUEST_DISPLAY must be a local X11 display, for example ':99'.")
-        return cls(configured_id("ENGINEBOX_GUEST_UID"), configured_id("ENGINEBOX_GUEST_GID"),
-                   user, configured_path("ENGINEBOX_GUEST_HOME", "/home/agent"),
-                   configured_path("ENGINEBOX_GUEST_WORKSPACE", "/workspace"), display)
+        return cls(configured_id("ENGINEBOX_GUEST_UID", values), configured_id("ENGINEBOX_GUEST_GID", values),
+                   user, configured_path("ENGINEBOX_GUEST_HOME", "/home/agent", values),
+                   configured_path("ENGINEBOX_GUEST_WORKSPACE", "/workspace", values), display)
 
 
 def identifier(value: str, *, instance: bool = False) -> str:
@@ -66,7 +70,7 @@ def identifier(value: str, *, instance: bool = False) -> str:
 
 
 class EngineBox:
-    def __init__(self, host: str | None = None):
+    def __init__(self, host: str | None = None, *, project: str | None = None, guest: GuestConfig | None = None):
         if guest_mode():
             raise ValueError("Host environment controls are unavailable in ENGINEBOX_GUEST=1 mode.")
         self.host = host if host is not None else os.environ.get("ENGINEBOX_HOST", "")
@@ -74,10 +78,10 @@ class EngineBox:
             raise ValueError("Set ENGINEBOX_HOST explicitly to an SSH host/alias or 'local'.")
         if not re.fullmatch(r"(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]*@)?[a-zA-Z0-9][a-zA-Z0-9_.-]*", self.host):
             raise ValueError("ENGINEBOX_HOST must be an SSH host/alias, optionally user@host, or 'local'.")
-        self.project = os.environ.get("ENGINEBOX_PROJECT", "enginebox")
+        self.project = project if project is not None else os.environ.get("ENGINEBOX_PROJECT", "enginebox")
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}", self.project):
             raise ValueError("ENGINEBOX_PROJECT must contain 1–63 letters, digits, underscores or hyphens and start with a letter or digit.")
-        self.guest = GuestConfig.from_env()
+        self.guest = guest if guest is not None else GuestConfig.from_env()
 
     def command(self, *args: str, interactive: bool = False) -> list[str]:
         prefix = ["sudo", "-n", "incus"]
@@ -198,8 +202,15 @@ with tempfile.TemporaryDirectory() as directory:
 
 
 def main():
+    # Bootstrap has its own argument schema and never implicitly targets the
+    # runtime's environment-selected host.
+    if len(sys.argv) > 1 and sys.argv[1] in {"init", "doctor", "plan", "apply"}:
+        from bootstrap import run_cli
+        return run_cli(sys.argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="action", required=True)
+    for operation in ["init", "doctor", "plan", "apply"]:
+        subs.add_parser(operation, help="Portable bootstrap; use --help for configuration options")
     subs.add_parser("list")
     for action in ["pause", "resume", "hibernate", "stop", "shell", "desktop"]:
         subs.add_parser(action).add_argument("name")

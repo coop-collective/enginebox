@@ -1,6 +1,6 @@
 # Portable self-hosted environment design
 
-Status: proposed implementation design, October 18, 2026. The repository already contains an extracted Incus runtime; the bootstrap, image preparation and CI interfaces described below are planned unless explicitly identified as available.
+Status: implementation design updated October 19, 2026. Bootstrap, native-client/browser preparation, fleet REST/MCP and the Vinext dashboard are implemented. Portable cache services, CI, upgrades and backup/recovery qualification remain planned. See the operational guides for supported commands.
 
 ## Outcome
 
@@ -12,7 +12,10 @@ Start with one trusted owner and one server. Support different server providers 
 
 ```mermaid
 flowchart TD
-  O[Owner: CLI or operator MCP] --> T[SSH or local transport]
+  W[Owner: Vinext dashboard] --> F[Authenticated fleet API]
+  M[Operator fleet MCP] --> F
+  F --> T[SSH or local transport]
+  O[Owner: CLI] --> T
   T --> C[Environment control and configuration]
   C --> I[Incus backend]
   I --> A[Private agent workspace VM]
@@ -44,11 +47,11 @@ Publish a tested host/kernel/Incus/QEMU matrix. Current upstream [Incus requirem
 
 ## Configuration and bootstrap
 
-Use a versioned, secret-free TOML file parsed with Python's standard library. [The example](../examples/enginebox.example.toml) is a proposed schema, not an input supported by the current runtime. The runtime currently uses explicit environment variables.
+Use a versioned, secret-free TOML file parsed with Python's standard library. [The bootstrap example](../examples/enginebox.example.toml) is supported by `init`, `doctor`, `plan` and `apply`. [Fleet configuration](../examples/fleet.example.toml) lists hosts, reserves and approved snapshots. The lower-level runtime uses explicit environment variables or internal configuration objects.
 
-Configuration describes transport/host, Incus project/profile, existing or managed network, storage pool, guest resources/identity, native-client selection, optional modules and mount/cache policies. Credentials belong in native clients or short-lived setup input, never this file.
+Configuration describes transport/host, Incus project/profile, existing or managed network, storage pool, guest resources/identity, native-client selection and optional modules. Mount/cache policies remain a separate unimplemented extension. Credentials belong in native clients or short-lived setup input, never this file.
 
-Proposed commands:
+Command status:
 
 | Command | Contract |
 |---|---|
@@ -56,10 +59,10 @@ Proposed commands:
 | `ebox doctor` | Read-only capability and conflict checks; readable and JSON results. |
 | `ebox plan` | Show desired/observed differences, ownership, operations, resource impact and conflicts. |
 | `ebox apply` | Apply a validated plan with a host lock, recheck relevant state, record progress and verify postconditions. |
-| `ebox image prepare` | Create a credential-free base and manifest of image fingerprint, recipe revision and installed versions. |
-| `ebox module ci ...` | Explicit optional runner setup and maintenance; core bootstrap never registers runners implicitly. |
+| Clean-base preparation | Implemented within `ebox apply`; no separate `ebox image prepare` command yet. Writes installed versions and captures a pre-login snapshot. |
+| `ebox module ci ...` (planned) | Explicit optional runner setup and maintenance; core bootstrap never registers runners implicitly. |
 
-Existing runtime commands (`list`, `shell`, `exec`, `pause`, `resume`, `hibernate`, `stop`, `snapshot`, `fork`, `restore`) will consume the same config after migration, while retaining documented environment-variable overrides.
+Existing runtime commands (`list`, `shell`, `exec`, `pause`, `resume`, `hibernate`, `stop`, `snapshot`, `fork`, `restore`) use the environment values returned by bootstrap. Fleet operations construct per-host runtime objects, keeping hosts isolated from process-wide environment changes.
 
 Bootstrap stages:
 
@@ -108,6 +111,14 @@ The owner completes each native sign-in. Subscription availability, refresh and 
 Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes computer tools only and receives no host keys or Incus socket. Its restricted tool list is not itself an authorization boundary; actual isolation depends on credentials and host/guest permissions. Installing an MCP server does not disable the native harness's approval policy. Desktop is optional and should be provisioned only when requested; guest computer MCP requires it, while operator MCP can be enabled independently.
 
 [Incus administrator access](https://linuxcontainers.org/incus/docs/main/explanation/security/) is host-level authority. The initial product is for trusted owners. Running native agents in private VMs does not make the operator control plane or existing privileged CI runner suitable for hostile tenants.
+
+## Fleet and fast readiness
+
+The fleet controller clones only configured disk snapshots marked as clean bases. It copies into the configured storage pool and applies per-VM CPU/RAM/disk limits. Prepared tools and dependencies live on the copy-on-write disk; no provider installer runs during a fork. Headless browser preparation avoids a desktop by default. Completed cloud-init is disabled in the reusable image, while clone identity and ordinary networking remain enabled.
+
+Admission counts active instances across Incus projects, includes frozen RAM, preserves configured host/CI reserves and budgets full root/state disks even for stopped instances. The API bounds its work queue and shares a host lock with bootstrap. This is manual multi-host fleet management; automatic workload placement and swarm scheduling remain outside scope.
+
+The Vinext server authenticates the owner and proxies a narrow REST surface. API tokens stay server-side. Operator MCP calls the same REST service. A guest receives browser/computer tools, not fleet credentials. See [fleet operations](FLEET.md) and [dashboard deployment](DASHBOARD.md).
 
 ## Optional CI module
 

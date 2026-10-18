@@ -1,49 +1,123 @@
-# Native client preparation
+# Native agent clients
 
-Reviewed October 18, 2026 against official documentation and the provider installers. Installation recipes described here are planned. The repository's runtime does not install or authenticate an agent client.
+Engine Box installs the providers' original terminal applications inside a private
+Ubuntu 24.04 workspace. It does not replace their agent loops, forward model
+requests, share subscription credentials, or automatically sign into accounts.
+The owner runs `codex`, `claude`, or `agent` in the guest terminal.
 
-Engine Box prepares a private Linux workspace, then the owner runs the official CLI directly. No replacement harness, prompt proxy or pooled provider account is required. The initial infrastructure target is Ubuntu x86_64 even where a provider supports additional architectures.
+## Guest setup contract
 
-## Provider contracts
+The bootstrap copies `runtime/` into `/opt/enginebox-runtime`, then runs
+`bash /opt/enginebox-runtime/guest_setup.sh` as root **inside the guest**.
+Do not run that script on a developer's laptop or the Incus host.
 
-| Client | Install/version policy | Native login on a remote workspace | Native conversation continuation |
-|---|---|---|---|
-| Codex (`codex`) | Official standalone installer; supports a selected release and noninteractive installation. Record the release and verified download. | `codex login --device-auth` where the account/workspace enables device login; official browser callback flow is another option. | `codex resume` interactively, or `codex exec resume` for supported noninteractive use. |
-| Claude Code (`claude`) | Official native installer supports exact versions. Set and record update policy because native installation can auto-update. | `claude auth login`; subscription-backed scripted use also has an official `claude setup-token` option, kept outside base images/config. | `claude --resume` or `claude --continue`. |
-| Cursor Agent (`agent`) | Official installer, with installed version recorded. Strict version pinning and updater control remain unresolved in the reviewed CLI docs. | `NO_OPEN_BROWSER=1 agent login`, then open the supplied URL in the owner's browser. | `agent --resume` or `agent --continue`. |
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `EBOX_USER`, `EBOX_UID`, `EBOX_GID` | `agent`, `1001`, `1001` | Private non-root account; existing mismatched identities fail |
+| `EBOX_HOME`, `EBOX_WORKSPACE` | `/home/agent`, `/workspace` | Private home and working directory |
+| `EBOX_INSTALL_CODEX`, `EBOX_INSTALL_CLAUDE`, `EBOX_INSTALL_CURSOR` | `1` | Select native clients independently |
+| `EBOX_MCP`, `EBOX_BROWSER` | `1` | Configure native MCP entries/Python test runtime; install headless Chromium and browser MCP |
+| `EBOX_DESKTOP` | `0` | Optional X11 desktop and loopback-only noVNC |
+| `EBOX_COMPUTER_MCP` | Same as `EBOX_DESKTOP` | Register guest computer tools; requires the desktop |
+| `EBOX_UPDATE_CLIENTS` | `0` | Existing clients are preserved; `1` explicitly reinstalls requested clients |
+| `EBOX_CODEX_VERSION`, `EBOX_CLAUDE_VERSION` | `0.163.0`, `2.1.302` | Exact versions for new installs/reinstalls |
+| `EBOX_NODE_VERSION` | `22.23.3` | Install this official Node distribution if no Node 18+ exists |
+| `EBOX_PLAYWRIGHT_MCP_VERSION` | `0.0.83` | Exact official browser MCP package |
 
-Primary sources: [Codex installation](https://developers.openai.com/codex/cli), [authentication](https://developers.openai.com/codex/auth) and [noninteractive execution](https://developers.openai.com/codex/noninteractive); [Claude setup](https://code.claude.com/docs/en/setup), [authentication](https://code.claude.com/docs/en/authentication) and [CLI reference](https://code.claude.com/docs/en/cli-reference); [Cursor installation](https://cursor.com/docs/cli/installation), [authentication](https://cursor.com/docs/cli/reference/authentication) and [parameters](https://cursor.com/docs/cli/reference/parameters).
+The script preserves existing native configuration, login state and other MCP
+entries. It adds an Engine Box entry only when that name is absent. Set a flag to
+`0` to skip installing/configuring that component; this does not uninstall an
+existing component. Existing native clients and a compatible Node installation
+are recorded as found rather than silently replaced. The result is saved to
+`/opt/enginebox-runtime/installed-versions.json`; account details are excluded.
+The bootstrap sets `EBOX_MCP=1` when either browser MCP or computer MCP is requested;
+browser installation alone without `EBOX_MCP` does not register client entries.
+Browser and computer MCP entries are distinct. Computer MCP runs with
+`ENGINEBOX_GUEST=1` and exposes only the guest's screenshot/click/type/key tools;
+it receives no host SSH identity or Incus socket. Operator lifecycle MCP is
+configured separately. Native client tool-approval settings remain in force.
 
-Recipes should use official release/install mechanisms rather than redistribute provider binaries in this repository. Codex and Claude provide version-selection options; resolve supported syntax from the selected installer when implementing. Cursor's version policy is an explicit investigation item. A manifest must not claim reproducibility solely because a mutable installer URL was recorded.
+Codex and Claude support pinned official installs. Claude background updates are
+disabled in prepared shell sessions; an owner can deliberately update using the
+native CLI. Cursor's official installer currently installs its published version
+and its CLI can update itself. Strict Cursor version pinning is **not implemented**.
+The manifest records what actually installed. Linux x64 is the integration target;
+ARM64 selects corresponding installer artifacts but requires its own integration
+run before being considered tested. [Codex installation](https://developers.openai.com/codex/cli),
+[Claude installation and updates](https://code.claude.com/docs/en/setup),
+[Cursor installation](https://cursor.com/docs/cli/installation).
 
-## Account and state boundaries
+## Owner sign-in
 
-Account eligibility and billing are provider-specific. Codex account sign-in and an OpenAI API key use different billing paths. Claude needs an eligible account mode; an environment API key can change the billing path. Cursor CLI usage depends on the customer's account/model terms. Do not hardcode a promise that every subscription or model is included. [Codex authentication](https://developers.openai.com/codex/auth), [Claude authentication](https://code.claude.com/docs/en/authentication), [Cursor pricing](https://cursor.com/docs/models-and-pricing).
+Run these yourself inside the private workspace:
 
-Keep native account state in the private guest home. Do not silently copy credentials from the operator laptop, share homes between jobs, log tokens or include them in images/cache exports. Clean bases are prepared before authentication. Private checkpoints may contain account state and RAM and must remain private.
+```sh
+codex login --device-auth
+claude auth login
+NO_OPEN_BROWSER=1 agent login
+```
 
-The optional CI module optimizes ordinary builds/tests and needs no model account. Public OSS repository CI must remain credential-free. OpenAI's documented advanced account-auth CI workflow is intended for trusted runners and excludes public/open-source repository CI. [Codex noninteractive guidance](https://developers.openai.com/codex/noninteractive).
+Open the provider's displayed URL in your local browser. Codex device login must
+be enabled by the account/workspace; its documentation also describes SSH callback
+forwarding. This project does not copy a workstation's account files or print
+credentials. Check status with `codex login status`, `claude auth status`, or
+`agent status`. Status output can identify the account; keep it out of public logs.
+[Codex authentication](https://developers.openai.com/codex/auth),
+[Claude authentication](https://code.claude.com/docs/en/authentication),
+[Cursor authentication](https://cursor.com/docs/cli/reference/authentication).
 
-Native conversation resume reloads session history in a new client process. VM pause/hibernate preserves machine execution state. A suspended network connection can still expire, and provider-side sessions, token refresh and quotas continue to follow provider behavior.
+Subscription entitlement, available models and concurrency remain provider/account
+decisions. Signing in successfully does not establish successful inference. API
+keys can select separate billing; avoid inheriting them into a subscription
+workspace. Claude's documented `setup-token` route supports subscription-backed
+scripts, with different feature availability from interactive sign-in. Cursor
+usage varies by plan/model. The project makes no promise that every plan includes
+every model or unlimited parallel work.
+[Claude authentication](https://code.claude.com/docs/en/authentication),
+[Cursor usage](https://cursor.com/docs/models-and-pricing).
 
-## MCP preparation
+Keep this public repository's own CI free of subscription credentials. OpenAI's
+advanced account-auth CI guidance is for trusted private runners and explicitly
+excludes public/open-source repository CI. Ordinary cached builds and tests do
+not need agent credentials.
+[Codex noninteractive mode](https://developers.openai.com/codex/noninteractive).
 
-Use the provider's native configuration interface. Keep the Engine Box entry distinct and preserve unrelated user entries on repeated setup.
+## Resume and reusable images
 
-| Client | Supported configuration surface |
-|---|---|
-| Codex | `codex mcp add`; user configuration under `~/.codex/config.toml`. |
-| Claude Code | `claude mcp add --scope user`; user configuration under `~/.claude.json`. |
-| Cursor Agent | `~/.cursor/mcp.json`; CLI MCP inspection commands. |
+Native conversation resume (`codex exec resume`, `claude --resume`,
+`agent --resume`) reloads conversation history. VM pause/hibernate preserves
+machine execution state. Remote model requests, OAuth expiry and network
+connections can still need reconnection after elapsed time; these are separate
+acceptance checks.
 
-Sources: [Codex MCP](https://developers.openai.com/codex/mcp), [Claude MCP](https://code.claude.com/docs/en/mcp), [Cursor MCP](https://cursor.com/docs/cli/mcp).
+Prepare reusable bases before account login. A private snapshot can contain
+provider credentials, browser cookies and RAM; it must not become a shared base.
+Clones use a new virtual machine UUID/MAC. The guest's startup identity service
+rotates filesystem machine ID, hostname and SSH host keys when that UUID changes;
+DHCP uses MAC rather than the copied machine ID. Identity rotation does **not**
+sanitize application credentials. The bootstrap clears machine ID in the owned
+pre-login base immediately before stopping/snapshotting, so PID1 also establishes
+a fresh identity on the clone's first boot. This is separate from ordinary guest
+setup, which must not erase identity in an already running user's workspace.
 
-Guest entries launch `enginebox-mcp` with `ENGINEBOX_GUEST=1` and expose only four desktop tools. They receive no host SSH identity or Incus socket. Operator MCP is configured separately and can administer environments. Native tool approval settings remain in force.
+Bootstrap fingerprints configuration, not installer source or dependency contents.
+Reapplying a prepared configuration is a no-op, and an existing
+`prepared-<configuration-fingerprint-prefix>` snapshot is retained. To adopt a new
+Engine Box release, changed installer recipe or native-client versions, provision
+a new base with a new workspace name, validate it, then select that new snapshot
+as the fleet template. Reprovisioning the source alone does not update a previously
+captured snapshot. Signed-in workspaces are private and are never image upgrades.
 
-## Acceptance
+After initial cloud-init finishes successfully, guest setup creates
+`/etc/cloud/cloud-init.disabled`. Prepared clones keep their rendered netplan and
+identity service, avoiding repeated metadata/setup work. Do not invoke guest setup
+from a cloud-init `runcmd`: it waits for initial cloud-init completion. Network
+readiness services remain enabled; readiness must reflect an operable guest,
+not just an early process start. [Cloud-init disable mechanism](https://docs.cloud-init.io/en/latest/howto/disable_cloud_init.html).
 
-The account-free preparation test installs selected clients in a clean disposable VM, checks `--version`/`--help`, records versions, exercises native MCP registration and a direct tool call, and repeats setup without destroying user configuration. Cache and lifecycle tests use deterministic local processes.
+## Validation
 
-The owner-account test is separate: complete each native login, inspect status privately, run one bounded prompt when authorized, and verify native continuation before/after restart or hibernation. Never publish tokens or account-identifying command output. Use documented diagnostics for quota/expiry behavior; do not burn an allowance just to force a limit.
-
-For upgrades, validate candidate versions in a disposable workspace before replacing a recipe manifest. A binary already existing on PATH is not proof that it matches the requested version.
+Bootstrap runs version checks only. Offline checks cover profile isolation and
+locking. See [browser validation](BROWSER.md) for an opt-in local fixture test that
+uses real Chromium and MCP without model inference. Account login and a small
+inference/session-resume check are separate owner-run validation steps.

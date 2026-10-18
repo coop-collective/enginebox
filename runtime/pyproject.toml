@@ -13,10 +13,15 @@ Issues = "https://github.com/coop-collective/enginebox/issues"
 [project.scripts]
 ebox = "enginebox:main"
 enginebox-mcp = "mcp_server:main"
+enginebox-api = "fleet_api:main"
+enginebox-fleet-mcp = "fleet_mcp:main"
 
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["enginebox", "mcp_server"]
+py-modules = ["enginebox", "mcp_server", "fleet", "fleet_api", "fleet_mcp", "bootstrap", "bootstrap_config", "browser_tools"]
+
+[tool.setuptools.data-files]
+"share/enginebox" = ["guest_setup.sh", "requirements.lock"]

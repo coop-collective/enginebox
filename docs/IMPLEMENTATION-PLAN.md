@@ -1,6 +1,6 @@
 # Implementation plan
 
-October 18, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; optional CI optimization; reusable open-source foundation. This plan distinguishes the extracted runtime from the complete bootstrap still to build.
+Updated October 19, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; optional CI optimization; reusable open-source foundation. This plan distinguishes implemented bootstrap/fleet/browser capabilities from platform and release acceptance still required.
 
 ## Milestones
 
@@ -14,19 +14,20 @@ October 18, 2026. Scope: portable environments for native Codex, Cursor Agent an
 | P5 | Optional GitHub Actions module | P2, P4 | Separate job state, explicit runner registration, compatible persistent caches, graceful drain and measured build/test feedback; core works with module disabled. |
 | P6 | Self-hosting release | P1–P4 | Another person bootstraps a second supported machine from documentation alone; upgrade/rollback tested; supported versions and remaining limits published. CI can remain optional/experimental. |
 
-P0 is the initial repository milestone. No later milestone is complete merely because similar behavior worked on the original private host. Login/inference acceptance is recorded separately from installation and environment tests.
+Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and upgrade/rollback remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
-## First implementation slice: configuration and inspection
+The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls and owner authentication. It does not add agent orchestration or automatic placement.
 
-Proposed code boundaries (names may change during implementation):
+## Implemented code boundaries
 
-- `runtime/config.py`: schema, defaults, explicit config loading and environment overrides.
-- `runtime/transport.py`: local/SSH argv execution, structured results, timeout and cancellation contract.
-- `runtime/backends/incus.py`: inventory and existing lifecycle operations.
-- `runtime/doctor.py`: read-only host/guest capability checks and diagnostics.
-- `runtime/planner.py`: desired-state diff, operation ordering, ownership/conflict checks.
-- `examples/`: minimal existing-Incus and fresh-dedicated-server configurations.
-- `tests/`: offline regression tests; disposable integration harness added separately.
+- `runtime/bootstrap_config.py`: strict schema, defaults and guest/resource validation.
+- `runtime/bootstrap.py`: read-only inventory, deterministic planning, host lock/journal and resumable provisioning.
+- `runtime/enginebox.py`: validated local/SSH Incus lifecycle and guest operations.
+- `runtime/guest_setup.sh` and `browser_tools.py`: official client/browser preparation and private browser profiles.
+- `runtime/fleet.py`, `fleet_api.py`, `fleet_mcp.py`: multi-host inventory, capacity, jobs, authenticated REST and operator MCP.
+- `dashboard/`: Vinext owner dashboard and authenticated server-side proxy.
+- `examples/`: existing-Incus, fresh-host and fleet configuration.
+- `tests/`: offline regression coverage and opt-in browser integration.
 
 Do not implement a generic plugin framework before a second backend exists. Keep config parsing and planning independent of live mutation so they can be tested without administrator access.
 
@@ -85,4 +86,4 @@ A clean external-host installation is a separate release gate. Success on the ow
 
 ## Deferred work
 
-Managed tenancy/billing, fleet placement, swarm orchestration, GPU memory restoration, Windows/ARM support, provider credential brokering, a new CI scheduler and premium engine recipes are outside the initial bootstrap. Unreal/Unity and Cloudflare preparations can use the resulting interfaces later.
+Managed tenancy/billing, automatic fleet placement, swarm orchestration, GPU memory restoration, Windows/ARM support, provider credential brokering, a new CI scheduler and premium engine recipes are outside the initial bootstrap. Unreal/Unity and Cloudflare preparations can use the resulting interfaces later.

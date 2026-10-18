@@ -8,31 +8,44 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 
 ## Status
 
-**Early development: a reusable runtime and implementation design, not yet a general-purpose server installer.**
+**Early development: working server bootstrap, capacity-aware fleet API, Vinext dashboard and headless browser MCP.**
 
 | Available in this repository | Planned |
 |---|---|
-| Incus environment controls over SSH or locally | Configurable, repeatable server bootstrap with `doctor`, `plan` and `apply` |
-| Pause, hibernate, disk/memory snapshots, forks and restore | Versioned preparation recipes for the three native clients |
-| Operator MCP tools and restricted guest desktop tools | Safe desktop provisioning, cache/mount setup and backup workflows |
-| Offline runtime tests | Optional GitHub Actions runner/cache module |
+| Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Independently qualified fresh-host installs and upgrade/rollback |
+| Official client preparation and reusable clean VM snapshots | Shared mount/cache services and off-host backup workflows |
+| Fleet REST API, operator MCP and authenticated Vinext dashboard | Automatic placement, tenancy and billing |
+| Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
+| Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 
-The original private-host prototype installed all three clients and passed 28 environment, mounted-Git and desktop checks. Those results apply to that prototype; this extraction needs its own disposable-VM validation. Native subscription login/inference, portable bootstrap and public tenancy have not been validated here.
+The first target is one trusted owner operating Linux/KVM servers. Native subscription login/inference, hostile tenancy, cross-host memory migration and a portable CI module are not validated capabilities. Provider and browser accounts stay inside private workspaces; reusable bases are prepared before login.
 
-## Try the runtime
+[Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 
-Prerequisites: Python 3.11+, `uv`, OpenSSH, and a prepared Linux Incus VM with the guest conventions below. This checkout does not install Incus or create a VM yet.
+## Bootstrap a server
+
+Prerequisites: Python 3.11+, `uv`, OpenSSH and a Linux x86_64 server with usable KVM and administrative access. Start with the [bootstrap guide](docs/BOOTSTRAP.md). Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
 
 ```sh
 git clone https://github.com/coop-collective/enginebox.git
 cd enginebox
 uv sync --project runtime --locked
-export ENGINEBOX_HOST=my-server # your SSH config alias, or local
-runtime/.venv/bin/ebox list
-runtime/.venv/bin/ebox shell ebox-dev
+runtime/.venv/bin/ebox init --output enginebox.toml
+# Edit enginebox.toml for your host, storage and networking.
+runtime/.venv/bin/ebox doctor --config enginebox.toml
+runtime/.venv/bin/ebox plan --config enginebox.toml
+runtime/.venv/bin/ebox apply --config enginebox.toml
 ```
 
 Inside a prepared guest, launch `codex`, `agent` or `claude` directly. Provider subscriptions and limits remain with the provider; Engine Box does not pool credentials or resell inference.
+
+## Manage workspaces
+
+The [fleet service](docs/FLEET.md) clones configured clean snapshots, checks CPU/RAM/storage reserves and serializes mutations per host. Installed tools and dependencies are inherited through storage-level copies; repeated forks do not rerun the installers. Frozen VMs retain their RAM allocation. Stopped and hibernated VMs release compute but keep disk commitments.
+
+The [Vinext dashboard](docs/DASHBOARD.md) provides inventory, creation and lifecycle controls. Its server holds the API token; the browser authenticates with a separate owner password. The [operator MCP](docs/FLEET.md) exposes the same fleet operations to local tools. Both use the same backend and admission checks.
+
+[Browser MCP](docs/BROWSER.md) gives each native CLI its own persistent headless Chromium profile. Agents can navigate, inspect pages, type, click and take screenshots. It controls the workspace browser; personal laptop browser sessions are not imported.
 
 The runtime targets an Incus project named `enginebox` by default, with `ebox-` prefixed VMs and an `agent` user (UID/GID 1001), `/home/agent`, `/workspace` and optional display `:99`. See [runtime configuration](docs/RUNTIME.md) for overrides and capability boundaries. The operator needs administrative Incus access through noninteractive `sudo`; this is a trusted-owner tool.
 
@@ -41,6 +54,10 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)
+- [Server bootstrap](docs/BOOTSTRAP.md)
+- [Fleet API and MCP](docs/FLEET.md)
+- [Vinext dashboard](docs/DASHBOARD.md)
+- [Headless browser control](docs/BROWSER.md)
 - [Runtime operations and configuration](docs/RUNTIME.md)
 - [Contributing](CONTRIBUTING.md)
 

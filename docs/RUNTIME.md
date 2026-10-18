@@ -1,6 +1,6 @@
 # Current runtime
 
-This is an extracted environment controller for **already prepared Incus VMs**. Host bootstrap, provider installation, desktop provisioning and a TOML configuration loader are planned. The example TOML is design documentation only.
+These are the lower-level commands for prepared Incus VMs. Use [bootstrap](BOOTSTRAP.md) to create a workspace and [fleet operations](FLEET.md) for capacity-aware creation and lifecycle controls through the API, MCP or dashboard.
 
 ## Configuration
 
@@ -37,7 +37,7 @@ runtime/.venv/bin/ebox fork ebox-dev checkpoint-one ebox-copy
 runtime/.venv/bin/ebox resume ebox-copy
 ```
 
-VM names must start with `ebox-`. Pause keeps memory allocated. Hibernate relies on a compatible stateful Incus VM configuration and saves memory to disk. A fork boots independently from the snapshot's disk. The controller does not create the VM/profile or enable stateful support itself.
+VM names must start with `ebox-`. Pause keeps memory allocated. Hibernate relies on a compatible stateful Incus VM configuration and saves memory to disk. A fork boots independently from the snapshot's disk. Bootstrap creates the VM/profile and configures stateful support; these lower-level commands assume that preparation is complete. They do not apply fleet admission or the fleet/installer host lock, so do not mix direct mutations with active controller jobs.
 
 Snapshotting a running VM requests memory state; snapshotting a cleanly stopped VM captures disk only. Shared external mounts are excluded. A snapshot includes private files and any account state present. Do not turn an authenticated workspace snapshot into a reusable/public base.
 
@@ -58,7 +58,7 @@ An operator MCP client can launch the absolute path to `runtime/.venv/bin/engine
 
 A prepared guest can launch the same entry point with `ENGINEBOX_GUEST=1`. That exposes only four desktop tools and does not require a host target. The mode flag restricts the tool list; actual authorization depends on keeping host credentials and privileges out of the guest. X11, `scrot`, `xdotool` and the display must already exist. The computer controls currently assume a 1440×900 desktop.
 
-`ebox desktop ebox-dev` prints connection information for an already configured noVNC service on guest port 6080. SSH mode produces a local tunnel; local mode produces a guest URL. **This command does not install or secure that service.** The original prototype's private-network listener was not isolated from other trusted guests. Safe generic desktop provisioning is an outstanding implementation gate; do not expose an unauthenticated desktop on a shared network.
+`ebox desktop ebox-dev` prints connection information for an existing guest-network noVNC listener on port 6080. **This legacy tunnel does not reach the new optional desktop recipe's guest-loopback-only listener.** Interactive viewer transport is still pending. Headless [browser MCP](BROWSER.md) works independently, and guest computer MCP can control the optional virtual desktop locally. Do not expose an unauthenticated desktop listener to work around this limitation.
 
 ## Verification and limitations
 
@@ -69,6 +69,6 @@ uv sync --project runtime --locked
 runtime/.venv/bin/python -m unittest discover -s tests -v
 ```
 
-These tests validate configuration, command construction, lifecycle guards and MCP mode boundaries without contacting a host. They do not establish native account/inference support or validate this extracted runtime on a real VM.
+These tests validate configuration, command construction, lifecycle guards, fleet capacity and MCP mode boundaries without contacting a host. They do not establish native account/inference support. The opt-in browser integration test runs only inside an explicitly prepared disposable guest.
 
-The original host scripts and live probes were deliberately excluded: they contain machine-specific changes and operate on an existing workspace. The new integration suite must provision disposable targets. Operation locking, complete cancellation, identity sanitization, reboot/backup recovery and generalized storage/network setup remain planned.
+Machine-specific inventory, credentials and live evidence remain outside Git. Bootstrap/fleet share a host lock; prepared disk clones regenerate guest identity. Complete cancellation, reboot/backup recovery and generalized shared mount/cache services remain release work.

@@ -1,0 +1,42 @@
+# Fresh Ubuntu 24.04/26.04 x86_64 with KVM, Python3, SSH and sudo already available.
+# Package installation is explicit; no repositories or global firewall rules added.
+schema_version = 1
+
+[host]
+transport = "ssh"
+target = "my-server"
+install_packages = true
+disk_reserve = "5GiB"
+memory_reserve = "1GiB"
+
+[incus]
+project = "enginebox"
+profile = "enginebox"
+
+[storage]
+mode = "development-loop"
+pool = "ebox-pool"
+size = "120GiB" # Bounded development convenience; never repartitions a disk
+
+[network]
+mode = "managed"
+name = "eboxbr0"
+subnet = "10.203.0.1/24" # Change if this overlaps an existing network
+
+[workspace]
+name = "ebox-dev"
+image = "images:ubuntu/24.04/cloud"
+cpu = 4
+memory = "4GiB"
+disk = "30GiB"
+state_disk = "8GiB"
+
+[agents]
+install = ["codex", "cursor", "claude"]
+
+[modules]
+desktop = false
+browser = true
+operator_mcp = true
+guest_computer_mcp = false
+ci = false

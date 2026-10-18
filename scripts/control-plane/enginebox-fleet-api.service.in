@@ -1,0 +1,27 @@
+# Managed by Engine Box control-plane installer v1
+# Engine Box prefix: @PREFIX@
+[Unit]
+Description=Engine Box fleet API (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+Environment=HOME=@HOME@
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=@PREFIX@/current/etc/api.env
+WorkingDirectory=@PREFIX@/current
+ExecStart=@PREFIX@/current/venv/bin/python -m fleet_api --config @PREFIX@/current/etc/fleet.toml --state-dir @PREFIX@/state/jobs --port ${ENGINEBOX_API_PORT}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+PrivateTmp=true
+ProtectSystem=full
+MemoryMax=512M
+CPUQuota=200%
+# Existing sudo/Incus permissions are required; this installer does not grant them.
+
+[Install]
+WantedBy=multi-user.target
