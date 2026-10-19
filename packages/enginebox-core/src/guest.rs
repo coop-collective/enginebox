@@ -62,6 +62,10 @@ fn write_root(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let _ = mode;
     file.as_file().sync_all()?;
     file.persist(path)?;
+    // The rename itself must be durable before bootstrap can snapshot/reboot
+    // the VM. fsync on the temporary inode alone does not persist its new name.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 fn ensure_root() -> Result<()> {

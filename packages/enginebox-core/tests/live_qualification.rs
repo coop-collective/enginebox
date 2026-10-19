@@ -4,6 +4,9 @@
 //! ENGINEBOX_TEST_HOST, ENGINEBOX_TEST_RELEASE_BIN, ENGINEBOX_TEST_SOURCE
 //! (ebox-base/snapshot). Optional ENGINEBOX_TEST_PREPARE=1 exercises preparation
 //! on the existing-client clone; it does not claim a fresh Ubuntu installation.
+//! ENGINEBOX_TEST_FRESH=1 uses the supported Ubuntu cloud image with no profiles,
+//! the fleet's existing pool/network, and no source snapshot. It runs preparation
+//! twice to check the real download path and repeatability without authentication.
 use anyhow::{Context, Result, ensure};
 use enginebox_core::{
     EngineBox, Host, Resources, bootstrap, capacity, fleet, guest, load_hosts,
@@ -256,31 +259,54 @@ fn disposable_linux_guest_qualification() -> Result<()> {
             && !release.chars().any(char::is_control),
         "Invalid candidate binary directory"
     );
-    let source = std::env::var("ENGINEBOX_TEST_SOURCE")?;
-    let (base, snapshot) = source
-        .split_once('/')
-        .context("Source must be BASE/SNAPSHOT")?;
-    enginebox_core::identifier(base, true)?;
-    enginebox_core::identifier(snapshot, false)?;
+    let fresh = std::env::var("ENGINEBOX_TEST_FRESH").as_deref() == Ok("1");
+    let source = if fresh {
+        "images:ubuntu/24.04/cloud".to_owned()
+    } else {
+        std::env::var("ENGINEBOX_TEST_SOURCE")?
+    };
     let bx = host.engine_box();
-    let mut source_before =
-        fleet::template_snapshot(&host, &json!({"source":base,"snapshot":snapshot}))?;
-    ensure!(
-        source_before["config"]["user.enginebox.owner"] == host.project,
-        "Clean snapshot owner mismatch"
-    );
+    let (template, mut source_before) = if fresh {
+        let network = host
+            .network
+            .as_ref()
+            .context("Fresh test requires an explicit existing fleet network")?;
+        let observed = bx.query(&format!("/1.0/networks/{network}?project={}", host.project))?;
+        ensure!(
+            observed["managed"] == true
+                && observed["type"] == "bridge"
+                && observed["status"] == "Created",
+            "Fresh test requires an existing managed bridge; it creates no host infrastructure"
+        );
+        (Value::Null, Value::Null)
+    } else {
+        let (base, snapshot) = source
+            .split_once('/')
+            .context("Source must be BASE/SNAPSHOT")?;
+        enginebox_core::identifier(base, true)?;
+        enginebox_core::identifier(snapshot, false)?;
+        let template = json!({"source":base,"snapshot":snapshot});
+        let observed = fleet::template_snapshot(&host, &template)?;
+        ensure!(
+            observed["config"]["user.enginebox.owner"] == host.project,
+            "Clean snapshot owner mismatch"
+        );
+        (template, observed)
+    };
     let resources = Resources {
         cpu: 2,
         memory_gib: 2,
         disk_gib: 30,
     };
-    let (_, disk) = fleet::root_device(&bx, &source_before)?;
-    ensure!(
-        disk["pool"] == host.pool
-            && capacity::resource_bytes(&disk["size"], u64::MAX)
-                <= resources.disk_gib * enginebox_core::GIB,
-        "Source disk cannot fit qualification allocation"
-    );
+    if !fresh {
+        let (_, disk) = fleet::root_device(&bx, &source_before)?;
+        ensure!(
+            disk["pool"] == host.pool
+                && capacity::resource_bytes(&disk["size"], u64::MAX)
+                    <= resources.disk_gib * enginebox_core::GIB,
+            "Source disk cannot fit qualification allocation"
+        );
+    }
     let candidate = format!("{release}/enginebox-host");
     let _lease = lease(&host, &candidate)?;
     let facts: Value = serde_json::from_slice(&host_exec(
@@ -338,13 +364,35 @@ fn disposable_linux_guest_qualification() -> Result<()> {
         );
     }
     let started = Instant::now();
-    bx.call(&[
-        "copy",
-        &source,
-        &name,
-        "--stateless",
-        "--storage",
-        &host.pool,
+    let mut create = if fresh {
+        vec![
+            "init",
+            &source,
+            &name,
+            "--vm",
+            "--no-profiles",
+            "--storage",
+            &host.pool,
+            "--network",
+            host.network.as_deref().unwrap(),
+        ]
+    } else {
+        vec![
+            "copy",
+            &source,
+            &name,
+            "--stateless",
+            "--storage",
+            &host.pool,
+        ]
+    };
+    let owner = format!("user.enginebox.owner={}", host.project);
+    let validation = format!("user.enginebox.validation={marker}");
+    create.extend([
+        "-c",
+        &owner,
+        "-c",
+        "migration.stateful=true",
         "-c",
         "limits.cpu=2",
         "-c",
@@ -360,8 +408,15 @@ fn disposable_linux_guest_qualification() -> Result<()> {
         "-c",
         "boot.autostart=false",
         "-c",
-        &format!("user.enginebox.validation={marker}"),
-    ])?;
+        &validation,
+    ]);
+    if fresh {
+        create.extend(["-c","cloud-init.user-data=#cloud-config\npreserve_hostname: true\n","-c","cloud-init.network-config=version: 2\nethernets:\n  enginebox:\n    match:\n      name: 'en*'\n    dhcp4: true\n    dhcp-identifier: mac\n"]);
+    }
+    bx.run(
+        &create.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+        Duration::from_secs(900),
+    )?;
     let vm = bx.instance(&name)?;
     let (device, disk) = fleet::root_device(&bx, &vm)?;
     ensure!(
@@ -405,14 +460,14 @@ fn disposable_linux_guest_qualification() -> Result<()> {
             "--already-locked",
         ],
     )?)?;
-    let readiness = ready(&bx, &name)?;
+    let mut readiness = if fresh {
+        Value::Null
+    } else {
+        ready(&bx, &name)?
+    };
     let migration_ready_seconds = started.elapsed().as_secs_f64();
     for binary in ["enginebox-host", "enginebox-guest", "enginebox-mcp"] {
-        let version = bx.execute(
-            &name,
-            &[binary.into(), "--version".into()],
-            Duration::from_secs(15),
-        )?;
+        let version = bx.call(&["exec", &name, "--", binary, "--version"])?;
         ensure!(
             String::from_utf8(version)?.trim() == format!("{binary} {}", env!("CARGO_PKG_VERSION")),
             "Helper version mismatch"
@@ -430,18 +485,20 @@ fn disposable_linux_guest_qualification() -> Result<()> {
             "Installed helper hash mismatch"
         );
     }
-    guest::assert_remote_idle(&host, &name)?;
-    bx.call(&[
-        "exec",
-        &name,
-        "--",
-        "enginebox-host",
-        "clean-base-check",
-        "--home",
-        &host.guest.home,
-    ])?;
+    if !fresh {
+        guest::assert_remote_idle(&host, &name)?;
+        bx.call(&[
+            "exec",
+            &name,
+            "--",
+            "enginebox-host",
+            "clean-base-check",
+            "--home",
+            &host.guest.home,
+        ])?;
+    }
     let mut preparation = Value::Null;
-    if std::env::var("ENGINEBOX_TEST_PREPARE").as_deref() == Ok("1") {
+    if fresh || std::env::var("ENGINEBOX_TEST_PREPARE").as_deref() == Ok("1") {
         let mut c = bootstrap::defaults();
         c["host"]["transport"] = json!("local");
         c["storage"]["pool"] = json!(host.pool);
@@ -451,7 +508,13 @@ fn disposable_linux_guest_qualification() -> Result<()> {
         c["workspace"]["cpu"] = json!(2);
         c["workspace"]["memory"] = json!("2GiB");
         c["workspace"]["state_disk"] = json!("4GiB");
+        c["workspace"]["user"] = json!(host.guest.user);
+        c["workspace"]["uid"] = json!(host.guest.uid);
+        c["workspace"]["gid"] = json!(host.guest.gid);
+        c["workspace"]["home"] = json!(host.guest.home);
+        c["workspace"]["path"] = json!(host.guest.workspace);
         let c = bootstrap::normalize(c)?;
+        eprintln!("Preparing {name}; fresh Ubuntu image: {fresh}");
         let before = Instant::now();
         let output = bx.run_input(
             &[
@@ -465,9 +528,34 @@ fn disposable_linux_guest_qualification() -> Result<()> {
             Duration::from_secs(1800),
         )?;
         let details: Value = serde_json::from_slice(&output)?;
-        preparation = json!({"basis":"existing native clients in clean clone; not a fresh Ubuntu installation","seconds":before.elapsed().as_secs_f64(),"result":details});
+        preparation = json!({"basis":if fresh { "fresh images:ubuntu/24.04/cloud VM; no inherited profile or native client installation" } else { "existing native clients in clean clone; not a fresh Ubuntu installation" },"seconds":before.elapsed().as_secs_f64(),"result":details});
+        bx.call(&[
+            "exec",
+            &name,
+            "--",
+            "test",
+            "-f",
+            "/etc/cloud/cloud-init.disabled",
+        ])?;
         bx.call(&["restart", &name, "--force"])?;
-        ready(&bx, &name)?;
+        readiness = ready(&bx, &name)?;
+        if fresh {
+            eprintln!("Rechecking preparation idempotence in {name}");
+            let before = Instant::now();
+            let output = bx.run_input(
+                &[
+                    "exec".into(),
+                    name.clone(),
+                    "--".into(),
+                    "enginebox-host".into(),
+                    "prepare-guest".into(),
+                ],
+                &serde_json::to_vec(&c)?,
+                Duration::from_secs(1800),
+            )?;
+            preparation["repeat"] = json!({"seconds":before.elapsed().as_secs_f64(),"result":serde_json::from_slice::<Value>(&output)?});
+            ready(&bx, &name)?;
+        }
         bx.call(&[
             "exec",
             &name,
@@ -478,6 +566,13 @@ fn disposable_linux_guest_qualification() -> Result<()> {
             &host.guest.home,
         ])?;
     }
+    let installed_versions: Value = serde_json::from_slice(&bx.call(&[
+        "exec",
+        &name,
+        "--",
+        "cat",
+        "/opt/enginebox-runtime/installed-versions.json",
+    ])?)?;
     let computer = mcp(&bx, &name, false)?;
     let browser = mcp(&bx, &name, true)?;
     guest::assert_remote_idle(&host, &name)?;
@@ -494,20 +589,25 @@ fn disposable_linux_guest_qualification() -> Result<()> {
     );
     ready(&bx, &name)?;
     let resume_seconds = resume.elapsed().as_secs_f64();
-    let mut source_after =
-        fleet::template_snapshot(&host, &json!({"source":base,"snapshot":snapshot}))?;
+    let mut source_after = if fresh {
+        Value::Null
+    } else {
+        fleet::template_snapshot(&host, &template)?
+    };
     // Incus observation fields may change when a CoW snapshot is copied:
     // `size` includes backend physical/shared extent accounting.
-    for key in ["last_used_at", "size"] {
-        source_before.as_object_mut().unwrap().remove(key);
-        source_after.as_object_mut().unwrap().remove(key);
+    if !fresh {
+        for key in ["last_used_at", "size"] {
+            source_before.as_object_mut().unwrap().remove(key);
+            source_after.as_object_mut().unwrap().remove(key);
+        }
+        ensure!(
+            source_before == source_after,
+            "Original clean snapshot changed"
+        );
     }
-    ensure!(
-        source_before == source_after,
-        "Original clean snapshot changed"
-    );
     disposable.cleanup()?;
-    let report = json!({"passed":true,"name":name,"version":env!("CARGO_PKG_VERSION"),"allocation":resources,"migration":migration,"helper_sha256":hashes,"readiness":readiness,"migration_ready_seconds":migration_ready_seconds,"preparation":preparation,"computer_mcp":computer,"browser_mcp":browser,"pause_seconds":pause_seconds,"resume_ready_seconds":resume_seconds,"source_snapshot_unchanged":true,"cleanup":true,"inference_tested":false});
+    let report = json!({"passed":true,"name":name,"version":env!("CARGO_PKG_VERSION"),"allocation":resources,"migration":migration,"helper_sha256":hashes,"readiness":readiness,"migration_ready_seconds":migration_ready_seconds,"preparation":preparation,"installed_versions":installed_versions,"computer_mcp":computer,"browser_mcp":browser,"pause_seconds":pause_seconds,"resume_ready_seconds":resume_seconds,"source_snapshot_unchanged":if fresh {Value::Null} else {json!(true)},"cleanup":true,"inference_tested":false});
     if let Ok(path) = std::env::var("ENGINEBOX_TEST_REPORT") {
         enginebox_core::state::write_json(Path::new(&path), &report)?;
     }

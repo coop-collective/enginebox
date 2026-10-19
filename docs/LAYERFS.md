@@ -12,6 +12,8 @@ Engine Box would own tenant authorization, scheduling, resource limits, native p
 
 The intended flow is: select an authorized base revision, create a private writable branch, attach it to an isolated workspace, launch the original CLI with that workspace's private home, then checkpoint the file state. This does not replace the native harness or require routing its inference through Engine Box. Tool-call-by-tool-call history is a separate integration decision; the current native CLI launch interface does not expose every internal tool call.
 
+The current documented sandbox path uses Docker. An Incus VM mount adapter is not established by that support: the first experiment must prove how a selected branch reaches the guest, which process owns the mount, and what survives either side restarting. An agent should receive its authorized workspace view, not unrestricted access to the underlying shared Store. Keep this adapter optional until that boundary works with the existing VM lifecycle.
+
 File checkpoints and memory checkpoints must remain separate capabilities. Incus pause/hibernate captures VM process state. A file branch alone cannot restore RAM, active sockets, browser sessions or a running compiler. A combined checkpoint needs a consistency barrier so the filesystem revision and VM memory describe the same state.
 
 ## Security and data scope
