@@ -31,7 +31,7 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 - `packages/dashboard`: Vinext owner dashboard, session authentication and server-side proxy.
 - `examples/`: host/fleet configuration and portable template manifests. Tests live with their owning package.
 
-The Rust port uses root pnpm with Cargo and JavaScript lockfiles. Real controller upgrade/rollback through the stable supervisor has been tested with concurrent requests and the real dashboard; independent Windows execution, fresh-host bootstrap and initial Python-to-Rust cutover remain distinct gates. See [migration](RUST-MIGRATION.md) and [updates](UPDATES.md).
+The Rust port uses root pnpm with Cargo and JavaScript lockfiles. Native Linux, macOS and Windows checks passed for the merged port. Real controller upgrade/rollback through the stable supervisor has been tested with concurrent requests and the real dashboard; Windows service installation, fresh-host bootstrap and initial Python-to-Rust cutover remain distinct gates. See [migration](RUST-MIGRATION.md) and [updates](UPDATES.md).
 
 Do not implement a generic plugin framework before a second backend exists. Keep config parsing and planning independent of live mutation so they can be tested without administrator access.
 

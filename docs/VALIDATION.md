@@ -4,7 +4,7 @@ October 19, 2026. These are development acceptance results on newly created VMs 
 
 ## Rust migration qualification
 
-The 0.3 development branch passes the Rust workspace tests and strict Clippy on macOS and Linux x86_64, with TypeScript checks, 20 dashboard unit tests and 19 dashboard browser tests on macOS. Native release binaries build on both platforms. A Windows GNU cross-target check covers every package and test target. The native verification matrix separately executes Windows MSVC tests and builds; cross-compilation alone does not establish Windows execution, service installation or native provider sign-in.
+The 0.3 Rust port merged in [PR #2](https://github.com/coop-collective/enginebox/pull/2) as `c8aaf37dab78111af0a7444313304b7f9e46bc2b` on October 19, 2026. The [native verification matrix](https://github.com/coop-collective/enginebox/actions/runs/39244413008) passed tests, strict Clippy and builds on Linux, macOS and Windows MSVC. Local checks also passed TypeScript, 20 dashboard unit tests and 19 dashboard browser tests; Linux CI passed the browser suite. Windows service installation and native provider sign-in remain separate qualifications. Merging did not deploy a replacement for the running v0.2 control plane.
 
 The actual native supervisor/controller/dashboard test stages a separately compiled next controller version, continuously calls authenticated GET/POST endpoints through upgrade and rollback, and verifies exclusive ownership, retained jobs/templates/private Claude scratchnotes, valid browser cookies and previous immutable browser assets. Failed version health and failed activation retain or restore the prior controller. Killing/restarting the supervisor releases old children through their lifelines. An actual stdio fleet MCP process also survives those transitions. See [UPDATES.md](UPDATES.md) for the reproducible opt-in test and its receipt.
 
@@ -25,6 +25,8 @@ A separate fresh Ubuntu 24.04 image, with no inherited profiles or installed cli
 No provider credentials were attached and no inference was requested in any guest qualification. All test guests and staging directories were removed; existing workspaces, reserves and source snapshots retained their states. Reproduce these checks only with the explicit opt-in test in `packages/enginebox-core/tests/live_qualification.rs` and a private fleet configuration. It admits each disposable guest under the host lock, marks it ineligible for credential delegation and records its own resource identifiers for guarded cleanup. Private receipts remain outside Git.
 
 These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. LayerFS remains an [evaluated candidate](LAYERFS.md), not a qualified dependency.
+
+After merge, [35 disposable Rust boot/resume samples](RUST-BOOT-BENCHMARKS.md) passed: full host-local readiness medians were 0.512 s from frozen RAM, 6.034 s from stopped and 5.846 s from hibernation. [Pinned LayerFS experiments](LAYERFS-VALIDATION.md) separately exercised real mounts, storage sharing, Git and offline dependency reuse, with remaining integration limits recorded.
 
 ## Historical v0.2 qualification
 
