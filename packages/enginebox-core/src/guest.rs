@@ -321,6 +321,10 @@ fn contains_secret(v: &Value) -> bool {
                 "authorization",
                 "oauthaccount",
                 "clientsecret",
+                "claudecodeoauthtoken",
+                "anthropicapikey",
+                "cursorapikey",
+                "openaiapikey",
             ]
             .contains(&k.as_str())
                 && !v.is_null()
@@ -335,6 +339,12 @@ fn contains_secret(v: &Value) -> bool {
 pub fn clean_base_check(home: &Path) -> Result<Value> {
     ensure!(home.is_absolute(), "Absolute home required");
     let mut blocked = Vec::new();
+    let backups = ".local/state/enginebox/browser-migrations";
+    match std::fs::symlink_metadata(home.join(backups)) {
+        Ok(_) => blocked.push(backups.to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     for relative in [
         ".codex/auth.json",
         ".claude/.credentials.json",
@@ -920,6 +930,17 @@ pub fn setup_user_mcp(c: &Value) -> Result<Value> {
         "MCP registration must run as guest user"
     );
     let home = Path::new(&g.home);
+    let migration = if c["modules"]["browser"] == true {
+        let providers = c["agents"]["install"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect::<Vec<_>>();
+        crate::browser_migration::migrate(home, &providers)?
+    } else {
+        json!({"changed":[]})
+    };
     let codex_path = home.join(".codex/config.toml");
     let codex: toml::Value = if codex_path.exists() {
         ensure!(!codex_path.is_symlink(), "Codex config cannot be symlink");
@@ -1025,7 +1046,61 @@ pub fn setup_user_mcp(c: &Value) -> Result<Value> {
         crate::state::private_dir(parent)?;
         crate::state::write_json(&cursor_path, &cursor)?;
     }
-    Ok(json!({"configured":true}))
+    Ok(json!({"configured":true,"browser_migration":migration}))
+}
+
+/// Guest-user half of the explicit migration; no provisioning or native login.
+pub fn migrate_user_browser_mcp(g: &GuestConfig) -> Result<Value> {
+    g.validate()?;
+    ensure!(
+        bootstrap::current_uid() == g.uid,
+        "Browser MCP migration must run as the configured guest user"
+    );
+    // This only edits this user's known config entries. The node half proves VM
+    // custody; do not require or rewrite a legacy identity service here.
+    crate::browser_migration::migrate(Path::new(&g.home), &["claude", "codex", "cursor"])
+}
+
+fn validate_browser_migration_target(vm: &Value, project: &str, name: &str) -> Result<()> {
+    validate_helper_target(vm, project)?;
+    let pool = capacity::pool_metadata(vm, &vm["config"]);
+    ensure!(
+        vm["config"]["user.enginebox.fleet"] == "true"
+            && vm["config"]["user.enginebox.clean-base"] != "true"
+            && !name.starts_with("ebox-template-")
+            && !["ready", "preparing", "quarantined"]
+                .contains(&pool["warm_pool_state"].as_str().unwrap_or("")),
+        "Browser MCP migration requires an assigned private workspace"
+    );
+    Ok(())
+}
+
+/// Node administrator operation. The caller holds the shared host lifecycle
+/// lease; private guest leases also protect each provider across controllers.
+pub fn migrate_browser_mcp(project: &str, name: &str, g: &GuestConfig) -> Result<Value> {
+    ensure_root()?;
+    g.validate()?;
+    crate::identifier(name, true)?;
+    let bx = crate::transport::EngineBox::new("local", project, g.clone())?;
+    let vm = bx.instance(name)?;
+    validate_browser_migration_target(&vm, project, name)?;
+    let host = Host {
+        target: "local".into(),
+        project: project.into(),
+        guest: g.clone(),
+        ..Default::default()
+    };
+    assert_remote_idle(&host, name)?;
+    let result: Value = serde_json::from_slice(&bx.execute_with_input(
+        name,
+        &[
+            "/usr/local/bin/enginebox-host".into(),
+            "migrate-user-browser-mcp".into(),
+        ],
+        &serde_json::to_vec(g)?,
+        Duration::from_secs(30),
+    )?)?;
+    Ok(json!({"name":name,"migration":result}))
 }
 
 /// Install only native Engine Box helper executables into an already owned VM.
@@ -1178,4 +1253,74 @@ pub fn validate_helper_target(vm: &Value, project: &str) -> Result<()> {
         "Quarantined reserves require explicit inspection before helper rollout"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod browser_migration_guards {
+    use super::*;
+
+    #[test]
+    fn explicit_migration_requires_running_owned_private_vm() {
+        let base = json!({"type":"virtual-machine","status":"Running","config":{
+            "user.enginebox.owner":"test-project", "user.enginebox.fleet":"true"
+        }});
+        assert!(validate_browser_migration_target(&base, "test-project", "private-01").is_ok());
+        for (field, value) in [
+            ("user.enginebox.owner", "foreign"),
+            ("user.enginebox.fleet", "false"),
+            ("user.enginebox.clean-base", "true"),
+            ("user.enginebox.pool.state", "ready"),
+            ("user.enginebox.pool.state", "preparing"),
+            ("user.enginebox.pool.state", "quarantined"),
+        ] {
+            let mut vm = base.clone();
+            vm["config"][field] = json!(value);
+            assert!(
+                validate_browser_migration_target(&vm, "test-project", "private-01").is_err(),
+                "Allowed {field}={value}"
+            );
+        }
+        assert!(
+            validate_browser_migration_target(&base, "test-project", "ebox-template-abc").is_err()
+        );
+        for status in ["Frozen", "Stopped"] {
+            let mut vm = base.clone();
+            vm["status"] = json!(status);
+            assert!(validate_browser_migration_target(&vm, "test-project", "private-01").is_err());
+        }
+    }
+
+    #[test]
+    fn clean_base_rejects_backups_even_when_original_configs_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join(".local/state/enginebox/browser-migrations");
+        std::fs::create_dir_all(&backups).unwrap();
+        let error = clean_base_check(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("browser-migrations"));
+    }
+
+    #[test]
+    fn clean_base_rejects_exact_delegated_environment_keys() {
+        for name in [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CURSOR_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(".claude.json"),
+                serde_json::to_vec(&json!({
+                    "mcpServers":{"custom":{"env":{name:"fixture-secret"}}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(clean_base_check(dir.path()).is_err(), "Missed {name}");
+            assert!(!contains_secret(&json!({name:""})));
+        }
+        assert!(!contains_secret(
+            &json!({"customTokenLabel":"not a known credential"})
+        ));
+    }
 }

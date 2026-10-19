@@ -1,6 +1,6 @@
 # Implementation plan
 
-Updated October 19, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
+Updated October 20, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
 
 ## Milestones
 
@@ -20,6 +20,18 @@ Updated October 19, 2026. Scope: portable environments for native Codex, Cursor 
 Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and initial legacy migration remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
 The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. It does not add agent orchestration or automatic placement.
+
+## Current agent-readiness work
+
+The immediate delivery is the existing Linux fleet running the Rust controller with its original account homes, native conversation history and working coding/browser tools. The migration now supports an external private state root. Real supervisor update/rollback checks preserve that root, browser sessions and stdio MCP access; a separate [metadata qualification](RUST-STATE-QUALIFICATION.md) loaded the deployed Python controller's completed jobs, runs and templates in an isolated copy.
+
+The [native qualification](RUST-NATIVE-QUALIFICATION.md) passed actual file changes, exact conversation resume after service recreation, browser MCP interaction and independent screenshot verification for Codex and Claude. Cursor reached its provider but remains usage-limit blocked; its inference and resume are not qualified. Fresh Rust measurements retain a 0.505-second median frozen resume and 6.288-second median cold readiness across three samples each. These are host-local readiness measurements, not a controlled Python comparison or a model-response guarantee.
+
+Fresh templates need current guest preparation: syncing binaries cannot repair an older image's missing sandbox profile. Existing Engine Box browser entries also need an explicit migration from the Python launcher while preserving custom configuration. The Linux release has passed archive installation and transient service execution; persistent enrollment and the first live migration remain separate gates.
+
+These checks are prerequisites for the first live cutover, not evidence that it has happened. Preserve running private workspaces and account paths. Qualify the new clean template generation and capacity for its fresh reserves before routing allocations to it; stale reserves consume disk commitments even when their physical data is small. Provider quota failures remain separate from infrastructure failures.
+
+LayerFS now has compatibility-checked, durable allocation preparation and conservative reconciliation of already-completed attachment effects. Automatic attachment/finalization, release rollback fencing against active attachments, recovery after a real host restart and native agent execution on an attached checkout remain open. See [allocation](LAYERFS-ALLOCATION.md) and [attachment recovery](LAYERFS-INCUS.md). The persistent core dev environment and disposable database forks remain the next environment feature; they are not supplied by checkout caching alone.
 
 ## Implemented code boundaries
 

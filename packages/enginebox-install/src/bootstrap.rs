@@ -213,7 +213,7 @@ pub fn service_plan(install: &Installation, config: &Path) -> Result<ServicePlan
         "linux" => {
             let definition = home.join(".config/systemd/user/enginebox-supervisor.service");
             let content = format!(
-                "# {marker}\n[Unit]\nDescription=Engine Box stable supervisor\nAfter=network-online.target\n[Service]\nExecStart={} --config {}\nRestart=on-failure\nRestartSec=3\nUMask=0077\nNoNewPrivileges=true\n[Install]\nWantedBy=default.target\n",
+                "# {marker}\n[Unit]\nDescription=Engine Box stable supervisor\nAfter=network-online.target\n[Service]\nExecStart={} --config {}\nRestart=on-failure\nRestartSec=3\nUMask=0077\n# Local Incus nodes require the administrator-configured sudo helper.\n[Install]\nWantedBy=default.target\n",
                 safe_systemd(&binary)?,
                 safe_systemd(config)?
             );

@@ -184,9 +184,21 @@ pub fn tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            "storage_prepare",
+            "Prepare a stopped reserved VM for future LayerFS attachment after compatibility and capacity checks. Does not attach storage, start the VM or delegate credentials; automatic finalization is not implemented. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"name":{"type":"string"},"template":{"type":"string"},"size":{"type":"string"},"resources":{"type":"object"}}),
+            &["host_id", "project", "name", "template"],
+        ),
+        tool(
+            "storage_allocation",
+            "Read the durable stopped-allocation receipt; receipt status is not a live VM health check. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"name":{"type":"string"}}),
+            &["host_id", "name"],
+        ),
+        tool(
             "storage_inspect",
             "Queue a node prerequisite check or read its durable workspace receipts; poll fleet_job. List is not a live health probe.",
-            json!({"host_id":{"type":"string"},"operation":{"type":"string","enum":["inspect","list"],"default":"list"}}),
+            json!({"host_id":{"type":"string"},"operation":{"type":"string","enum":["inspect","list","compatibility"],"default":"list"}}),
             &["host_id"],
         ),
         tool(
@@ -271,7 +283,7 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         "agent_connections" => ("/v1/agents".into(), None),
         "storage_catalog" => ("/v1/storage".into(), None),
         "storage_inspect" | "storage_preview" | "storage_import" | "storage_fork"
-        | "storage_action" => {
+        | "storage_action" | "storage_prepare" | "storage_allocation" => {
             let mut body = json!({});
             let operation = match name {
                 "storage_inspect" => {
@@ -281,10 +293,26 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
                         .transpose()?
                         .unwrap_or("list");
                     ensure!(
-                        ["list", "inspect"].contains(&operation),
+                        ["list", "inspect", "compatibility"].contains(&operation),
                         "Unknown storage observation"
                     );
                     operation
+                }
+                "storage_prepare" => {
+                    body = json!({"project":storage_id(args,"project")?,"name":id(args,"name",true)?,"template":id(args,"template",false)?});
+                    if let Some(size) = object.get("size") {
+                        ensure!(size.is_string(), "Invalid allocation size");
+                        body["size"] = size.clone();
+                    }
+                    if let Some(resources) = object.get("resources") {
+                        ensure!(resources.is_object(), "Invalid allocation resources");
+                        body["resources"] = resources.clone();
+                    }
+                    "prepare"
+                }
+                "storage_allocation" => {
+                    body = json!({"name":id(args,"name",true)?});
+                    "allocation"
                 }
                 "storage_preview" | "storage_import" => {
                     body["project"] = json!(storage_id(args, "project")?);
@@ -564,11 +592,21 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            18
+            20
         );
     }
     #[test]
     fn storage_tools_preserve_review_and_do_not_expose_shell_or_paths() {
+        let (path, body) = tool_request("storage_prepare", &json!({"host_id":"worker","project":"game","name":"ebox-agent","template":"native","size":"minimum"})).unwrap();
+        assert_eq!(path, "/v1/storage/hosts/worker/prepare");
+        assert_eq!(body.unwrap()["name"], "ebox-agent");
+        assert!(
+            tool_request(
+                "storage_prepare",
+                &json!({"host_id":"worker","project":"game","name":"agent","template":"native"})
+            )
+            .is_err()
+        );
         let (path, body) = tool_request(
             "storage_preview",
             &json!({"host_id":"worker","project":"game"}),

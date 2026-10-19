@@ -41,10 +41,27 @@ pub struct Plan {
     argv: Vec<String>,
     timeout: Duration,
     runner: Runner,
+    action: Action,
+}
+enum Action {
+    Node,
+    Compatibility,
+    Prepare {
+        fleet: Fleet,
+        project: String,
+        params: Value,
+    },
+    Allocation {
+        fleet: Fleet,
+    },
 }
 impl Plan {
     pub fn execute(self) -> Result<Value> {
-        let result = (self.runner)(&self.host, &self.argv, self.timeout)?;
+        let result = if let Action::Allocation { fleet } = &self.action {
+            enginebox_core::preparation::inspect(fleet, &self.host.id, &self.name)?
+        } else {
+            (self.runner)(&self.host, &self.argv, self.timeout)?
+        };
         ensure!(
             result.is_object(),
             "Storage node returned an invalid result"
@@ -54,10 +71,48 @@ impl Plan {
             serde_json::to_vec(&result)?.len() <= 3 * 1024 * 1024,
             "Storage result exceeds the controller limit; inspect it directly on the node"
         );
+        let result = match self.action {
+            Action::Compatibility => {
+                require_storage_protocol(&result)?;
+                result
+            }
+            Action::Prepare {
+                fleet,
+                project,
+                params,
+            } => {
+                require_storage_protocol(&result)?;
+                enginebox_core::preparation::prepare(&fleet, &self.host.id, &project, &params)?
+            }
+            _ => result,
+        };
+        ensure!(
+            serde_json::to_vec(&result)?.len() <= 3 * 1024 * 1024,
+            "Storage result exceeds the controller limit; inspect it directly on the node"
+        );
         Ok(
             json!({"backend":"layerfs","host_id":self.host.id,"operation":self.operation,"result":result}),
         )
     }
+}
+
+fn require_storage_protocol(report: &Value) -> Result<()> {
+    ensure!(
+        serde_json::to_vec(report)?.len() <= 16 * 1024,
+        "Node protocol report exceeds 16 KiB"
+    );
+    ensure!(
+        report["component"] == "ebox"
+            && report["protocol"] == enginebox_core::node_protocol::PROTOCOL
+            && report["os"] == "linux"
+            && report["layerfs"]["workspace_schema"] == 2
+            && report["layerfs"]["attachment_schema"] == 3
+            && report["layerfs"]["exclusive_guest_writer"] == true
+            && report["capabilities"]["reserved_workspace_guard"] == 1
+            && report["capabilities"]["external_checkout_lifecycle_guard"] == 1,
+        "Storage executable is incompatible with stopped workspace preparation; install a compatible complete release"
+    );
+    Ok(())
 }
 
 fn identifier(value: &str) -> Result<()> {
@@ -156,7 +211,7 @@ impl Storage {
         })
     }
     pub fn catalog(&self) -> Value {
-        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false})
+        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
     }
     pub fn plan(&self, host_id: &str, operation: &str, body: &Value) -> Result<Plan> {
         let node = self
@@ -181,7 +236,47 @@ impl Storage {
             node.config.clone(),
         ];
         let name;
+        let mut action = Action::Node;
         let timeout = match operation {
+            "compatibility" | "prepare" => {
+                argv.truncate(6);
+                argv.push("node-protocol".into());
+                if operation == "compatibility" {
+                    fields(body, &[], &[])?;
+                    name = host_id.to_owned();
+                    action = Action::Compatibility;
+                } else {
+                    fields(
+                        body,
+                        &["project", "name", "template", "size", "resources"],
+                        &["project", "name", "template"],
+                    )?;
+                    let project = text(body, "project")?;
+                    ensure!(
+                        node.projects.iter().any(|p| p.id == project),
+                        "Unknown registered storage project"
+                    );
+                    let mut params = body.clone();
+                    params.as_object_mut().unwrap().remove("project");
+                    self.fleet.validate_operation(host_id, "create", &params)?;
+                    name = text(body, "name")?.to_owned();
+                    action = Action::Prepare {
+                        fleet: self.fleet.clone(),
+                        project: project.into(),
+                        params,
+                    };
+                }
+                30
+            }
+            "allocation" => {
+                fields(body, &["name"], &["name"])?;
+                name = text(body, "name")?.to_owned();
+                enginebox_core::identifier(&name, true)?;
+                action = Action::Allocation {
+                    fleet: self.fleet.clone(),
+                };
+                0
+            }
             "inspect" | "list" => {
                 fields(body, &[], &[])?;
                 name = host_id.to_owned();
@@ -297,6 +392,7 @@ impl Storage {
             argv,
             timeout: Duration::from_secs(timeout),
             runner: self.runner.clone(),
+            action,
         })
     }
     #[cfg(test)]
@@ -316,6 +412,14 @@ mod tests {
             vec![Host {
                 id: "node".into(),
                 target: "unused-fixture-node".into(),
+                templates: vec![enginebox_core::model::StaticTemplate {
+                    id: "native".into(),
+                    label: "Native".into(),
+                    source: "ebox-base".into(),
+                    snapshot: "prepared".into(),
+                    minimum: None,
+                    recommended: None,
+                }],
                 ..Default::default()
             }],
             &state_root,
@@ -399,5 +503,61 @@ mod tests {
             .execute()
             .unwrap_err();
         assert!(error.to_string().contains("controller limit"));
+    }
+    #[test]
+    fn preparation_requires_registered_project_and_explicit_node_contract_before_mutation() {
+        let (root, storage) = configured();
+        let request = json!({"project":"game","name":"ebox-agent","template":"native"});
+        for body in [
+            json!({"project":"foreign","name":"ebox-agent","template":"native"}),
+            json!({"project":"game","name":"ebox-agent","template":"native","source":"/private"}),
+            json!({"project":"game","name":"ebox-agent","template":"missing"}),
+        ] {
+            assert!(storage.plan("node", "prepare", &body).is_err());
+        }
+        let plan = storage.plan("node", "prepare", &request).unwrap();
+        assert_eq!(&plan.argv[4..], &["--host", "local", "node-protocol"]);
+        let incompatible = storage.with_runner(Arc::new(|_, _, _| {
+            Ok(json!({"version":"0.3.0","protocol":1}))
+        }));
+        assert!(
+            incompatible
+                .plan("node", "prepare", &request)
+                .unwrap()
+                .execute()
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible")
+        );
+        assert!(!root.path().join("state/allocations").exists());
+    }
+    #[test]
+    fn compatibility_is_a_binary_check_and_rejects_missing_or_future_receipt_support() {
+        let (_root, storage) = configured();
+        let mut valid = enginebox_core::node_protocol::report();
+        valid["os"] = json!("linux");
+        valid["component"] = json!("ebox");
+        valid["layerfs"] =
+            json!({"workspace_schema":2,"attachment_schema":3,"exclusive_guest_writer":true});
+        require_storage_protocol(&valid).unwrap();
+        for replacement in [
+            json!({}),
+            json!({"workspace_schema":2,"attachment_schema":4,"exclusive_guest_writer":true}),
+            json!({"workspace_schema":2,"attachment_schema":2,"exclusive_guest_writer":true}),
+            json!({"workspace_schema":2,"attachment_schema":3,"exclusive_guest_writer":false}),
+        ] {
+            let mut bad = valid.clone();
+            bad["layerfs"] = replacement;
+            assert!(require_storage_protocol(&bad).is_err());
+        }
+        let storage = storage.with_runner(Arc::new(move |_, _, _| Ok(valid.clone())));
+        assert!(
+            storage
+                .plan("node", "compatibility", &json!({}))
+                .unwrap()
+                .execute()
+                .is_ok()
+        );
+        assert_eq!(storage.catalog()["incus_attachment"], false);
     }
 }

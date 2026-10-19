@@ -61,6 +61,8 @@ The supervisor configuration is JSON:
 
 Omit `dashboard_listen` to run only the native API. The environment file is parsed as JSON and never sourced as shell code. The service launches a standby controller from the active release, obtains exclusive state ownership, then serves traffic through the stable front door.
 
+On Linux/macOS, an optional absolute `state_dir` in the supervisor configuration preserves an existing controller state root outside the installation. This is useful when migrating a legacy controller without moving native homes or changing installed-client paths. The directory must already exist, belong to the service user, have owner-only permissions, contain no symlink path components, and not overlap the installation (except its normal `PREFIX/state`). A missing path is rejected rather than creating empty accounts. Omit the field for new installations and Windows. Stop the legacy writer before activating Rust against that state; the path setting does not provide a drain protocol for Python. It also does not migrate node helpers, template revisions or provider formats.
+
 ```sh
 PREFIX/releases/0.3.0/bin/enginebox-supervisor --config PREFIX/etc/supervisor.json
 ```
@@ -86,6 +88,8 @@ sudo /opt/enginebox-node/releases/0.3.0/bin/enginebox-install --prefix /opt/engi
 
 This creates only an installer-owned `/usr/local/bin/enginebox-host` symlink after checking root ownership and non-writable ancestors. It refuses unrelated executables and links owned by another prefix. It does not grant sudo permissions, add users to Incus administrator groups, or modify an existing SSH policy.
 
+A controller using a local node executes this helper through noninteractive `sudo`. Its generated Linux user service therefore does not set `NoNewPrivileges`, which would prevent that administrator-approved elevation. The controller itself still runs as the unprivileged service user. Configure the intended sudo policy separately; a remote node instead applies its own SSH and privilege policy.
+
 Use `enginebox-host bootstrap init`, `doctor`, `plan` and `apply` to inspect and provision owned Incus resources from the host configuration. The Linux host's release supplies its Linux guest binaries; a Mac or Windows controller's executables are never uploaded into a Linux guest. Fleet credentials, host inventories, customer repositories and private checkpoints are not included in release archives.
 
 ## Build an archive from source
@@ -102,3 +106,5 @@ cargo run -p enginebox-install --bin enginebox-release -- \
 ```
 
 It emits `enginebox-VERSION-TARGET.tar.gz`, the matching JSON manifest and target-specific `.sha256` receipt. Required service, node, guest, CLI and MCP binaries are allowlisted; use repeated `--binary NAME` for additional tools. Dashboard dependencies must be materialized inside the standalone artifact: escaping or remaining symlinks are rejected. The output directory must not already exist.
+
+The October 20 Linux x86-64 qualification built the dashboard on Linux, packaged the native release, and used the installer to verify, stage and activate it in a disposable prefix. The installed supervisor then ran in a transient systemd user unit: readiness, dashboard login and its authenticated API proxy passed. The fixture used fake fleet/provider executables and did not replace production services. This does not qualify a fresh machine's package provisioning, persistent service enrollment or Windows/macOS service execution. Build the standalone dashboard on its target platform too; its image-processing dependencies can contain platform-specific native modules.

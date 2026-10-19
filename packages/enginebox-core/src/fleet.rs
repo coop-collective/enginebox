@@ -16,6 +16,10 @@ use std::{
 };
 type LifecycleGuard = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
 type PostStart = Arc<dyn Fn(&str, &str) -> Result<Value> + Send + Sync>;
+pub(crate) enum CopyMode<'a> {
+    Start(Option<&'a Value>),
+    Reserved(&'a Value),
+}
 #[derive(Clone)]
 pub struct Fleet {
     pub registry: Registry,
@@ -352,6 +356,17 @@ impl Fleet {
         custom: Option<&Value>,
         pool: Option<&Value>,
     ) -> Result<Value> {
+        self.copy_locked(h, name, id, size, custom, CopyMode::Start(pool))
+    }
+    pub(crate) fn copy_locked(
+        &self,
+        h: &Host,
+        name: &str,
+        id: &str,
+        size: Option<&str>,
+        custom: Option<&Value>,
+        mode: CopyMode<'_>,
+    ) -> Result<Value> {
         let facts = inventory(h)?;
         check_name(h, name, &facts)?;
         let t = self.template(h, id)?;
@@ -362,6 +377,29 @@ impl Fleet {
         );
         let bx = h.engine_box();
         let snap = template_snapshot(h, &t)?;
+        if matches!(mode, CopyMode::Reserved(_)) {
+            // Existing inventory gives description claims precedence over pool
+            // config. Reject inherited assignments before copy so rollback also
+            // sees this clone as reserved if the response is lost.
+            let source = bx.instance(required(&t, "source")?)?;
+            for object in [&source, &snap] {
+                ensure!(
+                    !object["description"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("enginebox-pool:v1:"))
+                        && ["config", "expanded_config"]
+                            .iter()
+                            .all(|section| object[*section].as_object().is_none_or(|config| {
+                                !config.keys().any(|key| {
+                                    key.starts_with("user.enginebox.allocation.")
+                                        || key.starts_with("user.enginebox.pool.")
+                                        || key == "user.enginebox.workspace"
+                                })
+                            })),
+                    "Prepared allocation requires an unassigned template source and snapshot"
+                );
+            }
+        }
         let (_, root) = root_device(&bx, &snap)?;
         let source_vm = facts["instances"]
             .as_array()
@@ -397,7 +435,7 @@ impl Fleet {
             "-c".into(),
             "boot.autostart=false".into(),
         ];
-        if let Some(pool) = pool {
+        if let CopyMode::Start(Some(pool)) = &mode {
             for (k, v) in pool.as_object().context("Invalid pool metadata")? {
                 args.extend([
                     "-c".into(),
@@ -408,15 +446,53 @@ impl Fleet {
                 ]);
             }
         }
+        if let CopyMode::Reserved(receipt) = &mode {
+            // The reservation is part of the atomic clone request, so even a
+            // failed/timed-out copy never publishes an ordinary private VM.
+            // Existing controllers already refuse preparing pool instances.
+            for (key, value) in [
+                ("user.enginebox.pool.state", "preparing"),
+                ("user.enginebox.pool.size", "layerfs-preparation"),
+                ("user.enginebox.workspace", ""),
+                ("user.enginebox.allocation.id", required(receipt, "id")?),
+                (
+                    "user.enginebox.allocation.project",
+                    required(receipt, "storage_project")?,
+                ),
+                ("user.enginebox.owner", h.project.as_str()),
+            ] {
+                args.extend(["-c".into(), format!("{key}={value}")]);
+            }
+        }
         bx.run(&args, Duration::from_secs(300))?;
         let copy = started.elapsed().as_secs_f64();
         let clone = bx.instance(name)?;
+        let prepared_uuid = if let CopyMode::Reserved(receipt) = &mode {
+            ensure!(
+                clone["status"] == "Stopped"
+                    && clone["stateful"] != true
+                    && clone["config"]["user.enginebox.allocation.id"] == receipt["id"]
+                    && clone["config"]["user.enginebox.owner"] == h.project
+                    && clone["config"]["user.enginebox.pool.state"] == "preparing"
+                    && clone["config"]["boot.autostart"] == "false",
+                "Clone custody changed before disk configuration; inspect without mutation"
+            );
+            Some(
+                clone["config"]["volatile.uuid"]
+                    .as_str()
+                    .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+                    .context("Prepared VM has no valid persistent Incus identity")?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let (root_name, root) = root_device(&bx, &clone)?;
         ensure!(
             root["pool"] == h.pool,
             "Clone storage differs from admitted pool; VM remains stopped for inspection"
         );
-        let mode = if clone["devices"].get(&root_name).is_some() {
+        let disk_mode = if clone["devices"].get(&root_name).is_some() {
             "set"
         } else {
             "override"
@@ -424,15 +500,32 @@ impl Fleet {
         bx.call(&[
             "config",
             "device",
-            mode,
+            disk_mode,
             name,
             &root_name,
             &format!("size={}GiB", r.disk_gib),
             &format!("size.state={}GiB", r.memory_gib + 2),
         ])?;
+        if let CopyMode::Reserved(receipt) = mode {
+            let clone = bx.instance(name)?;
+            ensure!(
+                clone["status"] == "Stopped"
+                    && clone["stateful"] != true
+                    && clone["config"]["user.enginebox.allocation.id"] == receipt["id"]
+                    && clone["config"]["user.enginebox.owner"] == h.project
+                    && clone["config"]["user.enginebox.pool.state"] == "preparing"
+                    && clone["config"]["volatile.uuid"].as_str() == prepared_uuid.as_deref()
+                    && clone["config"]["boot.autostart"] == "false",
+                "Prepared VM identity or reservation changed; retain it for inspection"
+            );
+            let uuid = prepared_uuid.context("Missing prepared VM identity")?;
+            return Ok(
+                json!({"name":name,"status":"Stopped","startup":"prepared","instance_uuid":uuid,"copy_seconds":copy,"ready":false,"attachment_required":true,"reservation_id":receipt["id"],"template":t,"source_snapshot_digest":state::digest(&snap)}),
+            );
+        }
         bx.call(&["start", name])?;
         // Warm reserves perform their readiness wait outside the host lease.
-        let readiness = if pool.is_none() {
+        let readiness = if matches!(mode, CopyMode::Start(None)) {
             wait_ready(&bx, name)?
         } else {
             Value::Null

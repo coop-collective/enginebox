@@ -23,6 +23,8 @@ Incus calls the selected cache mode `unsafe`; in the qualified version it launch
 
 A project-specific VM can receive its checkout before it starts, then remain pre-attached for later pause/resume. Dynamically attaching a new checkout to an already frozen generic VM remains unqualified; the adapter currently requires a clean stop and refuses unclaimed warm-pool reserves.
 
+The separate [allocation preparation contract](LAYERFS-ALLOCATION.md) reserves a stopped VM before any external checkout is attached. Preparation is not a completed automatic attachment transaction; finalization and credential delegation need their own verified handoff.
+
 The initial 9p candidate was rejected during live qualification: Incus 6.0.5 ran QEMU as UID/GID 65534 without effective capabilities, while its 9p directory driver used `security_model=passthrough`. The mapped checkout correctly presented UID/GID 1001, and direct writes through bindfs succeeded as 1001, but guest creation failed as both 1001 and root. Readability and `test -w` alone did not prove write support. The adapter uses the existing virtiofs service instead of widening checkout permissions or elevating QEMU. [Incus 6.0.5 QEMU directory configuration](https://github.com/lxc/incus/blob/v6.0.5/internal/server/instance/drivers/driver_qemu_templates.go)
 
 ## Operator sequence
@@ -56,9 +58,37 @@ The same checkout can then be attached again. Completed attachment receipts are 
 
 ## Failure boundary
 
-The caller holds the storage workspace lease, and the adapter additionally acquires the shared Engine Box host lease before changing Incus. A schema-2 private attachment receipt, including the prior local stateful setting, is written before mutation. The VM UUID, container ID/PID/start time, host boot ID, export path and mount identity are pinned. Partial failure leaves an uncertain attachment and the VM markers intact for inspection. A changed or restarted owner is refused rather than rebound silently.
+The caller holds the storage workspace lease, and the adapter additionally acquires the shared Engine Box host lease before changing Incus. A schema-3 private attachment receipt, including operation intent and the prior local stateful setting, is written before mutation. Schema 2 remains readable. The VM UUID, container ID/PID/start time, host boot ID, export path and mount identity are pinned. Partial failure leaves an uncertain attachment and the VM markers intact for inspection. A changed or restarted owner is refused rather than rebound silently.
 
-Automatic repair of an interrupted attachment, restart of the mapped export after host reboot, coordinated file/RAM snapshots, cross-node movement and hostile-tenant qualification remain outstanding. A VM snapshot alone does not include this checkout. The existing LayerFS preview durability and filesystem limits still apply; native inference sessions, game-engine workloads and sustained I/O have separate qualification requirements.
+### Reconcile completed attachment effects
+
+An operator can inspect an interrupted attach/detach without replaying it:
+
+```sh
+sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
+  incus-reconcile checkout-a
+
+# Only when the inspection proves the complete original effects:
+sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
+  incus-reconcile checkout-a --apply
+```
+
+The default command returns observed identities, `reason`, `next_action`, `target_state` and `can_apply`; it does not change the attachment receipt. `--apply` also never changes Incus, starts/stops a VM, re-exports a mount, runs a checkpoint or removes a file. It can only finalize private metadata when two consecutive observations prove that the original operation already completed:
+
+- **Attach completed:** the exact owned VM is stopped and stateless, both custody markers and the exact directory device remain, `migration.stateful=false`, and the original live container's mapped mount matches the host export and saved device/inode identity.
+- **Detach completed:** the exact VM is stopped and stateless, its device and both markers are absent, the exact prior local stateful setting is restored, both export/mapped paths are absent, and the original container is still running with its original identity. The private writable checkout is retained; checkpoint it explicitly before closing.
+
+Successful metadata finalization retains the old receipt and observations in a private reconciliation intent record, then links that record from the updated attachment receipt. An orphan intent record alone does not mean finalization completed. Guest readiness still requires normal boot and `incus-verify`. A running VM, partial cleanup, inherited/foreign device, stacked mount, changed owner, missing resource or changing observation remains blocked and retains custody. The reconciler never treats an empty directory as a mounted checkout.
+
+After a host reboot the command reports `host-restarted` and preserves all attachment state. It does not access a historical PID's mount namespace, remount the old overlay or guess that checkpoint restoration is acceptable. A changed/stopped/unavailable Docker container similarly returns `container-unverified`. Inspection still works without SDK artifacts or a running Docker socket, provided the original private configuration/bridge binding and receipts can be read. These outcomes provide a recovery diagnosis, not automatic host-restart recovery or power-loss durability.
+
+Old schema-2 `attaching`/`detaching` records identify their operation and can be reconciled if the full proof is present. An old `uncertain` record has lost that intent and remains blocked, even when some resources appear complete. Schema-3 records retain attach/detach intent after an error. Older storage binaries reject the new schema instead of ignoring that information; older-controller rollback still has the separate [attachment compatibility gate](UPDATES.md).
+
+The new fixture tests cover lost final receipts, preservation of private files, partial attach/detach, exact restoration of inherited/local stateful settings, reused PIDs after restart, foreign devices/owners, mount-table parsing and changes between observations. These are offline recovery-contract tests; the October 19 live qualification below predates reconciliation. Rebooting a shared host or stopping an existing workspace is not part of this test path.
+
+On October 20, focused storage/CLI tests passed on macOS (34 tests) and Linux (35 tests, including actual kernel mount-table and `stat` identity inspection); strict Clippy passed on both. A separate actual Linux CLI fixture supplied missing SDK/socket paths and a synthetic previous boot ID. Both inspection and `--apply` returned `host-restarted`, retained the byte-identical attachment receipt and private-file sentinel, and created no reconciliation record. The temporary fixture was removed. No VM/container mutation or real host reboot was performed, and the opt-in live storage test remained skipped.
+
+Automatic completion of partial external operations, restart of the mapped export after host reboot, coordinated file/RAM snapshots, cross-node movement and hostile-tenant qualification remain outstanding. A VM snapshot alone does not include this checkout. The existing LayerFS preview durability and filesystem limits still apply; native inference sessions, game-engine workloads and sustained I/O have separate qualification requirements.
 
 With guest kernel `6.8.0-147-generic` and the initial `io.cache=none` candidate, virtiofs file creation, directories, rename, chmod and links worked, but direct script execution returned `EFAULT` (`Bad address`). Explicit interpreter execution worked. This matches an independently reported Ubuntu 6.8/virtiofs execution issue, but does not identify one exact kernel patch as the cause. Guest-only HWE kernel `7.0.0-38-generic` made direct script and ELF execution pass with cache disabled, but writable shared mmap still failed with `ENODEV`. These failed candidates are retained as qualification evidence. Guest kernel version and direct executable/mmap tests are part of qualification; readable files alone are insufficient. [Incus execution report](https://discuss.linuxcontainers.org/t/cant-execute-files-on-mounted-host-directory/24630)
 
