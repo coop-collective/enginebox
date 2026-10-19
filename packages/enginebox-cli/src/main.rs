@@ -175,7 +175,7 @@ fn main() -> Result<()> {
             );
             let mut report = enginebox_core::node_protocol::report();
             report["component"] = json!("ebox");
-            report["layerfs"] = json!({"revision":enginebox_storage_layerfs::REVISION,"workspace_schema":2,"attachment_schema":2,"exclusive_guest_writer":true,"automatic_attachment":false});
+            report["layerfs"] = json!({"revision":enginebox_storage_layerfs::REVISION,"workspace_schema":2,"attachment_schema":enginebox_storage_layerfs::incus::ATTACHMENT_SCHEMA,"exclusive_guest_writer":true,"automatic_attachment":false});
             return output(report);
         }
         Commands::Storage(storage) => {

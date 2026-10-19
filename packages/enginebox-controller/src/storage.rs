@@ -106,7 +106,7 @@ fn require_storage_protocol(report: &Value) -> Result<()> {
             && report["protocol"] == enginebox_core::node_protocol::PROTOCOL
             && report["os"] == "linux"
             && report["layerfs"]["workspace_schema"] == 2
-            && report["layerfs"]["attachment_schema"] == 2
+            && report["layerfs"]["attachment_schema"] == 3
             && report["layerfs"]["exclusive_guest_writer"] == true
             && report["capabilities"]["reserved_workspace_guard"] == 1
             && report["capabilities"]["external_checkout_lifecycle_guard"] == 1,
@@ -538,12 +538,13 @@ mod tests {
         valid["os"] = json!("linux");
         valid["component"] = json!("ebox");
         valid["layerfs"] =
-            json!({"workspace_schema":2,"attachment_schema":2,"exclusive_guest_writer":true});
+            json!({"workspace_schema":2,"attachment_schema":3,"exclusive_guest_writer":true});
         require_storage_protocol(&valid).unwrap();
         for replacement in [
             json!({}),
-            json!({"workspace_schema":2,"attachment_schema":3,"exclusive_guest_writer":true}),
-            json!({"workspace_schema":2,"attachment_schema":2,"exclusive_guest_writer":false}),
+            json!({"workspace_schema":2,"attachment_schema":4,"exclusive_guest_writer":true}),
+            json!({"workspace_schema":2,"attachment_schema":2,"exclusive_guest_writer":true}),
+            json!({"workspace_schema":2,"attachment_schema":3,"exclusive_guest_writer":false}),
         ] {
             let mut bad = valid.clone();
             bad["layerfs"] = replacement;
