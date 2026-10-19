@@ -112,28 +112,45 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 pub fn reject_symlink_components(path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "installation paths must be absolute");
     let mut part = PathBuf::new();
-    for c in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(c) = components.next() {
         ensure!(
             !matches!(c, Component::ParentDir | Component::CurDir),
             "dot components are not allowed"
         );
         part.push(c);
-        if let Ok(meta) = fs::symlink_metadata(&part) {
+        // A Windows drive prefix such as \\?\D: is not a complete filesystem
+        // path until RootDir is appended. Probe the root and every descendant.
+        if matches!(c, Component::Prefix(_)) {
+            continue;
+        }
+        let meta = match fs::symlink_metadata(&part) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect installation path {}", part.display()));
+            }
+        };
+        ensure!(
+            !meta.file_type().is_symlink(),
+            "symlink in installation path: {}",
+            part.display()
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
             ensure!(
-                !meta.file_type().is_symlink(),
-                "symlink in installation path: {}",
+                meta.file_attributes() & 0x400 == 0,
+                "Windows reparse point in installation path: {}",
                 part.display()
             );
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                ensure!(
-                    meta.file_attributes() & 0x400 == 0,
-                    "Windows reparse point in installation path: {}",
-                    part.display()
-                );
-            }
         }
+        ensure!(
+            components.peek().is_none() || meta.is_dir(),
+            "non-directory ancestor in installation path: {}",
+            part.display()
+        );
     }
     Ok(())
 }

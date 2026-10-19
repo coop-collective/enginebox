@@ -77,6 +77,20 @@ fn private_state_and_symlink_guard() {
             .unwrap()["a"],
         1
     );
+    security::write_json(&root, "nested/state.json", &json!({"a":2})).unwrap();
+    assert_eq!(
+        security::read_json(&root, "nested/state.json")
+            .unwrap()
+            .unwrap()["a"],
+        2
+    );
+    security::remove(&root, "nested/state.json").unwrap();
+    assert!(
+        security::read_json(&root, "nested/state.json")
+            .unwrap()
+            .is_none()
+    );
+    security::write_json(&root, "nested/state.json", &json!({"a":3})).unwrap();
     assert!(security::write_json(&root, "../outside", &json!({})).is_err());
     #[cfg(unix)]
     {
@@ -95,9 +109,47 @@ fn private_state_and_symlink_guard() {
 #[test]
 fn workspace_private_lease_excludes_second_writer() {
     let (_t, root) = temp();
-    let _lease = security::Lease::acquire(&root, "state/run.lock").unwrap();
+    let lease = security::Lease::acquire(&root, "state/run.lock").unwrap();
     assert!(security::Lease::active(&root, "state/run.lock").unwrap());
     assert!(security::Lease::acquire(&root, "state/run.lock").is_err());
+    drop(lease);
+    assert!(!security::Lease::active(&root, "state/run.lock").unwrap());
+    security::Lease::acquire(&root, "state/run.lock").unwrap();
+}
+#[cfg(windows)]
+#[test]
+fn windows_private_paths_accept_canonical_drives_and_reject_junctions() {
+    let temporary = tempfile::tempdir().unwrap();
+    let canonical = temporary.path().canonicalize().unwrap();
+    security::check_components(temporary.path()).unwrap();
+    security::private_dir(&canonical).unwrap();
+    let target = temporary.path().join("target");
+    security::private_dir(&target).unwrap();
+    let link = temporary.path().join("junction");
+    let result = std::process::Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:ENGINEBOX_TEST_LINK -Target $env:ENGINEBOX_TEST_TARGET | Out-Null"])
+        .env("ENGINEBOX_TEST_LINK", &link)
+        .env("ENGINEBOX_TEST_TARGET", &target)
+        .output().unwrap();
+    assert!(
+        result.status.success(),
+        "Junction fixture failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(security::check_components(&link).is_err());
+    assert!(security::check_components(&canonical.join("junction")).is_err());
+    assert!(security::private_dir(&link).is_err());
+    assert!(
+        security::write_json(
+            &canonical,
+            "junction/secret.json",
+            &json!({"secret":"fixture"})
+        )
+        .is_err()
+    );
+    assert!(!target.join("secret.json").exists());
+    assert!(security::check_components(std::path::Path::new("C:relative")).is_err());
 }
 #[test]
 fn official_authorization_urls_only() {

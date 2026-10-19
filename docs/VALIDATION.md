@@ -4,11 +4,17 @@ October 19, 2026. These are development acceptance results on newly created VMs 
 
 ## Rust migration qualification
 
-The 0.3 development branch passes the Rust workspace tests, strict Clippy, TypeScript checks, 20 dashboard unit tests and 19 dashboard browser tests on macOS. Native release binaries also build on Linux x86_64. A Windows GNU cross-target check covers every package and test target, but does not establish Windows execution, service installation or native provider sign-in.
+The 0.3 development branch passes the Rust workspace tests and strict Clippy on macOS and Linux x86_64, with TypeScript checks, 20 dashboard unit tests and 19 dashboard browser tests on macOS. Native release binaries build on both platforms. A Windows GNU cross-target check covers every package and test target, but does not establish Windows execution, service installation or native provider sign-in.
 
 The actual native supervisor/controller/dashboard test stages a separately compiled next controller version, continuously calls authenticated GET/POST endpoints through upgrade and rollback, and verifies exclusive ownership, retained jobs/templates/private Claude scratchnotes, valid browser cookies and previous immutable browser assets. Failed version health and failed activation retain or restore the prior controller. Killing/restarting the supervisor releases old children through their lifelines. An actual stdio fleet MCP process also survives those transitions. See [UPDATES.md](UPDATES.md) for the reproducible opt-in test and its receipt.
 
-These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. Current live Linux guest qualification is recorded separately as it completes. LayerFS remains an [evaluated candidate](LAYERFS.md), not a qualified dependency.
+Two separate disposable Ubuntu 24.04 guests qualified the Linux helpers. The first passed exact helper hashes/versions, private clone readiness, idle native leases, credential-free inspection, four-tool guest desktop MCP isolation, actual Playwright navigation, pause and resume. Clone/helper/readiness took 18.52 seconds, pause 2.19 seconds and resume/readiness 3.42 seconds including SSH overhead; these are individual observations, not throughput guarantees.
+
+The second ran the complete Rust preparation path using **already installed** official clients/browser dependencies. Package setup, scoped sandbox setup with actual Codex sandbox execution, native MCP registration, the Rust identity service, reboot/readiness, browser navigation and pause/resume passed. Preparation itself took 14.42 seconds. This does not qualify a fresh Ubuntu install/download path. No provider credentials were attached and no inference was requested. Both clones and their staging directories were removed; existing workspaces, reserves and source snapshots retained their states.
+
+Reproduce these checks only with the explicit opt-in test in `packages/enginebox-core/tests/live_qualification.rs` and a private fleet configuration. It admits a small disposable clone under the host lock, marks it ineligible for credential delegation and records its own resource identifiers for guarded cleanup. Private receipts remain outside Git.
+
+These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. LayerFS remains an [evaluated candidate](LAYERFS.md), not a qualified dependency.
 
 ## Historical v0.2 qualification
 

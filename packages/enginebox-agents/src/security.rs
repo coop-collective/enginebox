@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde_json::Value;
 use std::{
@@ -15,13 +15,35 @@ pub fn check_components(path: &Path) -> Result<()> {
     for c in path.components() {
         ensure!(!matches!(c, Component::ParentDir), "Unsafe private path.");
         current.push(c);
+        // Windows canonical paths start with a verbatim drive or UNC prefix.
+        // That prefix alone (for example \\?\C:) is not a filesystem entry;
+        // inspect it only after RootDir supplies the trailing separator.
+        if matches!(c, Component::Prefix(_)) {
+            ensure!(path.has_root(), "Private Windows paths must be rooted.");
+            continue;
+        }
         match fs::symlink_metadata(&current) {
-            Ok(m) => ensure!(
-                !m.file_type().is_symlink(),
-                "Private paths must not be symbolic links."
-            ),
+            Ok(m) => {
+                ensure!(
+                    !m.file_type().is_symlink(),
+                    "Private paths must not be symbolic links."
+                );
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    // Junctions and other reparse points can redirect a private
+                    // path even when they are not reported as symbolic links.
+                    ensure!(
+                        m.file_attributes() & 0x400 == 0,
+                        "Private paths must not contain Windows reparse points."
+                    );
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Inspecting private path {}", current.display()));
+            }
         }
     }
     Ok(())

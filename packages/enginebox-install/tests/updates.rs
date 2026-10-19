@@ -219,6 +219,14 @@ fn unrelated_prefix_and_concurrent_update_are_rejected() {
     assert!(install.lock().is_ok());
 }
 #[test]
+fn path_validation_rejects_a_non_directory_ancestor() {
+    let tmp = temp();
+    let file = tmp.path().canonicalize().unwrap().join("file");
+    fs::write(&file, "not a directory").unwrap();
+    enginebox_install::release::reject_symlink_components(&file).unwrap();
+    assert!(enginebox_install::release::reject_symlink_components(&file.join("state")).is_err());
+}
+#[test]
 fn rollback_requires_state_compatibility() {
     let tmp = temp();
     let install = installation(&tmp);
@@ -708,6 +716,53 @@ fn native_release_builder_and_installer_round_trip_with_deterministic_archives()
             .current,
         Version::new(0, 3, 0)
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_canonical_drive_paths_are_checked_after_the_root_is_complete() {
+    let tmp = temp();
+    let canonical = tmp.path().canonicalize().unwrap();
+    assert!(matches!(
+        canonical.components().next(),
+        Some(std::path::Component::Prefix(_))
+    ));
+    enginebox_install::release::reject_symlink_components(&canonical).unwrap();
+    enginebox_install::release::reject_symlink_components(&canonical.join("future/state")).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_junction_ancestors_are_still_rejected() {
+    let tmp = temp();
+    let target = tmp.path().join("target");
+    let link = tmp.path().join("junction");
+    fs::create_dir(&target).unwrap();
+    let result = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:ENGINEBOX_JUNCTION_LINK -Target $env:ENGINEBOX_JUNCTION_TARGET | Out-Null",
+        ])
+        .env("ENGINEBOX_JUNCTION_LINK", &link)
+        .env("ENGINEBOX_JUNCTION_TARGET", &target)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let canonical_parent = tmp.path().canonicalize().unwrap();
+    assert!(
+        enginebox_install::release::reject_symlink_components(
+            &canonical_parent.join("junction/state")
+        )
+        .is_err()
+    );
+    fs::remove_dir(&link).unwrap();
+    assert!(target.is_dir());
 }
 
 #[cfg(windows)]
