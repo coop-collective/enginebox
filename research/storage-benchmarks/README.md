@@ -5,7 +5,7 @@
 Use Node 22.12+ and the verified native Lore **v0.10.1** CLI and server release for your platform. Extract both binaries into one directory, check their release SHA-256 digests, and make them executable. No server or CLI is installed by this script.
 
 ```sh
-node packages/storage-benchmarks/lore.mjs \
+node research/storage-benchmarks/lore.mjs \
   /path/to/unity-project \
   .state/lore/fresh-run \
   /path/to/verified-lore-binaries

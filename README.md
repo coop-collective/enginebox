@@ -82,6 +82,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Vinext dashboard](docs/DASHBOARD.md)
 - [Headless browser control](docs/BROWSER.md)
 - [Runtime operations and configuration](docs/RUNTIME.md)
+- [Research experiments and storage benchmarks](research/README.md)
 - [Contributing](CONTRIBUTING.md)
 
 The first host target is Linux x86_64 with KVM; the reference prototype used Ubuntu 26.04, Incus 6.0.5 and an Ubuntu 24.04 guest. Other supported combinations will be added after testing. A dedicated server or a VM exposing hardware virtualization can be a candidate; macOS can operate the server over SSH.
