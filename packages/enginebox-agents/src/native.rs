@@ -108,6 +108,8 @@ pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
                     "acceptEdits",
                     "--permission-prompts",
                     "none",
+                    "--allowedTools",
+                    "Read,Write,Edit,Bash,mcp__enginebox-browser__*",
                     "--max-turns",
                     "20",
                 ]

@@ -50,6 +50,28 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
             assert!(args.windows(2).any(|x| x == ["--sandbox", "enabled"]));
             assert_eq!(args[args.len() - 2..], ["--", "hello"]);
         }
+        if p == "claude" {
+            // acceptEdits alone still denies Python/test commands in a headless
+            // session. Preapprove coding tools without disabling native policy.
+            assert!(args.windows(2).any(|x| x
+                == [
+                    "--allowedTools",
+                    "Read,Write,Edit,Bash,mcp__enginebox-browser__*"
+                ]));
+            assert!(
+                args.windows(2)
+                    .any(|x| x == ["--permission-mode", "acceptEdits"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|x| x == ["--permission-prompts", "none"])
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|x| x == "--bare" || x == "bypassPermissions")
+            );
+        }
     }
 }
 #[test]
