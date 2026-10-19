@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "experimental": true,
+  "root": "/var/lib/enginebox-layerfs",
+  "sdk": "/opt/layerfs/sdk/js",
+  "daemon": "/opt/layerfs/layerfs-daemon",
+  "native_sha256": "REPLACE_WITH_BUILT_ADDON_SHA256",
+  "daemon_sha256": "REPLACE_WITH_BUILT_DAEMON_SHA256",
+  "image": "sha256:REPLACE_WITH_LOCAL_RUNTIME_IMAGE_ID",
+  "max_workspaces": 2,
+  "cpus_per_workspace": 1,
+  "memory_mib_per_workspace": 1024,
+  "disk_reserve_gib": 4,
+  "import_limit_gib": 2,
+  "pnpm_store": null,
+  "pnpm_metadata": null
+}

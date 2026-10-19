@@ -24,9 +24,11 @@ A separate fresh Ubuntu 24.04 image, with no inherited profiles or installed cli
 
 No provider credentials were attached and no inference was requested in any guest qualification. All test guests and staging directories were removed; existing workspaces, reserves and source snapshots retained their states. Reproduce these checks only with the explicit opt-in test in `packages/enginebox-core/tests/live_qualification.rs` and a private fleet configuration. It admits each disposable guest under the host lock, marks it ineligible for credential delegation and records its own resource identifiers for guarded cleanup. Private receipts remain outside Git.
 
-These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. LayerFS remains an [evaluated candidate](LAYERFS.md), not a qualified dependency.
+These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. LayerFS has a separately qualified [experimental node-local CLI backend](LAYERFS-BACKEND-VALIDATION.md); it is not the fleet VM filesystem or a default-installed dependency.
 
 After merge, [35 disposable Rust boot/resume samples](RUST-BOOT-BENCHMARKS.md) passed: full host-local readiness medians were 0.512 s from frozen RAM, 6.034 s from stopped and 5.846 s from hibernation. [Pinned LayerFS experiments](LAYERFS-VALIDATION.md) separately exercised real mounts, storage sharing, Git and offline dependency reuse, with remaining integration limits recorded.
+
+The subsequent Rust LayerFS CLI test passed approved Git import, separate writable branches, prepared dependency forks, stable-path remounts, resource admission, parallel commands and refusal to replay interrupted operations. [Measured results and reproduction instructions](LAYERFS-BACKEND-VALIDATION.md) distinguish full Docker workspace creation from branch-reference creation and VM resume.
 
 ## Historical v0.2 qualification
 

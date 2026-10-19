@@ -1,0 +1,20 @@
+[package]
+name = "enginebox-storage-layerfs"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+description = "Opt-in node-local LayerFS checkout operations"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+enginebox-core = { path = "../enginebox-core" }
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

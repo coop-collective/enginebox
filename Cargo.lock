@@ -368,6 +368,7 @@ dependencies = [
  "anyhow",
  "clap",
  "enginebox-core",
+ "enginebox-storage-layerfs",
  "reqwest",
  "serde",
  "serde_json",
@@ -443,6 +444,21 @@ dependencies = [
  "tower",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "enginebox-storage-layerfs"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "enginebox-core",
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

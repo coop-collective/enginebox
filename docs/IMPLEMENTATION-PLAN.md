@@ -28,6 +28,7 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 - `packages/enginebox-controller`: authenticated REST, private durable jobs, reconciliation and exclusive controller ownership.
 - `packages/enginebox-cli`: operator terminal and fleet MCP access.
 - `packages/enginebox-install`: immutable native release artifacts, checksum-verified installation, platform service plans, supervised upgrade and compatible rollback.
+- `packages/enginebox-storage-layerfs`: opt-in administrator CLI for pinned node-local Docker checkouts, stable project paths, immutable pnpm reuse and file checkpoints. Separate from fleet VM storage, provider homes and RAM snapshots; see [backend scope and limits](LAYERFS-BACKEND.md).
 - `packages/dashboard`: Vinext owner dashboard, session authentication and server-side proxy.
 - `examples/`: host/fleet configuration and portable template manifests. Tests live with their owning package.
 

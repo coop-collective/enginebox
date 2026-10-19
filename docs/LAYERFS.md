@@ -1,6 +1,6 @@
 # LayerFS evaluation
 
-Decision recorded 2026-10-19: preserve a first-class place for a workspace filesystem provider, with LayerFS as the first candidate. Keep Incus as the current compute and VM checkpoint backend. LayerFS is not installed, linked into the release, or selected by default in this migration.
+Decision recorded 2026-10-19: keep Incus as the current fleet compute and VM checkpoint backend. The [experimental node-local LayerFS CLI backend](LAYERFS-BACKEND.md) now integrates the pinned checkout workflow separately. LayerFS artifacts are not installed or selected by default, and this does not attach LayerFS storage to Incus workspaces.
 
 The [disposable Linux validation](LAYERFS-VALIDATION.md) now establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. It also records mtime, Git metadata, recovery and topology limits. This is experimental qualification, not a production storage integration.
 
@@ -33,7 +33,7 @@ The integration direction is therefore optional, node-local, credential-free che
 
 ## Placement
 
-Engine Box would own tenant authorization, scheduling, resource limits, native provider credentials and compute lifecycle. A filesystem provider would own file branches, workspace mounts and durable file checkpoints. A LayerFS adapter belongs in `packages/enginebox-storage-layerfs/` once implemented; shared storage contracts belong in a separate Rust package when a second working provider justifies that split.
+Engine Box owns fleet authorization, scheduling, resource limits, native provider credentials and compute lifecycle. The first administrator-only adapter lives in `packages/enginebox-storage-layerfs/` and is exposed through `ebox storage layerfs`; its Docker workspaces are not fleet nodes. It implements file branching, mounts, limits, operation receipts and file checkpoints, with no crash-durability guarantee. Shared storage contracts belong in a separate Rust package only when another working provider justifies that split.
 
 The intended flow is: select an authorized base revision, create a private writable branch, attach it to an isolated workspace, launch the original CLI with that workspace's private home, then checkpoint the file state. This does not replace the native harness or require routing its inference through Engine Box. Tool-call-by-tool-call history is a separate integration decision; the current native CLI launch interface does not expose every internal tool call.
 
