@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 const LIMIT: u64 = 1024 * 1024;
 const BROWSER: &str = "enginebox-browser";
@@ -76,6 +76,7 @@ fn transform(provider: &str, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
 #[cfg(unix)]
 fn secure_path(path: &Path, home: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
     ensure!(
         path.is_absolute() && path.starts_with(home),
         "MCP path escapes guest home"
@@ -154,13 +155,13 @@ fn directory(path: &Path, home: &Path) -> Result<()> {
     for component in path.strip_prefix(home)?.components() {
         current.push(component);
         if !current.exists() {
-            let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
+                fs::DirBuilder::new().mode(0o700).create(&current)?;
             }
-            builder.create(&current)?;
+            #[cfg(not(unix))]
+            fs::create_dir(&current)?;
             #[cfg(unix)]
             File::open(current.parent().context("Directory parent missing")?)?.sync_all()?;
         }
