@@ -13,7 +13,11 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $BaseUrl.StartsWith('https://')) { throw 'HTTPS release source required.' }
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-$target = switch ($architecture) { 'X64' { 'x86_64-pc-windows-msvc' } 'Arm64' { 'aarch64-pc-windows-msvc' } default { throw 'Unsupported Windows architecture.' } }
+$target = switch ($architecture) {
+  'X64' { 'x86_64-pc-windows-msvc' }
+  'Arm64' { throw 'Windows ARM64 release archives are not yet shipped. This bootstrap currently supports Windows x64 only.' }
+  default { throw 'Unsupported Windows architecture.' }
+}
 Write-Output "Engine Box $Version; target $target; prefix $Prefix; role $Role"
 Write-Output 'Windows installs the controller/operator. Linux Incus compute requires a separate Linux host or explicitly provisioned Linux VM.'
 if (-not $Apply) { Write-Output 'Plan only. Add -Apply after reviewing the pinned release and trusted hashes.'; return }

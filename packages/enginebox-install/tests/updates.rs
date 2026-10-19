@@ -776,17 +776,31 @@ fn windows_private_directory_replaces_explicit_everyone_permissions() {
         .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
         .output()
         .unwrap();
-    assert!(grant.status.success());
+    assert!(
+        grant.status.success(),
+        "icacls grant failed: {}",
+        String::from_utf8_lossy(&grant.stderr)
+    );
     enginebox_install::release::private_dir(&directory).unwrap();
-    let check = r#"$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=Get-Acl -LiteralPath $env:ENGINEBOX_PRIVATE_DIRECTORY; if(-not $acl.AreAccessRulesProtected){exit 2}; $rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); foreach($rule in $rules){if($rule.IdentityReference -ne $sid){exit 3}}; if($rules.Count -ne 1){exit 4}"#;
+    fs::create_dir(directory.join("child")).unwrap();
+    fs::write(directory.join("child/secret.txt"), "retained private state").unwrap();
+    // Native calls accept the canonical verbatim path. Independently inspect
+    // the same directory through PowerShell's ordinary filesystem path.
+    let check = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=Get-Acl -LiteralPath $env:ENGINEBOX_PRIVATE_DIRECTORY; if(-not $acl.AreAccessRulesProtected){throw 'DACL is not protected'}; if($acl.GetOwner([System.Security.Principal.SecurityIdentifier]) -ne $sid){throw 'Owner is not current user'}; $rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); if($rules.Count -ne 1){throw 'Expected exactly one owner ACE'}; foreach($rule in $rules){if($rule.IdentityReference -ne $sid -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl' -or $rule.InheritanceFlags -ne 'ContainerInherit,ObjectInherit'){throw 'Unexpected owner ACE'}}; $child=Get-Acl -LiteralPath (Join-Path $env:ENGINEBOX_PRIVATE_DIRECTORY 'child/secret.txt'); $childRules=$child.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); if($childRules.Count -ne 1 -or $childRules[0].IdentityReference -ne $sid -or -not $childRules[0].IsInherited){throw 'Child file did not inherit private owner access'}"#;
     let result = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", check])
-        .env("ENGINEBOX_PRIVATE_DIRECTORY", &directory)
+        .env("ENGINEBOX_PRIVATE_DIRECTORY", tmp.path().join("private"))
         .output()
         .unwrap();
     assert!(
         result.status.success(),
-        "Windows directory DACL retained unrelated access: {:?}",
-        result.status.code()
+        "Windows directory DACL check failed ({:?}): {}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    enginebox_install::release::private_dir(&directory).unwrap();
+    assert_eq!(
+        fs::read_to_string(directory.join("child/secret.txt")).unwrap(),
+        "retained private state"
     );
 }

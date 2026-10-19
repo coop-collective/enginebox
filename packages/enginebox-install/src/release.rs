@@ -155,6 +155,7 @@ pub fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn private_dir(path: &Path) -> Result<()> {
+    reject_symlink_components(path)?;
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
@@ -163,23 +164,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        // Replace the protected DACL, including existing explicit grants.
-        // Pass the path as data in a child-only variable, never shell code.
-        let script = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=[System.Security.AccessControl.DirectorySecurity]::new(); $acl.SetAccessRuleProtection($true,$false); $acl.SetOwner($sid); $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::FullControl,[System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $env:ENGINEBOX_PRIVATE_DIRECTORY -AclObject $acl"#;
-        let result = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ])
-            .env("ENGINEBOX_PRIVATE_DIRECTORY", path)
-            .output()?;
-        ensure!(
-            result.status.success(),
-            "could not restrict installation directory ACL"
-        );
+        crate::windows_acl::restrict_directory(path)?;
     }
     Ok(())
 }
