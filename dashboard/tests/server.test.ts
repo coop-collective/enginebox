@@ -283,6 +283,9 @@ test("native account proxy routes stay scoped to known providers and session ope
   for (const [method, path] of [
     ["GET", base],
     ["GET", `${base}/codex/sessions/${session}`],
+    ["GET", `${base}/codex/usage`],
+    ["GET", `${base}/claude/usage`],
+    ["GET", `${base}/cursor/usage`],
     ["POST", `${base}/codex/login`],
     ["POST", `${base}/cursor/login`],
     ["POST", "v1/templates/native-dev/sync"],
@@ -301,6 +304,8 @@ test("native account proxy routes stay scoped to known providers and session ope
   const accepted = fetch.mock.callCount();
   for (const [method, path] of [
     ["GET", `${base}/codex/login`],
+    ["POST", `${base}/codex/usage`],
+    ["GET", `${base}/deepseek/usage`],
     ["POST", `${base}/deepseek/login`],
     ["POST", `${base}/codex/sessions/${session}/input`],
     ["POST", `${base}/claude/sessions/not-a-session/cancel`],

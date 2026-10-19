@@ -10,13 +10,16 @@ import {
   delegationLabel,
 } from "@/lib/accounts";
 import type { AuthSession, ProviderAccount } from "@/lib/types";
+import { AgentUsageSummary } from "@/components/agent-usage";
 
 function ProviderCard({
   account,
   changed,
+  refreshToken,
 }: {
   account: ProviderAccount;
   changed: () => Promise<void>;
+  refreshToken: number;
 }) {
   const bound = (session?: AuthSession | null) =>
     !!session && session.provider === account.id;
@@ -147,6 +150,7 @@ function ProviderCard({
           This agent currently authenticates with an API key.
         </p>
       )}
+      <AgentUsageSummary account={account} refreshToken={refreshToken} />
       {error && (
         <p className="account-error" role="alert">
           {error}
@@ -261,6 +265,7 @@ function ProviderCard({
 
 function ControllerAgents() {
   const [providers, setProviders] = useState<ProviderAccount[] | null>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const current = useRef<AbortController | null>(null);
@@ -275,7 +280,10 @@ function ControllerAgents() {
         "/api/control/v1/agents",
         { signal: controller.signal },
       );
-      if (!controller.signal.aborted) setProviders(data.providers);
+      if (!controller.signal.aborted) {
+        setProviders(data.providers);
+        setRefreshToken((value) => value + 1);
+      }
     } catch (err) {
       if (!controller.signal.aborted) {
         setError((err as Error).message);
@@ -324,6 +332,7 @@ function ControllerAgents() {
                 }
               }
               changed={load}
+              refreshToken={refreshToken}
             />
           ))}
         </div>

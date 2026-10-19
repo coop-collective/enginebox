@@ -25,6 +25,7 @@ from accounts import AccountManager
 from template_sync import TemplateSync
 from agent_access import AgentAccess
 from agent_sync import AgentSync
+from agent_runs import AgentRuns
 
 GIB = 1024**3
 SIZES = {"small": {"cpu": 2, "memory_gib": 2},
@@ -55,6 +56,15 @@ class Host:
     guest: GuestConfig = GuestConfig(1001, 1001, "agent", "/home/agent", "/workspace", ":99")
     network: str | None = None
     warm_pools: tuple[dict, ...] = ()
+    contribution_cpu: int | None = None
+    contribution_memory_gib: int | None = None
+
+    def __post_init__(self):
+        if (self.contribution_cpu is None) != (self.contribution_memory_gib is None):
+            raise ValueError("contribution_cpu and contribution_memory_gib must be supplied together.")
+        if self.contribution_cpu is not None:
+            positive(self.contribution_cpu, "contribution_cpu", minimum=1)
+            positive(self.contribution_memory_gib, "contribution_memory_gib", minimum=1, maximum=16384)
 
     def box(self):
         return EngineBox(self.target, project=self.project, guest=self.guest)
@@ -69,7 +79,7 @@ def load_hosts(path: str | Path) -> list[Host]:
         raise ValueError("Unknown fleet configuration sections.")
     hosts, ids, targets = [], set(), set()
     for entry in config["hosts"]:
-        allowed = {"id", "label", "target", "project", "pool", "reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "disk_gib", "max_instances", "templates", "guest", "network", "warm_pools"}
+        allowed = {"id", "label", "target", "project", "pool", "reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "disk_gib", "max_instances", "templates", "guest", "network", "warm_pools", "contribution_cpu", "contribution_memory_gib"}
         if not isinstance(entry, dict) or set(entry) - allowed or not {"id", "target"} <= set(entry):
             raise ValueError("Each host requires id/target and only supported host fields.")
         for key in ["id", "target", "label", "project", "pool", "network"]:
@@ -139,7 +149,8 @@ def load_hosts(path: str | Path) -> list[Host]:
                           positive(entry.get("reserve_disk_gib", 10), "reserve_disk_gib"),
                           positive(entry.get("disk_gib", 30), "disk_gib", minimum=8),
                           positive(entry.get("max_instances", 16), "max_instances", minimum=1, maximum=256),
-                          tuple(templates), guest_config, network, tuple(policies)))
+                          tuple(templates), guest_config, network, tuple(policies),
+                          entry.get("contribution_cpu"), entry.get("contribution_memory_gib")))
     return hosts
 
 
@@ -229,6 +240,7 @@ for vm in data:
       'pool':root.get('pool'),'disk_bytes':size(root.get('size'),30*1024**3),
       'state_disk_bytes':size(root.get('size.state'),0),
       'managed':cfg.get('user.enginebox.fleet')=='true',
+      'enginebox_owned':cfg.get('user.enginebox.owner')==vm.get('project','default'),
       'template':cfg.get('user.enginebox.template'),
       'ipv4':addresses(vm),**pool_metadata(vm,cfg)})
 space=query('/1.0/storage-pools/'+quote(pool,safe='')+'/resources')['space']
@@ -291,6 +303,9 @@ def capacity(host: Host, facts: dict) -> dict:
     active = [item for item in facts["instances"] if item["status"] != "Stopped"]
     allocated_cpu = sum(item["cpu"] for item in active)
     allocated_memory = sum(item["memory_bytes"] for item in active)
+    contributed = [item for item in active if item.get("managed") or item.get("enginebox_owned")]
+    contributed_cpu = sum(item["cpu"] for item in contributed)
+    contributed_memory = sum(item["memory_bytes"] for item in contributed)
     # Full disk commitments are counted even for stopped clones. This is
     # deliberately conservative on copy-on-write pools and prevents thin-pool
     # overcommit from becoming the default fleet policy.
@@ -299,6 +314,13 @@ def capacity(host: Host, facts: dict) -> dict:
     cpu_room = max(0, facts["cpu_total"] - host.reserve_cpu - allocated_cpu)
     memory_room = max(0, min(facts["memory_total_bytes"] - host.reserve_memory_gib * GIB - allocated_memory,
                              facts["memory_available_bytes"] - host.reserve_memory_gib * GIB))
+    # Optional contribution ceilings bound aggregate Engine Box commitments
+    # across projects, including templates, warm reserves and transitional states.
+    # They can only reduce admission; physical reserves and available RAM still
+    # apply independently. Existing VMs are never stopped to meet a lowered cap.
+    if host.contribution_cpu is not None:
+        cpu_room = min(cpu_room, max(0, host.contribution_cpu - contributed_cpu))
+        memory_room = min(memory_room, max(0, host.contribution_memory_gib * GIB - contributed_memory))
     disk_room = max(0, min(facts["disk_free_bytes"],
                            facts["pool_total_bytes"] - facts["pool_used_bytes"],
                            facts["pool_total_bytes"] - disk_committed) - host.reserve_disk_gib * GIB)
@@ -311,6 +333,9 @@ def capacity(host: Host, facts: dict) -> dict:
     return {key: facts[key] for key in ("cpu_total", "memory_total_bytes", "memory_available_bytes", "disk_free_bytes")} | {
         "pool_total_bytes": facts["pool_total_bytes"], "pool_free_bytes": facts["pool_total_bytes"] - facts["pool_used_bytes"],
         "reserve_cpu": host.reserve_cpu, "reserve_memory_bytes": host.reserve_memory_gib * GIB,
+        "contribution_cpu": host.contribution_cpu,
+        "contribution_memory_bytes": host.contribution_memory_gib * GIB if host.contribution_memory_gib is not None else None,
+        "contribution_allocated_cpu": contributed_cpu, "contribution_allocated_memory_bytes": contributed_memory,
         "allocated_cpu": allocated_cpu, "allocated_memory_bytes": allocated_memory,
         "disk_committed_bytes": disk_committed, "max_additional": additional,
         "cpu_available": cpu_room, "memory_budget_available_bytes": memory_room,
@@ -409,6 +434,7 @@ class Fleet:
         self.template_sync = TemplateSync(self)
         self.agents = None
         self.agent_sync = AgentSync(self)
+        self.agent_runs = AgentRuns(self, self.state_dir.parent / "agent-runs" if self.state_dir else None)
         if state_dir:
             state_dir = self.state_dir
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -470,6 +496,20 @@ class Fleet:
         # authorization wait. start() registers its active session before return.
         with self.locks[host.id], host_operation_lock(host):
             return self.accounts.start(host_id, name, provider)
+
+    def agent_launch(self, host_id, name, request):
+        from guest_agent_run import validate_request
+        request = validate_request(request)
+        host = self.host(host_id)
+        # Reserve the workspace/provider writer before lifecycle admission can
+        # proceed; the guest also holds a process-lifetime file lock.
+        with self.locks[host.id], host_operation_lock(host):
+            self.account_workspace(host_id, name)
+            if self.agents:
+                attached = self.agents.attach(host_id, name, [request["provider"]])
+                if not all(item["status"] in {"attached", "unchanged"} for item in attached["providers"]):
+                    raise ValueError("Connect this agent on the controller before launching a session.")
+            return self.agent_runs.start(host_id, name, request)
 
     def _host_status(self, host):
         try:
@@ -721,6 +761,8 @@ class Fleet:
             raise ValueError("Workspace moved outside this host's admission pool; update the fleet configuration explicitly.")
         if self.accounts.active(host.id, name):
             raise ValueError("Finish or cancel provider sign-in before changing this workspace's state.")
+        if self.agent_runs.active(host.id, name):
+            raise ValueError("Wait for this workspace's native run to finish before changing its state.")
         if action == "resume" and vm["status"] == "Stopped":
             room = capacity(host, facts)
             if vm["cpu"] > room["cpu_available"] or vm["memory_bytes"] > room["memory_budget_available_bytes"]:

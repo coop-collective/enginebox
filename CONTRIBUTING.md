@@ -14,4 +14,4 @@ Offline tests must not contact a server. Integration tests must use a disposable
 
 For a change, explain the behavior, how it was verified and any remaining platform limits. Preserve official provider clients and the optional-module boundary. Add regression coverage for configuration, command handling, lifecycle transitions and host mutations where relevant.
 
-Contributions are licensed under the repository's Apache-2.0 license. Provider binaries, third-party proprietary code and customer workspace recipes do not belong in this repository.
+New contributions are licensed under the repository's Sustainable Use License 1.0. This is a source-available project. Contributors must have rights to submit their work; no separate contributor license agreement is currently in place. Historical Apache grants remain valid as described in [licensing](docs/LICENSING.md). Provider binaries, third-party proprietary code and customer workspace recipes do not belong in this repository.

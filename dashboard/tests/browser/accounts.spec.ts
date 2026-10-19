@@ -15,6 +15,33 @@ test.beforeEach(async ({ request }) => {
   await request.post(`${fixture}/__test/reset`);
 });
 
+test("Agents distinguishes live allowance, provider credits, reset dates and unknown billing", async ({ page, request }) => {
+  await request.post(`${fixture}/__test/mode`, { data: { mode: "usage-current" } });
+  await signIn(page);
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  const codex = provider(page, "Codex (ChatGPT)");
+  await expect(codex.getByText("75% left", { exact: true })).toBeVisible();
+  await expect(codex.getByText("7-day allowance", { exact: true })).toBeVisible();
+  await expect(codex.getByText("12.50", { exact: true })).toBeVisible();
+  await expect(codex.getByText("Quota reset:", { exact: false })).toBeVisible();
+  await expect(codex.getByText("Not reported", { exact: true })).toBeVisible();
+  await expect(codex.getByRole("link", { name: "Open provider usage & billing" })).toHaveAttribute("href", "https://chatgpt.com/codex/settings/usage");
+  for (const name of ["Claude", "Cursor"]) {
+    const card = provider(page, name);
+    await expect(card.getByText("Allowance not reported", { exact: true })).toBeVisible();
+    await expect(card.getByRole("progressbar")).toHaveCount(0);
+  }
+  await request.post(`${fixture}/__test/mode`, { data: { mode: "usage-stale" } });
+  await page.getByRole("button", { name: "Refresh agents", exact: true }).click();
+  await expect(codex.getByText("Last reported", { exact: true })).toBeVisible();
+  await expect(codex.getByText("75% left", { exact: true })).toHaveCount(0);
+  await expect(codex.getByRole("progressbar")).toHaveCount(0);
+  await request.post(`${fixture}/__test/mode`, { data: { mode: "usage-error" } });
+  await page.getByRole("button", { name: "Refresh agents", exact: true }).click();
+  await expect(codex.getByText("Usage could not be refreshed.", { exact: false })).toBeVisible();
+  await expect(codex.getByText("Signed in", { exact: true })).toBeVisible();
+});
+
 test("Agents shows native sign-in links, reconnect, Claude codes and cancellation", async ({
   page,
   request,

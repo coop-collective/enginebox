@@ -55,12 +55,23 @@ class AccountAPITests(unittest.TestCase):
 
     def test_authentication_covers_status_start_poll_input_and_cancel(self):
         for path, body in [(self.path, None), (self.path + "/claude/login", {}),
+                           (self.path + "/codex/usage", None),
                            (self.session_path, None), (self.session_path + "/input", {"text": "code"}),
                            (self.session_path + "/cancel", {})]:
             with self.subTest(path=path):
                 self.assertEqual(self.request(path, body, authenticated=False)[0], 401)
                 self.assertEqual(self.request(path, body, origin="https://outside.example")[0], 403)
         self.assertEqual(self.fleet.mock_calls, [])
+
+    def test_usage_is_read_only_scoped_and_does_not_start_a_model_job(self):
+        self.agents.usage.return_value = {"provider": "codex", "status": "available"}
+        self.assertEqual(self.request(self.path + "/codex/usage"),
+                         (200, {"usage": {"provider": "codex", "status": "available"}}))
+        self.agents.usage.assert_called_once_with("codex")
+        self.assertEqual(self.request(self.path + "/unknown/usage")[0], 404)
+        self.assertEqual(self.request(self.path + "/codex/usage", {})[0], 404)
+        self.agents.start.assert_not_called()
+        self.fleet.submit.assert_not_called()
 
     def test_native_session_routes_are_scoped_and_do_not_create_job_records(self):
         self.assertEqual(self.request(self.path), (200, {"providers": [], "scope": "controller"}))

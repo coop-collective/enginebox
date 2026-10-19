@@ -78,6 +78,10 @@ export type Host = {
     reserve_memory_bytes: number;
     allocated_cpu: number;
     allocated_memory_bytes: number;
+    contribution_cpu?: number | null;
+    contribution_memory_bytes?: number | null;
+    contribution_allocated_cpu?: number;
+    contribution_allocated_memory_bytes?: number;
     cpu_available?: number;
     memory_budget_available_bytes?: number;
     disk_budget_available_bytes?: number;
@@ -141,4 +145,26 @@ export type ProviderAccount = {
   session?: AuthSession | null;
   delegation_status?: "ready" | "unsupported" | "reauth_required" | "unknown";
   workspace_count?: number;
+};
+export type AgentUsage = {
+  provider: ProviderId;
+  scope: "controller_account";
+  status: "available" | "unavailable";
+  detail: string;
+  source: string | null;
+  observed_at: string | null;
+  freshness: "current" | "stale" | "unknown";
+  plan: string | null;
+  billing_cycle: null;
+  allowance_windows: {
+    id: string;
+    label: string;
+    used_percentage: number;
+    remaining_percentage: number | null;
+    window_minutes: number | null;
+    resets_at: string;
+    freshness: "current" | "stale";
+  }[];
+  credits: { label: string; balance: string | null; unlimited: boolean; unit: string }[];
+  refresh_after_seconds: number;
 };

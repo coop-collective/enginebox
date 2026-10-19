@@ -77,10 +77,15 @@ def normalize(raw: dict) -> dict:
         size_bytes(host[key])
     policy = host["admission"]
     if policy:
-        if set(policy) != {"reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "max_instances"}:
+        required = {"reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "max_instances"}
+        optional = {"contribution_cpu", "contribution_memory_gib"}
+        if not required <= set(policy) or set(policy) - required - optional:
             raise ValueError("host.admission requires reserve_cpu, reserve_memory_gib, reserve_disk_gib and max_instances.")
+        if bool(optional & set(policy)) and not optional <= set(policy):
+            raise ValueError("host.admission contribution_cpu and contribution_memory_gib must be supplied together.")
         for key, value in policy.items():
-            low, high = (1, 256) if key == "max_instances" else (0, 16384)
+            low, high = {"max_instances": (1, 256), "contribution_cpu": (1, 4096),
+                         "contribution_memory_gib": (1, 16384)}.get(key, (0, 16384))
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"host.admission.{key} must be an integer from {low} through {high}.")
     for key in ["project", "profile"]:

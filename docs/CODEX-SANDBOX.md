@@ -1,5 +1,9 @@
 # Codex sandbox on Ubuntu 24.04
 
+Cursor Agent needs a separate application-scoped helper profile. See
+[Cursor sandbox setup](CURSOR-SANDBOX.md); the distro bwrap profile below does
+not authorize Cursor's earlier namespace setup step.
+
 Guest preparation installs Ubuntu's `bubblewrap`, `apparmor-profiles` and
 `apparmor-utils` packages when Codex is enabled. On guests with AppArmor active,
 it installs and loads the distribution's `bwrap-userns-restrict` profile before

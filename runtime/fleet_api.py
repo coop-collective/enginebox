@@ -10,14 +10,17 @@ from pathlib import Path
 import re
 import signal
 import sys
+from typing import TYPE_CHECKING
 
-from fleet import Fleet, load_hosts
+if TYPE_CHECKING:
+    from fleet import Fleet
 
 
 ACCOUNT_PATH = r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances/(ebox-[a-z0-9][a-z0-9-]{0,48})/accounts"
 ACCOUNT_SESSION_PATH = ACCOUNT_PATH + r"/(codex|claude|cursor)/sessions/([a-f0-9]{32})"
 AGENT_PATH = r"/v1/agents/(codex|claude|cursor)"
 AGENT_SESSION_PATH = AGENT_PATH + r"/sessions/([a-f0-9]{32})"
+RUN_PATH = r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances/(ebox-[a-z0-9][a-z0-9-]{0,48})/agent-runs"
 
 
 def api_token() -> str:
@@ -70,8 +73,14 @@ def handler_for(fleet: Fleet, token: str):
                     return self.respond(200, fleet.summary())
                 if self.path == "/v1/templates":
                     return self.respond(200, fleet.catalog())
+                native_run = re.fullmatch(RUN_PATH + r"/([a-f0-9]{32})", self.path)
+                if native_run:
+                    return self.respond(200, {"run": fleet.agent_runs.get(*native_run.groups())})
                 if self.path == "/v1/agents":
                     return self.respond(200, fleet.agent_access().status())
+                usage = re.fullmatch(AGENT_PATH + r"/usage", self.path)
+                if usage:
+                    return self.respond(200, {"usage": fleet.agent_access().usage(usage[1])})
                 central_session = re.fullmatch(AGENT_SESSION_PATH, self.path)
                 if central_session:
                     return self.respond(200, {"session": fleet.agent_access().session(*central_session.groups())})
@@ -105,6 +114,10 @@ def handler_for(fleet: Fleet, token: str):
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("Body must be an object.")
+                native_launch = re.fullmatch(RUN_PATH, self.path)
+                if native_launch:
+                    from guest_agent_run import validate_request
+                    return self.respond(202, {"run": fleet.agent_launch(*native_launch.groups(), validate_request(body))})
                 central_login = re.fullmatch(AGENT_PATH + r"/login", self.path)
                 central_action = re.fullmatch(AGENT_SESSION_PATH + r"/(input|cancel)", self.path)
                 if central_login:
@@ -189,6 +202,7 @@ def handler_for(fleet: Fleet, token: str):
 
 
 def main(argv=None):
+    from fleet import Fleet, load_hosts
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--port", type=int, default=8765)
@@ -223,6 +237,7 @@ def main(argv=None):
             fleet.template_sync.stop()
             fleet.agent_sync.stop()
             fleet.accounts.close()
+            fleet.agent_runs.close()
             if fleet.agents:
                 fleet.agents.close()
             fleet.executor.shutdown(wait=True)

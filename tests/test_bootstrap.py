@@ -213,7 +213,7 @@ class BootstrapExecutionTests(unittest.TestCase):
         snapshot = "prepared-" + fingerprint(config)[:12]
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py", "requirements.lock", "guest_setup.sh"]:
                 (source / filename).touch()
             for stale_marker in [False, True]:
                 for existing_snapshot in [False, True]:
@@ -267,7 +267,7 @@ class BootstrapExecutionTests(unittest.TestCase):
             return b""
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py", "requirements.lock", "guest_setup.sh"]:
                 (source / filename).touch()
             with patch("bootstrap.incus", side_effect=strict_incus), patch("bootstrap.wait_guest"):
                 with self.assertRaisesRegex(RuntimeError, "Snapshot failed"):
@@ -287,7 +287,7 @@ class BootstrapExecutionTests(unittest.TestCase):
             return b""
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py", "requirements.lock", "guest_setup.sh"]:
                 (source / filename).touch()
             with patch("bootstrap.incus", side_effect=fake_incus), patch("bootstrap.wait_guest"):
                 with self.assertRaisesRegex(RuntimeError, "Credential state"):
@@ -304,7 +304,7 @@ class BootstrapExecutionTests(unittest.TestCase):
             return b""
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py", "requirements.lock", "guest_setup.sh"]:
                 (source / filename).touch()
             with patch("bootstrap.incus", side_effect=fake_incus), patch("bootstrap.wait_guest"):
                 bootstrap.prepare_workspace(config, source)
@@ -330,7 +330,7 @@ class BootstrapExecutionTests(unittest.TestCase):
             return b""
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py", "requirements.lock", "guest_setup.sh"]:
                 (source / filename).touch()
             with patch("bootstrap.incus", side_effect=fake_incus), patch("bootstrap.wait_guest", side_effect=[None, RuntimeError("restart failed")]):
                 with self.assertRaisesRegex(RuntimeError, "restart failed"):

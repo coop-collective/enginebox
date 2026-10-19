@@ -12,6 +12,7 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 - A template catalog panel for registering JSON manifests or HTTPS URLs, exporting portable JSON, automatic synchronization to every registered node, and per-node readiness and errors.
 - Pause, resume, hibernate and stop controls for assigned managed workspaces. Unmanaged bases and preparing, ready or quarantined pool instances have no lifecycle controls. Each pending operation affects only its target row. Stop asks for confirmation because it ends running processes.
 - An Agents panel for connecting Codex (ChatGPT), Claude and Cursor once through controller-level native sign-in sessions, with separate workspace-delegation readiness. It displays status, official provider links, device codes, Claude authorization-code entry and cancellation.
+- Usage cards separate provider allowance windows, quota resets, optional credits and billing renewal. Codex uses its native read-only quota interface; Claude/Cursor and unreported billing dates display explicit unavailable states with provider links.
 - Asynchronous operation status, error messages, loading states, empty fleet instructions and responsive mobile layouts.
 - A separate operator sign-in, an eight-hour signed HttpOnly session, and exact Origin checks for login, logout and mutations.
 
@@ -36,6 +37,8 @@ Complete sign-in on the official provider page. Codex may show a device code to 
 The controller manages the owner's provider connections; the backend reports whether access is ready for private workspaces across the fleet. The UI shows **Signed in** separately from delegation readiness: unsupported providers, connections requiring reauthentication and unconfirmed access are explicit. Available-workspace counts appear only when the API confirms readiness. Provider details explain limitations, and unavailable controller clients cannot start a login. Sign-in status does not establish paid-plan eligibility, quota or remaining subscription balance. **Refresh agents** reads the current status. Credentials never become part of portable template exports or shared prepared bases.
 
 Active sign-ins are polled approximately once per second. Closing the panel, signing out or leaving the page stops that view's polling and discards its local fields. Closing the view does not cancel the native flow; reopening recovers a still-active session from the API. URLs and codes are kept only in page memory, never browser storage. Only the verified HTTPS authorization endpoints for `auth.openai.com`, `claude.com` and `cursor.com` are clickable; callback URLs, token-bearing parameters and unexpected query fields are rejected.
+
+The usage cards read the connected controller account, not a per-workspace copy of its allowance. A passed quota reset does not imply that the billing cycle renewed or that an account has a full allowance. Stale values are labeled, and no model prompt is sent merely to populate usage. See [usage collection and limitations](AGENT-USAGE.md).
 
 ## Local setup
 

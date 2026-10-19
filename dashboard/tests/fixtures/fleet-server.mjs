@@ -116,6 +116,8 @@ createServer(async (req, res) => {
     mode = data.mode;
     if (mode === "accounts-unsupported") connectedAccounts.add("cursor");
     if (mode === "accounts-reauth") connectedAccounts.add("claude");
+    if (mode.startsWith("usage-"))
+      for (const provider of ["codex", "claude", "cursor"]) connectedAccounts.add(provider);
     if (mode === "catalog-new-node")
       for (const record of templates) {
         record.sync.nodes.push({
@@ -330,6 +332,29 @@ createServer(async (req, res) => {
         large: { cpu: 8, memory_gib: 8 },
       },
     });
+  }
+  const usage = req.url.match(/^\/v1\/agents\/(codex|claude|cursor)\/usage$/);
+  if (usage && req.method === "GET") {
+    const provider = usage[1];
+    if (mode === "usage-error") return send(503, { error: "Usage unavailable" });
+    const available = provider === "codex" && connectedAccounts.has(provider);
+    const stale = mode === "usage-stale";
+    return send(200, { usage: {
+      provider, scope: "controller_account", status: available ? "available" : "unavailable",
+      detail: provider === "claude" ? "Claude does not provide an on-demand allowance through this integration. Check provider usage."
+        : "Cursor does not expose personal allowance through the supported CLI. Check provider usage.",
+      source: available ? "Codex native app-server" : null,
+      observed_at: available ? new Date().toISOString() : null,
+      freshness: available ? "current" : "unknown", plan: available ? "pro" : null,
+      billing_cycle: null, refresh_after_seconds: 60,
+      allowance_windows: available ? [{
+        id: "codex:primary", label: "codex", used_percentage: 25,
+        remaining_percentage: stale ? null : 75, window_minutes: 10080,
+        resets_at: new Date(Date.now() + (stale ? -1000 : 86400_000)).toISOString(),
+        freshness: stale ? "stale" : "current",
+      }] : [],
+      credits: available ? [{ label: "codex", balance: "12.50", unlimited: false, unit: "provider credits" }] : [],
+    } });
   }
   const accounts = req.url.match(
     /^\/v1\/agents(?:\/(codex|claude|cursor)\/(login|sessions)(?:\/([a-f0-9]{32})(?:\/(input|cancel))?)?)?$/,

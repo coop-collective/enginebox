@@ -27,6 +27,7 @@ import threading
 import time
 
 from accounts import AccountManager
+from agent_usage import UsageCache, read_codex, unavailable as usage_unavailable
 import guest_auth
 
 
@@ -455,6 +456,7 @@ class AgentAccess:
             self.binaries[provider] = path
         self.manager = AccountManager(_ControllerGuard(self), command_factory=self._command)
         self._lock = threading.RLock()
+        self._usage = UsageCache()
 
     def home(self, provider):
         return private_directory(self.homes / provider_id(provider))
@@ -556,6 +558,24 @@ class AgentAccess:
         with ThreadPoolExecutor(max_workers=3) as executor:
             providers = list(executor.map(self._status, PROVIDERS))
         return {"providers": providers, "scope": "controller", "credential_storage": "private_files"}
+
+    def usage(self, provider):
+        provider_id(provider)
+        if provider != "codex":
+            return usage_unavailable(provider)
+        try:
+            with self._provider_lock(provider) as home:
+                native = read_private(home / NATIVE_FILES[provider], home, missing=True)
+                if not native or native.get("OPENAI_API_KEY") or not native.get("tokens"):
+                    return usage_unavailable(provider)
+                executable = self.binaries.get(provider)
+                if not executable:
+                    return usage_unavailable(provider, "Install the native Codex client to read account allowance.")
+                environment = controller_environment(home, self.binaries)
+                return self._usage.read(provider, self._credential_digest(provider),
+                    lambda: read_codex(executable, environment))
+        except (OSError, ValueError):
+            return usage_unavailable(provider, "Usage is temporarily unavailable. Check the connection or retry shortly.")
 
     def adopt(self, host_id, name, provider):
         provider_id(provider)

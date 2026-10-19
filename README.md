@@ -15,7 +15,10 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 | Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Independently qualified fresh-host installs and upgrade/rollback |
 | Controller-synchronized templates, resource presets and prebooted fresh workspace pools | Additional image/recipe formats |
 | Official client preparation and reusable clean VM snapshots | Shared mount/cache services and off-host backup workflows |
-| Fleet REST API, operator MCP and authenticated Vinext dashboard | Automatic placement, tenancy and billing |
+| Fleet REST API, operator MCP and authenticated Vinext dashboard | Automatic placement, public tenant authorization and billing |
+| Native CLI launch/resume through operator MCP; persistent private workspace state | Movable tenant state volumes and authenticated multi-tenant service |
+| Account usage cards with native Codex allowance reads and provider links | Claude/Cursor allowance ingestion and subscription renewal dates |
+| Portable hardware preflight and test-gated runtime package builds | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
 | Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 
@@ -55,6 +58,10 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)
+- [Persistent private agent state and native session launching](docs/TENANT-AGENT-STATE.md)
+- [Portable host capabilities and platform qualification](docs/PORTABLE-HOSTS.md)
+- [Provider allowance and billing visibility](docs/AGENT-USAGE.md)
+- [License and commercial boundary](docs/LICENSING.md)
 - [Server bootstrap](docs/BOOTSTRAP.md)
 - [Fleet API and MCP](docs/FLEET.md)
 - [Template catalog and resource requirements](docs/TEMPLATES.md)
@@ -66,8 +73,10 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 
 The first host target is Linux x86_64 with KVM; the reference prototype used Ubuntu 26.04, Incus 6.0.5 and an Ubuntu 24.04 guest. Other supported combinations will be added after testing. A dedicated server or a VM exposing hardware virtualization can be a candidate; macOS can operate the server over SSH.
 
-## Open-source and commercial boundary
+Personal computers are an optional resource-contribution track. Owners choose how much CPU and memory to contribute. The current Linux fleet enforces configured contribution ceilings in admission in addition to physical reserves and per-VM limits. macOS/Windows Docker and native workers are not yet enrollment targets; `enginebox-host` reports hardware and planning budgets without installing a worker or allocating resources. See the [platform matrix and installation gates](docs/PORTABLE-HOSTS.md).
 
-This repository contains the open-source environment foundation. Reusable optional modules, including CI integration, will live here as they are implemented. Self-hosting remains useful on its own. Managed hosting and proprietary, maintained workspace recipes can be separate offerings. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
+## Source-available and commercial boundary
 
-Licensed under [Apache-2.0](LICENSE).
+This repository contains the source-available environment foundation. Personal and internal company self-hosting are permitted under the community license. Commercial hosting, selling access and commercial redistribution require a separate agreement. Reusable optional modules, including CI integration, will live here as they are implemented. Managed hosting and proprietary workspace recipes can be separate offerings. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
+
+New versions use the [Sustainable Use License 1.0](LICENSE), originally published by n8n. This is not OSI open source. Previously published Apache-2.0 code retains its existing rights; see the [licensing boundary](docs/LICENSING.md).

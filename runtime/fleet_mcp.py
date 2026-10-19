@@ -29,7 +29,7 @@ def request(path, body=None):
         raise ValueError("Use HTTPS for a remote API, or an SSH tunnel to loopback.")
     if parsed.port is not None and not 1 <= parsed.port <= 65535:
         raise ValueError("ENGINEBOX_API_URL has an invalid port.")
-    data = None if body is None else json.dumps(body).encode()
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode()
     req = Request(base + path, data=data, headers={"Authorization": "Bearer " + api_token(),
                                                 "Content-Type": "application/json"})
     try:
@@ -103,6 +103,34 @@ def register(mcp):
     def agent_connections() -> dict:
         """Show controller agent connection readiness without exposing credentials."""
         return request("/v1/agents")
+
+    @mcp.tool()
+    def agent_launch(host_id: str, name: str, provider: Literal["codex", "claude", "cursor"],
+                     prompt: str, resume_id: str | None = None, workdir: str = ".",
+                     timeout_seconds: int = 120, model: str | None = None) -> dict:
+        """Start the official native CLI in an assigned private workspace; may consume provider allowance.
+
+        Reuses that workspace's existing home, skills, configuration and history.
+        workdir is relative to its workspace root. Resume only an exact native
+        session ID returned by agent_run. One writer per workspace/provider.
+        Poll agent_run for the private result. No public multi-tenant sharing.
+        """
+        from guest_agent_run import validate_request
+        identifier(host_id)
+        identifier(name, instance=True)
+        body = validate_request({"provider": provider, "prompt": prompt, "resume_id": resume_id,
+                                 "workdir": workdir, "timeout_seconds": timeout_seconds, "model": model})
+        return request(f"/v1/hosts/{host_id}/instances/{name}/agent-runs", body)
+
+    @mcp.tool()
+    def agent_run(host_id: str, name: str, run_id: str) -> dict:
+        """Poll a native run and read its private bounded output/native_session_id for exact resume."""
+        import re
+        identifier(host_id)
+        identifier(name, instance=True)
+        if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+            raise ValueError("Invalid native run ID.")
+        return request(f"/v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}")
 
     @mcp.tool()
     def fleet_action(host_id: str, name: str, action: Literal["pause", "resume", "hibernate", "stop"]) -> dict:

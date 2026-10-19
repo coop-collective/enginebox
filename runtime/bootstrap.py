@@ -19,7 +19,7 @@ from bootstrap_config import fingerprint, load_config, normalize, runtime_enviro
 OWNER_KEY = "user.enginebox.owner"
 RECIPE_KEY = "user.enginebox.recipe"
 PREPARED_KEY = "user.enginebox.prepared"
-PYTHON_ASSETS = ["bootstrap.py", "bootstrap_config.py", "enginebox.py", "mcp_server.py", "browser_tools.py",
+PYTHON_ASSETS = ["bootstrap.py", "bootstrap_config.py", "enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py",
                  "fleet.py", "fleet_api.py", "fleet_mcp.py"]
 DATA_ASSETS = ["requirements.lock", "guest_setup.sh"]
 
@@ -120,7 +120,8 @@ if config['host'].get('admission') and server:
                                 'status': vm['status'], 'pool': root.get('pool'),
                                 'cpu': cfg.get('limits.cpu'), 'memory': cfg.get('limits.memory'),
                                 'disk': root.get('size'), 'state_disk': root.get('size.state'),
-                                'managed': cfg.get('user.enginebox.fleet') == 'true'})
+                                'managed': cfg.get('user.enginebox.fleet') == 'true',
+                                'enginebox_owned': cfg.get('user.enginebox.owner') == vm.get('project', 'default')})
         result['admission_instances'] = commitments
 print(json.dumps(result))
 '''
@@ -207,6 +208,14 @@ def admission_errors(config: dict, observed: dict) -> list[str]:
     if (memory_committed + memory_required + policy["reserve_memory_gib"] * gib > total_memory
             or observed.get("memory_available", 0) < memory_required + policy["reserve_memory_gib"] * gib):
         errors.append("Fleet admission: RAM commitments or available RAM exceed the host reserve.")
+    if "contribution_cpu" in policy:
+        contributed = [item for item in active if item.get("managed") or item.get("enginebox_owned")]
+        contributed_cpu = sum(allocation_cpu(item.get("cpu")) for item in contributed)
+        contributed_memory = sum(allocation_size(item.get("memory"), total_memory) for item in contributed)
+        if contributed_cpu + cpu_required > policy["contribution_cpu"]:
+            errors.append("Fleet admission: Engine Box CPU commitments exceed the contribution ceiling.")
+        if contributed_memory + memory_required > policy["contribution_memory_gib"] * gib:
+            errors.append("Fleet admission: Engine Box RAM commitments exceed the contribution ceiling.")
     disk_budget = min(observed.get("incus_disk_free", 0), total_disk - used_disk, total_disk - disk_committed)
     if disk_required + policy["reserve_disk_gib"] * gib > disk_budget:
         errors.append("Fleet admission: full root/state disk commitments exceed storage capacity or reserve.")
@@ -534,7 +543,7 @@ def prepare_workspace(config: dict, source: Path) -> None:
         raise RuntimeError("An incomplete workspace is frozen/hibernated. Resume it explicitly before preparation.")
     wait_guest(config)
     incus(config, "exec", name, "--", "mkdir", "-p", "/opt/enginebox-runtime", project=True)
-    required = ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]
+    required = ["enginebox.py", "mcp_server.py", "browser_tools.py", "cursor_sandbox.py", "requirements.lock", "guest_setup.sh"]
     for filename in required:
         if not (source / filename).is_file():
             raise RuntimeError(f"Missing provisioning asset {filename}.")

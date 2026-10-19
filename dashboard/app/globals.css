@@ -841,6 +841,91 @@ textarea {
 .account-actions {
   margin-top: 16px;
 }
+.agent-usage {
+  border-top: 1px solid var(--line);
+  margin-top: 16px;
+  padding-top: 14px;
+  font-size: 11px;
+  color: #687f86;
+}
+.usage-heading,
+.usage-window > div,
+.usage-billing {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.usage-heading h4 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: #47616a;
+}
+.usage-heading { align-items: center; }
+.usage-heading > span {
+  text-transform: capitalize;
+  font-size: 10px;
+}
+.usage-window {
+  margin-top: 15px;
+}
+.usage-window strong {
+  color: #347965;
+}
+.usage-window progress {
+  display: block;
+  appearance: none;
+  width: 100%;
+  height: 5px;
+  margin: 9px 0 6px;
+  border: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #e9efee;
+  accent-color: #57947e;
+}
+.usage-window progress::-webkit-progress-bar { background: #e9efee; }
+.usage-window progress::-webkit-progress-value { background: #57947e; }
+.usage-window progress::-moz-progress-bar { background: #57947e; }
+.usage-window small,
+.usage-credit small {
+  display: block;
+  font-size: 10px;
+  line-height: 1.7;
+}
+.usage-empty,
+.usage-credit {
+  margin-top: 12px;
+}
+.usage-empty { color: #687f86; }
+.usage-billing {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.usage-billing dd { margin: 0; }
+.usage-note,
+.usage-observed {
+  margin-top: 7px;
+  font-size: 10px;
+  line-height: 1.7;
+  color: #748990;
+  overflow-wrap: anywhere;
+}
+.usage-links {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+}
+.usage-links a {
+  color: #347965;
+  font-size: 10px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 .account-delegation {
   font-size: 11px;
   line-height: 1.7;

@@ -253,6 +253,8 @@ def bootstrap_configuration(host, manifest, network):
     generation = _digest({"manifest": digest, "host": host_binding(host), "network": network})[:16]
     base = "ebox-template-" + generation
     guest, resources = host.guest, manifest["recommended"]
+    contribution = {key: getattr(host, key) for key in ("contribution_cpu", "contribution_memory_gib")
+                    if getattr(host, key, None) is not None}
     return normalize({"schema_version": 1,
                       "host": {"transport": "local" if host.target == "local" else "ssh", "target": host.target,
                                "install_packages": False, "disk_reserve": f"{max(1, host.reserve_disk_gib)}GiB",
@@ -260,7 +262,7 @@ def bootstrap_configuration(host, manifest, network):
                                "admission": {"reserve_cpu": host.reserve_cpu,
                                              "reserve_memory_gib": host.reserve_memory_gib,
                                              "reserve_disk_gib": host.reserve_disk_gib,
-                                             "max_instances": host.max_instances}},
+                                             "max_instances": host.max_instances, **contribution}},
                       "incus": {"project": host.project, "profile": base},
                       "storage": {"mode": "existing", "pool": host.pool},
                       "network": {"mode": "existing", "name": network},

@@ -1,6 +1,6 @@
 {
   "name": "enginebox-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "packageManager": "npm@11.11.0",
   "dependencies": {
@@ -31,7 +31,7 @@
     "test": "tsx --test tests/*.test.ts",
     "test:e2e": "playwright test"
   },
-  "license": "Apache-2.0",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=22.12"
   },

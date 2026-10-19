@@ -82,6 +82,9 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `POST /v1/hosts/{host_id}/instances/{name}/actions` | Queue `{"action":"pause"}`, `resume`, `hibernate` or `stop`. |
 | `GET /v1/jobs/{job_id}` | Poll the job's `queued`, `running`, `succeeded` or `failed` state. |
 | `GET /v1/agents` | Controller Codex, Claude and Cursor connection/delegation status. |
+| `GET /v1/agents/{provider}/usage` | Sanitized native allowance observation or explicit unavailable result; billing renewal is not inferred. |
+| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs` | Launch the official native CLI with `provider`, `prompt` and optional exact `resume_id`, relative `workdir`, `model` and bounded `timeout_seconds`. |
+| `GET /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}` | Private bounded output, run state and native session ID; scoped to the named workspace. |
 | `POST /v1/agents/{provider}/login` | Start native controller sign-in using `{}`; HTTP 202 with a session. |
 | `GET /v1/agents/{provider}/sessions/{id}` | Poll the in-memory sign-in session. |
 | `POST /v1/agents/{provider}/sessions/{id}/input` | Submit the one-time authorization code as `{"text":"…"}`. |
@@ -89,7 +92,7 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `POST /v1/templates/{id}/sync` | Retry synchronization on all registered nodes using `{}`. |
 | `GET /v1/hosts/{host_id}/instances/{name}/accounts` | Legacy native workspace status for diagnostics; workspace login creation returns 409. |
 
-Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no arbitrary command-execution, snapshot-restore or deletion endpoint.
+Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no raw shell-command, snapshot-restore or deletion endpoint. Native agent runs can execute tools under the configured native CLI policy and consume provider allowance; they are operator-authorized operations, not guest-accessible infrastructure tools.
 
 Use `size: "minimum"` or `size: "recommended"` for template-defined resources, or replace `size` with `resources: {"cpu":4,"memory_gib":8,"disk_gib":40}`. All three custom values must be integers at or above the registered minimum. Registered templates become allocatable only after the current manifest revision is installed on that exact host/project/pool/guest binding.
 
@@ -155,7 +158,7 @@ export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
 runtime/.venv/bin/enginebox-fleet-mcp
 ```
 
-Register that command through your client's ordinary MCP configuration. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register` and `template_install`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them.
+Register that command through your client's ordinary MCP configuration. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch` and `agent_run`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate bounded run queue and private result endpoint; see [native runs and state](TENANT-AGENT-STATE.md).
 
 The MCP client only permits HTTP for loopback origins, requires HTTPS for remote origins, rejects URL credentials and disables redirects and ambient forward proxies. A redirect must not forward the bearer token to another service. Use a direct API connection or SSH tunnel. Do not install fleet API tokens or operator SSH authority inside agent guests; guest computer/browser MCP is a separate interface.
 

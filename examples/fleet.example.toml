@@ -12,6 +12,14 @@ reserve_disk_gib = 10
 disk_gib = 30
 max_instances = 16
 
+# Optional aggregate Engine Box CPU/RAM ceilings for a personal machine. Supply both.
+# Active/frozen managed workspaces, warm reserves and owned template preparation
+# instances count across projects. Unrelated workloads still consume host capacity.
+# Host reserves, actual available RAM, disk admission and max_instances still
+# apply. Lowering the caps blocks new work; existing instances are not stopped.
+# contribution_cpu = 8
+# contribution_memory_gib = 16
+
 [[hosts.templates]]
 id = "native-agents"
 label = "Codex, Cursor and Claude with browser"

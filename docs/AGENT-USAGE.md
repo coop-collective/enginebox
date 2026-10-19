@@ -1,20 +1,30 @@
-# Subscription usage and remaining allowance
+# Agent usage and remaining allowance
 
-Research checked 2026-10-19. This is a proposed integration, not a claim that usage collection is implemented or that an account has a paid entitlement.
+Research checked 2026-10-19. The dashboard now includes account-level usage and billing information. Codex allowance collection is implemented; Claude/Cursor collection and subscription billing dates remain unavailable through this integration. A successful sign-in alone does not establish a paid entitlement.
 
-Build an account-level **Usage & limits** panel beside Agent Access. Show provider-reported allowance percentages, reset times and optional credit balances separately. Do not convert token counts into a guessed subscription balance or add the same account's allowance across workspaces.
+The **Agents** cards show provider-reported allowance percentages, quota reset times and optional provider credit balances separately. They do not convert token counts into a guessed subscription balance or add the same account's allowance across workspaces. Billing renewal is explicitly **Not reported**; provider links lead to account usage/billing. The connected provider does not establish a specific subscription plan.
+
+## Implemented behavior
+
+Authenticated `GET /v1/agents/{provider}/usage` returns a sanitized controller-account observation. The Codex collector sends only native app-server initialization and `account/rateLimits/read`; it does not start a thread or model turn, read account identity, redeem resets, buy credits or alter billing. It uses the controller's private native account context, suppresses native stderr, limits output and runtime, and retains no raw response. API-key authentication is not treated as subscription allowance.
+
+Reads are cached in memory for 60 seconds per connection fingerprint; reconnecting with different credentials invalidates the previous observation. Refresh failures preserve any earlier values only as stale. Both API and UI stop reporting a remaining percentage once the reported quota window expires, and the UI additionally expires missed observations after five minutes. The Agents view polls Codex once per minute while open and stops on navigation/logout. Connection status loads independently of usage.
+
+Claude and Cursor currently return explicit unavailable states and provider links. Claude's documented status-line observation hook is not yet installed; ordinary native stream observations are not yet ingested. A billing cycle, subscription renewal date, personal Cursor balance, and Claude remaining allowance are **not** inferred or scraped. Provider credits preserve their reported unit and are never relabeled as dollars.
+
+Offline validation covers malformed/missing fields, duplicate multi-bucket views, no-model native RPC traces, output/time bounds, account changes, concurrent cached reads, reset/failure staleness, authenticated read-only routes, and browser display. Live verification of the deployed collector is tracked separately in `VALIDATION.md`.
 
 | Provider | Official machine-readable surface | Useful display | First-release recommendation |
 | --- | --- | --- | --- |
-| Codex / ChatGPT | Native app-server account methods | Remaining percentage per reported window, reset time, optional workspace credits; token activity separately | Implement a read-only adapter for the owner's installation, with installed-version capability checks |
-| Claude Code | Native status-line JSON; interactive `/usage` | Five-hour/seven-day usage and resets when supplied; local session statistics separately | Collect native observations during normal use; link to provider usage settings for missing data |
-| Cursor Agent | Enterprise Admin API; personal dashboard | Enterprise spending/activity where authorized; personal remaining allowance in provider dashboard | Link to provider usage; do not invent a personal balance API |
+| Codex / ChatGPT | Native app-server account methods | Remaining percentage per reported window, reset time, optional workspace credits; token activity separately | Implemented read-only quota adapter; unsupported native methods return unavailable |
+| Claude Code | Native status-line JSON; interactive `/usage` | Five-hour/seven-day usage and resets when supplied; local session statistics separately | Provider usage link implemented; native observation ingestion remains planned |
+| Cursor Agent | Enterprise Admin API; personal dashboard | Enterprise spending/activity where authorized; personal remaining allowance in provider dashboard | Provider usage links implemented; no personal balance API claimed |
 
 ## Codex
 
 The official app-server exposes `account/rateLimits/read` and `account/rateLimits/updated`. Returned windows contain `usedPercent`, `windowDurationMins`, and `resetsAt`; prefer `rateLimitsByLimitId` when present. Optional `credits` represents workspace credit details; optional reset credits are a different resource. `account/usage/read` returns token-activity summaries and daily buckets, not remaining monetary credit. All optional fields can be absent. [Official app-server account methods](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt).
 
-Proposed collector: run the installed native app-server on private stdio in the controller's account context; initialize, read the supported account methods, then close. Do not start a model turn, redeem resets or send credit-request emails. Retain only normalized usage fields. Validate the deployed schema before using newer documented methods.
+Implemented collector: run the installed native app-server on private stdio in the controller's account context; initialize, read the documented quota method, then close. Only normalized usage fields are retained. Unsupported response shapes and methods produce an unavailable result. Token-activity methods are not called.
 
 Live read-only check: Codex **0.163.0** successfully answered `account/rateLimits/read` through its native app-server, without a model turn or an account-identity request. This account reported one weekly window (`windowDurationMins: 10080`) with numeric `usedPercent` and `resetsAt`; its secondary window was null. The optional credit object contained `hasCredits`, `unlimited` and a non-null `balance`. Personal usage values were retained only in private evidence. This verifies the installed quota interface, not `account/usage/read`, every plan's schema, or a fixed pair of allowance windows.
 
@@ -60,12 +70,12 @@ Pinned Codex 0.163.0 source accepts `auth_mode: chatgptAuthTokens` from auth sto
 
 Keep independent fields for `connection`, `plan` (nullable), `allowance_windows[]`, `credits` (nullable, provider unit preserved), `spend`, `activity`, `source`, `observed_at` and `freshness`. Derive a window's remaining percentage as `max(0, 100 - used_percentage)` only from a valid current observation. Preserve model/bucket labels. Never manufacture a fresh allowance when a countdown reaches zero; refresh or show stale data.
 
-Suggested first delivery:
+Delivery status:
 
-1. Provider usage links and explicit unsupported/stale states for all three accounts.
-2. Codex native read-only usage collector, with bounded refresh frequency and capability detection.
-3. Claude status-line observations, preserving existing configuration.
-4. Optional Cursor Enterprise reporting after an admin credential is configured.
+1. **Implemented:** provider usage links and explicit unsupported/stale states for all three accounts.
+2. **Implemented:** Codex native read-only usage collector, with bounded refresh frequency and unsupported-method handling.
+3. **Planned:** Claude status-line observations, preserving existing configuration.
+4. **Planned:** optional Cursor Enterprise reporting after an admin credential is configured.
 
 Acceptance should compare the same account and observation time with native/provider UI, verify missing data and reset boundaries, and prove two workspaces using one account show one shared allowance. Test logged-out, unsupported-method, expired delegated credential, paused-worker and API-key modes. No background paid inference, automatic credit purchase, limit change, reset redemption or admin notification belongs in a usage refresh.
 

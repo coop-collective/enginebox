@@ -58,7 +58,7 @@ apt-get install -y --no-install-recommends ca-certificates curl git ripgrep jq p
 # Use the distro helper/profile documented by OpenAI; its child profile drops
 # capabilities again. Never disable the guest or host's global userns policy.
 # https://learn.chatgpt.com/docs/sandboxing#prerequisites
-if test "$EBOX_INSTALL_CODEX" = 1; then
+if test "$EBOX_INSTALL_CODEX" = 1 || test "$EBOX_INSTALL_CURSOR" = 1; then
   apt-get install -y --no-install-recommends bubblewrap apparmor-profiles apparmor-utils
   if test -d /sys/kernel/security/apparmor; then
     task_bwrap_profile=/etc/apparmor.d/bwrap-userns-restrict
@@ -191,6 +191,13 @@ install_client() {
 install_client "$EBOX_INSTALL_CODEX" codex https://chatgpt.com/codex/install.sh sh --release "$EBOX_CODEX_VERSION"
 install_client "$EBOX_INSTALL_CLAUDE" claude https://claude.ai/install.sh bash "$EBOX_CLAUDE_VERSION"
 install_client "$EBOX_INSTALL_CURSOR" agent https://cursor.com/install bash
+
+if test "$EBOX_INSTALL_CURSOR" = 1; then
+  # Cursor creates namespaces in its own helper before selecting Landlock or
+  # bubblewrap; the bwrap-only policy cannot authorize that first step.
+  python3 /opt/enginebox-runtime/cursor_sandbox.py --home "$EBOX_HOME" --user "$EBOX_USER" \
+    --workspace "$EBOX_WORKSPACE" --apply
+fi
 
 if test "$EBOX_INSTALL_CODEX" = 1; then
   # Model-free readiness check: no provider connection or inference is needed.

@@ -190,6 +190,18 @@ function HostCard({ host }: { host: Host }) {
                 <strong>{bytes(c.disk_budget_available_bytes)}</strong>
               </span>
             )}
+            {typeof c.contribution_cpu === "number" && (
+              <span>
+                Fleet CPU limit
+                <strong>{c.contribution_allocated_cpu ?? 0} / {c.contribution_cpu} cores</strong>
+              </span>
+            )}
+            {typeof c.contribution_memory_bytes === "number" && (
+              <span>
+                Fleet memory limit
+                <strong>{bytes(c.contribution_allocated_memory_bytes)} / {bytes(c.contribution_memory_bytes)}</strong>
+              </span>
+            )}
           </div>
           <div className="host-foot">
             <span>

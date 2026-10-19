@@ -181,6 +181,76 @@ The final deployed dashboard passed read-only checks at 1440-pixel desktop and 3
 
 Final offline validation: **205 Python tests** with **one opt-in browser test skipped**, **8 installer tests**, **19 dashboard unit tests**, **18 fixture browser tests**, TypeScript and production builds. The sandbox disposable and fresh-allocation disposable were removed. The two original private workspaces remain running, with two ready reserves on the new template. Superseded clean reserves were stopped and quarantined with disks retained; original bases and the separate CI runner were preserved.
 
+## 0.2.0 preview: native MCP, usage and resource limits
+
+The new operator MCP launch path was exercised against the deployed authenticated
+controller in a fresh disposable Ubuntu 24.04 VM with 2 vCPU, 3 GiB RAM and a
+35 GiB root disk. The test used the real stdio MCP client to allocate the
+workspace, launch the installed native clients and poll their private runs.
+Codex `0.163.0` and Claude Code `2.1.302` each wrote a proof file, then resumed
+the exact returned native session ID in a new process. Both recalled a
+conversation-only random marker and read their earlier file. An independent
+guest read confirmed both files contained the expected content. Codex retained
+its workspace-write sandbox; Claude used its native unattended permission mode.
+No alternate inference gateway or API-key billing path was introduced.
+
+Cursor Agent `2026.10.16-e3cb207` initially failed before inference because its
+own sandbox helper lacked Ubuntu's user-namespace permission. A scoped helper
+profile fixed native startup without disabling the global restriction. Native
+model-free tests allowed workspace writes and denied an outside-home write and
+outbound socket; see [Cursor sandbox qualification](CURSOR-SANDBOX.md). The exact
+operator MCP launch was then retried with the sandbox still enabled. It reached
+the provider, which rejected inference because the test team's usage limit had
+been reached and reported a reset on October 23, 2026. The native process exited
+with status 1 without hitting the Engine Box timeout or output bound. Cursor
+inference, tool use and conversation resume remain blocked by that quota; a
+returned session ID alone is not a successful inference/resume test.
+
+The same reviewed sandbox repair then passed its model-free preflight in both
+existing assigned workspaces. Their boot IDs remained unchanged. The repair did
+not reinstall native clients or reset account/session state.
+
+The controller installed native development template revision 3 automatically.
+A new cold clone from that revision contained the exact reviewed helper and
+passed both native Codex and Cursor sandbox commands after boot; AppArmor remained
+in enforce mode and the global namespace restriction stayed enabled. Admission
+initially rejected the clone because retained old cache replicas consumed its
+disk budget. Two obsolete, quarantined, never-assigned replicas were verified
+against the pre-upgrade inventory and removed; the retry succeeded. Both
+disposable test VMs were removed after testing. The two original assigned
+workspaces and separate original workspace remain running, the new pool has two
+ready frozen reserves, and the single GitHub runner remains active. Retained
+base snapshots were not removed.
+
+The deployed Agents panel passed read-only browser checks at 1440-pixel desktop
+and 390-pixel mobile widths. All three controller connections were ready. The
+Codex native app-server collector returned live allowance data and the UI showed
+remaining percentage and quota reset time. The checks found no browser/HTTP
+errors, horizontal overflow, credentials in the document/browser storage or
+provider-control mutations. Claude/Cursor allowance and all billing-cycle dates
+remain explicitly unavailable; provider links are available instead.
+
+Offline contribution-limit tests cover configured CPU/RAM ceilings, unrelated
+workloads, active/frozen/template allocations, stopped-workspace admission, warm
+refill and a warm claim at the limit. No existing host's contribution budget was
+changed by the release. This qualifies admission behavior of the Linux backend,
+not a Windows/macOS resource service.
+
+The test-gated 0.2.0 runtime wheel/source distribution was built on macOS arm64
+with Python 3.14.6. The wheel was installed into clean environments on that Mac
+and on Linux x86_64 with Python 3.14.4, outside the source checkout. Locked
+dependency installation, declared-module imports, CLI dispatch and read-only
+host inventory passed. The Mac also reported local Docker Engine 29.3.0 and
+kept Docker VM capacity separate from the physical machine's totals. Artifact
+hashes and platform receipts accompany the preview release. These packages are
+runtime/operator tools; they are not a universal host or desktop-worker installer.
+
+Final offline validation for this preview: **262 runtime tests** on both macOS
+and Linux, with **one opt-in browser test skipped** on each; **8 installer tests**;
+**20 dashboard unit tests**; **19 fixture browser tests**; TypeScript and production
+builds. Clean wheel imports covered all 20 declared modules. The Cursor policy
+fix received an independent focused review before the final package build.
+
 ## Remaining qualification
 
 Fresh-host package/bridge installation, an independent operator's second machine, host reboot, off-host backup restore, upgrades/rollback, arbitrary shared mounts and production multitenancy remain separate gates. Native inference and central delegation are qualified only as recorded above; automatic expiry/renewal, long-running credential reload and Cursor quota availability require separate validation. Interactive noVNC viewer transport remains separate from the working headless browser path.

@@ -158,3 +158,8 @@ normal `workspace-write` sandboxing and no bypass. See the
 [sandbox setup](CODEX-SANDBOX.md) and
 [acceptance record](VALIDATION.md#native-inference-and-conversation-resume)
 for command patterns and remaining qualification.
+
+Cursor also needs permission for its own namespace helper on the tested Ubuntu
+guest. The [scoped Cursor sandbox setup](CURSOR-SANDBOX.md) now runs a model-free
+preflight during preparation. Live operator MCP reached the provider with that
+sandbox enabled; the test team's quota still blocked inference and resume.

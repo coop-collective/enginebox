@@ -6,7 +6,7 @@ Status: implementation design updated October 19, 2026. Bootstrap, native-client
 
 An owner connects a Linux server, prepares a workspace once, signs into the official Codex, Cursor Agent or Claude Code client, and works through the ordinary terminal. Files, compatible dependencies and caches remain available. Optional CI uses the same preparation contracts to return reliable build/test results sooner.
 
-Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Agent delegation, a new model gateway and a replacement CI scheduler are outside this product.
+Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Launching an official CLI and resuming its native conversation belong in the environment API. Agent planning, task delegation between workers, a model gateway and a replacement CI scheduler remain outside this product.
 
 ## Components
 
@@ -41,7 +41,8 @@ The first backend is Incus. Keep backend-specific operations behind a small inte
 | Host | Linux x86_64 with `/dev/kvm`, sufficient disk/RAM and administrator access. Reference prototype: Ubuntu 26.04, Incus 6.0.5, QEMU 10.2. |
 | Guest | Ubuntu 24.04 x86_64, configurable non-root user and workspace paths. |
 | Server provider | Dedicated hardware, or a VM exposing usable KVM; provider-independent configuration. |
-| Deferred | ARM, Windows guests, GPU editor support, cross-host live migration, hostile tenancy and automatic fleet scheduling. |
+| Next qualification tracks | Personal macOS/Windows resource contributors, ARM Linux containers, native Windows/macOS workers and explicit GPU allocation. These are planned backends, not capabilities of the current Incus implementation. |
+| Separate acceptance gates | Windows/macOS guest images, GPU editor support, cross-host migration, hostile tenancy and automatic fleet scheduling. |
 
 Publish a tested host/kernel/Incus/QEMU matrix. Current upstream [Incus requirements](https://linuxcontainers.org/incus/docs/main/requirements/) must not be confused with the requirements of the specific release tested in the prototype. Do not install a moving package stream and claim support for every Ubuntu host.
 
@@ -105,6 +106,18 @@ Lifecycle changes need serialized operations and state rechecks. Reject conflict
 
 ## Native clients and MCP
 
+### Persistent private agent state
+
+Native conversation history and filesystem memory are different from process RAM. Exact conversation resume starts the provider's native CLI against its saved conversation. Pause or hibernation can preserve the running process when the backend supports it. Neither operation promises provider-side prompt-cache reuse.
+
+The current controller authenticates one trusted owner. Each assigned workspace has its own persistent guest home and project disk; native sessions in that workspace reuse those directories. Private state includes provider history, project memory, skills, settings, scratch files and explicitly authorized browser profiles. Reusable bases, download caches and unassigned warm reserves must never contain that state. Two unrelated tenants must never share a writable provider home or account connection.
+
+Future multi-tenant service design must add an authenticated tenant principal, tenant-scoped account storage, authorization on every workspace/session operation, and a private persistent state volume. Tenant identity cannot be a trusted request-body field. Separate session IDs do not isolate users who share a Unix account or writable home. A guest must not receive another tenant's storage, controller refresh credentials or host control sockets.
+
+Moving native memory between a tenant's workspaces requires stable project paths and an exclusive writer lease for mutable provider state, with crash recovery and tested native compatibility. Conversation databases and credential/configuration files cannot be treated like concurrent package caches. Preserve provider formats; do not merge opaque history databases. Read-only, versioned skills and explicitly shared project notes can be distributed separately. Portable tenant-volume mounting and public tenant authorization remain release gates; persistent state in today's private VM is not a substitute for either.
+
+### Native execution and access
+
 Codex, Cursor Agent and Claude Code run unmodified in the guest. Native installation recipes record selected and resolved versions, installation source and update policy. Where providers cannot pin a release, say so and record what was installed rather than promising byte-for-byte reproducibility.
 
 The owner completes each native sign-in. Subscription availability, refresh and quota behavior must be validated per provider and account mode. Installation and `--version` checks do not establish successful inference. See [native-client design](NATIVE-CLIENTS.md).
@@ -127,7 +140,7 @@ The Vinext server authenticates the owner and proxies a narrow REST surface. API
 
 ## Optional CI module
 
-Keep GitHub Actions workflows, scheduling, checks and logs. The module supplies prepared execution environments, runner lifecycle integration, persistent cache policies, resource limits and measurements. Model account credentials are not required for ordinary build/test CI or for this OSS repository's tests.
+Keep GitHub Actions workflows, scheduling, checks and logs. The module supplies prepared execution environments, runner lifecycle integration, persistent cache policies, resource limits and measurements. Model account credentials are not required for ordinary build/test CI or for this repository's tests.
 
 The owner currently has one retained runner on their server; preserve that capacity decision for the first integration. A portable setup should put new CI execution in a separate VM/service boundary, with no default host Docker socket or writable agent home. Drain jobs before runner maintenance. Moving an existing privileged host runner is an explicit migration, not a bootstrap side effect.
 
@@ -135,8 +148,8 @@ Agent and CI jobs can reuse compatible recipes and eligible caches. They must us
 
 Existing private workflow patterns include a persistent pnpm store, mounted Cargo/build caches and serialization of heavy builds. Their performance has not been benchmarked here. First measure cold/warm setup and build/test times, queue delay, cache behavior, correctness, resource contention and cost per successful validation.
 
-## Open-source boundary
+## Source-available and commercial boundary
 
-The foundation, usable generic workspace recipe and reusable optional modules belong in this Apache-2.0 repository. Managed operations and original specialized workspace recipes may be maintained separately. User code remains the user's. Do not import proprietary recipes, provider binaries or engine source into this repository.
+The foundation, usable generic workspace recipe and reusable optional modules belong in this source-available repository under Sustainable Use License 1.0. Personal and internal business use are permitted; commercial hosting and redistribution require a separate agreement. Managed operations and original specialized workspace recipes may be maintained separately. Historical Apache-2.0 grants remain valid. User code remains the user's. Do not import proprietary recipes, provider binaries or engine source into this repository. See [licensing](LICENSING.md).
 
 Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate workload candidates. They do not block a useful native-agent environment or require expanding the core into orchestration.
