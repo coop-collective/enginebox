@@ -335,3 +335,23 @@ test("native account proxy routes stay scoped to known providers and session ope
   );
   assert.equal(fetch.mock.callCount(), accepted);
 });
+
+test("storage proxy exposes bounded operations and never a general command or restore endpoint", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ job: { id: "storage-1", status: "queued" } }, { status: 202 }));
+  for (const operation of ["inspect", "list", "preview", "import", "fork", "deps", "checkpoint", "remount", "close", "recover"]) {
+    const response = await proxy(request(undefined, "POST", {}), ["v1", "storage", "hosts", "node", operation]);
+    assert.equal(response.status, 202);
+  }
+  assert.equal((await proxy(request(), ["v1", "storage"])).status, 202);
+  for (const operation of ["exec", "restore-checkpoint", "delete", "attach", "../inspect"]) {
+    await assert.rejects(proxy(request(undefined, "POST", {}), ["v1", "storage", "hosts", "node", operation]),
+      (error: unknown) => error instanceof HttpError && error.status === 404);
+  }
+  await assert.rejects(proxy(request(), ["v1", "storage", "hosts", "node", "fork"]),
+    (error: unknown) => error instanceof HttpError && error.status === 404);
+  const crossOrigin = request(undefined, "POST", {});
+  crossOrigin.headers.set("origin", "https://attacker.example");
+  await assert.rejects(proxy(crossOrigin, ["v1", "storage", "hosts", "node", "import"]),
+    (error: unknown) => error instanceof HttpError && error.status === 403);
+  assert.equal(fetch.mock.callCount(), 11);
+});

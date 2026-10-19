@@ -523,6 +523,7 @@ pub fn template_snapshot(h: &Host, t: &Value) -> Result<Value> {
         required(t, "snapshot")?,
         h.project
     ))?;
+    crate::transport::ensure_no_external_checkout(&snap, "template clone")?;
     ensure!(
         snap["config"]["user.enginebox.clean-base"] == "true"
             && snap["stateful"] != true

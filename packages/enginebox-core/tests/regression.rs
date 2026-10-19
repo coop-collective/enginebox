@@ -382,6 +382,27 @@ fn bootstrap_plan_only_creates_owned_named_resources() {
     );
 }
 #[test]
+fn bootstrap_refuses_partial_checkout_markers_before_preparation() {
+    let c = fixture()["bootstrap"].clone();
+    for section in ["config", "expanded_config"] {
+        for marker in ["user.enginebox.layerfs", "user.enginebox.layerfs.workspace"] {
+            let mut o = observed(&c);
+            add_owned(&c, &mut o);
+            o["instances"][0]["config"]["user.enginebox.prepared"] = json!("");
+            o["instances"][0][section][marker] = json!("");
+            let plan = bootstrap::build_plan(&c, &o).unwrap();
+            assert_eq!(plan["ok"], false);
+            assert!(
+                plan["errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|error| error.as_str().unwrap_or("").contains("Detach the LayerFS"))
+            );
+        }
+    }
+}
+#[test]
 fn bootstrap_second_apply_is_noop_even_when_ram_is_used() {
     let c = fixture()["bootstrap"].clone();
     let mut o = observed(&c);

@@ -230,15 +230,48 @@ fn tracked_secret_paths_and_submodules_are_refused() {
     assert!(source::preview(clean.path(), "HEAD").is_err());
 }
 #[test]
-fn private_configuration_requires_opt_in_pins_and_budgets() {
-    let mut config:Config=serde_json::from_value(serde_json::json!({"schema":1,"experimental":true,"root":"/var/lib/enginebox-layerfs","sdk":"/opt/layerfs/sdk/js","daemon":"/opt/layerfs/layerfs-daemon",
+fn private_configuration_requires_pins_and_budgets_without_feature_opt_in() {
+    let mut config:Config=serde_json::from_value(serde_json::json!({"schema":1,"root":"/var/lib/enginebox-layerfs","sdk":"/opt/layerfs/sdk/js","daemon":"/opt/layerfs/layerfs-daemon",
         "native_sha256":"a".repeat(64),"daemon_sha256":"b".repeat(64),"image":format!("sha256:{}","c".repeat(64)),
         "max_workspaces":2,"cpus_per_workspace":1,"memory_mib_per_workspace":1024,"disk_reserve_gib":4,"import_limit_gib":2,
         "pnpm_store":null,"pnpm_metadata":null})).unwrap();
     config.validate().unwrap();
-    config.experimental = false;
-    assert!(config.validate().is_err());
+    assert!(!config.experimental);
+    assert_eq!(config.docker_socket, Path::new("/var/run/docker.sock"));
+    assert!(
+        serde_json::to_value(&config)
+            .unwrap()
+            .get("docker_socket")
+            .is_none()
+    );
+    config.docker_socket = "/run/enginebox-validation/docker.sock".into();
+    config.validate().unwrap();
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        serialized["docker_socket"],
+        "/run/enginebox-validation/docker.sock"
+    );
+    assert_eq!(
+        serde_json::from_value::<Config>(serialized)
+            .unwrap()
+            .docker_socket,
+        config.docker_socket
+    );
+    for invalid in [
+        "tcp://localhost:2375",
+        "relative.sock",
+        "/run/../tmp/docker.sock",
+        "/run/bad\tname.sock",
+    ] {
+        config.docker_socket = invalid.into();
+        assert!(config.validate().is_err(), "{invalid}");
+    }
+    config.docker_socket = "/var/run/docker.sock".into();
     config.experimental = true;
+    config.validate().unwrap();
+    config.schema = 2;
+    assert!(config.validate().is_err());
+    config.schema = 1;
     config.image = "runtime:latest".into();
     assert!(config.validate().is_err());
     config.image = format!("sha256:{}", "c".repeat(64));

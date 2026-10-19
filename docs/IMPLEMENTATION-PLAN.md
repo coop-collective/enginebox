@@ -28,7 +28,7 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 - `packages/enginebox-controller`: authenticated REST, private durable jobs, reconciliation and exclusive controller ownership.
 - `packages/enginebox-cli`: operator terminal and fleet MCP access.
 - `packages/enginebox-install`: immutable native release artifacts, checksum-verified installation, platform service plans, supervised upgrade and compatible rollback.
-- `packages/enginebox-storage-layerfs`: opt-in administrator CLI for pinned node-local Docker checkouts, stable project paths, immutable pnpm reuse and file checkpoints. Separate from fleet VM storage, provider homes and RAM snapshots; see [backend scope and limits](LAYERFS-BACKEND.md).
+- `packages/enginebox-storage-layerfs`: first-class checkout storage with pinned node-local execution, stable project paths, immutable pnpm reuse and file checkpoints. Controller registration and bounded API/MCP jobs expose the backend. Private provider homes and RAM snapshots retain separate contracts; see [backend scope and limits](LAYERFS-BACKEND.md).
 - `packages/dashboard`: Vinext owner dashboard, session authentication and server-side proxy.
 - `examples/`: host/fleet configuration and portable template manifests. Tests live with their owning package.
 
@@ -109,6 +109,10 @@ Public multi-tenancy requires real tenant authorization and private account/stat
 
 Automatic placement, swarm orchestration, GPU memory restoration, a new CI scheduler and premium engine recipes remain separate work. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
 
-## Shared filesystem candidate
+## Checkout storage and large game assets
 
-Evaluate [LayerFS](LAYERFS.md) as an optional filesystem provider for private branches over approved shared repository/dependency bases. Keep file checkpointing separate from Incus RAM checkpointing. It is not yet a bundled dependency or proven storage backend; qualify a pinned supported release before implementation.
+[LayerFS](LAYERFS.md) is a first-class checkout provider exposed through controller registration, durable API jobs, MCP and the Storage dashboard. The pinned preview remains explicitly provisioned on qualified Linux nodes; it is not downloaded by a general installer. Keep file checkpoints separate from Incus RAM checkpoints, and retain uncertain state for operator inspection. See [the backend contract](LAYERFS-BACKEND.md) and [Incus attachment](LAYERFS-INCUS.md) for the tested boundaries and remaining release gates.
+
+[Lore and Artifacts assessment](LORE-STORAGE.md) records a 3.96 GB Unity fixture and the current Artifacts size limits. Lore is a proposed first-class source/asset provider feeding prepared LayerFS bases. The local Lore benchmark is complete; fleet ingestion, native engine builds, cross-host distribution and an R2-backed service remain separate implementation and qualification work.
+
+The proposed [Wrangler environment-state recipe](LAYERFS.md#wrangler-environment-state-forks-proposed) extends reuse to consistent local D1/KV/R2/Durable Object snapshots. Each fork owns its writable runtime data; intentionally shared project state goes through a separate service API. Database consistency, local service lifecycle, publish/restore behavior and storage durability need qualification before this can be offered as a supported environment fork. This requires no DuckDB dependency and does not snapshot remote Cloudflare bindings.

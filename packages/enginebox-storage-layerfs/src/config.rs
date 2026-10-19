@@ -12,9 +12,17 @@ pub const SDK_DIGEST: &str = "f571de4c12a0201d4daaed5ec86a1472303ca7b88ec7372819
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub schema: u32,
+    /// Legacy receipt field, accepted for compatibility; no longer an opt-in gate.
+    #[serde(default)]
     pub experimental: bool,
     /// One administrator/trust boundary. Never a provider home.
     pub root: PathBuf,
+    /// A daemon on this Linux host; remote Docker endpoints cannot export local mounts.
+    #[serde(
+        default = "default_docker_socket",
+        skip_serializing_if = "is_default_docker_socket"
+    )]
+    pub docker_socket: PathBuf,
     /// Pinned upstream sdk/js directory, containing the built native addon.
     pub sdk: PathBuf,
     pub daemon: PathBuf,
@@ -30,6 +38,12 @@ pub struct Config {
     /// Optional immutable generation. The operator must prohibit other writers.
     pub pnpm_store: Option<String>,
     pub pnpm_metadata: Option<String>,
+}
+pub fn default_docker_socket() -> PathBuf {
+    PathBuf::from("/var/run/docker.sock")
+}
+fn is_default_docker_socket(path: &Path) -> bool {
+    path == default_docker_socket()
 }
 pub fn identifier(value: &str) -> Result<()> {
     ensure!(
@@ -54,7 +68,8 @@ pub fn safe_path(path: &Path) -> Result<()> {
     let s = path.to_str().context("Paths must be UTF-8")?;
     ensure!(
         path.is_absolute()
-            && !s.contains([',', '\n', '\r', '\0'])
+            && !s.contains(',')
+            && !s.chars().any(char::is_control)
             && !path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir)),
@@ -80,11 +95,8 @@ impl Config {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.schema == 1 && self.experimental,
-            "LayerFS requires schema 1 and explicit experimental=true"
-        );
-        for p in [&self.root, &self.sdk, &self.daemon] {
+        ensure!(self.schema == 1, "LayerFS requires schema 1");
+        for p in [&self.root, &self.sdk, &self.daemon, &self.docker_socket] {
             safe_path(p)?;
         }
         ensure!(

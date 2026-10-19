@@ -245,6 +245,19 @@ pub fn host_run(
 ) -> Result<Vec<u8>> {
     run_process(&host_command(host, argv), input, timeout)
 }
+/// A VM snapshot cannot capture an externally mounted checkout's file state.
+/// A partial attachment marker is also a reason to stop rather than guess.
+pub fn ensure_no_external_checkout(instance: &Value, operation: &str) -> Result<()> {
+    for field in ["config", "expanded_config"] {
+        let config = &instance[field];
+        ensure!(
+            config.get("user.enginebox.layerfs").is_none()
+                && config.get("user.enginebox.layerfs.workspace").is_none(),
+            "Detach the LayerFS checkout before {operation}; external files are not part of VM disk or RAM snapshots"
+        );
+    }
+    Ok(())
+}
 #[derive(Debug, Clone)]
 pub struct EngineBox {
     pub host: String,
@@ -410,7 +423,10 @@ impl EngineBox {
         self.run_input(&self.exec_args(name, argv)?, input, timeout)
     }
     pub fn lifecycle(&self, name: &str, action: &str) -> Result<Value> {
-        let v = self.status(name)?;
+        let v = self.instance(name)?;
+        if action == "hibernate" {
+            ensure_no_external_checkout(&v, "hibernation")?;
+        }
         let state = v["status"].as_str().unwrap_or("");
         let args = match (action, state) {
             ("pause", "Running") => vec!["pause", name],
@@ -424,7 +440,8 @@ impl EngineBox {
     }
     pub fn snapshot(&self, name: &str, snapshot: &str) -> Result<Value> {
         identifier(snapshot, false)?;
-        let v = self.status(name)?;
+        let v = self.instance(name)?;
+        ensure_no_external_checkout(&v, "snapshot")?;
         let state = v["status"].as_str().unwrap_or("");
         let mut args = vec!["snapshot", "create", name, snapshot];
         match state {
@@ -441,6 +458,14 @@ impl EngineBox {
         identifier(source, true)?;
         identifier(snapshot, false)?;
         identifier(target, true)?;
+        ensure_no_external_checkout(&self.instance(source)?, "fork")?;
+        ensure_no_external_checkout(
+            &self.query(&format!(
+                "/1.0/instances/{source}/snapshots/{snapshot}?project={}",
+                self.project
+            ))?,
+            "fork",
+        )?;
         self.call(&[
             "copy",
             &format!("{source}/{snapshot}"),
@@ -451,10 +476,19 @@ impl EngineBox {
     }
     pub fn restore(&self, name: &str, snapshot: &str, stateful: bool) -> Result<Value> {
         identifier(snapshot, false)?;
+        let instance = self.instance(name)?;
+        ensure_no_external_checkout(&instance, "restore")?;
         ensure!(
-            self.status(name)?["status"] == "Stopped",
+            instance["status"] == "Stopped",
             "Stop explicitly before restoring disk and memory"
         );
+        ensure_no_external_checkout(
+            &self.query(&format!(
+                "/1.0/instances/{name}/snapshots/{snapshot}?project={}",
+                self.project
+            ))?,
+            "restore",
+        )?;
         let mut args = vec!["snapshot", "restore", name, snapshot];
         if stateful {
             args.push("--stateful");

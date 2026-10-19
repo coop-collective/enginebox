@@ -454,6 +454,7 @@ dependencies = [
  "clap",
  "enginebox-core",
  "fs2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

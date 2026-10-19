@@ -126,6 +126,22 @@ Allocation performs the same guest identity, tools and networking readiness
 checks as ordinary creation. It does not validate provider credentials or spend
 model quota.
 
+## External LayerFS checkouts
+
+The current generic pool does not attach LayerFS checkouts during allocation.
+The [Incus checkout adapter](LAYERFS-INCUS.md) targets a virtiofs directory disk
+with an explicitly stopped VM for attach/detach. It refuses unclaimed or
+quarantined pool members.
+Adding a new project mount to an already frozen generic reserve is therefore not
+an instant operation supported by this backend.
+
+A future project-specific pool can prepare and attach its private checkout
+before booting and freezing the VM, then use pause/resume for assignment. That
+needs coordinated checkout/VM admission, ownership and cleanup; it is not the
+existing template-only pool contract. Dynamic attachment to generic reserves
+requires separately qualified hotplug support. Neither path establishes combined
+LayerFS file and VM RAM checkpoints.
+
 ## Verification
 
 Run the offline allocation, admission and recovery regressions with:
