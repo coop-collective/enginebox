@@ -106,3 +106,5 @@ cargo run -p enginebox-install --bin enginebox-release -- \
 ```
 
 It emits `enginebox-VERSION-TARGET.tar.gz`, the matching JSON manifest and target-specific `.sha256` receipt. Required service, node, guest, CLI and MCP binaries are allowlisted; use repeated `--binary NAME` for additional tools. Dashboard dependencies must be materialized inside the standalone artifact: escaping or remaining symlinks are rejected. The output directory must not already exist.
+
+The October 20 Linux x86-64 qualification built the dashboard on Linux, packaged the native release, and used the installer to verify, stage and activate it in a disposable prefix. The installed supervisor then ran in a transient systemd user unit: readiness, dashboard login and its authenticated API proxy passed. The fixture used fake fleet/provider executables and did not replace production services. This does not qualify a fresh machine's package provisioning, persistent service enrollment or Windows/macOS service execution. Build the standalone dashboard on its target platform too; its image-processing dependencies can contain platform-specific native modules.
