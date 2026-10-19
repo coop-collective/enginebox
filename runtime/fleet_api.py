@@ -8,9 +8,14 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 
 from fleet import Fleet, load_hosts
+
+
+ACCOUNT_PATH = r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances/(ebox-[a-z0-9][a-z0-9-]{0,48})/accounts"
+ACCOUNT_SESSION_PATH = ACCOUNT_PATH + r"/(codex|claude|cursor)/sessions/([a-f0-9]{32})"
 
 
 def api_token() -> str:
@@ -63,6 +68,12 @@ def handler_for(fleet: Fleet, token: str):
                     return self.respond(200, fleet.summary())
                 if self.path == "/v1/templates":
                     return self.respond(200, fleet.catalog())
+                account = re.fullmatch(ACCOUNT_PATH, self.path)
+                if account:
+                    return self.respond(200, fleet.accounts.status(account[1], account[2]))
+                session = re.fullmatch(ACCOUNT_SESSION_PATH, self.path)
+                if session:
+                    return self.respond(200, {"session": fleet.accounts.session(*session.groups())})
                 match = re.fullmatch(r"/v1/jobs/([a-f0-9]{32})", self.path)
                 if match:
                     return self.respond(200, {"job": fleet.job(match[1])})
@@ -87,6 +98,23 @@ def handler_for(fleet: Fleet, token: str):
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("Body must be an object.")
+                login = re.fullmatch(ACCOUNT_PATH + r"/(codex|claude|cursor)/login", self.path)
+                account_action = re.fullmatch(ACCOUNT_SESSION_PATH + r"/(input|cancel)", self.path)
+                if login:
+                    if body:
+                        raise ValueError("Native provider sign-in accepts an empty object.")
+                    return self.respond(202, {"session": fleet.account_start(*login.groups())})
+                if account_action:
+                    host_id, name, provider, session_id, operation = account_action.groups()
+                    if operation == "input":
+                        if set(body) != {"text"} or not isinstance(body["text"], str):
+                            raise ValueError("Provide the one-time authorization code as text.")
+                        result = fleet.accounts.input(host_id, name, provider, session_id, body["text"])
+                    else:
+                        if body:
+                            raise ValueError("Cancel accepts an empty object.")
+                        result = fleet.accounts.cancel(host_id, name, provider, session_id)
+                    return self.respond(200, {"session": result})
                 if self.path == "/v1/templates":
                     if not fleet.registry:
                         raise ValueError("Configure a persistent template registry first.")
@@ -142,6 +170,9 @@ def main(argv=None):
         token = api_token()
         fleet = Fleet(load_hosts(args.config), state_dir=args.state_dir)
         server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(fleet, token))
+        def stop(_signal, _frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, stop)
         fleet.warm.start()
         print(f"Engine Box API listening on http://127.0.0.1:{server.server_port}", flush=True)
         server.serve_forever()
@@ -156,6 +187,7 @@ def main(argv=None):
             # Graceful shutdown lets admitted jobs finish. Abrupt termination is
             # recovered as failed/inspect-required from the persisted journal.
             fleet.warm.stop()
+            fleet.accounts.close()
             fleet.executor.shutdown(wait=True)
 
 

@@ -217,13 +217,23 @@ export async function proxy(request: Request, segments: string[]) {
   requireSession(request);
   if (request.method !== "GET") requireOrigin(request);
   const path = segments.join("/");
+  const accountRead =
+    /^v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/instances\/ebox-[a-z0-9-]{1,49}\/accounts(?:\/(?:codex|claude|cursor)\/sessions\/[a-f0-9]{32})?$/.test(
+      path,
+    );
+  const accountWrite =
+    /^v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/instances\/ebox-[a-z0-9-]{1,49}\/accounts\/(?:(?:codex|claude|cursor)\/(?:login|sessions\/[a-f0-9]{32}\/cancel)|claude\/sessions\/[a-f0-9]{32}\/input)$/.test(
+      path,
+    );
   const allowed =
     request.method === "GET"
-      ? /^v1\/(fleet|templates|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
+      ? accountRead ||
+        /^v1\/(fleet|templates|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
       : request.method === "POST" &&
-        /^(?:v1\/templates|v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/(?:templates\/[a-z][a-z0-9-]{0,31}\/install|allocations|instances(?:\/ebox-[a-z0-9-]{1,49}\/actions)?))$/.test(
-          path,
-        );
+        (accountWrite ||
+          /^(?:v1\/templates|v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/(?:templates\/[a-z][a-z0-9-]{0,31}\/install|allocations|instances(?:\/ebox-[a-z0-9-]{1,49}\/actions)?))$/.test(
+            path,
+          ));
   if (
     !allowed ||
     segments.some((part) => part.includes("/") || part.includes(".."))

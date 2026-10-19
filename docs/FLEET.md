@@ -81,6 +81,11 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `POST /v1/hosts/{host_id}/instances` | Queue a clone: `{"name":"ebox-work","template":"native-agents","size":"standard"}`. |
 | `POST /v1/hosts/{host_id}/instances/{name}/actions` | Queue `{"action":"pause"}`, `resume`, `hibernate` or `stop`. |
 | `GET /v1/jobs/{job_id}` | Poll the job's `queued`, `running`, `succeeded` or `failed` state. |
+| `GET /v1/hosts/{host_id}/instances/{name}/accounts` | Native Codex, Claude and Cursor sign-in status, with any active sign-in session. |
+| `POST /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/login` | Start native browser/device sign-in using `{}`; returns HTTP 202 with a session. |
+| `GET /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/sessions/{id}` | Poll an in-memory sign-in session. |
+| `POST /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/sessions/{id}/input` | Submit Claude's one-time authorization code as `{"text":"…"}`. |
+| `POST /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/sessions/{id}/cancel` | Cancel pending sign-in using `{}`. |
 
 Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no arbitrary command-execution, snapshot-restore or deletion endpoint.
 
@@ -89,6 +94,14 @@ Use `size: "minimum"` or `size: "recommended"` for template-defined resources, o
 Legacy `small`, `standard` and `large` select 2/4/8 vCPUs and 2/4/8 GiB RAM respectively. `disk_gib` is configured per host. Saved-memory storage is the selected RAM size plus 2 GiB.
 
 For optional prebooted reserves, see [warm pools](WARM-POOLS.md). Allocation returns the actual Incus VM `name` plus the requested `workspace_name`; subsequent lifecycle calls use the actual name. Assigned VMs never return to the fresh pool.
+
+## Provider accounts
+
+Use the dashboard's **Subscriptions** panel for owner sign-in. The account routes accept only `codex`, `claude` and `cursor`, and only assigned, running workspaces in the host's configured admission pool. Bases and unassigned warm reserves cannot receive accounts. Resume a paused or stopped workspace first.
+
+The service launches the installed native CLI as the configured guest user. It forwards only a validated provider authorization link, a device code when applicable and session state. Claude's one-time code goes to that native process. Tokens remain in the provider's native guest storage; they are not copied between workspaces or saved in the fleet registry/job journal. Sessions are temporary and expire or cancel on service shutdown. The guest supervisor terminates the login process group when the control connection ends.
+
+Account status reflects the CLI's supported diagnostics. A browser account login is not proof of a paid plan, remaining allowance or successful inference. API-key mode is shown separately. An exit code alone does not establish login success: status is checked again. Complete or cancel active sign-in before using this controller's workspace lifecycle actions; other workspaces remain available. Provider account setup is an owner dashboard/REST operation, not a fleet MCP prompt-delegation tool. See [native-client authentication](NATIVE-CLIENTS.md).
 
 ## Capacity and coordination
 

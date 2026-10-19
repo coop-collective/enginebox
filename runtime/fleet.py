@@ -21,6 +21,7 @@ from urllib.parse import quote
 from enginebox import EngineBox, GuestConfig, identifier
 from templates import Registry, host_binding_digest, validate_resources
 from warm_pool import WarmPool
+from accounts import AccountManager
 
 GIB = 1024**3
 SIZES = {"small": {"cpu": 2, "memory_gib": 2},
@@ -401,6 +402,7 @@ class Fleet:
         self.state_dir = state_dir.expanduser().resolve() if state_dir else None
         self.registry = registry if registry is not None else (Registry(self.state_dir.parent) if self.state_dir else None)
         self.warm = WarmPool(self)
+        self.accounts = AccountManager(self)
         if state_dir:
             state_dir = self.state_dir
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -425,6 +427,28 @@ class Fleet:
         if host_id not in self.hosts:
             raise ValueError("Unknown host.")
         return self.hosts[host_id]
+
+    def account_workspace(self, host_id, name):
+        """Read-only guard: provider credentials belong only in assigned VMs."""
+        identifier(name, instance=True)
+        host = self.host(host_id)
+        facts = inventory(host)
+        vm = next((item for item in facts["instances"]
+                   if item["project"] == host.project and item["name"] == name), None)
+        if not vm or not vm.get("managed") or vm.get("pool") != host.pool:
+            raise ValueError("Provider sign-in requires a private workspace managed by this fleet.")
+        if vm.get("warm_pool_state") in {"preparing", "ready", "quarantined"}:
+            raise ValueError("Assign a fresh workspace before connecting provider accounts.")
+        if vm["status"] != "Running":
+            raise ValueError("Resume this workspace before connecting provider accounts.")
+        return host
+
+    def account_start(self, host_id, name, provider):
+        host = self.host(host_id)
+        # Serialize only admission with lifecycle operations, never the browser
+        # authorization wait. start() registers its active session before return.
+        with self.locks[host.id], host_operation_lock(host):
+            return self.accounts.start(host_id, name, provider)
 
     def _host_status(self, host):
         try:
@@ -660,6 +684,8 @@ class Fleet:
             raise ValueError("Unassigned warm reserves cannot be changed through workspace lifecycle controls.")
         if vm.get("pool") != host.pool:
             raise ValueError("Workspace moved outside this host's admission pool; update the fleet configuration explicitly.")
+        if self.accounts.active(host.id, name):
+            raise ValueError("Finish or cancel provider sign-in before changing this workspace's state.")
         if action == "resume" and vm["status"] == "Stopped":
             room = capacity(host, facts)
             if vm["cpu"] > room["cpu_available"] or vm["memory_bytes"] > room["memory_budget_available_bytes"]:

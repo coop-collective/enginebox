@@ -258,6 +258,7 @@ h1 {
 }
 .heading-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 9px;
   align-items: center;
 }
@@ -730,6 +731,149 @@ textarea {
   color: #648b7f;
   margin-bottom: 14px;
 }
+.subscriptions-panel {
+  background: #fff;
+  border: 1px solid #c9ded8;
+  border-radius: 7px;
+  padding: 22px;
+  margin-bottom: 28px;
+}
+.subscriptions-panel .section-title p {
+  color: #748990;
+  font-size: 11px;
+  line-height: 1.7;
+  margin-top: 7px;
+}
+.account-selectors {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 14px;
+  margin: 20px 0;
+}
+.account-selectors label {
+  min-width: 0;
+}
+.account-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 10px;
+  color: #748990;
+  margin: 16px 0;
+}
+.account-toolbar code {
+  overflow-wrap: anywhere;
+}
+.accounts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+.account-card {
+  border: 1px solid var(--line);
+  padding: 17px;
+  border-radius: 6px;
+  min-width: 0;
+}
+.account-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 9px;
+}
+.account-heading h3 {
+  font-size: 13px;
+  color: #47616a;
+}
+.account-status {
+  font-size: 9px;
+  color: #879ba0;
+  background: #f3f6f6;
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+.account-connected {
+  color: #528777;
+  background: #eff8f3;
+}
+.account-detail,
+.account-resume p {
+  font-size: 11px;
+  color: #748990;
+  line-height: 1.8;
+  margin-top: 12px;
+}
+.account-resume {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 0;
+}
+.account-resume p {
+  margin-top: 0;
+}
+.account-error {
+  color: #a86e5c;
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  margin-top: 12px;
+}
+.account-actions {
+  margin-top: 16px;
+}
+.auth-session {
+  border-top: 1px solid var(--line);
+  margin-top: 14px;
+  padding-top: 14px;
+  color: #648b7f;
+  font-size: 10px;
+}
+.auth-session > strong {
+  font-size: 11px;
+}
+.auth-session > p {
+  margin: 9px 0;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.auth-session > small {
+  display: block;
+  color: #879ba0;
+  margin-top: 10px;
+}
+.auth-failed,
+.auth-expired {
+  color: #a86e5c;
+}
+.auth-code-form {
+  margin-top: 14px;
+}
+.auth-code-form button {
+  margin-top: 9px;
+}
+.device-code {
+  margin-top: 12px;
+}
+.device-code span {
+  display: block;
+  font-size: 9px;
+  margin-bottom: 6px;
+  color: #879ba0;
+}
+.device-code code {
+  display: inline-block;
+  padding: 7px 9px;
+  border: 1px solid #dbe5e7;
+  border-radius: 4px;
+  letter-spacing: 1px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
 .workspaces-section {
   margin-top: 31px;
 }
@@ -1200,6 +1344,18 @@ input::placeholder {
   }
   .catalog-panel {
     padding: 20px;
+  }
+  .subscriptions-panel {
+    padding: 20px;
+  }
+  .account-selectors {
+    grid-template-columns: 1fr;
+  }
+  .accounts-grid {
+    grid-template-columns: 1fr;
+  }
+  .account-toolbar {
+    align-items: flex-start;
   }
   .catalog-grid {
     grid-template-columns: 1fr;

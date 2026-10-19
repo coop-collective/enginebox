@@ -106,3 +106,27 @@ export type Job = {
   instance?: string;
   kind?: "workspace" | "template";
 };
+
+export type ProviderId = "codex" | "claude" | "cursor";
+export type AuthSession = {
+  id: string;
+  host_id: string;
+  name: string;
+  provider: ProviderId;
+  status:
+    "starting" | "waiting" | "succeeded" | "failed" | "cancelled" | "expired";
+  authorization_url?: string | null;
+  user_code?: string | null;
+  input_required: boolean;
+  message: string;
+  expires_at: string;
+};
+export type ProviderAccount = {
+  id: ProviderId;
+  label: string;
+  installed: boolean;
+  status: "connected" | "disconnected" | "unknown" | "unavailable";
+  auth_method: "subscription" | "account" | "api_key" | "unknown" | "none";
+  detail?: string;
+  session?: AuthSession | null;
+};

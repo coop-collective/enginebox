@@ -108,6 +108,8 @@ Codex, Cursor Agent and Claude Code run unmodified in the guest. Native installa
 
 The owner completes each native sign-in. Subscription availability, refresh and quota behavior must be validated per provider and account mode. Installation and `--version` checks do not establish successful inference. See [native-client design](NATIVE-CLIENTS.md).
 
+The dashboard's Subscriptions panel starts the native CLI login inside a selected running, assigned workspace and exposes only the provider's browser/device authorization step and status. Its supervisor expires/cancels pending processes, while completed credentials stay in native guest storage. Clean bases and warm reserves cannot be used for sign-in, and a connected account is not treated as evidence of a paid subscription or remaining balance.
+
 Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes computer tools only and receives no host keys or Incus socket. Its restricted tool list is not itself an authorization boundary; actual isolation depends on credentials and host/guest permissions. Installing an MCP server does not disable the native harness's approval policy. Desktop is optional and should be provisioned only when requested; guest computer MCP requires it, while operator MCP can be enabled independently.
 
 [Incus administrator access](https://linuxcontainers.org/incus/docs/main/explanation/security/) is host-level authority. The initial product is for trusted owners. Running native agents in private VMs does not make the operator control plane or existing privileged CI runner suitable for hostile tenants.

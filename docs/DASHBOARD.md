@@ -10,10 +10,11 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 - Template minimum/recommended presets and custom CPU, RAM and disk allocations. Custom values must be whole numbers at or above the template minimum. Older templates without resource metadata retain the legacy named sizes.
 - A template catalog panel for registering JSON manifests or HTTPS URLs, exporting portable JSON, installing templates on a selected host, and syncing deployments whose digest differs from the registered revision.
 - Pause, resume, hibernate and stop controls for assigned managed workspaces. Unmanaged bases and preparing, ready or quarantined pool instances have no lifecycle controls. Each pending operation affects only its target row. Stop asks for confirmation because it ends running processes.
+- A Subscriptions panel for connecting Codex (ChatGPT), Claude and Cursor through their native sign-in commands inside a selected private workspace. It displays status, official provider links, device codes, Claude authorization-code entry and cancellation.
 - Asynchronous operation status, error messages, loading states, empty fleet instructions and responsive mobile layouts.
 - A separate operator sign-in, an eight-hour signed HttpOnly session, and exact Origin checks for login, logout and mutations.
 
-The page reads `/v1/fleet` every ten seconds while signed in. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. There is no cancellation button or multi-user account system.
+The page reads `/v1/fleet` every ten seconds while signed in. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. Infrastructure jobs cannot be cancelled through the dashboard. There is no multi-user account system.
 
 The assigned-workspace count excludes unmanaged bases and pool reserves. The instance inventory still shows all of them, with reserve state clearly marked. Claimed reserves keep their Incus VM ID; the requested workspace name appears above that ID, and lifecycle requests always use the actual VM ID. Host cards show each configured reserve's ready/preparing/target counts and refill errors. Paused reserves retain their memory allocation.
 
@@ -24,6 +25,16 @@ Registration alone does not install anything on a host. The catalog shows the re
 Each catalog record's **Export JSON** button downloads `{id}-r{revision}.json` with only the supported v1 manifest fields. Host inventory, deployment receipts, snapshot references and catalog digests are excluded. The exported file can be registered in another Engine Box installation through JSON import or an HTTPS URL.
 
 The app has no demo mode and no production fallback to synthetic inventory. Test fixtures live only in `dashboard/tests/fixtures/`.
+
+## Connect native accounts
+
+Open **Subscriptions**, or choose **Connect accounts** on an assigned workspace. Select its host and workspace, then **Connect** beside the installed native client. A stopped or paused workspace must be resumed explicitly before connecting; opening the panel never resumes it. Prepared reserves and unmanaged bases cannot receive accounts.
+
+Complete sign-in on the official provider page. Codex may show a device code to enter there. Claude may request the authorization code returned by its browser flow; the dashboard accepts it only while that native session requests input, masks it and clears the field on submission. Cursor completes in the browser. The panel never asks for a provider password or API key. **Cancel sign-in** stops the pending native flow; **Reconnect** starts a new one. Neither action is a provider logout.
+
+Final account credentials stay in the selected VM. The control plane relays bounded sign-in instructions and, for Claude, the one-time authorization code to that VM's native process. Sign-in status does not establish paid-plan eligibility, quota or remaining subscription balance. Accounts are not pooled or copied to other workspaces. **Refresh accounts** reads the native clients' current status.
+
+Active sign-ins are polled approximately once per second. Switching workspaces, closing the panel, signing out or leaving the page stops that view's polling and discards its local fields. Closing the view does not cancel the native flow; reopening recovers a still-active session from the API. URLs and codes are kept only in page memory, never browser storage. Only the verified HTTPS authorization endpoints for `auth.openai.com`, `claude.com` and `cursor.com` are clickable; callback URLs, token-bearing parameters and unexpected query fields are rejected.
 
 ## Local setup
 
@@ -109,7 +120,7 @@ For access through a TLS reverse proxy, set an HTTPS dashboard origin. The start
 
 Only the configured fleet endpoints are proxied. Browser-supplied Authorization headers are not forwarded. The server uses the configured API token, rejects upstream redirects, bounds ordinary JSON request bodies to 8 KiB and template-registration bodies to 1 MiB, and disables response caching. This is a single-operator control plane, not tenant authorization.
 
-The dashboard does not embed noVNC, open desktop ports, install agents or proxy provider authentication. Lifecycle buttons call the environment API; official native harnesses retain their own authentication. In particular, publishing the dashboard does not make an unauthenticated desktop listener safe.
+The dashboard does not embed noVNC, open desktop ports or proxy model inference. Lifecycle buttons call the environment API; account controls coordinate the official native harnesses' own authentication. In particular, publishing the dashboard does not make an unauthenticated desktop listener safe.
 
 ## API contract
 
@@ -123,8 +134,15 @@ The dashboard does not embed noVNC, open desktop ports, install agents or proxy 
 | Install/sync a template on a host | `POST /v1/hosts/{id}/templates/{template_id}/install` with `{}` |
 | Change workspace state | `POST /v1/hosts/{id}/instances/{name}/actions` with `{action}` |
 | Poll operation state | `GET /v1/jobs/{id}` |
+| Read native account status and active sign-ins | `GET /v1/hosts/{id}/instances/{name}/accounts` |
+| Start native sign-in | `POST /v1/hosts/{id}/instances/{name}/accounts/{provider}/login` with `{}` |
+| Poll native sign-in | `GET /v1/hosts/{id}/instances/{name}/accounts/{provider}/sessions/{session_id}` |
+| Submit a requested Claude authorization code | `POST /v1/hosts/{id}/instances/{name}/accounts/claude/sessions/{session_id}/input` with `{text}` |
+| Cancel native sign-in | `POST /v1/hosts/{id}/instances/{name}/accounts/{provider}/sessions/{session_id}/cancel` with `{}` |
 
 Workspace mutations and template installation return HTTP 202 with `{job: {id, status}}`; template registration returns synchronously. Job status is `queued`, `running`, `succeeded` or `failed`. Allocation results contain the actual `name`, requested `workspace_name`, `startup` (`warm` or `cold`) and `ready_seconds`. The frontend treats failed inventory and job requests as visible errors. It does not infer success from a timeout. Capacity is advisory in the UI; the fleet service must enforce it and reject conflicting concurrent mutations.
+
+Native sign-in endpoints return `{session}` independently of infrastructure jobs. Providers are `codex`, `claude` and `cursor`; session IDs are 32 lowercase hexadecimal characters. Status is `starting`, `waiting`, `succeeded`, `failed`, `cancelled` or `expired`. The proxy permits only these account routes, with the ordinary 8 KiB body limit. Claude authorization codes are limited to 8–2048 characters and validated by the backend.
 
 ## Validation
 
@@ -137,7 +155,7 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The Node tests cover signed sessions, expiry, credential rotation, exact origins, proxy authentication, path restrictions, backend failure handling, body limits, custom resource validation, cold capacity and warm matching. Playwright runs the production build with a test-only API on `127.0.0.1:18765` and dashboard on `127.0.0.1:3007`. It exercises login/logout, token separation, row-isolated lifecycle operations, resource-card math, reserve restrictions, warm/cold allocation, custom minimums, template import/install/sync, async job failures, empty/error states and mobile layout. It never calls a real fleet API or stops a developer workspace.
+The Node tests cover signed sessions, expiry, credential rotation, exact origins, proxy authentication, path restrictions, backend failure handling, body limits, custom resource validation, cold capacity, warm matching and official provider URL validation. Playwright runs the production build with a test-only API on `127.0.0.1:18765` and dashboard on `127.0.0.1:3007`. It exercises login/logout, token separation, row-isolated lifecycle operations, resource-card math, reserve restrictions, warm/cold allocation, custom minimums, template import/install/sync, async job failures, empty/error states and mobile layout. Account tests cover device flow, code entry, reconnect/cancel, completion, workspace switching, session recovery, polling cleanup and unauthenticated requests. It never calls a real fleet API, signs in to a real provider or stops a developer workspace.
 
 Tested initial dependency versions: Vinext 1.2.1, React 19.3.1, Vite 8.3.4. Exact versions and transitive integrity hashes are in `package-lock.json`. The scaffold was generated with the official `create-vinext-app --platform=node` workflow; see the [upstream setup and Node hosting docs](https://github.com/cloudflare/vinext#starting-a-new-vinext-project).
 

@@ -4,7 +4,7 @@ const GiB = 1024 ** 3;
 const token = "fixture-api-token-server-only-12345";
 const minimum = { cpu: 2, memory_gib: 2, disk_gib: 30 };
 const recommended = { cpu: 4, memory_gib: 4, disk_gib: 40 };
-let mode, jobs, instances, templates;
+let mode, jobs, instances, templates, authSessions, connectedAccounts;
 function manifest(id = "native", revision = 1) {
   return {
     schema_version: 1,
@@ -25,6 +25,8 @@ function manifest(id = "native", revision = 1) {
 function reset() {
   mode = "normal";
   jobs = new Map();
+  authSessions = new Map();
+  connectedAccounts = new Set();
   const native = manifest();
   native.deployments.push({
     host_id: "metal-01",
@@ -89,6 +91,10 @@ createServer(async (req, res) => {
   }
   if (req.url === "/__test/mode") {
     mode = data.mode;
+    if (mode.startsWith("accounts")) {
+      instances.find((item) => item.name === "ebox-review").status = "Running";
+      connectedAccounts.add("ebox-review/codex");
+    }
     if (poolMode())
       for (const state of ["ready", "preparing", "quarantined"]) {
         if (!instances.some((item) => item.name === `ebox-pool-${state}`))
@@ -229,6 +235,124 @@ createServer(async (req, res) => {
         large: { cpu: 8, memory_gib: 8 },
       },
     });
+  }
+  const accounts = req.url.match(
+    /^\/v1\/hosts\/metal-01\/instances\/(ebox-[a-z0-9-]+)\/accounts(?:\/(codex|claude|cursor)\/(login|sessions)(?:\/([a-f0-9]{32})(?:\/(input|cancel))?)?)?$/,
+  );
+  if (accounts) {
+    const [, name, provider, operation, id, inputAction] = accounts;
+    const vm = instances.find((item) => item.name === name);
+    if (
+      !vm?.managed ||
+      (vm.warm_pool_state && vm.warm_pool_state !== "claimed")
+    )
+      return send(400, { error: "Choose an assigned workspace." });
+    if (vm.status !== "Running")
+      return send(409, { error: "Resume this workspace to connect accounts." });
+    const publicSession = (session) => {
+      const { polls, ...value } = session;
+      return value;
+    };
+    if (req.method === "GET" && !provider) {
+      if (mode === "accounts-error")
+        return send(503, { error: "Native account status is unavailable." });
+      if (mode === "accounts-delayed" && name === "ebox-editor")
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      return send(200, {
+        providers: ["codex", "claude", "cursor"].map((provider) => {
+          const installed = !(
+            mode === "accounts-unavailable" && provider === "cursor"
+          );
+          const connected = connectedAccounts.has(`${name}/${provider}`);
+          const session = [...authSessions.values()]
+            .reverse()
+            .find(
+              (item) =>
+                item.name === name &&
+                item.provider === provider &&
+                ["starting", "waiting"].includes(item.status),
+            );
+          return {
+            id: provider,
+            label: provider,
+            installed,
+            status: installed
+              ? connected
+                ? "connected"
+                : "disconnected"
+              : "unavailable",
+            auth_method: connected ? "account" : "none",
+            detail: connected
+              ? `Account connected in ${name}.`
+              : "No account connected in this workspace.",
+            ...(session ? { session: publicSession(session) } : {}),
+          };
+        }),
+      });
+    }
+    if (req.method === "POST" && operation === "login") {
+      const id = String(authSessions.size + 1).padStart(32, "0");
+      const session = {
+        id,
+        host_id: "metal-01",
+        name,
+        provider,
+        status: "waiting",
+        input_required: provider === "claude",
+        polls: 0,
+        authorization_url: {
+          codex: "https://auth.openai.com/codex/device",
+          claude:
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=fixture",
+          cursor: "https://cursor.com/loginDeepControl?challenge=fixture",
+        }[provider],
+        ...(provider === "codex" ? { user_code: "ABCD-EFGH" } : {}),
+        message:
+          provider === "claude"
+            ? "Complete sign-in, then paste the authorization code."
+            : "Finish signing in with your provider in the browser.",
+        expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+      };
+      authSessions.set(id, session);
+      return send(200, { session: publicSession(session) });
+    }
+    const session = authSessions.get(id);
+    if (!session || session.name !== name || session.provider !== provider)
+      return send(404, { error: "Unknown sign-in session." });
+    if (req.method === "POST" && inputAction === "cancel") {
+      session.status = "cancelled";
+      session.message = "Sign-in cancelled.";
+      session.input_required = false;
+      return send(200, { session: publicSession(session) });
+    }
+    if (req.method === "POST" && inputAction === "input") {
+      if (
+        provider !== "claude" ||
+        !session.input_required ||
+        data.text !== "fixture-owner-code"
+      )
+        return send(400, { error: "Authorization code was not accepted." });
+      session.input_required = false;
+      session.message = "Completing native sign-in.";
+      return send(200, { session: publicSession(session) });
+    }
+    if (req.method === "GET") {
+      if (mode === "accounts-delayed")
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      if (["starting", "waiting"].includes(session.status)) {
+        session.polls++;
+        if (
+          !["accounts-pending", "accounts-delayed"].includes(mode) &&
+          !session.input_required &&
+          session.polls >= 2
+        ) {
+          session.status = "succeeded";
+          session.message = "Native account sign-in completed.";
+          connectedAccounts.add(`${name}/${provider}`);
+        }
+      }
+      return send(200, { session: publicSession(session) });
+    }
   }
   const action = req.url.match(
     /^\/v1\/hosts\/([^/]+)\/instances\/([^/]+)\/actions$/,

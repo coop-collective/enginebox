@@ -27,6 +27,7 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 - `runtime/fleet.py`, `fleet_api.py`, `fleet_mcp.py`: multi-host inventory, capacity, jobs, authenticated REST and operator MCP.
 - `runtime/templates.py`: strict portable manifests, public HTTPS import, per-host revision receipts and bootstrap installation adapter.
 - `runtime/warm_pool.py`: prebooted reserves, durable one-way claims, refill admission and quarantine.
+- `runtime/accounts.py`, `guest_auth.py`: workspace-scoped native CLI sign-in/status, ephemeral browser authorization sessions and supervised guest login processes.
 - `dashboard/`: Vinext owner dashboard and authenticated server-side proxy.
 - `examples/`: existing-Incus, fresh-host and fleet configuration.
 - `tests/`: offline regression coverage and opt-in browser integration.
@@ -58,6 +59,8 @@ Create provider-specific installation recipes and a resolved manifest, not a har
 Add desktop MCP only when selected. Merge an Engine Box entry through each client's supported configuration interface; repeated setup must neither duplicate it nor erase unrelated servers. Create the reusable base before any provider or Git login.
 
 For each client, the operator then validates native sign-in, one bounded prompt, reconnect/session resume and account state after a VM restart. Document quota/expiry behavior from supported diagnostics or real observations; do not consume an allowance merely to force exhaustion. Account tokens and raw auth logs stay out of Git and public CI.
+
+The dashboard Subscriptions panel launches native Codex, Claude and Cursor login in assigned private workspaces, forwards browser/device authorization steps and checks native status afterward. It distinguishes API-key authentication from account sign-in without inferring paid-plan entitlement. Disposable testing covers unsigned-in prompts/cancellation; owner-completed authentication, subscription inference and account persistence acceptance remain required. This is account setup, not a replacement harness or prompt router.
 
 ## Disposable environment validation
 

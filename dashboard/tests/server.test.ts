@@ -273,3 +273,58 @@ test("template registration alone accepts larger manifests up to one MiB", async
   );
   assert.equal(fetch.mock.callCount(), 1);
 });
+
+test("native account proxy routes stay scoped to known providers and session operations", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ ok: true }),
+  );
+  const base = "v1/hosts/test-host/instances/ebox-test/accounts";
+  const session = "1234567890abcdef1234567890abcdef";
+  for (const [method, path] of [
+    ["GET", base],
+    ["GET", `${base}/codex/sessions/${session}`],
+    ["POST", `${base}/codex/login`],
+    ["POST", `${base}/cursor/login`],
+    ["POST", `${base}/claude/sessions/${session}/input`],
+    ["POST", `${base}/cursor/sessions/${session}/cancel`],
+  ])
+    assert.equal(
+      (
+        await proxy(
+          request(undefined, method, method === "POST" ? {} : undefined),
+          path.split("/"),
+        )
+      ).status,
+      200,
+    );
+  const accepted = fetch.mock.callCount();
+  for (const [method, path] of [
+    ["GET", `${base}/codex/login`],
+    ["POST", `${base}/deepseek/login`],
+    ["POST", `${base}/codex/sessions/${session}/input`],
+    ["POST", `${base}/claude/sessions/not-a-session/cancel`],
+    ["POST", `${base}/claude/sessions/${session}/delete`],
+    ["POST", `${base}/claude/logout`],
+  ])
+    await assert.rejects(
+      proxy(
+        request(undefined, method, method === "POST" ? {} : undefined),
+        path.split("/"),
+      ),
+      (err: unknown) => err instanceof HttpError && err.status === 404,
+    );
+  const crossOrigin = request(undefined, "POST", { text: "fixture-code" });
+  crossOrigin.headers.set("origin", "https://attacker.example");
+  await assert.rejects(
+    proxy(crossOrigin, `${base}/claude/sessions/${session}/input`.split("/")),
+    (err: unknown) => err instanceof HttpError && err.status === 403,
+  );
+  await assert.rejects(
+    proxy(
+      request(undefined, "POST", { text: "a".repeat(9000) }),
+      `${base}/claude/sessions/${session}/input`.split("/"),
+    ),
+    (err: unknown) => err instanceof HttpError && err.status === 413,
+  );
+  assert.equal(fetch.mock.callCount(), accepted);
+});

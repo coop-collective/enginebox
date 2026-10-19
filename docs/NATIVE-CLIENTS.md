@@ -49,11 +49,13 @@ run before being considered tested. [Codex installation](https://developers.open
 
 ## Owner sign-in
 
-Run these yourself inside the private workspace:
+Open **Subscriptions** in the dashboard, select a running private workspace, then choose **Connect** on Codex, Claude or Cursor. Follow the provider link in your browser. Codex supplies a device code; Claude asks you to paste its one-time authorization code back into the panel; Cursor waits for browser completion. The panel reports native account status and lets you cancel pending sign-in. Credentials stay inside the selected workspace, so each fresh workspace starts disconnected.
+
+The same native commands remain available directly inside that workspace:
 
 ```sh
 codex login --device-auth
-claude auth login
+claude auth login --claudeai
 NO_OPEN_BROWSER=1 agent login
 ```
 
@@ -65,6 +67,8 @@ credentials. Check status with `codex login status`, `claude auth status`, or
 [Codex authentication](https://developers.openai.com/codex/auth),
 [Claude authentication](https://code.claude.com/docs/en/authentication),
 [Cursor authentication](https://cursor.com/docs/cli/reference/authentication).
+
+The dashboard integration was checked against Codex CLI `0.163.0`, Claude Code `2.1.302` and Cursor Agent `2026.10.16-e3cb207`. Their browser/device prompts and cancellation were exercised in a disposable, unsigned-in workspace. Completing account authorization and running paid-plan inference remain owner acceptance steps. The panel neither requests API keys/passwords nor uses Claude's token-export command. A controller restart cancels pending sign-in; completed native credentials remain in the VM.
 
 Subscription entitlement, available models and concurrency remain provider/account
 decisions. Signing in successfully does not establish successful inference. API
