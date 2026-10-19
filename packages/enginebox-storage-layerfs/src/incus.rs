@@ -15,6 +15,7 @@ const DEVICE: &str = "ebox-layerfs";
 const MARKER: &str = "user.enginebox.layerfs";
 const WORKSPACE_MARKER: &str = "user.enginebox.layerfs.workspace";
 const MAPPED: &str = "/enginebox-incus";
+const STATEFUL: &str = "migration.stateful";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +55,7 @@ struct Attachment {
     id: String,
     target: Target,
     instance_uuid: String,
+    prior_stateful: Option<String>,
     container: String,
     container_pid: u64,
     host_boot_id: String,
@@ -76,7 +78,7 @@ fn load(root: &Path, name: &str) -> Result<Attachment> {
     let a: Attachment = serde_json::from_value(state::read_json(&receipt(root, name))?)?;
     a.target.validate()?;
     ensure!(
-        a.schema == 1
+        a.schema == 2
             && a.workspace == name
             && a.export == root.join("exports").join(name)
             && digest(&a.container),
@@ -85,6 +87,10 @@ fn load(root: &Path, name: &str) -> Result<Attachment> {
     ensure!(
         uuid::Uuid::parse_str(&a.id).is_ok() && uuid::Uuid::parse_str(&a.instance_uuid).is_ok(),
         "Invalid attachment identity"
+    );
+    ensure!(
+        matches!(a.prior_stateful.as_deref(), None | Some("true" | "false")),
+        "Invalid saved VM stateful configuration"
     );
     Ok(a)
 }
@@ -159,13 +165,17 @@ pub fn validate_instance(v: &Value, target: &Target, stopped: bool) -> Result<St
         "Cannot attach a private checkout to a reusable base or unclaimed warm VM"
     );
     ensure!(
+        expanded(v, "raw.idmap").as_str().is_none_or(str::is_empty),
+        "Additional VM identity mapping is not qualified for checkout exports"
+    );
+    ensure!(
         v["stateful"] == false,
         "Memory state is incompatible with checkout attach/detach"
     );
     if stopped {
         ensure!(
             v["status"] == "Stopped",
-            "Incus 9p checkout attachment requires a cleanly stopped VM"
+            "Incus checkout attachment requires a cleanly stopped VM"
         );
     }
     let id = expanded(v, "volatile.uuid")
@@ -175,7 +185,7 @@ pub fn validate_instance(v: &Value, target: &Target, stopped: bool) -> Result<St
     Ok(id.into())
 }
 fn expected_device(a: &Attachment) -> Value {
-    json!({"type":"disk","source":a.export,"path":"/project","io.bus":"9p","io.cache":"none","required":"true"})
+    json!({"type":"disk","source":a.export,"path":"/project","io.bus":"virtiofs","io.cache":"none","required":"true"})
 }
 fn ensure_unattached(v: &Value) -> Result<()> {
     ensure!(
@@ -186,7 +196,16 @@ fn ensure_unattached(v: &Value) -> Result<()> {
     );
     Ok(())
 }
-fn check_instance(a: &Attachment, stopped: bool) -> Result<Value> {
+fn prior_stateful(v: &Value) -> Result<Option<String>> {
+    match v["config"].get(STATEFUL) {
+        None => Ok(None),
+        Some(Value::String(value)) if matches!(value.as_str(), "true" | "false") => {
+            Ok(Some(value.clone()))
+        }
+        _ => anyhow::bail!("Unsupported local VM stateful setting; refusing to overwrite it"),
+    }
+}
+fn check_custody(a: &Attachment, stopped: bool) -> Result<Value> {
     let v = instance(&a.target)?;
     ensure!(
         validate_instance(&v, &a.target, stopped)? == a.instance_uuid,
@@ -196,6 +215,14 @@ fn check_instance(a: &Attachment, stopped: bool) -> Result<Value> {
         v["config"][MARKER] == a.id && v["config"][WORKSPACE_MARKER] == a.workspace,
         "VM attachment ownership changed"
     );
+    ensure!(
+        v["config"][STATEFUL] == "false",
+        "VM stateful override changed; preserve for inspection"
+    );
+    Ok(v)
+}
+fn check_instance(a: &Attachment, stopped: bool) -> Result<Value> {
+    let v = check_custody(a, stopped)?;
     ensure!(
         v["devices"][DEVICE] == expected_device(a),
         "VM checkout device changed; preserve for inspection"
@@ -341,7 +368,7 @@ fn check_export(docker_socket: &Path, a: &Attachment) -> Result<()> {
     )?)?;
     ensure!(
         m["filesystems"][0]["fstype"] == "fuse.bindfs"
-            && m["filesystems"][0]["source"] == format!("enginebox-{}", a.id),
+            && m["filesystems"][0]["source"] == "/project",
         "Mapped checkout export is no longer mounted"
     );
     ensure!(
@@ -351,6 +378,13 @@ fn check_export(docker_socket: &Path, a: &Attachment) -> Result<()> {
                 a.mount_inode.context("Export inode missing")?
             ),
         "Checkout export mount changed"
+    );
+    ensure!(
+        mount_identity(Path::new(&format!(
+            "/proc/{}/root{MAPPED}",
+            a.container_pid
+        )))? == mount_identity(&a.export)?,
+        "Sandbox mapped mount no longer matches its host export"
     );
     Ok(())
 }
@@ -425,11 +459,12 @@ pub fn attach(
     let export = root.join("exports").join(name);
     ensure!(!export.exists(), "Export path already exists");
     let mut a = Attachment {
-        schema: 1,
+        schema: 2,
         workspace: name.into(),
         id: uuid::Uuid::new_v4().to_string(),
         target,
         instance_uuid,
+        prior_stateful: prior_stateful(&v)?,
         container: container.into(),
         container_pid: pid,
         host_boot_id: host_boot_id()?,
@@ -463,6 +498,7 @@ pub fn attach(
                 &a.target.instance,
                 &format!("{MARKER}={}", a.id),
                 &format!("{WORKSPACE_MARKER}={name}"),
+                "migration.stateful=false",
             ],
         )?;
         docker(
@@ -479,7 +515,7 @@ pub fn attach(
                 &format!("--map=501/{}:@20/@{}", a.target.uid, a.target.gid),
                 "--disable-lock-forwarding",
                 "-o",
-                &format!("subtype=bindfs,fsname=enginebox-{}", a.id),
+                "subtype=bindfs",
                 "/project",
                 MAPPED,
             ],
@@ -502,7 +538,7 @@ pub fn attach(
                 "disk",
                 &format!("source={}", a.export.display()),
                 "path=/project",
-                "io.bus=9p",
+                "io.bus=virtiofs",
                 "io.cache=none",
                 "required=true",
             ],
@@ -548,9 +584,9 @@ pub fn verify(root: &Path, name: &str, docker_socket: &Path) -> Result<Value> {
         ],
     )?)?;
     ensure!(
-        mount["filesystems"][0]["fstype"] == "9p"
+        mount["filesystems"][0]["fstype"] == "virtiofs"
             && mount["filesystems"][0]["target"] == "/project",
-        "Guest project path is not the expected 9p mount"
+        "Guest project path is not the expected virtiofs mount"
     );
     incus(
         &a.target,
@@ -602,6 +638,23 @@ pub fn detach(root: &Path, name: &str, docker_socket: &Path) -> Result<Value> {
             &["exec", "--user=0", &a.container, "rmdir", MAPPED],
         )?;
         fs::remove_dir(&a.export)?;
+        check_custody(&a, true)?;
+        if let Some(value) = &a.prior_stateful {
+            incus(
+                &a.target,
+                &[
+                    "config",
+                    "set",
+                    &a.target.instance,
+                    &format!("{STATEFUL}={value}"),
+                ],
+            )?;
+        } else {
+            incus(
+                &a.target,
+                &["config", "unset", &a.target.instance, STATEFUL],
+            )?;
+        }
         incus(&a.target, &["config", "unset", &a.target.instance, MARKER])?;
         incus(
             &a.target,
@@ -635,6 +688,7 @@ mod tests {
             ("", "stateful", json!(true)),
             ("", "type", json!("container")),
             ("expanded_config", "user.enginebox.owner", json!("another")),
+            ("expanded_config", "raw.idmap", json!("both 1001 501")),
             (
                 "expanded_config",
                 "user.enginebox.clean-base",
@@ -667,6 +721,21 @@ mod tests {
                 "accepted {key}"
             );
         }
+    }
+    #[test]
+    fn stateful_setting_preserves_local_inheritance_boundary() -> Result<()> {
+        let mut v = instance();
+        v["expanded_config"][STATEFUL] = json!("true");
+        assert_eq!(prior_stateful(&v)?, None);
+        for value in ["true", "false"] {
+            v["config"][STATEFUL] = json!(value);
+            assert_eq!(prior_stateful(&v)?, Some(value.into()));
+        }
+        for value in [json!("unknown"), json!(true), Value::Null] {
+            v["config"][STATEFUL] = value;
+            assert!(prior_stateful(&v).is_err());
+        }
+        Ok(())
     }
     #[test]
     fn partial_attachment_markers_cannot_be_overwritten() {
@@ -702,11 +771,12 @@ mod tests {
         state::private_dir(&dir.path().join("attachments"))?;
         ensure_detached(dir.path(), "checkout")?;
         let mut a = Attachment {
-            schema: 1,
+            schema: 2,
             workspace: "checkout".into(),
             id: uuid::Uuid::new_v4().to_string(),
             target: target(),
             instance_uuid: uuid::Uuid::new_v4().to_string(),
+            prior_stateful: None,
             container: "a".repeat(64),
             container_pid: 100,
             host_boot_id: "test-boot".into(),
