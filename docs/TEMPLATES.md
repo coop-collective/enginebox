@@ -103,3 +103,5 @@ Import only registers the validated specification. Installation remains an expli
 ## Current boundaries
 
 There is no arbitrary Dockerfile, shell hook, archive import, third-party recipe plugin, credential injection, guest identity override or automatic base garbage collection. The first recipe supports native clients plus browser/desktop capabilities on Ubuntu 24.04. Adding a new recipe requires reviewed Engine Box code and a new supported recipe identifier. Registration and adapter tests run without a server; actual recipe installation still needs a disposable-host integration test for the Engine Box release being deployed.
+
+Catalog records can be exported from the dashboard as portable v1 JSON. Exports include the resource and recipe contract but omit deployment receipts, host bindings and snapshot references, so they can be imported into another installation.

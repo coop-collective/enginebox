@@ -8,6 +8,40 @@ function resources(value: Resources) {
   return `${value.cpu} vCPU · ${value.memory_gib} GiB RAM · ${value.disk_gib} GiB disk`;
 }
 
+function downloadTemplate(record: TemplateRecord) {
+  // Catalog records also contain private deployment receipts. Export only the
+  // portable v1 manifest so the file can be registered on another installation.
+  const keys = [
+    "schema_version",
+    "id",
+    "revision",
+    "label",
+    "description",
+    "recipe",
+    "source_image",
+    "minimum",
+    "recommended",
+    "native_clients",
+    "config",
+  ] as const;
+  const manifest = Object.fromEntries(keys.map((key) => [key, record[key]]));
+  const url = URL.createObjectURL(
+    new Blob([JSON.stringify(manifest, null, 2) + "\n"], {
+      type: "application/json",
+    }),
+  );
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${record.id}-r${record.revision}.json`;
+  document.body.appendChild(link);
+  try {
+    link.click();
+  } finally {
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
 function TemplateEntry({
   record,
   hosts,
@@ -44,6 +78,13 @@ function TemplateEntry({
           </span>
         </div>
         <span className="catalog-recipe">{record.recipe}</span>
+        <button
+          className="button small"
+          type="button"
+          onClick={() => downloadTemplate(record)}
+        >
+          Export JSON
+        </button>
       </div>
       {record.description && (
         <p className="catalog-description">{record.description}</p>

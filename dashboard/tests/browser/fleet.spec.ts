@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 const origin = "http://127.0.0.1:3007";
 async function signIn(page: Page) {
@@ -440,6 +441,59 @@ test("template catalog imports JSON and URLs, installs and syncs changed revisio
     path: "test-results/template-catalog-mobile.png",
     fullPage: true,
   });
+});
+
+test("exported templates download as portable manifests and can be reimported", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "catalog" },
+  });
+  await signIn(page);
+  await page.getByRole("button", { name: "Templates", exact: true }).click();
+  const card = page
+    .locator(".catalog-card")
+    .filter({ hasText: "Native coding agents" });
+  await expect(
+    card.getByText("Installed revision 1 · Up to date"),
+  ).toBeVisible();
+  const downloaded = page.waitForEvent("download");
+  await card.getByRole("button", { name: "Export JSON" }).click();
+  const download = await downloaded;
+  expect(download.suggestedFilename()).toBe("native-r1.json");
+  await download.saveAs("test-results/native-r1.json");
+  const serialized = await readFile("test-results/native-r1.json", "utf8");
+  const manifest = JSON.parse(serialized);
+  expect(Object.keys(manifest).sort()).toEqual(
+    [
+      "schema_version",
+      "id",
+      "revision",
+      "label",
+      "description",
+      "recipe",
+      "source_image",
+      "minimum",
+      "recommended",
+      "native_clients",
+      "config",
+    ].sort(),
+  );
+  expect(manifest.schema_version).toBe(1);
+  expect(manifest.minimum).toEqual({ cpu: 2, memory_gib: 2, disk_gib: 30 });
+  expect(manifest.recommended).toEqual({ cpu: 4, memory_gib: 4, disk_gib: 40 });
+  expect(serialized).not.toContain("ebox-native-base");
+  expect(serialized).not.toContain("metal-01");
+  await page.getByLabel("Import from").selectOption("json");
+  await page.getByLabel("Template JSON").fill(serialized);
+  await page.getByRole("button", { name: "Register template" }).click();
+  await expect(
+    page.getByText("Template registered. Choose a host to install it."),
+  ).toBeVisible();
+  await expect(
+    card.getByText("Installed revision 1 · Up to date"),
+  ).toBeVisible();
 });
 
 test("mobile layout has no page overflow and remains operable", async ({

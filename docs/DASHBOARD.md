@@ -8,7 +8,7 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.
 - Allocating a workspace from a matching ready, paused reserve, with an explicit cold-start fallback. Completed operations show the actual startup mode and ready time reported by the API. Availability is advisory; another request can claim a ready instance before submission.
 - Template minimum/recommended presets and custom CPU, RAM and disk allocations. Custom values must be whole numbers at or above the template minimum. Older templates without resource metadata retain the legacy named sizes.
-- A template catalog panel for registering JSON manifests or HTTPS URLs, installing templates on a selected host, and syncing deployments whose digest differs from the registered revision.
+- A template catalog panel for registering JSON manifests or HTTPS URLs, exporting portable JSON, installing templates on a selected host, and syncing deployments whose digest differs from the registered revision.
 - Pause, resume, hibernate and stop controls for assigned managed workspaces. Unmanaged bases and preparing, ready or quarantined pool instances have no lifecycle controls. Each pending operation affects only its target row. Stop asks for confirmation because it ends running processes.
 - Asynchronous operation status, error messages, loading states, empty fleet instructions and responsive mobile layouts.
 - A separate operator sign-in, an eight-hour signed HttpOnly session, and exact Origin checks for login, logout and mutations.
@@ -20,6 +20,8 @@ The assigned-workspace count excludes unmanaged bases and pool reserves. The ins
 Warm matching compares template and resolved CPU/RAM/disk requirements, so a custom allocation can match a reserve prepared under a named preset. Sizing prefers the selected host's `host_resources` requirements when present. Cold capacity uses the API's available CPU, memory, disk and instance-count budgets. Disk admission includes the requested root disk plus RAM size and 2 GiB of checkpoint overhead. The backend enforces all limits and readiness checks.
 
 Registration alone does not install anything on a host. The catalog shows the registered revision and the selected host's installed revision/sync state. Installation and synchronization are asynchronous jobs. Only templates installed on a host are offered in its workspace form. The backend validates manifests, supported recipes and remote imports; templates do not carry provider credentials.
+
+Each catalog record's **Export JSON** button downloads `{id}-r{revision}.json` with only the supported v1 manifest fields. Host inventory, deployment receipts, snapshot references and catalog digests are excluded. The exported file can be registered in another Engine Box installation through JSON import or an HTTPS URL.
 
 The app has no demo mode and no production fallback to synthetic inventory. Test fixtures live only in `dashboard/tests/fixtures/`.
 

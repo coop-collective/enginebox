@@ -149,3 +149,9 @@ This metadata path matters on the tested Incus version: updating `user.*`
 configuration can wait for the paused guest agent, and a frozen VM cannot be
 renamed. The claim therefore uses the description property and preserves the
 physical name.
+
+Full API allocation and replacement refill were then verified on the reference
+host. Two simultaneous requests received distinct warm VMs; full server jobs took
+0.626 and 0.625 seconds, including 0.386/0.399-second reservation-to-readiness
+paths. See [reference-host validation](VALIDATION.md) for timing boundaries,
+custom-resource checks and qualification limits.
