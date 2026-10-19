@@ -62,6 +62,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Versioned updates, draining and rollback](docs/UPDATES.md)
 - [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)
 - [LayerFS workspace storage evaluation](docs/LAYERFS.md)
+- [Experimental LayerFS checkout backend and measured validation](docs/LAYERFS-BACKEND.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)

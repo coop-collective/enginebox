@@ -39,6 +39,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Optional checkout storage, independent of VM and private agent state.
+    Storage(enginebox_storage_layerfs::cli::Storage),
     /// Inspect this computer's fleet capabilities without modifying it.
     Host {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -163,6 +165,20 @@ fn output(v: Value) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
+        Commands::Storage(storage) => {
+            ensure!(
+                args.host.as_deref().is_none_or(|host| host == "local")
+                    && args.fleet_host.is_none(),
+                "Storage commands are node-local; SSH to the selected Linux node and use --host local"
+            );
+            let result = enginebox_storage_layerfs::cli::run(storage)?;
+            let failed = result["ok"] == false;
+            output(result)?;
+            if failed {
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
         Commands::Host { args } => return companion("enginebox-host", &args),
         Commands::Init { output } => {
             return companion(
