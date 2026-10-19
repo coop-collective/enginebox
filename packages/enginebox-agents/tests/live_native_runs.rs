@@ -92,9 +92,9 @@ impl Drop for Fixture {
         }
     }
 }
-fn copy_access(source: &Path, state_root: &Path) -> Result<Value> {
+fn copy_access(source: &Path, state_root: &Path, providers: &[&str]) -> Result<Value> {
     let mut report = serde_json::Map::new();
-    for provider in ["codex", "claude", "cursor"] {
+    for &provider in providers {
         let home = source.join(provider);
         let _lock = security::Lease::acquire(
             &home,
@@ -236,9 +236,24 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
         &json!({"kind":"native-run-qualification","version":env!("CARGO_PKG_VERSION")}),
     )?;
     let source_homes = PathBuf::from(std::env::var("ENGINEBOX_NATIVE_SOURCE_HOMES")?);
+    let providers_text = std::env::var("ENGINEBOX_NATIVE_TEST_PROVIDERS")
+        .unwrap_or_else(|_| "codex,claude,cursor".into());
+    let providers = providers_text.split(',').collect::<Vec<_>>();
+    ensure!(
+        !providers.is_empty()
+            && providers
+                .iter()
+                .all(|p| ["codex", "claude", "cursor"].contains(p))
+            && providers
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == providers.len(),
+        "Select distinct supported providers"
+    );
     let browser_qualification =
         std::env::var("ENGINEBOX_NATIVE_BROWSER_QUALIFICATION").as_deref() == Ok("1");
-    let material = copy_access(&source_homes, &root)?;
+    let material = copy_access(&source_homes, &root, &providers)?;
     eprintln!(
         "Access-only credentials derived under original provider leases; live homes were not modified"
     );
@@ -256,7 +271,7 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
         created: false,
         cleaned: false,
     };
-    let mut report = json!({"version":env!("CARGO_PKG_VERSION"),"project":host.project,"name":name,"credential_derivation":material,"providers":{},"layerfs":false,"cleanup":false});
+    let mut report = json!({"version":env!("CARGO_PKG_VERSION"),"project":host.project,"name":name,"credential_derivation":material,"selected_providers":providers,"providers":{},"layerfs":false,"cleanup":false});
     let outcome = (|| -> Result<()> {
         {
             let _lock = lease(&source_host)?;
@@ -493,7 +508,7 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
             ),
         ]);
         let mut service = AgentService::with_binaries(&root, fleet.clone(), binaries.clone())?;
-        for provider in ["codex", "claude", "cursor"] {
+        for &provider in &providers {
             let workdir = format!("qualification-{provider}");
             host.engine_box().execute(
                 &name,
@@ -703,7 +718,7 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&report)?);
     cleanup?;
     outcome?;
-    for provider in ["codex", "claude", "cursor"] {
+    for provider in providers {
         let p = &report["providers"][provider];
         if p["first"]["quota_blocked"] == true {
             continue;
