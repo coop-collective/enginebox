@@ -93,6 +93,10 @@ pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
                     "approval_policy=\"never\"",
                     "-c",
                     "sandbox_mode=\"workspace-write\"",
+                    // Only this server gets a headless default. Native per-tool
+                    // approval overrides and disabled_tools remain authoritative.
+                    "-c",
+                    "mcp_servers.enginebox-browser.default_tools_approval_mode=\"approve\"",
                 ]
                 .map(str::to_owned),
             );

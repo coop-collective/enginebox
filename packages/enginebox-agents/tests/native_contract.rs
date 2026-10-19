@@ -45,6 +45,21 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
             assert_eq!(args[1..4], ["exec", "resume", id]);
             assert_eq!(args.last().unwrap(), "-");
             assert!(!args.contains(&"hello".into()));
+            // A leaf override lets native config preserve explicit per-tool
+            // approvals, disabled_tools and unrelated MCP server policies.
+            let overrides: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-c")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(
+                overrides,
+                [
+                    "approval_policy=\"never\"",
+                    "sandbox_mode=\"workspace-write\"",
+                    "mcp_servers.enginebox-browser.default_tools_approval_mode=\"approve\"",
+                ]
+            );
         }
         if p == "cursor" {
             assert!(args.windows(2).any(|x| x == ["--sandbox", "enabled"]));
