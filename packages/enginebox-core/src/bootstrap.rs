@@ -1011,7 +1011,22 @@ pub fn install_template(h: &Host, manifest: &Value) -> Result<Value> {
     let c = normalize(
         json!({"host":{"transport":if h.target=="local"{"local"}else{"ssh"},"target":h.target,"install_packages":false,"disk_reserve":format!("{}GiB",h.reserve_disk_gib.max(1)),"memory_reserve":format!("{}GiB",h.reserve_memory_gib.max(1)),"admission":admission},"incus":{"project":h.project,"profile":base},"storage":{"mode":"existing","pool":h.pool},"network":{"mode":"existing","name":network},"workspace":{"name":base,"image":manifest["source_image"],"cpu":r.cpu,"memory":format!("{}GiB",r.memory_gib),"disk":format!("{}GiB",manifest["minimum"]["disk_gib"].as_u64().unwrap()),"state_disk":format!("{}GiB",r.memory_gib+2),"user":h.guest.user,"uid":h.guest.uid,"gid":h.guest.gid,"home":h.guest.home,"path":h.guest.workspace},"agents":{"install":manifest["native_clients"]},"modules":manifest["config"]}),
     )?;
-    let plan = build_plan(&c, &inventory(&c)?)?;
+    // The controller can share a machine with its node while remaining an
+    // unprivileged private-state owner. Bootstrap always crosses the same
+    // administrator-configured sudo helper boundary, including target=local.
+    // Keep the original host/config binding; changing it to SSH would invalidate
+    // existing deployment receipts and warm generations.
+    let observed: Value = serde_json::from_slice(&host_run(
+        h,
+        &[
+            "enginebox-host".into(),
+            "bootstrap".into(),
+            "inspect".into(),
+        ],
+        Some(&serde_json::to_vec(&c)?),
+        Duration::from_secs(180),
+    )?)?;
+    let plan = build_plan(&c, &observed)?;
     ensure!(
         plan["ok"] == true,
         "Template preflight failed: {}",
@@ -1026,7 +1041,12 @@ pub fn install_template(h: &Host, manifest: &Value) -> Result<Value> {
         .contains(&o["action"].as_str().unwrap_or(""))),
         "Templates require an existing owned project, storage and bridge; bootstrap host first"
     );
-    apply(&c, None)?;
+    host_run(
+        h,
+        &["enginebox-host".into(), "bootstrap".into(), "apply".into()],
+        Some(&serde_json::to_vec(&c)?),
+        Duration::from_secs(7200),
+    )?;
     let _lock = crate::operation_lock(h)?;
     let bx = h.engine_box();
     let vm = bx.instance(&base)?;

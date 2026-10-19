@@ -487,9 +487,14 @@ fn scenario() -> Result<()> {
                 "Preparation started guest, invoked harness or cleaned ambiguous resources"
             );
         }
-        "template-checkout-guards" => {
+        "template-checkout-guards" | "local-template-checkout-guards" => {
             let mut h = host();
-            h.target = "fixture".into();
+            h.target = if name == "local-template-checkout-guards" {
+                "local"
+            } else {
+                "fixture"
+            }
+            .into();
             h.network = Some("bridge".into());
             let manifest = json!({"schema_version":1,"id":"native","revision":1,"label":"Native","source_image":"images:ubuntu/24.04/cloud","minimum":{"cpu":2,"memory_gib":2,"disk_gib":30},"recommended":{"cpu":2,"memory_gib":2,"disk_gib":30},"native_clients":["codex"],"config":{"browser":true}});
             for stage in ["preflight", "vm", "snapshot"] {
@@ -505,10 +510,19 @@ fn scenario() -> Result<()> {
                     "Missing {stage} template guard: {error}"
                 );
                 let events = std::fs::read_to_string(root.join("events.jsonl"))?;
+                ensure!(
+                    events.contains("[\"bootstrap\",\"inspect\"]"),
+                    "Template preflight bypassed node helper"
+                );
                 if stage == "preflight" {
                     ensure!(
                         !events.contains("[\"bootstrap\",\"apply\"]"),
                         "Attached template reached apply"
+                    );
+                } else {
+                    ensure!(
+                        events.contains("[\"bootstrap\",\"apply\"]"),
+                        "Template apply bypassed node helper"
                     );
                 }
                 for line in events.lines() {
@@ -721,6 +735,7 @@ fn tests() -> Result<()> {
         "legacy-warm",
         "external-checkout-guards",
         "template-checkout-guards",
+        "local-template-checkout-guards",
     ] {
         let root = tempfile::tempdir()?;
         let bin = root.path().join("bin");
