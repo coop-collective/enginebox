@@ -24,6 +24,24 @@ const bytes = (value?: number) =>
     ? `${(value / GiB).toLocaleString(undefined, { maximumFractionDigits: 1 })} GiB`
     : "—";
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+const sections = {
+  fleet: {
+    title: "Fleet overview",
+    description: "Manage your machines and give every workspace room to build.",
+    icon: "server",
+  },
+  agents: {
+    title: "Agents",
+    description: "Manage native agent connections for your entire fleet.",
+    icon: "terminal",
+  },
+  templates: {
+    title: "Templates",
+    description: "Prepare reusable environments and keep your nodes in sync.",
+    icon: "box",
+  },
+};
+type DashboardSection = keyof typeof sections;
 
 function Icon({ name = "box", size = 20 }: { name?: string; size?: number }) {
   const paths: Record<string, React.ReactNode> = {
@@ -641,8 +659,7 @@ export default function Dashboard() {
   const [submitting, setSubmitting] = useState(false);
   const [pendingInstances, setPendingInstances] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
-  const [catalogOpen, setCatalogOpen] = useState(false);
-  const [agentsOpen, setAgentsOpen] = useState(false);
+  const [section, setSection] = useState<DashboardSection>("fleet");
   const [updated, setUpdated] = useState<Date | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const loading = useRef(false);
@@ -735,8 +752,7 @@ export default function Dashboard() {
       setFleet(null);
       setJobs([]);
       setPendingInstances([]);
-      setCatalogOpen(false);
-      setAgentsOpen(false);
+      setSection("fleet");
       setError("");
     } catch (err) {
       setError((err as Error).message);
@@ -792,8 +808,9 @@ export default function Dashboard() {
       name,
     );
   }
-  function manageAgents() {
-    setAgentsOpen(true);
+  function navigate(next: DashboardSection) {
+    setSection(next);
+    window.scrollTo({ top: 0 });
   }
   const online = fleet?.hosts.filter((host) => host.online) ?? [];
   const instances =
@@ -846,12 +863,22 @@ export default function Dashboard() {
           </span>
         </a>
         <div className="nav-label">CONTROL PLANE</div>
-        <nav>
-          <a href="/" className="nav-item active">
-            <Icon name="server" />
-            Fleet overview
-            <span className="nav-dot" />
-          </a>
+        <nav aria-label="Control plane">
+          {(["fleet", "agents", "templates"] as const)
+            .filter((item) => session === "ready" || item === "fleet")
+            .map((item) => (
+              <button
+                key={item}
+                type="button"
+                className={`nav-item${section === item ? " active" : ""}`}
+                aria-current={section === item ? "page" : undefined}
+                onClick={() => navigate(item)}
+              >
+                <Icon name={sections[item].icon} />
+                {sections[item].title}
+                {section === item && <span className="nav-dot" />}
+              </button>
+            ))}
         </nav>
         <div className="sidebar-bottom">
           <div className="native-note">
@@ -874,7 +901,8 @@ export default function Dashboard() {
         <header className="topbar">
           <div>
             <span className="breadcrumb">Infrastructure</span>
-            <span className="slash">/</span>Fleet
+            <span className="slash">/</span>
+            {section === "fleet" ? "Fleet" : sections[section].title}
           </div>
           <div className="topbar-right">
             <span className="private-label">
@@ -951,28 +979,12 @@ export default function Dashboard() {
                 <div>
                   <span className="eyebrow">YOUR COMPUTE, CONNECTED</span>
                   <h1>
-                    Fleet overview<span className="title-dot">.</span>
+                    {sections[section].title}
+                    <span className="title-dot">.</span>
                   </h1>
-                  <p>
-                    Manage your machines and give every workspace room to build.
-                  </p>
+                  <p>{sections[section].description}</p>
                 </div>
                 <div className="heading-actions">
-                  <button
-                    className="button"
-                    onClick={() => setAgentsOpen((value) => !value)}
-                    aria-expanded={agentsOpen}
-                  >
-                    <Icon name="lock" size={15} /> Agents
-                  </button>
-                  <button
-                    className="button"
-                    onClick={() => setCatalogOpen((value) => !value)}
-                    disabled={!fleet}
-                    aria-expanded={catalogOpen}
-                  >
-                    Templates
-                  </button>
                   <button
                     className="button"
                     onClick={refresh}
@@ -981,14 +993,16 @@ export default function Dashboard() {
                     <Icon name="refresh" size={16} />
                     {refreshing ? "Refreshing" : "Refresh"}
                   </button>
-                  <button
-                    className="button primary"
-                    onClick={() => setCreating((value) => !value)}
-                    disabled={!fleet || !online.length}
-                  >
-                    <Icon name="plus" size={17} />
-                    New workspace
-                  </button>
+                  {section === "fleet" && (
+                    <button
+                      className="button primary"
+                      onClick={() => setCreating((value) => !value)}
+                      disabled={!fleet || !online.length}
+                    >
+                      <Icon name="plus" size={17} />
+                      New workspace
+                    </button>
+                  )}
                 </div>
               </div>
               {error && (
@@ -999,246 +1013,252 @@ export default function Dashboard() {
                   </button>
                 </div>
               )}
-              <div className="stat-grid">
-                {[
-                  {
-                    label: "Connected hosts",
-                    value: fleet ? `${online.length}` : "—",
-                    note: fleet
-                      ? `${fleet.hosts.length} configured`
-                      : "Loading fleet",
-                    icon: "server",
-                  },
-                  {
-                    label: "CPU allocated",
-                    value: fleet ? (
-                      <>
-                        {cpuAllocated}{" "}
-                        <span className="stat-total">/ {cpuTotal}</span>
-                      </>
-                    ) : (
-                      "—"
-                    ),
-                    note: `${percent(cpuAllocated, cpuTotal)} allocated · logical cores`,
-                    icon: "cpu",
-                  },
-                  {
-                    label: "Host memory used",
-                    value: fleet ? (
-                      <>
-                        {bytes(memoryUsed)}{" "}
-                        <span className="stat-total">
-                          / {bytes(memoryTotal)}
-                        </span>
-                      </>
-                    ) : (
-                      "—"
-                    ),
-                    note: `${percent(memoryUsed, memoryTotal)} used · across online hosts`,
-                    icon: "memory",
-                  },
-                  {
-                    label: "Assigned workspaces",
-                    value: fleet ? `${assigned.length}` : "—",
-                    note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
-                    icon: "box",
-                  },
-                ].map((stat) => (
-                  <article className="stat-card" key={stat.label}>
-                    <div>
-                      <span>{stat.label}</span>
-                      <Icon name={stat.icon} size={19} />
-                    </div>
-                    <strong>{stat.value}</strong>
-                    <small>{stat.note}</small>
-                  </article>
-                ))}
-              </div>
-              {agentsOpen && <AgentsPanel close={() => setAgentsOpen(false)} />}
-              {creating && fleet && (
-                <CreateWorkspace
-                  fleet={fleet}
-                  busy={submitting}
-                  close={() => setCreating(false)}
-                  create={create}
-                />
+              {section === "agents" && (
+                <AgentsPanel close={() => navigate("fleet")} />
               )}
-              {catalogOpen && (
+              {section === "templates" && (
                 <TemplateCatalog
                   refreshToken={updated?.getTime() ?? 0}
                   registered={refresh}
-                  close={() => setCatalogOpen(false)}
+                  close={() => navigate("fleet")}
                 />
               )}
-              <section className="hosts-section">
-                <div className="section-title">
-                  <div className="section-heading">
-                    <h2>Hosts</h2>
-                    <span className="count">{fleet?.hosts.length ?? 0}</span>
-                  </div>
-                  <span className="update-label">
-                    <span className={`live-dot ${error ? "stale" : ""}`} />
-                    {updated
-                      ? `Updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-                      : "Waiting for fleet"}
-                  </span>
-                </div>
-                {!fleet ? (
-                  <div className="empty-state">
-                    {refreshing ? (
-                      <>
-                        <span className="spinner" />
-                        <h3>Connecting to your fleet</h3>
-                        <p>Reading host capacity and workspace status.</p>
-                      </>
-                    ) : (
-                      <>
-                        <Icon name="server" size={32} />
-                        <h3>Fleet connection unavailable</h3>
-                        <p>
-                          Check the service connection, then refresh to try
-                          again.
-                        </p>
-                      </>
-                    )}
-                  </div>
-                ) : !fleet.hosts.length ? (
-                  <div className="empty-state">
-                    <Icon name="server" size={32} />
-                    <h3>Add your first host</h3>
-                    <p>
-                      Configure a host in your Engine Box fleet inventory. It
-                      will appear here after refresh.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="host-grid">
-                    {fleet.hosts.map((host) => (
-                      <HostCard key={host.id} host={host} />
-                    ))}
-                  </div>
-                )}
-              </section>
-              <section className="workspaces-section">
-                <div className="section-title">
-                  <div className="section-heading">
-                    <h2>Instance inventory</h2>
-                    <span className="count">{instances.length}</span>
-                  </div>
-                  <span className="section-caption">
-                    Assigned workspaces · Prepared reserves · Bases
-                  </span>
-                </div>
-                <div className="table-container">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Workspace</th>
-                        <th>Host</th>
-                        <th>Status</th>
-                        <th>Resources</th>
-                        <th className="actions">Controls</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {instances.map(({ host, instance }) => (
-                        <WorkspaceRow
-                          key={`${host.id}/${instance.name}`}
-                          host={host}
-                          instance={instance}
-                          busy={
-                            pendingInstances.includes(
-                              `${host.id}/${instance.name}`,
-                            ) ||
-                            jobs.some(
-                              (job) =>
-                                active(job) &&
-                                job.host === host.id &&
-                                (job.instance === instance.name ||
-                                  (!!instance.workspace_name &&
-                                    job.instance === instance.workspace_name)),
-                            )
-                          }
-                          action={action}
-                          connect={manageAgents}
-                        />
-                      ))}
-                    </tbody>
-                  </table>
-                  {!instances.length && (
-                    <div className="empty-state compact">
-                      <Icon size={28} />
-                      <h3>
-                        {fleet
-                          ? "No workspaces yet"
-                          : "Waiting for workspace inventory"}
-                      </h3>
-                      <p>
-                        {fleet
-                          ? "Create a workspace from a prepared template to start building."
-                          : "Workspaces appear when the fleet service responds."}
-                      </p>
-                    </div>
-                  )}
-                </div>
-                <p className="workspace-hint">
-                  Pause keeps memory allocated. Hibernate saves memory to disk.
-                  Stop ends running processes.
-                </p>
-              </section>
-              {!!jobs.length && (
-                <section className="jobs-section" aria-live="polite">
-                  <div className="section-title">
-                    <h2>Recent operations</h2>
-                    <span className="section-caption">
-                      This browser session
-                    </span>
-                  </div>
-                  <div className="job-list">
-                    {jobs.map((job) => (
-                      <article className="job" key={job.id}>
-                        <span className={`job-icon ${job.status}`}>
-                          {active(job) ? (
-                            <span className="spinner" />
-                          ) : (
-                            <Icon
-                              name={
-                                job.status === "succeeded" ? "check" : "close"
-                              }
-                              size={18}
-                            />
-                          )}
-                        </span>
+              {section === "fleet" && (
+                <>
+                  <div className="stat-grid">
+                    {[
+                      {
+                        label: "Connected hosts",
+                        value: fleet ? `${online.length}` : "—",
+                        note: fleet
+                          ? `${fleet.hosts.length} configured`
+                          : "Loading fleet",
+                        icon: "server",
+                      },
+                      {
+                        label: "CPU allocated",
+                        value: fleet ? (
+                          <>
+                            {cpuAllocated}{" "}
+                            <span className="stat-total">/ {cpuTotal}</span>
+                          </>
+                        ) : (
+                          "—"
+                        ),
+                        note: `${percent(cpuAllocated, cpuTotal)} allocated · logical cores`,
+                        icon: "cpu",
+                      },
+                      {
+                        label: "Host memory used",
+                        value: fleet ? (
+                          <>
+                            {bytes(memoryUsed)}{" "}
+                            <span className="stat-total">
+                              / {bytes(memoryTotal)}
+                            </span>
+                          </>
+                        ) : (
+                          "—"
+                        ),
+                        note: `${percent(memoryUsed, memoryTotal)} used · across online hosts`,
+                        icon: "memory",
+                      },
+                      {
+                        label: "Assigned workspaces",
+                        value: fleet ? `${assigned.length}` : "—",
+                        note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
+                        icon: "box",
+                      },
+                    ].map((stat) => (
+                      <article className="stat-card" key={stat.label}>
                         <div>
-                          <strong>{job.label ?? job.id}</strong>
-                          {job.error && (
-                            <p className="job-error">{job.error}</p>
-                          )}
-                          {job.status === "succeeded" &&
-                            job.result?.startup && (
-                              <p className="job-detail">
-                                {job.result.startup === "warm"
-                                  ? "Warm allocation"
-                                  : "Cold start"}
-                                {typeof job.result.ready_seconds === "number" &&
-                                  Number.isFinite(job.result.ready_seconds) &&
-                                  ` · ready in ${job.result.ready_seconds.toFixed(2)} s`}
-                                {job.result.name && (
-                                  <span className="mono">
-                                    VM: {job.result.name}
-                                  </span>
-                                )}
-                              </p>
-                            )}
-                          <small className="mono">{job.id}</small>
+                          <span>{stat.label}</span>
+                          <Icon name={stat.icon} size={19} />
                         </div>
-                        <span className={`status status-${job.status}`}>
-                          {title(job.status)}
-                        </span>
+                        <strong>{stat.value}</strong>
+                        <small>{stat.note}</small>
                       </article>
                     ))}
                   </div>
-                </section>
+                  {creating && fleet && (
+                    <CreateWorkspace
+                      fleet={fleet}
+                      busy={submitting}
+                      close={() => setCreating(false)}
+                      create={create}
+                    />
+                  )}
+                  <section className="hosts-section">
+                    <div className="section-title">
+                      <div className="section-heading">
+                        <h2>Hosts</h2>
+                        <span className="count">{fleet?.hosts.length ?? 0}</span>
+                      </div>
+                      <span className="update-label">
+                        <span className={`live-dot ${error ? "stale" : ""}`} />
+                        {updated
+                          ? `Updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                          : "Waiting for fleet"}
+                      </span>
+                    </div>
+                    {!fleet ? (
+                      <div className="empty-state">
+                        {refreshing ? (
+                          <>
+                            <span className="spinner" />
+                            <h3>Connecting to your fleet</h3>
+                            <p>Reading host capacity and workspace status.</p>
+                          </>
+                        ) : (
+                          <>
+                            <Icon name="server" size={32} />
+                            <h3>Fleet connection unavailable</h3>
+                            <p>
+                              Check the service connection, then refresh to try
+                              again.
+                            </p>
+                          </>
+                        )}
+                      </div>
+                    ) : !fleet.hosts.length ? (
+                      <div className="empty-state">
+                        <Icon name="server" size={32} />
+                        <h3>Add your first host</h3>
+                        <p>
+                          Configure a host in your Engine Box fleet inventory. It
+                          will appear here after refresh.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="host-grid">
+                        {fleet.hosts.map((host) => (
+                          <HostCard key={host.id} host={host} />
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                  <section className="workspaces-section">
+                    <div className="section-title">
+                      <div className="section-heading">
+                        <h2>Instance inventory</h2>
+                        <span className="count">{instances.length}</span>
+                      </div>
+                      <span className="section-caption">
+                        Assigned workspaces · Prepared reserves · Bases
+                      </span>
+                    </div>
+                    <div className="table-container">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Workspace</th>
+                            <th>Host</th>
+                            <th>Status</th>
+                            <th>Resources</th>
+                            <th className="actions">Controls</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {instances.map(({ host, instance }) => (
+                            <WorkspaceRow
+                              key={`${host.id}/${instance.name}`}
+                              host={host}
+                              instance={instance}
+                              busy={
+                                pendingInstances.includes(
+                                  `${host.id}/${instance.name}`,
+                                ) ||
+                                jobs.some(
+                                  (job) =>
+                                    active(job) &&
+                                    job.host === host.id &&
+                                    (job.instance === instance.name ||
+                                      (!!instance.workspace_name &&
+                                        job.instance === instance.workspace_name)),
+                                )
+                              }
+                              action={action}
+                              connect={() => navigate("agents")}
+                            />
+                          ))}
+                        </tbody>
+                      </table>
+                      {!instances.length && (
+                        <div className="empty-state compact">
+                          <Icon size={28} />
+                          <h3>
+                            {fleet
+                              ? "No workspaces yet"
+                              : "Waiting for workspace inventory"}
+                          </h3>
+                          <p>
+                            {fleet
+                              ? "Create a workspace from a prepared template to start building."
+                              : "Workspaces appear when the fleet service responds."}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                    <p className="workspace-hint">
+                      Pause keeps memory allocated. Hibernate saves memory to disk.
+                      Stop ends running processes.
+                    </p>
+                  </section>
+                  {!!jobs.length && (
+                    <section className="jobs-section" aria-live="polite">
+                      <div className="section-title">
+                        <h2>Recent operations</h2>
+                        <span className="section-caption">
+                          This browser session
+                        </span>
+                      </div>
+                      <div className="job-list">
+                        {jobs.map((job) => (
+                          <article className="job" key={job.id}>
+                            <span className={`job-icon ${job.status}`}>
+                              {active(job) ? (
+                                <span className="spinner" />
+                              ) : (
+                                <Icon
+                                  name={
+                                    job.status === "succeeded" ? "check" : "close"
+                                  }
+                                  size={18}
+                                />
+                              )}
+                            </span>
+                            <div>
+                              <strong>{job.label ?? job.id}</strong>
+                              {job.error && (
+                                <p className="job-error">{job.error}</p>
+                              )}
+                              {job.status === "succeeded" &&
+                                job.result?.startup && (
+                                  <p className="job-detail">
+                                    {job.result.startup === "warm"
+                                      ? "Warm allocation"
+                                      : "Cold start"}
+                                    {typeof job.result.ready_seconds === "number" &&
+                                      Number.isFinite(job.result.ready_seconds) &&
+                                      ` · ready in ${job.result.ready_seconds.toFixed(2)} s`}
+                                    {job.result.name && (
+                                      <span className="mono">
+                                        VM: {job.result.name}
+                                      </span>
+                                    )}
+                                  </p>
+                                )}
+                              <small className="mono">{job.id}</small>
+                            </div>
+                            <span className={`status status-${job.status}`}>
+                              {title(job.status)}
+                            </span>
+                          </article>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                </>
               )}
               <footer className="page-footer">
                 <span>Engine Box</span>

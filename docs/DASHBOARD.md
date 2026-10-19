@@ -4,6 +4,7 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 
 ## What is implemented
 
+- Sidebar navigation for Fleet overview, Agents and Templates. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
 - Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size. The top CPU card shows allocated cores and percentage, not CPU utilization. Host memory usage is total minus available memory, clamped to the reported total.
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.
 - Allocating a workspace from a matching ready, paused reserve, with an explicit cold-start fallback. Completed operations show the actual startup mode and ready time reported by the API. Availability is advisory; another request can claim a ready instance before submission.

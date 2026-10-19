@@ -109,6 +109,10 @@ select:focus {
   color: #718b93;
   margin: 52px 12px 16px;
 }
+.sidebar nav {
+  display: grid;
+  gap: 5px;
+}
 .nav-item {
   display: flex;
   align-items: center;
@@ -116,6 +120,17 @@ select:focus {
   font-size: 12px;
   padding: 13px 12px;
   border-radius: 6px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+.nav-item:hover {
+  background: #1c3338;
+}
+.nav-item > svg {
+  flex-shrink: 0;
 }
 .nav-item.active {
   color: #b2e6da;
@@ -1327,6 +1342,12 @@ input::placeholder {
     padding: 15px 20px;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  .sidebar nav {
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
   .brand {
     font-size: 22px;
@@ -1344,8 +1365,16 @@ input::placeholder {
   }
   .nav-item {
     font-size: 10px;
-    padding: 10px;
-    gap: 8px;
+    padding: 10px 7px;
+    gap: 6px;
+    min-height: 44px;
+  }
+  .nav-item > svg {
+    width: 16px;
+    height: 16px;
+  }
+  .nav-dot {
+    display: none;
   }
   .app-shell {
     display: block;
