@@ -41,6 +41,27 @@ The upstream sandbox path uses Docker. Engine Box's separately qualified Incus a
 
 File checkpoints and memory checkpoints must remain separate capabilities. Incus pause/hibernate captures VM process state. A file branch alone cannot restore RAM, active sockets, browser sessions or a running compiler. A combined checkpoint needs a consistency barrier so the filesystem revision and VM memory describe the same state.
 
+## Wrangler environment state forks (proposed)
+
+LayerFS can contribute more than dependency reuse: a prepared filesystem checkpoint can contain application code and a consistent local development dataset. Each agent would receive an independent writable branch from that same starting state. This is a proposed Engine Box environment recipe, not a Wrangler integration already delivered or a database-consistency guarantee from filesystem branching alone. DuckDB is not required; local D1 uses its existing SQLite-based development runtime.
+
+Wrangler and the Cloudflare Vite plugin normally persist local D1, KV, R2 and Durable Object data under `.wrangler/state`. Wrangler's `--persist-to` can select an explicit directory; data-management commands must use the same directory and local mode. Internal layouts and resource identifiers must be pinned to the qualified Wrangler/Miniflare versions. Remote bindings are external services and are not captured by a local filesystem fork. [Cloudflare local data](https://developers.cloudflare.com/workers/local-development/local-data/)
+
+| State | Proposed ownership and sharing |
+| --- | --- |
+| Prepared source, dependencies and seeded development data | Immutable, authorized checkpoint reused by many forks |
+| Each environment's live database and local service files | Private writable state owned by that environment's runtime |
+| Project notes, task results, coordination and intentionally shared services | Project-scoped controller/service APIs with transactions or version checks |
+| Provider credentials, session databases and personal agent memory | Private owner-scoped storage; excluded from reusable checkpoints |
+
+The first recipe should drain requests and cleanly stop all relevant local runtimes, capture the complete consistent persistence state, validate it, and record its revision together with code, configuration and toolchain versions. Fork that manifest into independent environments with separate endpoints, then start one owning runtime for each environment. Do not copy only the main SQLite file during live WAL writes: the WAL can contain committed transactions. A database-aware backup is an alternative for an individual database, but does not by itself make multiple bindings consistent. [SQLite WAL lifecycle](https://www.sqlite.org/wal.html), [SQLite backup snapshots](https://www.sqlite.org/backup.html)
+
+Agents can hand a checkpoint to another agent, or call an intentionally shared application service. Filesystem forks do not provide live cross-branch synchronization, row-level database merges, RAM restoration or cross-host replication. Publish code changes through reviewable patches and data changes through application migrations/imports; do not merge SQLite files as text or point independent Wrangler processes at one writable persistence directory.
+
+The current Incus qualification proves script/ELF execution and a shared-mmap smoke test. It does **not** qualify workerd, SQLite WAL/locking, Durable Object alarms, database recovery or Wrangler startup performance. The pinned LayerFS preview's fsync and power-loss limitations above still apply. Initially treat any LayerFS-backed local service data as disposable test data; authoritative shared project state belongs on separately qualified persistent storage behind its service API.
+
+The product feature is coordinated environment branching: code, prepared dependencies, local data, service startup and explicit sharing policy in one operation. LayerFS supplies reusable filesystem history; it is not exclusive to Engine Box. Ordinary `docker commit` excludes mounted volume data, so a container image alone does not capture this environment state. [Docker commit scope](https://docs.docker.com/reference/cli/docker/container/commit/)
+
 ## Security and data scope
 
 - Use separate stores and authorization boundaries for unrelated tenants. Deduplication is an optimization, not access control. Do not rely on branch names or a shared database to isolate secrets.

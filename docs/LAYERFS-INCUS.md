@@ -63,3 +63,27 @@ Automatic repair of an interrupted attachment, restart of the mapped export afte
 With guest kernel `6.8.0-147-generic` and the initial `io.cache=none` candidate, virtiofs file creation, directories, rename, chmod and links worked, but direct script execution returned `EFAULT` (`Bad address`). Explicit interpreter execution worked. This matches an independently reported Ubuntu 6.8/virtiofs execution issue, but does not identify one exact kernel patch as the cause. Guest-only HWE kernel `7.0.0-38-generic` made direct script and ELF execution pass with cache disabled, but writable shared mmap still failed with `ENODEV`. These failed candidates are retained as qualification evidence. Guest kernel version and direct executable/mmap tests are part of qualification; readable files alone are insufficient. [Incus execution report](https://discuss.linuxcontainers.org/t/cant-execute-files-on-mounted-host-directory/24630)
 
 The reproducible fixture harness is [incus-attachment.mjs](../packages/layerfs-validation/incus-attachment.mjs). It requires an explicit live-test flag, a fresh storage root, an exact disposable VM marker and a fresh private report path. It exercises guest UID/GID 1001 file operations, branch isolation, lifecycle refusals, pause/resume, clean detach/checkpoint, reattachment and cold VM restart. A failed fixture is retained for evidence export and ownership-checked cleanup.
+## Live qualification — 2026-10-19
+
+The final disposable run passed all **53 recorded commands in 33.905 seconds**. It used Linux host kernel `7.0.0-30-generic`, Incus `6.0.5`, virtiofsd `1.13.2`, bindfs `1.14.7`, the pinned LayerFS revision `968a5d0be0ea3e9456b06f9148b65523138e9490`, and an Ubuntu 24.04 guest upgraded only inside the fixture to HWE kernel `7.0.0-38-generic` (`linux-image-generic-hwe-24.04=7.0.0-38.38~24.04.4`). The actual virtiofsd process arguments confirmed `--cache=always` and no writeback flag.
+
+The passing cases included guest UID/GID 1001 writes, directory creation, rename, chmod, symlinks and hardlinks; direct script and ELF execution; writable shared mmap with flush; another branch's isolation; attached-operation refusals; pause/resume preserving the guest process ID and start time; clean stop/detach; checkpoint/remount and readback of normal and mmap writes; cold reattachment and readback; and restoration of both an inherited stateful setting and an explicit local `false` setting. Both test workspaces closed cleanly.
+
+| Operation | Observed command time |
+| --- | ---: |
+| Attach | 0.774 / 0.715 s |
+| Guest verification including write/execute/delete probe | 0.261 / 0.276 s |
+| Pause | 0.039 s |
+| Resume the already running VM | 0.045 s |
+| Clean stop | 0.609 / 0.618 s |
+| Detach | 0.527 / 0.476 s |
+| File checkpoint after detach | 0.443 / 0.447 s |
+| LayerFS remount after checkpoint | 1.152 s |
+
+These are individual observations from a cached synthetic fixture, not percentiles, large-project measurements, complete agent startup times or game-engine build benchmarks. The start-command acknowledgment is not cold-boot readiness; no standalone cold-boot latency is claimed here.
+
+The fixture used a 2-CPU/4-GiB VM and a private Docker daemon capped at 4 CPUs/6 GiB; LayerFS sandboxes had 1 CPU/1 GiB each within that daemon. Admission preserved 12 CPUs, 40 GiB host memory and 32 GiB storage-pool reserve. The host's existing Docker `29.1.3` exposed API `1.52`, so the SDK's required API `1.54` could not run on it. Qualification instead used an explicitly selected, task-owned Docker `29.5.3` Unix socket with private data/network state. This privileged, host-PID-namespace validation daemon kept the LayerFS processes in the host kernel without changing the default daemon. It is a qualification fixture, not evidence of hostile-tenant isolation or a production installer recommendation. A normal deployment needs a compatible Docker API and the documented same-kernel topology; the runtime checks the selected socket/API before mutation.
+
+The initial 9p and cache-disabled candidates were rejected for the failures described above. A later run passed the storage checks but sent its final ACPI shutdown before `systemd-logind` registered the power-button input. After the original Incus stop operation finished, normal shutdown succeeded. The final harness waits for the guest system to finish booting (running or degraded) and for logind to be active before exercising clean shutdown. Storage readiness and whole-OS shutdown readiness are distinct.
+
+Private reports, receipts, source hashes and daemon arguments were exported before teardown. Ownership-checked cleanup then deleted the fixture VM, normally unmounted all three retained mapped host exports, normally stopped the private Docker daemon and verified all 16 inner container processes exited, removed the three owned outer containers and three owned outer volumes, and removed the private daemon data/socket directories plus synthetic SDK runtime state. Final checks found no experiment VM, containers, volumes or host mounts. The default Docker daemon stayed at `29.1.3` with the same process ID. Only inert private reports/configurations, source/build artifacts, pinned test binaries and image cache were retained. No existing user VM, provider home, host profile or default Docker service was changed.

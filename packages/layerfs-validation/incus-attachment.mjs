@@ -48,11 +48,11 @@ async function boot() {
   incus(['start', vm]);
   let ready = false;
   for (let attempt = 0; attempt < 90; attempt++) {
-    const probe = spawnSync('incus', ['--project', project, 'exec', vm, '--', 'true'], { encoding: 'utf8', timeout: 5000 });
+    const probe = spawnSync('incus', ['--project', project, 'exec', vm, '--', 'sh', '-c', 'boot_state=$(systemctl is-system-running); case "$boot_state" in running|degraded) systemctl is-active --quiet systemd-logind.service ;; *) exit 1 ;; esac'], { encoding: 'utf8', timeout: 5000 });
     if (probe.status === 0) { ready = true; break; }
     await sleep(1000);
   }
-  assert(ready, 'Incus agent did not become ready');
+  assert(ready, 'Incus agent and systemd-logind shutdown handling did not become ready');
   storage(['incus-verify', 'incus-a']);
 }
 try {
