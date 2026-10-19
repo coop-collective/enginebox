@@ -243,6 +243,14 @@ importers:
         specifier: 8.3.4
         version: 8.3.4(@types/node@26.6.5)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(tsx@4.23.15)
 
+  packages/enginebox-install: {}
+
+  packages/site:
+    devDependencies:
+      '@playwright/test':
+        specifier: 1.64.1
+        version: 1.64.1
+
 packages:
 
   '@alloc/quick-lru@5.3.0':
