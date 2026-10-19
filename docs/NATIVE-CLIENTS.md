@@ -2,8 +2,10 @@
 
 Engine Box installs the providers' original terminal applications inside a private
 Ubuntu 24.04 workspace. It does not replace their agent loops, forward model
-requests, share subscription credentials, or automatically sign into accounts.
-The owner runs `codex`, `claude`, or `agent` in the guest terminal.
+requests, or turn subscription allowances into independent worker balances.
+The owner runs `codex`, `claude`, or `agent` in the guest terminal. Controller-level
+Agent Access connects an owner's accounts and delivers supported access material
+to that owner's assigned private workspaces; refresh ownership stays central.
 
 ## Guest setup contract
 
@@ -47,11 +49,15 @@ run before being considered tested. [Codex installation](https://developers.open
 [Claude installation and updates](https://code.claude.com/docs/en/setup),
 [Cursor installation](https://cursor.com/docs/cli/installation).
 
-## Owner sign-in
+## Owner sign-in and Agent Access
 
-Open **Subscriptions** in the dashboard, select a running private workspace, then choose **Connect** on Codex, Claude or Cursor. Follow the provider link in your browser. Codex supplies a device code; Claude asks you to paste its one-time authorization code back into the panel; Cursor waits for browser completion. The panel reports native account status and lets you cancel pending sign-in. Credentials stay inside the selected workspace, so each fresh workspace starts disconnected.
+The current architecture connects accounts once on the controller and delegates
+access to assigned private workspaces. Prepared bases and unassigned warm reserves
+remain credential-free. Native clients still contact their providers directly;
+each workspace consumes the same underlying account allowance. Existing private
+workspace logins require explicit adoption, rather than background replacement.
 
-The same native commands remain available directly inside that workspace:
+The native commands remain available directly inside a workspace:
 
 ```sh
 codex login --device-auth
@@ -61,14 +67,33 @@ NO_OPEN_BROWSER=1 agent login
 
 Open the provider's displayed URL in your local browser. Codex device login must
 be enabled by the account/workspace; its documentation also describes SSH callback
-forwarding. This project does not copy a workstation's account files or print
-credentials. Check status with `codex login status`, `claude auth status`, or
+forwarding. Check status with `codex login status`, `claude auth status`, or
 `agent status`. Status output can identify the account; keep it out of public logs.
 [Codex authentication](https://developers.openai.com/codex/auth),
 [Claude authentication](https://code.claude.com/docs/en/authentication),
 [Cursor authentication](https://cursor.com/docs/cli/reference/authentication).
 
-The dashboard integration was checked against Codex CLI `0.163.0`, Claude Code `2.1.302` and Cursor Agent `2026.10.16-e3cb207`. Their browser/device prompts and cancellation were exercised in a disposable, unsigned-in workspace. Completing account authorization and running paid-plan inference remain owner acceptance steps. The panel neither requests API keys/passwords nor uses Claude's token-export command. A controller restart cancels pending sign-in; completed native credentials remain in the VM.
+The original workspace sign-in panel was checked against Codex CLI `0.163.0`,
+Claude Code `2.1.302` and Cursor Agent `2026.10.16-e3cb207`, including provider
+prompts, code entry and cancellation. Central adoption and automatic delivery were
+then checked separately in a disposable workspace: all three native clients
+reported connected, and Codex/Claude completed inference and exact-session resume
+using delegated access. Cursor inference remained quota-blocked from the earlier
+test and was not retried.
+
+Claude's documented `claude setup-token` route creates a long-lived subscription
+token for `CLAUDE_CODE_OAUTH_TOKEN`; it supports model requests and local MCP, with
+different account features from a full interactive login. Cursor documents user
+API keys through `CURSOR_API_KEY`. Codex's experimental external-token auth format
+and any Cursor browser-token cache adapter require explicit version gates and
+regression checks. Live controller qualification also exercised native Codex and Claude renewal, confirmed changed access tokens, and verified delivery to both existing private workspaces after a controller restart. Cursor renewal at expiry and hot replacement inside a running process remain unqualified.
+
+An expired access credential must trigger central renewal or
+reconnection, not distribution of refresh credentials. A running native process
+may retain its old credential even after a controller updates files.
+[Claude token authentication](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token),
+[Cursor automation authentication](https://cursor.com/docs/cli/reference/authentication),
+[Codex external-token authentication](https://learn.chatgpt.com/docs/app-server#3c-log-in-with-externally-managed-chatgpt-tokens-chatgptauthtokens).
 
 Subscription entitlement, available models and concurrency remain provider/account
 decisions. Signing in successfully does not establish successful inference. API
@@ -123,5 +148,13 @@ not just an early process start. [Cloud-init disable mechanism](https://docs.clo
 
 Bootstrap runs version checks only. Offline checks cover profile isolation and
 locking. See [browser validation](BROWSER.md) for an opt-in local fixture test that
-uses real Chromium and MCP without model inference. Account login and a small
-inference/session-resume check are separate owner-run validation steps.
+uses real Chromium and MCP without model inference. A separately authorized small
+native inference run passed code edits, assertions, exact-session resume and
+browser MCP for Codex and Claude. Cursor's run was blocked by its provider team
+usage limit. Codex's initial `workspace-write` sandbox failed with
+`bwrap: Operation not permitted`. After installing the Ubuntu distro bubblewrap
+profile, a separate delegated-credential test passed both inference turns with
+normal `workspace-write` sandboxing and no bypass. See the
+[sandbox setup](CODEX-SANDBOX.md) and
+[acceptance record](VALIDATION.md#native-inference-and-conversation-resume)
+for command patterns and remaining qualification.

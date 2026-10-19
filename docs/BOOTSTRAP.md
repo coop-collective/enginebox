@@ -29,7 +29,7 @@ For direct operation on the server, set `host.transport = "local"`. For SSH, `ho
 3. Push the runtime/provisioning files into `/opt/enginebox-runtime` and invoke `guest_setup.sh` as guest root. It creates the configured ordinary user, installs selected clients and prepares optional browser/desktop tools.
 4. Stop the new VM cleanly, capture the prepared disk snapshot and start it again. The response names the workspace, snapshot and environment variables for ordinary runtime access.
 
-The native clients run directly as the guest user. Open a shell using the returned runtime environment and complete each client's normal sign-in yourself. Successful provisioning proves installation and preparation; it does not prove subscription inference or quota behavior.
+The native clients run directly as the guest user. With the controller installed, connect providers once in **Agents** and assigned workspaces receive native access automatically. A standalone bootstrap without a controller still uses each client's normal native sign-in in the private guest. Successful provisioning proves installation and preparation; it does not prove subscription inference or quota behavior.
 
 The guest installer records resolved versions in `/opt/enginebox-runtime/installed-versions.json`. Core preparation defaults are maintained in the guest recipe; changed code is not silently reapplied to a completed workspace. Create a new named workspace/profile for changed resource requirements, and perform upgrades explicitly.
 

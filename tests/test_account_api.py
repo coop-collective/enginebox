@@ -17,18 +17,19 @@ class AccountAPITests(unittest.TestCase):
         self.fleet = Mock()
         self.session = {"id": "c" * 32, "host_id": "primary", "name": "ebox-work",
                         "provider": "claude", "status": "waiting", "input_required": True}
-        self.fleet.account_start.return_value = self.session
-        self.fleet.accounts.session.return_value = self.session
-        self.fleet.accounts.input.return_value = self.session
-        self.fleet.accounts.cancel.return_value = self.session | {"status": "cancelled"}
-        self.fleet.accounts.status.return_value = {"providers": []}
+        self.agents = self.fleet.agent_access.return_value
+        self.agents.start.return_value = self.session
+        self.agents.session.return_value = self.session
+        self.agents.input.return_value = self.session
+        self.agents.cancel.return_value = self.session | {"status": "cancelled"}
+        self.agents.status.return_value = {"providers": [], "scope": "controller"}
         self.token = "unit-test-token-only-" + "a" * 32
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.fleet, self.token))
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
         self.thread.start()
         self.addCleanup(self.close_server)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
-        self.path = "/v1/hosts/primary/instances/ebox-work/accounts"
+        self.path = "/v1/agents"
         self.session_path = self.path + "/claude/sessions/" + self.session["id"]
 
     def close_server(self):
@@ -62,17 +63,23 @@ class AccountAPITests(unittest.TestCase):
         self.assertEqual(self.fleet.mock_calls, [])
 
     def test_native_session_routes_are_scoped_and_do_not_create_job_records(self):
-        self.assertEqual(self.request(self.path), (200, {"providers": []}))
+        self.assertEqual(self.request(self.path), (200, {"providers": [], "scope": "controller"}))
         self.assertEqual(self.request(self.path + "/claude/login", {})[0], 202)
         self.assertEqual(self.request(self.session_path)[0], 200)
         self.assertEqual(self.request(self.session_path + "/input", {"text": "one-time-code"})[0], 200)
         self.assertEqual(self.request(self.session_path + "/cancel", {})[1]["session"]["status"], "cancelled")
-        self.fleet.account_start.assert_called_once_with("primary", "ebox-work", "claude")
-        scope = ("primary", "ebox-work", "claude", "c" * 32)
-        self.fleet.accounts.session.assert_called_once_with(*scope)
-        self.fleet.accounts.input.assert_called_once_with(*scope, "one-time-code")
-        self.fleet.accounts.cancel.assert_called_once_with(*scope)
+        self.agents.start.assert_called_once_with("claude")
+        scope = ("claude", "c" * 32)
+        self.agents.session.assert_called_once_with(*scope)
+        self.agents.input.assert_called_once_with(*scope, "one-time-code")
+        self.agents.cancel.assert_called_once_with(*scope)
         self.fleet.submit.assert_not_called()
+
+    def test_workspace_login_redirects_to_controller_without_launching(self):
+        status, body = self.request("/v1/hosts/primary/instances/ebox-work/accounts/claude/login", {})
+        self.assertEqual(status, 409)
+        self.assertIn("controller", body["error"])
+        self.fleet.account_start.assert_not_called()
 
     def test_login_cannot_accept_commands_credentials_or_unknown_provider(self):
         for body in [{"command": "shell"}, {"api_key": "secret"}, {"password": "secret"}]:

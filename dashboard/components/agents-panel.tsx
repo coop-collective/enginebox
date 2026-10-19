@@ -4,29 +4,22 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/client";
 import {
   activeAuth,
-  assignedWorkspace,
   officialAuthorizationUrl,
   providerIds,
   providerLabels,
+  delegationLabel,
 } from "@/lib/accounts";
-import type { AuthSession, Host, Instance, ProviderAccount } from "@/lib/types";
+import type { AuthSession, ProviderAccount } from "@/lib/types";
 
 function ProviderCard({
   account,
-  host,
-  name,
   changed,
 }: {
   account: ProviderAccount;
-  host: string;
-  name: string;
   changed: () => Promise<void>;
 }) {
   const bound = (session?: AuthSession | null) =>
-    !!session &&
-    session.host_id === host &&
-    session.name === name &&
-    session.provider === account.id;
+    !!session && session.provider === account.id;
   const [session, setSession] = useState<AuthSession | null>(
     bound(account.session) ? account.session! : null,
   );
@@ -35,7 +28,7 @@ function ProviderCard({
   const [error, setError] = useState("");
   const pendingRequests = useRef(new Set<AbortController>());
   const pollRequest = useRef<AbortController | null>(null);
-  const base = `/api/control/v1/hosts/${encodeURIComponent(host)}/instances/${encodeURIComponent(name)}/accounts/${account.id}`;
+  const base = `/api/control/v1/agents/${account.id}`;
   useEffect(
     () => () => {
       for (const request of pendingRequests.current) request.abort();
@@ -59,7 +52,7 @@ function ProviderCard({
         if (controller.signal.aborted) return;
         if (!bound(data.session))
           throw new Error(
-            "The sign-in response belongs to a different workspace.",
+            "The sign-in response belongs to a different provider.",
           );
         setSession(data.session);
         setError("");
@@ -92,7 +85,7 @@ function ProviderCard({
       if (controller.signal.aborted) return;
       if (!bound(data.session))
         throw new Error(
-          "The sign-in response belongs to a different workspace.",
+          "The sign-in response belongs to a different provider.",
         );
       setSession(data.session);
       if (data.session.status === "succeeded") void changed();
@@ -139,9 +132,19 @@ function ProviderCard({
         </span>
       </div>
       {account.detail && <p className="account-detail">{account.detail}</p>}
+      {!account.installed && !account.detail && (
+        <p className="account-detail">
+          The native client is unavailable on the controller.
+        </p>
+      )}
+      <p
+        className={`account-delegation delegation-${account.delegation_status ?? "unknown"}`}
+      >
+        {delegationLabel(account)}
+      </p>
       {account.auth_method === "api_key" && (
         <p className="account-detail">
-          This workspace currently authenticates with an API key.
+          This agent currently authenticates with an API key.
         </p>
       )}
       {error && (
@@ -256,13 +259,7 @@ function ProviderCard({
   );
 }
 
-function WorkspaceAccounts({
-  host,
-  instance,
-}: {
-  host: Host;
-  instance: Instance;
-}) {
+function ControllerAgents() {
   const [providers, setProviders] = useState<ProviderAccount[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -275,16 +272,19 @@ function WorkspaceAccounts({
     setError("");
     try {
       const data = await api<{ providers: ProviderAccount[] }>(
-        `/api/control/v1/hosts/${encodeURIComponent(host.id)}/instances/${encodeURIComponent(instance.name)}/accounts`,
+        "/api/control/v1/agents",
         { signal: controller.signal },
       );
       if (!controller.signal.aborted) setProviders(data.providers);
     } catch (err) {
-      if (!controller.signal.aborted) setError((err as Error).message);
+      if (!controller.signal.aborted) {
+        setError((err as Error).message);
+        setProviders(null);
+      }
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [host.id, instance.name]);
+  }, []);
   useEffect(() => {
     void load();
     return () => current.current?.abort();
@@ -292,11 +292,9 @@ function WorkspaceAccounts({
   return (
     <>
       <div className="account-toolbar">
-        <span>
-          VM: <code>{instance.name}</code>
-        </span>
+        <span>Controller connections</span>
         <button className="button small" disabled={loading} onClick={load}>
-          {loading ? "Refreshing…" : "Refresh accounts"}
+          {loading ? "Refreshing…" : "Refresh agents"}
         </button>
       </div>
       {error && (
@@ -307,7 +305,7 @@ function WorkspaceAccounts({
       {providers === null ? (
         <p className="account-detail">
           {loading
-            ? "Reading native sign-in status…"
+            ? "Reading agent connection status…"
             : "Account status is unavailable. Refresh to try again."}
         </p>
       ) : (
@@ -325,8 +323,6 @@ function WorkspaceAccounts({
                   detail: "No status was returned for this provider.",
                 }
               }
-              host={host.id}
-              name={instance.name}
               changed={load}
             />
           ))}
@@ -336,138 +332,24 @@ function WorkspaceAccounts({
   );
 }
 
-export function SubscriptionsPanel({
-  hosts,
-  initialSelection,
-  pending,
-  resume,
-  close,
-}: {
-  hosts: Host[];
-  initialSelection?: { host: string; name: string } | null;
-  pending: string[];
-  resume: (host: string, name: string) => void;
-  close: () => void;
-}) {
-  const firstHost =
-    hosts.find(
-      (item) => item.online && item.instances.some(assignedWorkspace),
-    ) ?? hosts[0];
-  const [hostId, setHostId] = useState(
-    initialSelection?.host ?? firstHost?.id ?? "",
-  );
-  const selectedHost = hosts.find((item) => item.id === hostId);
-  const workspaces = selectedHost?.instances.filter(assignedWorkspace) ?? [];
-  const [name, setName] = useState(
-    initialSelection?.name ??
-      workspaces.find((item) => item.status === "Running")?.name ??
-      workspaces[0]?.name ??
-      "",
-  );
-  const instance = workspaces.find((item) => item.name === name);
-  const isPending = pending.includes(`${hostId}/${name}`);
-  function chooseHost(id: string) {
-    setHostId(id);
-    const available =
-      hosts
-        .find((item) => item.id === id)
-        ?.instances.filter(assignedWorkspace) ?? [];
-    setName(
-      available.find((item) => item.status === "Running")?.name ??
-        available[0]?.name ??
-        "",
-    );
-  }
+export function AgentsPanel({ close }: { close: () => void }) {
   return (
-    <section
-      className="subscriptions-panel"
-      aria-labelledby="subscriptions-title"
-    >
+    <section className="agents-panel" aria-labelledby="agents-title">
       <div className="section-title">
         <div>
-          <h2 id="subscriptions-title">Subscriptions</h2>
+          <h2 id="agents-title">Agents</h2>
           <p>
-            Connect native clients inside a private workspace. Credentials stay
-            in its VM.
+            Connect once. Available to your private workspaces across the fleet.
           </p>
         </div>
         <button className="button small" onClick={close}>
-          Close subscriptions
+          Close agents
         </button>
       </div>
-      <div className="account-selectors">
-        <label>
-          Account host
-          <select
-            value={hostId}
-            onChange={(event) => chooseHost(event.target.value)}
-          >
-            <option value="" disabled>
-              Select a host
-            </option>
-            {hosts.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.label}
-                {!item.online ? " (offline)" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Private workspace
-          <select
-            value={instance ? name : ""}
-            onChange={(event) => setName(event.target.value)}
-          >
-            <option value="" disabled>
-              Select an assigned workspace
-            </option>
-            {workspaces.map((item) => (
-              <option key={item.name} value={item.name}>
-                {item.workspace_name || item.name}
-                {item.workspace_name && item.workspace_name !== item.name
-                  ? ` (${item.name})`
-                  : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-      {!instance ? (
-        <p className="account-detail">
-          Choose an assigned workspace. Prepared reserves and unmanaged bases
-          cannot receive account credentials.
-        </p>
-      ) : !selectedHost?.online ? (
-        <p className="account-detail">
-          This host is offline. Reconnect it before signing in.
-        </p>
-      ) : instance.status !== "Running" ? (
-        <div className="account-resume">
-          <p>
-            Resume this workspace to connect accounts. Sign-in commands need a
-            running workspace.
-          </p>
-          {["Stopped", "Frozen"].includes(instance.status) && (
-            <button
-              className="button"
-              disabled={isPending}
-              onClick={() => resume(hostId, name)}
-            >
-              {isPending ? "Resuming…" : "Resume workspace"}
-            </button>
-          )}
-        </div>
-      ) : (
-        <WorkspaceAccounts
-          key={`${hostId}/${name}`}
-          host={selectedHost}
-          instance={instance}
-        />
-      )}
+      <ControllerAgents />
       <p className="workspace-hint">
-        Sign-in status does not confirm a paid plan or remaining usage. Accounts
-        are not pooled or copied between workspaces.
+        Each provider's workspace access is shown on its card. Sign-in status
+        does not confirm a paid plan or remaining usage.
       </p>
     </section>
   );

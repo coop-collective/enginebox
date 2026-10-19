@@ -174,6 +174,8 @@ def preflight(args):
     node = shutil.which("node")
     if not node or not shutil.which("systemctl"):
         raise ValueError("Existing Node.js and systemctl are required; the installer does not install them.")
+    if not args.skip_agent_clients and any(not shutil.which(binary) for binary in ("curl", "bash", "runuser")):
+        raise ValueError("Native controller client installation requires existing curl, bash and runuser.")
     node = str(safe_path(Path(node).resolve()))
     version = subprocess.check_output([node, "--version"], text=True).strip().lstrip("v")
     if tuple(map(int, version.split(".")[:2])) < (22, 12):
@@ -182,7 +184,7 @@ def preflight(args):
     artifact = args.checkout / "dashboard/dist/standalone"
     for path in [runtime / "pyproject.toml", runtime / "requirements.lock", runtime / "fleet_api.py",
                  artifact / "dist/server/index.js", artifact / "node_modules/vinext/package.json",
-                 args.checkout / "dashboard/scripts/start.mjs"]:
+                 args.checkout / "dashboard/scripts/start.mjs", args.checkout / "scripts/control-plane/install-agent-clients.py"]:
         if not path.is_file():
             raise ValueError(f"Missing source or built artifact: {path}. Build the dashboard on the target platform first.")
     env = validate_environment(read_environment(args.env_file), args.api_port)
@@ -236,6 +238,10 @@ def apply(args, user, group, node, values):
     state = prefix / "state"
     state.mkdir(exist_ok=True, mode=0o700)
     os.chown(state, user.pw_uid, user.pw_gid)
+    if not args.skip_agent_clients:
+        subprocess.run(["runuser", "-u", user.pw_name, "--", sys.executable,
+                        str(Path(__file__).parent / "install-agent-clients.py"),
+                        "--state-dir", str(state)], check=True)
     substitutions = {"PREFIX": str(prefix), "USER": user.pw_name, "GROUP": group, "HOME": user.pw_dir, "NODE": node}
     unit_texts = {}
     for name in UNITS:
@@ -276,6 +282,7 @@ def main():
     parser.add_argument("--prefix", type=Path, default=Path("/opt/enginebox-control"))
     parser.add_argument("--api-port", type=int, default=8765)
     parser.add_argument("--apply", action="store_true", help="Apply the printed plan after successful preflight.")
+    parser.add_argument("--skip-agent-clients", action="store_true", help="Leave native controller clients uninstalled (Agents login will be unavailable).")
     args = parser.parse_args()
     try:
         for field in ["config", "env_file", "checkout", "prefix"]:
@@ -286,6 +293,8 @@ def main():
         print(f"  Copy private inputs with owner-only permissions; run as existing user {user.pw_name}.")
         print(f"  Use existing Node {node}; API 127.0.0.1:{args.api_port}, dashboard 127.0.0.1:{values['PORT']}.")
         print("  Install/restart only enginebox-fleet-api.service and enginebox-dashboard.service.")
+        if not args.skip_agent_clients:
+            print("  Prepare original Codex, Claude and Cursor CLIs in private controller storage for account connections.")
         print("  Preserve existing host software, firewall, sudoers, compute resources and earlier releases.")
         if args.apply:
             apply(args, user, group, node, values)

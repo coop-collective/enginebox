@@ -85,6 +85,23 @@ class StatusAndProtocolTests(unittest.TestCase):
                                           {"type": "input_required"}])
                 self.assertNotIn("\x1b", parser.buffer)
 
+    def test_compact_claude_setup_token_prompt_requires_verified_url_and_claude(self):
+        prompt = "Paste\x1b[1Ccode\x1b[1Chere\x1b[1Cif\x1b[1Cprompted>"
+        parser = guest_auth.LoginOutput("claude")
+        self.assertEqual(parser.feed(CLAUDE_URL + "\n"), [{"type": "authorization", "authorization_url": CLAUDE_URL}])
+        events = []
+        for start in range(0, len(prompt), 3):
+            events.extend(parser.feed(prompt[start:start + 3]))
+        self.assertEqual(events, [{"type": "input_required"}])
+        self.assertTrue(parser.input_required)
+        self.assertEqual(parser.feed("Pastecodehereifprompted>"), [])
+        for provider, url in [("claude", "https://example.com/login"), ("cursor", CURSOR_URL),
+                              ("codex", "https://auth.openai.com/codex/device")]:
+            parser = guest_auth.LoginOutput(provider)
+            events = parser.feed(url + "\nPastecodehereifprompted>")
+            self.assertNotIn({"type": "input_required"}, events)
+            self.assertFalse(parser.input_required)
+
     def test_split_osc_sequences_never_publish_hidden_target(self):
         parser = guest_auth.LoginOutput("claude")
         hidden = CLAUDE_URL.replace("example-state", "hidden-state")
@@ -112,6 +129,16 @@ class StatusAndProtocolTests(unittest.TestCase):
         self.assertTrue(guest_auth.valid_input("returned-code#state-part"))
         for value in ["short", "a" * 2049, "valid-code\nrm -rf /", "code\x1b[2J", "https://site/path", {}, "space code"]:
             self.assertFalse(guest_auth.valid_input(value))
+
+    def test_disappearing_process_group_permission_race_keeps_cleanup_idempotent(self):
+        process = Mock(pid=12345)
+        process.poll.return_value = 0
+        with patch("guest_auth.os.killpg", side_effect=PermissionError):
+            guest_auth.stop_group(process)
+        process.poll.return_value = None
+        with patch("guest_auth.os.killpg", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                guest_auth.stop_group(process)
 
     def test_guest_transport_uses_explicit_user_home_isolated_python_and_no_shell(self):
         guest = GuestConfig(2000, 2001, "builder", "/home/builder", "/work", ":99")

@@ -27,7 +27,7 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 - `runtime/fleet.py`, `fleet_api.py`, `fleet_mcp.py`: multi-host inventory, capacity, jobs, authenticated REST and operator MCP.
 - `runtime/templates.py`: strict portable manifests, public HTTPS import, per-host revision receipts and bootstrap installation adapter.
 - `runtime/warm_pool.py`: prebooted reserves, durable one-way claims, refill admission and quarantine.
-- `runtime/accounts.py`, `guest_auth.py`: workspace-scoped native CLI sign-in/status, ephemeral browser authorization sessions and supervised guest login processes.
+- `runtime/agent_access.py`, `agent_sync.py`, `accounts.py`, `guest_auth.py`: controller-owned native connections, private refresh ownership, access-only workspace delivery and supervised browser authorization.
 - `dashboard/`: Vinext owner dashboard and authenticated server-side proxy.
 - `examples/`: existing-Incus, fresh-host and fleet configuration.
 - `tests/`: offline regression coverage and opt-in browser integration.
@@ -38,7 +38,7 @@ P1 is done when an explicit example config can inspect a fresh supported host an
 
 ## Template and warm workspace slice
 
-Implemented: Minimum/Recommended/Custom resource selection, API-enforced floors, serialized JSON recipes independent of host bootstrap, explicit per-host installation and revision status, and warm allocation with cold fallback. Template imports do not run arbitrary scripts; the initial recipe supports official native clients and optional browser/desktop on Ubuntu 24.04.
+Implemented: Minimum/Recommended/Custom resource selection, API-enforced floors, serialized JSON recipes independent of host bootstrap, controller-owned desired state, automatic synchronization to all registered nodes and per-node revision status, and warm allocation with cold fallback. Template imports do not run arbitrary scripts; the initial recipe supports official native clients and optional browser/desktop on Ubuntu 24.04.
 
 A registered revision is offered only on hosts whose installation receipt matches that revision and their current host/project/pool/guest binding. Installation consumes normal host admission under the shared lock. Existing workspaces retain their original image and files.
 
@@ -60,7 +60,7 @@ Add desktop MCP only when selected. Merge an Engine Box entry through each clien
 
 For each client, the operator then validates native sign-in, one bounded prompt, reconnect/session resume and account state after a VM restart. Document quota/expiry behavior from supported diagnostics or real observations; do not consume an allowance merely to force exhaustion. Account tokens and raw auth logs stay out of Git and public CI.
 
-The dashboard Subscriptions panel launches native Codex, Claude and Cursor login in assigned private workspaces, forwards browser/device authorization steps and checks native status afterward. It distinguishes API-key authentication from account sign-in without inferring paid-plan entitlement. Disposable testing covers unsigned-in prompts/cancellation; owner-completed authentication, subscription inference and account persistence acceptance remain required. This is account setup, not a replacement harness or prompt router.
+The dashboard **Agents** panel connects the owner once at the controller. Assigned private workspaces receive native access credentials after create, allocation and resume, with periodic reconciliation for existing workspaces and refreshed tokens. Clean bases and unassigned warm reserves remain credential-free. Provider-specific compatibility and expiry limitations are documented in [native clients](NATIVE-CLIENTS.md); this does not add a prompt router or account pooling across unrelated owners.
 
 ## Disposable environment validation
 
@@ -99,4 +99,4 @@ A clean external-host installation is a separate release gate. Success on the ow
 
 ## Deferred work
 
-Managed tenancy/billing, automatic fleet placement, swarm orchestration, GPU memory restoration, Windows/ARM support, provider credential brokering, a new CI scheduler and premium engine recipes are outside the initial bootstrap. Unreal/Unity and Cloudflare preparations can use the resulting interfaces later.
+Managed tenancy/billing, automatic fleet placement, swarm orchestration, GPU memory restoration, Windows/ARM support, a new CI scheduler and premium engine recipes are outside the initial bootstrap. Unreal/Unity and Cloudflare preparations can use the resulting interfaces later.

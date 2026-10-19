@@ -1,13 +1,29 @@
 {
   "schema_version": 1,
   "id": "native-desktop",
-  "revision": 1,
+  "revision": 2,
   "label": "Native development with desktop",
   "description": "Official native clients, Chromium and an isolated desktop with computer MCP. Desktop services remain on guest loopback; use an authenticated tunnel.",
   "recipe": "native-clients-v1",
   "source_image": "images:ubuntu/24.04/cloud",
-  "minimum": {"cpu": 4, "memory_gib": 4, "disk_gib": 35},
-  "recommended": {"cpu": 8, "memory_gib": 8, "disk_gib": 60},
-  "native_clients": ["codex", "claude", "cursor"],
-  "config": {"browser": true, "desktop": true, "guest_computer_mcp": true}
+  "minimum": {
+    "cpu": 4,
+    "memory_gib": 4,
+    "disk_gib": 35
+  },
+  "recommended": {
+    "cpu": 8,
+    "memory_gib": 8,
+    "disk_gib": 60
+  },
+  "native_clients": [
+    "codex",
+    "claude",
+    "cursor"
+  ],
+  "config": {
+    "browser": true,
+    "desktop": true,
+    "guest_computer_mcp": true
+  }
 }

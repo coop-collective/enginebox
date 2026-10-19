@@ -142,6 +142,11 @@ def stop_group(process):
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # macOS can report EPERM for a disappearing/reaped process group.
+        # Do not lose the final protocol result after its leader is gone.
+        if process.poll() is None:
+            raise
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
@@ -151,6 +156,9 @@ def stop_group(process):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        if process.poll() is None:
+            raise
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
@@ -254,7 +262,10 @@ class LoginOutput:
                 self.code = match[0]
                 events.append({"type": "code", "user_code": self.code})
         if self.provider == "claude" and self.url and not self.input_required and re.search(
-                r"paste (?:the )?(?:authentication )?code|enter (?:the )?authorization code", clean, re.I):
+                r"paste (?:the )?(?:authentication )?code|enter (?:the )?authorization code|"
+                # setup-token uses cursor movements for spacing, which leaves
+                # this compact prompt after terminal controls are discarded.
+                r"paste\s*code\s*here\s*if\s*prompted\s*>", clean, re.I):
             self.input_required = True
             events.append({"type": "input_required"})
         return events
@@ -283,7 +294,7 @@ def provider_lock(provider):
         raise
 
 
-def login(provider, seconds=MAX_SECONDS):
+def login(provider, seconds=MAX_SECONDS, *, login_args=None, output_hook=None, completion_hook=None):
     lock, process, master, slave, selector = None, None, None, None, None
     interrupted = False
     def interrupt(_signum, _frame):
@@ -304,7 +315,7 @@ def login(provider, seconds=MAX_SECONDS):
         attributes[3] &= ~termios.ECHO
         termios.tcsetattr(slave, termios.TCSANOW, attributes)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 4096, 0, 0))
-        process = subprocess.Popen([executable, *COMMANDS[provider]["login"]], stdin=slave, stdout=slave,
+        process = subprocess.Popen([executable, *(COMMANDS[provider]["login"] if login_args is None else login_args)], stdin=slave, stdout=slave,
                                    stderr=slave, env=environment, start_new_session=True)
         os.close(slave)
         slave = None
@@ -313,6 +324,11 @@ def login(provider, seconds=MAX_SECONDS):
         selector.register(sys.stdin.fileno(), selectors.EVENT_READ, "control")
         deadline, control = time.monotonic() + min(MAX_SECONDS, max(1, seconds)), b""
         parser = LoginOutput(provider)
+        def consume_output(data):
+            for event in parser.feed(data):
+                emit(event)
+            if output_hook is not None:
+                output_hook(parser.buffer)
         emit({"type": "started"})
         while True:
             if interrupted:
@@ -323,6 +339,17 @@ def login(provider, seconds=MAX_SECONDS):
                 break
             if process.poll() is not None:
                 stop_group(process)
+                # Native setup-token may print its result immediately before
+                # exiting. Drain the PTY before verifying the completed login.
+                os.set_blocking(master, False)
+                while True:
+                    try:
+                        remaining = os.read(master, 4096)
+                        if not remaining:
+                            break
+                        consume_output(remaining)
+                    except (BlockingIOError, OSError):
+                        break
                 # Only native status after success can establish a connected account.
                 if process.returncode == 0:
                     def cancelled_verification():
@@ -336,7 +363,8 @@ def login(provider, seconds=MAX_SECONDS):
                             os.read(sys.stdin.fileno(), 4096)
                             interrupted = True
                         return interrupted
-                    status = probe(provider, environment, cancelled=cancelled_verification)
+                    status = (completion_hook(environment, cancelled_verification) if completion_hook else
+                              probe(provider, environment, cancelled=cancelled_verification))
                     if interrupted:
                         if result["reason"] != "expired":
                             result["reason"] = "cancelled"
@@ -357,8 +385,7 @@ def login(provider, seconds=MAX_SECONDS):
                     if not data:
                         selector.unregister(key.fd)
                     else:
-                        for event in parser.feed(data):
-                            emit(event)
+                        consume_output(data)
                 else:
                     if not data:
                         interrupted = True

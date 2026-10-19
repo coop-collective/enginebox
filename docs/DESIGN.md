@@ -84,7 +84,8 @@ Prefer an existing compatible storage pool. Offer bounded loop-backed storage as
 | Writable project and installed dependency tree | Private VM disk; snapshot/fork uses the backend's copy-on-write facilities where supported. |
 | Large repository and asset references | Versioned read-only mounts near compute; each workspace gets independent writable state. |
 | Download/build caches | Tool-supported reuse, separated by trust domain, OS/architecture and relevant toolchain/input keys. |
-| Provider and Git account state | Private guest identity; never shared in a cache or credential-free base. |
+| Provider account state | Private controller refresh credentials; access-only credentials delivered to the same owner’s assigned workspaces. Never stored in caches or clean bases. |
+| Git and browser account state | Private workspace identity, with separate explicit authorization. |
 | External data | Its own backup and versioning policy; not implicitly captured by a VM snapshot. |
 
 The prototype used guest NFS because its Incus version rejected direct shared devices with stateful migration enabled. Generalize this as an optional mount backend. Initially use an existing suitable NFS endpoint or an isolated, explicitly provisioned service. Do not disable unrelated rpcbind/statd services, replace global NFS bindings or claim arbitrary shared mounts support memory restoration.
@@ -108,7 +109,7 @@ Codex, Cursor Agent and Claude Code run unmodified in the guest. Native installa
 
 The owner completes each native sign-in. Subscription availability, refresh and quota behavior must be validated per provider and account mode. Installation and `--version` checks do not establish successful inference. See [native-client design](NATIVE-CLIENTS.md).
 
-The dashboard's Subscriptions panel starts the native CLI login inside a selected running, assigned workspace and exposes only the provider's browser/device authorization step and status. Its supervisor expires/cancels pending processes, while completed credentials stay in native guest storage. Clean bases and warm reserves cannot be used for sign-in, and a connected account is not treated as evidence of a paid subscription or remaining balance.
+The dashboard's **Agents** panel starts native browser/device authorization on the controller. The controller keeps refresh credentials in private provider homes and delivers only the access material needed by the owner's assigned workspaces. Adoption of an existing signed-in workspace is explicit and retires its refresh ownership. Reconciliation preserves manual credential changes and checks host binding and guest identity; clean bases and unassigned warm reserves receive no accounts. OS file permissions protect the storage; this is not an encrypted secret vault. A connected account does not prove a paid entitlement or available quota. Native processes keep their provider's own limits, and long-running processes may need restarting after an access token expires.
 
 Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes computer tools only and receives no host keys or Incus socket. Its restricted tool list is not itself an authorization boundary; actual isolation depends on credentials and host/guest permissions. Installing an MCP server does not disable the native harness's approval policy. Desktop is optional and should be provisioned only when requested; guest computer MCP requires it, while operator MCP can be enabled independently.
 
@@ -119,6 +120,8 @@ Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes
 The fleet controller clones only configured disk snapshots marked as clean bases. It copies into the configured storage pool and applies per-VM CPU/RAM/disk limits. Prepared tools and dependencies live on the copy-on-write disk; no provider installer runs during a fork. Headless browser preparation avoids a desktop by default. Completed cloud-init is disabled in the reusable image, while clone identity and ordinary networking remain enabled.
 
 Admission counts active instances across Incus projects, includes frozen RAM, preserves configured host/CI reserves and budgets full root/state disks even for stopped instances. The API bounds its work queue and shares a host lock with bootstrap. This is manual multi-host fleet management; automatic workload placement and swarm scheduling remain outside scope.
+
+Registered templates are controller-owned desired state. Importing or revising one schedules installation on every registered node, subject to capacity and compatibility checks. Adding a host to the inventory and restarting the controller enrolls it in synchronization; live host registration is not yet implemented. Per-node readiness/errors remain visible, and existing workspaces keep their original image.
 
 The Vinext server authenticates the owner and proxies a narrow REST surface. API tokens stay server-side. Operator MCP calls the same REST service. A guest receives browser/computer tools, not fleet credentials. See [fleet operations](FLEET.md) and [dashboard deployment](DASHBOARD.md).
 

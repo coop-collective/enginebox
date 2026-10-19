@@ -1,4 +1,4 @@
-import type { AuthSession, Instance, ProviderId } from "./types";
+import type { AuthSession, ProviderAccount, ProviderId } from "./types";
 
 export const providerLabels: Record<ProviderId, string> = {
   codex: "Codex (ChatGPT)",
@@ -8,9 +8,23 @@ export const providerLabels: Record<ProviderId, string> = {
 export const providerIds = Object.keys(providerLabels) as ProviderId[];
 export const activeAuth = (session?: AuthSession | null) =>
   session?.status === "starting" || session?.status === "waiting";
-export const assignedWorkspace = (instance: Instance) =>
-  !!instance.managed &&
-  (!instance.warm_pool_state || instance.warm_pool_state === "claimed");
+export function delegationLabel(account: ProviderAccount) {
+  if (account.delegation_status === "unsupported")
+    return "Workspace access is not supported for this provider.";
+  if (account.delegation_status === "reauth_required")
+    return "Reconnect to restore workspace access.";
+  if (
+    account.installed &&
+    account.status === "connected" &&
+    account.delegation_status === "ready"
+  ) {
+    return typeof account.workspace_count === "number" &&
+      account.workspace_count >= 0
+      ? `Available to ${account.workspace_count} private workspace${account.workspace_count === 1 ? "" : "s"}.`
+      : "Available to your private workspaces.";
+  }
+  return "Workspace access has not been confirmed.";
+}
 
 export function officialAuthorizationUrl(
   provider: ProviderId,

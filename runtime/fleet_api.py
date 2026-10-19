@@ -16,6 +16,8 @@ from fleet import Fleet, load_hosts
 
 ACCOUNT_PATH = r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances/(ebox-[a-z0-9][a-z0-9-]{0,48})/accounts"
 ACCOUNT_SESSION_PATH = ACCOUNT_PATH + r"/(codex|claude|cursor)/sessions/([a-f0-9]{32})"
+AGENT_PATH = r"/v1/agents/(codex|claude|cursor)"
+AGENT_SESSION_PATH = AGENT_PATH + r"/sessions/([a-f0-9]{32})"
 
 
 def api_token() -> str:
@@ -68,6 +70,11 @@ def handler_for(fleet: Fleet, token: str):
                     return self.respond(200, fleet.summary())
                 if self.path == "/v1/templates":
                     return self.respond(200, fleet.catalog())
+                if self.path == "/v1/agents":
+                    return self.respond(200, fleet.agent_access().status())
+                central_session = re.fullmatch(AGENT_SESSION_PATH, self.path)
+                if central_session:
+                    return self.respond(200, {"session": fleet.agent_access().session(*central_session.groups())})
                 account = re.fullmatch(ACCOUNT_PATH, self.path)
                 if account:
                     return self.respond(200, fleet.accounts.status(account[1], account[2]))
@@ -98,12 +105,30 @@ def handler_for(fleet: Fleet, token: str):
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("Body must be an object.")
+                central_login = re.fullmatch(AGENT_PATH + r"/login", self.path)
+                central_action = re.fullmatch(AGENT_SESSION_PATH + r"/(input|cancel)", self.path)
+                if central_login:
+                    if body:
+                        raise ValueError("Native provider sign-in accepts an empty object.")
+                    return self.respond(202, {"session": fleet.agent_access().start(central_login[1])})
+                if central_action:
+                    provider, session_id, operation = central_action.groups()
+                    if operation == "input":
+                        if set(body) != {"text"} or not isinstance(body["text"], str):
+                            raise ValueError("Provide the one-time authorization code as text.")
+                        result = fleet.agent_access().input(provider, session_id, body["text"])
+                    else:
+                        if body:
+                            raise ValueError("Cancel accepts an empty object.")
+                        result = fleet.agent_access().cancel(provider, session_id)
+                    fleet.agent_sync.wake()
+                    return self.respond(200, {"session": result})
                 login = re.fullmatch(ACCOUNT_PATH + r"/(codex|claude|cursor)/login", self.path)
                 account_action = re.fullmatch(ACCOUNT_SESSION_PATH + r"/(input|cancel)", self.path)
                 if login:
                     if body:
                         raise ValueError("Native provider sign-in accepts an empty object.")
-                    return self.respond(202, {"session": fleet.account_start(*login.groups())})
+                    return self.respond(409, {"error": "Connect agents on the controller through /v1/agents; workspaces receive access automatically."})
                 if account_action:
                     host_id, name, provider, session_id, operation = account_action.groups()
                     if operation == "input":
@@ -126,7 +151,13 @@ def handler_for(fleet: Fleet, token: str):
                         raise ValueError("Provide a manifest object or an HTTPS URL.")
                     for host in fleet.hosts:
                         fleet.warm.wake(host)
+                    fleet.template_sync.wake()
                     return self.respond(200, {"template": record})
+                sync = re.fullmatch(r"/v1/templates/([a-z][a-z0-9-]{0,31})/sync", self.path)
+                if sync:
+                    if body:
+                        raise ValueError("Template synchronization accepts an empty object.")
+                    return self.respond(202, fleet.template_sync.request(sync[1]))
                 create = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/(instances|allocations)", self.path)
                 install = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/templates/([a-z][a-z0-9-]{0,31})/install", self.path)
                 action = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances/(ebox-[a-z0-9][a-z0-9-]{0,48})/actions", self.path)
@@ -174,6 +205,8 @@ def main(argv=None):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stop)
         fleet.warm.start()
+        fleet.template_sync.start()
+        fleet.agent_sync.start()
         print(f"Engine Box API listening on http://127.0.0.1:{server.server_port}", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
@@ -187,7 +220,11 @@ def main(argv=None):
             # Graceful shutdown lets admitted jobs finish. Abrupt termination is
             # recovered as failed/inspect-required from the persisted journal.
             fleet.warm.stop()
+            fleet.template_sync.stop()
+            fleet.agent_sync.stop()
             fleet.accounts.close()
+            if fleet.agents:
+                fleet.agents.close()
             fleet.executor.shutdown(wait=True)
 
 

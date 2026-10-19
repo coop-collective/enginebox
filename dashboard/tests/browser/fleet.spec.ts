@@ -372,7 +372,7 @@ test("preparing reserves remain unavailable and refill errors are visible", asyn
   ).toBeVisible();
 });
 
-test("template catalog imports JSON and URLs, installs and syncs changed revisions", async ({
+test("canonical templates import once and automatically sync revisions and future nodes", async ({
   page,
   request,
 }) => {
@@ -403,8 +403,8 @@ test("template catalog imports JSON and URLs, installs and syncs changed revisio
   const card = page
     .locator(".catalog-card")
     .filter({ hasText: "Web development" });
-  await expect(card.getByText("Not installed on this host.")).toBeVisible();
-  await card.getByRole("button", { name: "Install template" }).click();
+  await expect(page.getByLabel("Install host")).toHaveCount(0);
+  await expect(card.getByText("Syncing", { exact: true })).toBeVisible();
   await expect(
     card.getByText("Installed revision 1 · Up to date"),
   ).toBeVisible();
@@ -413,9 +413,8 @@ test("template catalog imports JSON and URLs, installs and syncs changed revisio
     .fill(JSON.stringify({ ...manifest, revision: 2 }));
   await page.getByRole("button", { name: "Register template" }).click();
   await expect(
-    card.getByText("Installed revision 1 · Out of sync"),
+    card.getByText("Installed revision 1 · Awaiting synchronization"),
   ).toBeVisible();
-  await card.getByRole("button", { name: "Sync template" }).click();
   await expect(
     card.getByText("Installed revision 2 · Up to date"),
   ).toBeVisible();
@@ -426,6 +425,28 @@ test("template catalog imports JSON and URLs, installs and syncs changed revisio
   await page.getByRole("button", { name: "Register template" }).click();
   await expect(
     page.locator(".catalog-card").filter({ hasText: "url-native" }),
+  ).toBeVisible();
+  const requests: string[] = [];
+  page.on("request", (req) => {
+    if (req.method() === "POST") requests.push(req.url());
+  });
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "catalog-new-node" },
+  });
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  const future = card.getByRole("listitem", {
+    name: "New machine synchronization",
+  });
+  await expect(future.getByText("Syncing", { exact: true })).toBeVisible();
+  await expect(future.getByText("Ready", { exact: true })).toBeVisible();
+  expect(requests).toEqual([]);
+  await expect(
+    card.getByText("2 / 3 nodes ready · target revision 2"),
+  ).toBeVisible();
+  await expect(
+    card.getByText(
+      "Node is offline; synchronization will retry when it reconnects.",
+    ),
   ).toBeVisible();
   await page.screenshot({
     path: "test-results/template-catalog-desktop.png",
@@ -441,6 +462,40 @@ test("template catalog imports JSON and URLs, installs and syncs changed revisio
     path: "test-results/template-catalog-mobile.png",
     fullPage: true,
   });
+});
+
+test("template node failures stay explicit and fleet-wide retry recovers capacity errors", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "catalog-sync-error" },
+  });
+  await signIn(page);
+  await page.getByRole("button", { name: "Templates", exact: true }).click();
+  await page.getByLabel("Import from").selectOption("url");
+  await page.getByLabel("Template URL").fill("https://example.com/native.json");
+  await page.getByRole("button", { name: "Register template" }).click();
+  const card = page.locator(".catalog-card").filter({ hasText: "url-native" });
+  await expect(
+    card.getByText("Not enough disk capacity to prepare this template."),
+  ).toBeVisible();
+  await expect(
+    card.getByText("0 / 2 nodes ready · target revision 1"),
+  ).toBeVisible();
+  const retry = page.waitForRequest(
+    (req) =>
+      req.method() === "POST" &&
+      req.url().endsWith("/v1/templates/url-native/sync"),
+  );
+  await card.getByRole("button", { name: "Retry sync" }).click();
+  expect((await retry).postDataJSON()).toEqual({});
+  await expect(
+    card.getByText("1 / 2 nodes ready · target revision 1"),
+  ).toBeVisible();
+  await expect(
+    card.getByText("Not enough disk capacity to prepare this template."),
+  ).toHaveCount(0);
 });
 
 test("exported templates download as portable manifests and can be reimported", async ({
@@ -489,7 +544,9 @@ test("exported templates download as portable manifests and can be reimported", 
   await page.getByLabel("Template JSON").fill(serialized);
   await page.getByRole("button", { name: "Register template" }).click();
   await expect(
-    page.getByText("Template registered. Choose a host to install it."),
+    page.getByText(
+      "Template registered. Automatic synchronization is queued across all nodes.",
+    ),
   ).toBeVisible();
   await expect(
     card.getByText("Installed revision 1 · Up to date"),

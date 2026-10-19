@@ -72,8 +72,9 @@ class _Session:
 
 
 class AccountManager:
-    def __init__(self, fleet):
+    def __init__(self, fleet, *, command_factory=None):
         self.fleet = fleet
+        self.command_factory = command_factory
         self._lock = threading.RLock()
         self._sessions = {}
         self._closed = False
@@ -112,7 +113,8 @@ class AccountManager:
             try:
                 providers = [guest_auth.provider_status(p, False) for p in guest_auth.PROVIDERS]
                 try:
-                    _, output = guest_auth.capture(guest_command(host, name, "status", "all"), timeout=25)
+                    command = (self.command_factory or guest_command)(host, name, "status", "all")
+                    _, output = guest_auth.capture(command, timeout=25)
                     for line in output.splitlines():
                         try:
                             event = json.loads(line)
@@ -274,7 +276,8 @@ class AccountManager:
     def _run(self, host, value):
         process, selector, buffer, cancellation_deadline = None, None, b"", None
         try:
-            process = subprocess.Popen(guest_command(host, value.public["name"], "login", value.public["provider"]),
+            command = (self.command_factory or guest_command)(host, value.public["name"], "login", value.public["provider"])
+            process = subprocess.Popen(command,
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                        start_new_session=True, bufsize=0)
             with self._lock:

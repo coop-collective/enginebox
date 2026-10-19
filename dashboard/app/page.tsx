@@ -11,7 +11,7 @@ import type {
 } from "@/lib/types";
 import { api, RequestError } from "@/lib/client";
 import { TemplateCatalog } from "@/components/template-catalog";
-import { SubscriptionsPanel } from "@/components/subscriptions-panel";
+import { AgentsPanel } from "@/components/agents-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -228,7 +228,7 @@ function WorkspaceRow({
   instance: Instance;
   busy: boolean;
   action: (host: string, name: string, action: string) => void;
-  connect: (host: string, name: string) => void;
+  connect: () => void;
 }) {
   const running = instance.status === "Running";
   const resumable = ["Stopped", "Frozen"].includes(instance.status);
@@ -294,11 +294,8 @@ function WorkspaceRow({
             </span>
           ) : (
             <>
-              <button
-                className="button small"
-                onClick={() => connect(host.id, instance.name)}
-              >
-                Connect accounts
+              <button className="button small" onClick={connect}>
+                Manage agents
               </button>
               {resumable && (
                 <button
@@ -645,11 +642,7 @@ export default function Dashboard() {
   const [pendingInstances, setPendingInstances] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
   const [catalogOpen, setCatalogOpen] = useState(false);
-  const [subscriptionsOpen, setSubscriptionsOpen] = useState(false);
-  const [accountSelection, setAccountSelection] = useState<{
-    host: string;
-    name: string;
-  } | null>(null);
+  const [agentsOpen, setAgentsOpen] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const loading = useRef(false);
@@ -743,8 +736,7 @@ export default function Dashboard() {
       setJobs([]);
       setPendingInstances([]);
       setCatalogOpen(false);
-      setSubscriptionsOpen(false);
-      setAccountSelection(null);
+      setAgentsOpen(false);
       setError("");
     } catch (err) {
       setError((err as Error).message);
@@ -791,16 +783,6 @@ export default function Dashboard() {
       setCreating(false);
     setSubmitting(false);
   }
-  async function installTemplate(host: string, template: string) {
-    return queue(
-      `v1/hosts/${encodeURIComponent(host)}/templates/${encodeURIComponent(template)}/install`,
-      {},
-      `Install ${template}`,
-      host,
-      template,
-      "template",
-    );
-  }
   function action(host: string, name: string, operation: string) {
     void queue(
       `v1/hosts/${encodeURIComponent(host)}/instances/${encodeURIComponent(name)}/actions`,
@@ -810,9 +792,8 @@ export default function Dashboard() {
       name,
     );
   }
-  function connectAccounts(host: string, name: string) {
-    setAccountSelection({ host, name });
-    setSubscriptionsOpen(true);
+  function manageAgents() {
+    setAgentsOpen(true);
   }
   const online = fleet?.hosts.filter((host) => host.online) ?? [];
   const instances =
@@ -979,11 +960,10 @@ export default function Dashboard() {
                 <div className="heading-actions">
                   <button
                     className="button"
-                    disabled={!fleet}
-                    onClick={() => setSubscriptionsOpen((value) => !value)}
-                    aria-expanded={subscriptionsOpen}
+                    onClick={() => setAgentsOpen((value) => !value)}
+                    aria-expanded={agentsOpen}
                   >
-                    <Icon name="lock" size={15} /> Subscriptions
+                    <Icon name="lock" size={15} /> Agents
                   </button>
                   <button
                     className="button"
@@ -1074,25 +1054,7 @@ export default function Dashboard() {
                   </article>
                 ))}
               </div>
-              {subscriptionsOpen && fleet && (
-                <SubscriptionsPanel
-                  key={
-                    accountSelection
-                      ? `${accountSelection.host}/${accountSelection.name}`
-                      : "default"
-                  }
-                  hosts={fleet.hosts}
-                  initialSelection={accountSelection}
-                  pending={[
-                    ...pendingInstances,
-                    ...jobs
-                      .filter((job) => active(job) && job.kind !== "template")
-                      .map((job) => `${job.host}/${job.instance}`),
-                  ]}
-                  resume={(host, name) => action(host, name, "resume")}
-                  close={() => setSubscriptionsOpen(false)}
-                />
-              )}
+              {agentsOpen && <AgentsPanel close={() => setAgentsOpen(false)} />}
               {creating && fleet && (
                 <CreateWorkspace
                   fleet={fleet}
@@ -1101,14 +1063,9 @@ export default function Dashboard() {
                   create={create}
                 />
               )}
-              {catalogOpen && fleet && (
+              {catalogOpen && (
                 <TemplateCatalog
-                  hosts={fleet.hosts}
                   refreshToken={updated?.getTime() ?? 0}
-                  installing={jobs
-                    .filter((job) => active(job) && job.kind === "template")
-                    .map((job) => `${job.host}/${job.instance}`)}
-                  install={installTemplate}
                   registered={refresh}
                   close={() => setCatalogOpen(false)}
                 />
@@ -1203,7 +1160,7 @@ export default function Dashboard() {
                             )
                           }
                           action={action}
-                          connect={connectAccounts}
+                          connect={manageAgents}
                         />
                       ))}
                     </tbody>

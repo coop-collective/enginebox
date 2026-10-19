@@ -53,6 +53,33 @@ test -f /opt/enginebox-runtime/requirements.lock
 apt-get update -qq
 apt-get install -y --no-install-recommends ca-certificates curl git ripgrep jq python3 python3-venv build-essential tmux xz-utils apparmor
 
+# Codex uses the first bwrap on PATH. Ubuntu 24.04's bundled-helper fallback
+# cannot acquire capabilities under the default unprivileged_userns policy.
+# Use the distro helper/profile documented by OpenAI; its child profile drops
+# capabilities again. Never disable the guest or host's global userns policy.
+# https://learn.chatgpt.com/docs/sandboxing#prerequisites
+if test "$EBOX_INSTALL_CODEX" = 1; then
+  apt-get install -y --no-install-recommends bubblewrap apparmor-profiles apparmor-utils
+  if test -d /sys/kernel/security/apparmor; then
+    task_bwrap_profile=/etc/apparmor.d/bwrap-userns-restrict
+    if test -L "$task_bwrap_profile" || { test -e "$task_bwrap_profile" && ! test -f "$task_bwrap_profile"; }; then
+      echo 'Refusing a non-regular bwrap AppArmor profile.' >&2
+      exit 1
+    fi
+    for task_bwrap_mode in disable force-complain; do
+      if test -e "/etc/apparmor.d/$task_bwrap_mode/bwrap-userns-restrict" || test -L "/etc/apparmor.d/$task_bwrap_mode/bwrap-userns-restrict"; then
+        echo 'The bwrap AppArmor profile has a local mode override; reconcile it before guest preparation.' >&2
+        exit 1
+      fi
+    done
+    # Preserve any operator-maintained profile instead of overwriting it.
+    if ! test -f "$task_bwrap_profile"; then
+      install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict "$task_bwrap_profile"
+    fi
+    apparmor_parser -r "$task_bwrap_profile"
+  fi
+fi
+
 if id "$EBOX_USER" >/dev/null 2>&1; then
   test "$(id -u "$EBOX_USER")" = "$EBOX_UID" && test "$(id -g "$EBOX_USER")" = "$EBOX_GID" || { echo 'Existing guest user has a different UID/GID; refusing to change it.' >&2; exit 1; }
   test "$(getent passwd "$EBOX_USER" | cut -d: -f6)" = "$EBOX_HOME" || { echo 'Existing guest user has a different home.' >&2; exit 1; }
@@ -164,6 +191,12 @@ install_client() {
 install_client "$EBOX_INSTALL_CODEX" codex https://chatgpt.com/codex/install.sh sh --release "$EBOX_CODEX_VERSION"
 install_client "$EBOX_INSTALL_CLAUDE" claude https://claude.ai/install.sh bash "$EBOX_CLAUDE_VERSION"
 install_client "$EBOX_INSTALL_CURSOR" agent https://cursor.com/install bash
+
+if test "$EBOX_INSTALL_CODEX" = 1; then
+  # Model-free readiness check: no provider connection or inference is needed.
+  as_guest bash -c 'cd "$1" && shift && exec "$@"' -- "$EBOX_WORKSPACE" \
+    codex -c 'sandbox_mode="workspace-write"' sandbox -- /bin/true
+fi
 
 # Shell startup setup contains no credentials and does not modify user rc files.
 python3 - <<'PY'

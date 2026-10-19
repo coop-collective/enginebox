@@ -15,7 +15,7 @@ test.beforeEach(async ({ request }) => {
   await request.post(`${fixture}/__test/reset`);
 });
 
-test("native sign-ins show device links, reconnect, accept Claude codes and cancel", async ({
+test("Agents shows native sign-in links, reconnect, Claude codes and cancellation", async ({
   page,
   request,
 }) => {
@@ -26,9 +26,15 @@ test("native sign-ins show device links, reconnect, accept Claude codes and canc
   await page
     .getByRole("row")
     .filter({ hasText: "ebox-editor" })
-    .getByRole("button", { name: "Connect accounts" })
+    .getByRole("button", { name: "Manage agents" })
     .click();
-  await expect(page.getByLabel("Private workspace")).toHaveValue("ebox-editor");
+  await expect(page.getByRole("combobox")).toHaveCount(0);
+  await expect(
+    page.getByRole("region", { name: "Agents", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Agents", exact: true }),
+  ).toBeVisible();
   const codex = provider(page, "Codex (ChatGPT)");
   await codex.getByRole("button", { name: "Connect", exact: true }).click();
   await expect(codex.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
@@ -41,6 +47,9 @@ test("native sign-ins show device links, reconnect, accept Claude codes and canc
   await expect(link).toHaveAttribute("target", "_blank");
   await expect(codex.locator("input")).toHaveCount(0);
   await expect(codex.getByText("Signed in", { exact: true })).toBeVisible();
+  await expect(
+    codex.getByText("Available to 2 private workspaces."),
+  ).toBeVisible();
   await codex.getByRole("button", { name: "Reconnect" }).click();
   await codex.getByRole("button", { name: "Cancel sign-in" }).click();
   await expect(codex.getByText("Cancelled", { exact: true })).toBeVisible();
@@ -72,7 +81,7 @@ test("native sign-ins show device links, reconnect, accept Claude codes and canc
   ).toBeVisible();
   await expect(
     page.getByText(
-      "Sign-in status does not confirm a paid plan or remaining usage. Accounts are not pooled or copied between workspaces.",
+      "Each provider's workspace access is shown on its card. Sign-in status does not confirm a paid plan or remaining usage.",
     ),
   ).toBeVisible();
   expect(
@@ -80,7 +89,7 @@ test("native sign-ins show device links, reconnect, accept Claude codes and canc
   ).toBe(0);
   expect(errors).toEqual([]);
   await page.screenshot({
-    path: "test-results/subscriptions-desktop.png",
+    path: "test-results/agents-desktop.png",
     fullPage: true,
   });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -90,58 +99,43 @@ test("native sign-ins show device links, reconnect, accept Claude codes and canc
     ),
   ).toBe(true);
   await page.screenshot({
-    path: "test-results/subscriptions-mobile.png",
+    path: "test-results/agents-mobile.png",
     fullPage: true,
   });
 });
 
-test("account setup excludes reserves and requires an explicit resume", async ({
+test("global agent connections need no host or running workspace and never resume a VM", async ({
   page,
   request,
 }) => {
   await request.post(`${fixture}/__test/mode`, { data: { mode: "warm" } });
   await signIn(page);
-  for (const name of [
-    "ebox-native-base",
-    "ebox-pool-ready",
-    "ebox-pool-preparing",
-    "ebox-pool-quarantined",
-  ]) {
-    await expect(
-      page
-        .getByRole("row")
-        .filter({ hasText: name })
-        .getByRole("button", { name: "Connect accounts" }),
-    ).toHaveCount(0);
-  }
   const mutations: string[] = [];
   page.on("request", (req) => {
-    if (req.method() === "POST" && req.url().endsWith("/actions"))
-      mutations.push(req.url());
+    if (req.method() === "POST") mutations.push(req.url());
   });
   await page
     .getByRole("row")
     .filter({ hasText: "ebox-review" })
-    .getByRole("button", { name: "Connect accounts" })
+    .getByRole("button", { name: "Manage agents" })
     .click();
-  await expect(
-    page.getByText(
-      "Resume this workspace to connect accounts. Sign-in commands need a running workspace.",
-    ),
-  ).toBeVisible();
-  expect(mutations).toEqual([]);
-  const options = await page
-    .getByLabel("Private workspace")
-    .locator("option")
-    .allTextContents();
-  expect(options.join(" ")).not.toMatch(/ebox-pool|ebox-native-base/);
-  await page.getByRole("button", { name: "Resume workspace" }).click();
   await expect(provider(page, "Codex (ChatGPT)")).toBeVisible();
-  expect(mutations).toHaveLength(1);
-  expect(mutations[0]).toContain("/instances/ebox-review/actions");
+  await expect(page.getByRole("combobox")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Resume workspace" }),
+  ).toHaveCount(0);
+  expect(mutations).toEqual([]);
+  await page.getByRole("button", { name: "Close agents" }).click();
+  await request.post(`${fixture}/__test/mode`, { data: { mode: "empty" } });
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Add your first host" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(provider(page, "Codex (ChatGPT)")).toBeVisible();
 });
 
-test("switching workspaces hides delayed sessions and closing or logout stops polling", async ({
+test("global sessions recover after reload and closing or logout stops every provider poll", async ({
   page,
   request,
 }) => {
@@ -149,61 +143,56 @@ test("switching workspaces hides delayed sessions and closing or logout stops po
     data: { mode: "accounts-delayed" },
   });
   await signIn(page);
-  await page
-    .getByRole("button", { name: "Subscriptions", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
   await provider(page, "Codex (ChatGPT)")
     .getByRole("button", { name: "Connect", exact: true })
     .click();
   await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
+  await provider(page, "Cursor")
+    .getByRole("button", { name: "Connect", exact: true })
+    .click();
+  await provider(page, "Cursor")
+    .getByRole("button", { name: "Cancel sign-in" })
+    .click();
+  await expect(
+    provider(page, "Cursor").getByText("Cancelled", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    provider(page, "Codex (ChatGPT)").getByRole("button", {
+      name: "Cancel sign-in",
+    }),
+  ).toBeVisible();
   const polls: string[] = [];
   page.on("request", (req) => {
-    if (
-      req.method() === "GET" &&
-      req.url().includes("/accounts/codex/sessions/")
-    )
+    if (req.method() === "GET" && req.url().includes("/agents/codex/sessions/"))
       polls.push(req.url());
   });
   await page.waitForRequest(
     (req) =>
-      req.method() === "GET" && req.url().includes("/accounts/codex/sessions/"),
+      req.method() === "GET" && req.url().includes("/agents/codex/sessions/"),
   );
-  await page.getByLabel("Private workspace").selectOption("ebox-review");
-  await expect(
-    provider(page, "Codex (ChatGPT)").getByText("Signed in", { exact: true }),
-  ).toBeVisible();
-  await expect(page.getByText("ABCD-EFGH", { exact: true })).toHaveCount(0);
-  const switchedCount = polls.length;
-  await page.waitForTimeout(1300);
-  expect(polls).toHaveLength(switchedCount);
-  await page.getByLabel("Private workspace").selectOption("ebox-editor");
-  await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
-  await page.reload();
-  await page
-    .getByRole("button", { name: "Subscriptions", exact: true })
-    .click();
-  await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Close subscriptions" }).click();
+  await page.getByRole("button", { name: "Close agents" }).click();
   const closedCount = polls.length;
   await page.waitForTimeout(1300);
   expect(polls).toHaveLength(closedCount);
-  await page
-    .getByRole("button", { name: "Subscriptions", exact: true })
-    .click();
+  await expect(page.getByText("ABCD-EFGH", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByLabel("Operator password")).toBeVisible();
   const loggedOutCount = polls.length;
   await page.waitForTimeout(1300);
   expect(polls).toHaveLength(loggedOutCount);
-  await expect(page.getByText("ABCD-EFGH", { exact: true })).toHaveCount(0);
 });
 
 test("account endpoints require dashboard auth and status failures remain visible", async ({
   page,
   request,
 }) => {
-  const path = "/api/control/v1/hosts/metal-01/instances/ebox-editor/accounts";
+  const path = "/api/control/v1/agents";
   expect((await request.get(path)).status()).toBe(401);
   expect(
     (await request.post(`${path}/codex/login`, { data: {} })).status(),
@@ -212,9 +201,7 @@ test("account endpoints require dashboard auth and status failures remain visibl
     data: { mode: "accounts-unavailable" },
   });
   await signIn(page);
-  await page
-    .getByRole("button", { name: "Subscriptions", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(
     provider(page, "Cursor").getByText("Unavailable", { exact: true }),
   ).toBeVisible();
@@ -227,8 +214,38 @@ test("account endpoints require dashboard auth and status failures remain visibl
   await request.post(`${fixture}/__test/mode`, {
     data: { mode: "accounts-error" },
   });
-  await page.getByRole("button", { name: "Refresh accounts" }).click();
+  await page.getByRole("button", { name: "Refresh agents" }).click();
   await expect(page.getByRole("alert")).toContainText(
     "Native account status is unavailable.",
+  );
+  await expect(page.locator(".accounts-grid")).toHaveCount(0);
+});
+
+test("signed-in providers report unsupported or expired delegation without claiming workspace access", async ({
+  page,
+  request,
+}) => {
+  await request.post(`${fixture}/__test/mode`, {
+    data: { mode: "accounts-unsupported" },
+  });
+  await signIn(page);
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  const cursor = provider(page, "Cursor");
+  await expect(cursor.getByText("Signed in", { exact: true })).toBeVisible();
+  await expect(
+    cursor.getByText("Workspace access is not supported for this provider."),
+  ).toBeVisible();
+  await expect(cursor.getByText(/Available to/)).toHaveCount(0);
+  await request.post(`${fixture}/__test/mode`, {
+    data: { mode: "accounts-reauth" },
+  });
+  await page.getByRole("button", { name: "Refresh agents" }).click();
+  await expect(
+    provider(page, "Claude").getByText(
+      "Reconnect to restore workspace access.",
+    ),
+  ).toBeVisible();
+  await expect(provider(page, "Claude").getByText(/Available to/)).toHaveCount(
+    0,
   );
 });

@@ -13,13 +13,13 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 | Available in this repository | Planned |
 |---|---|
 | Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Independently qualified fresh-host installs and upgrade/rollback |
-| Portable template catalog, resource presets and prebooted fresh workspace pools | Additional image/recipe formats |
+| Controller-synchronized templates, resource presets and prebooted fresh workspace pools | Additional image/recipe formats |
 | Official client preparation and reusable clean VM snapshots | Shared mount/cache services and off-host backup workflows |
 | Fleet REST API, operator MCP and authenticated Vinext dashboard | Automatic placement, tenancy and billing |
 | Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 
-The first target is one trusted owner operating Linux/KVM servers. Native subscription login/inference, hostile tenancy, cross-host memory migration and a portable CI module are not validated capabilities. Provider and browser accounts stay inside private workspaces; reusable bases are prepared before login.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Real Codex/Claude prompts, tools and exact conversation resume have been tested; Cursor inference is currently blocked by the test account’s provider quota. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
 [Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 

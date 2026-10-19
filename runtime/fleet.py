@@ -22,6 +22,9 @@ from enginebox import EngineBox, GuestConfig, identifier
 from templates import Registry, host_binding_digest, validate_resources
 from warm_pool import WarmPool
 from accounts import AccountManager
+from template_sync import TemplateSync
+from agent_access import AgentAccess
+from agent_sync import AgentSync
 
 GIB = 1024**3
 SIZES = {"small": {"cpu": 2, "memory_gib": 2},
@@ -403,6 +406,9 @@ class Fleet:
         self.registry = registry if registry is not None else (Registry(self.state_dir.parent) if self.state_dir else None)
         self.warm = WarmPool(self)
         self.accounts = AccountManager(self)
+        self.template_sync = TemplateSync(self)
+        self.agents = None
+        self.agent_sync = AgentSync(self)
         if state_dir:
             state_dir = self.state_dir
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -422,6 +428,21 @@ class Fleet:
                 self.jobs[job["id"]] = job
             for job in recovered:
                 self._save(job)
+            self.agents = AgentAccess(self, state_dir.parent / "agents")
+
+    def agent_access(self):
+        if not self.agents:
+            raise ValueError("Configure persistent controller state before connecting agents.")
+        return self.agents
+
+    def attach_agents(self, host_id, name):
+        """Called while the caller holds the host lifecycle locks."""
+        if not self.agents:
+            return {"providers": []}
+        try:
+            return self.agents.attach(host_id, name)
+        except Exception:
+            return {"providers": [], "error": "Agent access could not synchronize; it will retry automatically."}
 
     def host(self, host_id):
         if host_id not in self.hosts:
@@ -480,6 +501,7 @@ class Fleet:
                 host = self.hosts.get(deployment["host_id"])
                 deployment["in_sync"] = bool(deployment["in_sync"] and host
                     and deployment["host_binding_digest"] == host_binding_digest(host))
+            record["sync"] = self.template_sync.summary(record)
         return {"templates": records}
 
     def templates_for(self, host):
@@ -580,7 +602,7 @@ class Fleet:
         elif operation == "install_template":
             if set(params) != {"template"} or not isinstance(params["template"], str) or not self.registry:
                 raise ValueError("Provide a registered template ID; configure a persistent registry first.")
-            self.registry.get(params["template"])
+            install_record = self.registry.get(params["template"])
             name = params["template"]
         else:
             if set(params) != {"name"} or not isinstance(params["name"], str):
@@ -591,8 +613,17 @@ class Fleet:
             raise ValueError("Fleet queue is full; wait for existing jobs.")
         job = {"id": uuid.uuid4().hex, "host_id": host_id, "operation": operation, "name": name,
                "status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+        if operation == "install_template":
+            job["template_digest"] = install_record["manifest_digest"]
         try:
             with self.jobs_lock:
+                if operation == "install_template":
+                    duplicate = next((entry for entry in self.jobs.values()
+                                      if entry["operation"] == operation and entry["host_id"] == host_id
+                                      and entry["name"] == name and entry["status"] in {"queued", "running"}), None)
+                    if duplicate:
+                        self.pending.release()
+                        return json.loads(json.dumps(duplicate))
                 self.jobs[job["id"]] = job
                 self._save(job)
             self.executor.submit(self._work, host, job["id"], operation, params)
@@ -626,6 +657,8 @@ class Fleet:
                                                         params.get("resources"), job_id=job_id)
                         else:
                             result = self._action(host, params["name"], operation)
+                        if operation in {"create", "allocate", "resume"} and self.agents:
+                            result["agents"] = self.attach_agents(host.id, result.get("name", params["name"]))
                 with self.jobs_lock:
                     self.jobs[job_id].update(status="succeeded", result=result,
                                              duration_seconds=round(time.monotonic() - started, 3))
@@ -637,6 +670,8 @@ class Fleet:
         finally:
             self.pending.release()
             self.warm.wake(host.id)
+            self.template_sync.wake()
+            self.agent_sync.wake()
 
     def _create(self, host, name, template, size=None, *, resources=None, pool_metadata=None, wait=True):
         facts = inventory(host)

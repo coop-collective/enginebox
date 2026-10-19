@@ -731,14 +731,14 @@ textarea {
   color: #648b7f;
   margin-bottom: 14px;
 }
-.subscriptions-panel {
+.agents-panel {
   background: #fff;
   border: 1px solid #c9ded8;
   border-radius: 7px;
   padding: 22px;
   margin-bottom: 28px;
 }
-.subscriptions-panel .section-title p {
+.agents-panel .section-title p {
   color: #748990;
   font-size: 11px;
   line-height: 1.7;
@@ -825,6 +825,61 @@ textarea {
 }
 .account-actions {
   margin-top: 16px;
+}
+.account-delegation {
+  font-size: 11px;
+  line-height: 1.7;
+  color: #687f86;
+  margin: 10px 0;
+}
+.delegation-ready {
+  color: #347965;
+}
+.delegation-unsupported,
+.delegation-reauth_required {
+  color: #a16435;
+}
+.template-sync-heading,
+.template-node-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.template-sync-heading {
+  margin-top: 18px;
+}
+.template-nodes {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: grid;
+  gap: 8px;
+}
+.template-nodes li {
+  border: 1px solid #e1e9ed;
+  border-radius: 5px;
+  padding: 12px;
+  min-width: 0;
+}
+.template-node-heading strong {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.node-status {
+  font-size: 10px;
+  color: #657d87;
+  background: #f0f4f5;
+  padding: 4px 7px;
+  border-radius: 3px;
+}
+.node-ready {
+  color: #347965;
+  background: #edf7f2;
+}
+.node-failed {
+  color: #b04d42;
+  background: #fff2f0;
 }
 .auth-session {
   border-top: 1px solid var(--line);
@@ -1345,7 +1400,7 @@ input::placeholder {
   .catalog-panel {
     padding: 20px;
   }
-  .subscriptions-panel {
+  .agents-panel {
     padding: 20px;
   }
   .account-selectors {

@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/client";
-import type { Host, Resources, TemplateRecord } from "@/lib/types";
+import type { Resources, TemplateRecord } from "@/lib/types";
 
 function resources(value: Resources) {
   return `${value.cpu} vCPU · ${value.memory_gib} GiB RAM · ${value.disk_gib} GiB disk`;
@@ -44,26 +44,27 @@ function downloadTemplate(record: TemplateRecord) {
 
 function TemplateEntry({
   record,
-  hosts,
-  installing,
-  install,
+  refresh,
 }: {
   record: TemplateRecord;
-  hosts: Host[];
-  installing: string[];
-  install: (host: string, template: string) => Promise<boolean>;
+  refresh: () => Promise<void>;
 }) {
-  const [host, setHost] = useState(hosts.find((item) => item.online)?.id ?? "");
   const [submitting, setSubmitting] = useState(false);
-  const selected = hosts.find((item) => item.id === host);
-  const deployment = record.deployments?.find((item) => item.host_id === host);
-  const busy = submitting || installing.includes(`${host}/${record.id}`);
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (!selected?.online || busy || deployment?.in_sync) return;
+  const [error, setError] = useState("");
+  const nodes = record.sync?.nodes ?? [];
+  const ready = nodes.filter((node) => node.status === "ready").length;
+  const busy = submitting || nodes.some((node) => node.status === "syncing");
+  async function retry() {
     setSubmitting(true);
+    setError("");
     try {
-      await install(host, record.id);
+      await api(
+        `/api/control/v1/templates/${encodeURIComponent(record.id)}/sync`,
+        { method: "POST", body: "{}" },
+      );
+      await refresh();
+    } catch (err) {
+      setError((err as Error).message);
     } finally {
       setSubmitting(false);
     }
@@ -104,94 +105,121 @@ function TemplateEntry({
           Native clients: {record.native_clients.join(", ")}
         </p>
       )}
-      <form className="template-install" onSubmit={submit}>
-        <label>
-          Install host
-          <select
-            value={host}
-            onChange={(event) => setHost(event.target.value)}
-            required
-          >
-            <option value="" disabled>
-              Select a host
-            </option>
-            {hosts.map((item) => (
-              <option key={item.id} value={item.id} disabled={!item.online}>
-                {item.label}
-                {!item.online ? " (offline)" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button
-          className="button"
-          type="submit"
-          disabled={!selected?.online || busy || !!deployment?.in_sync}
-        >
-          {busy
-            ? "Installing…"
-            : deployment?.in_sync
-              ? "Installed"
-              : deployment
-                ? "Sync template"
-                : "Install template"}
-        </button>
-      </form>
-      <p
-        className={`deployment-status ${deployment && !deployment.in_sync ? "out-of-sync" : ""}`}
-      >
-        {deployment
-          ? `Installed revision ${deployment.revision} · ${deployment.in_sync ? "Up to date" : "Out of sync"}`
-          : "Not installed on this host."}
-      </p>
-      {deployment && (
-        <p className="mono deployment-source">
-          {deployment.source}/{deployment.snapshot}
+      <div className="template-sync-heading">
+        <p className="deployment-status">
+          {record.sync
+            ? `${ready} / ${nodes.length} nodes ready · target revision ${record.sync.desired_revision}`
+            : "Synchronization status has not been reported."}
         </p>
+        <button
+          className="button small"
+          type="button"
+          disabled={busy || (nodes.length > 0 && ready === nodes.length)}
+          onClick={retry}
+        >
+          {submitting ? "Requesting sync…" : "Retry sync"}
+        </button>
+      </div>
+      {error && (
+        <p className="account-error" role="alert">
+          {error}
+        </p>
+      )}
+      {nodes.length ? (
+        <ul
+          className="template-nodes"
+          aria-label={`${record.label} node synchronization`}
+        >
+          {nodes.map((node) => {
+            const deployment = record.deployments?.find(
+              (item) => item.host_id === node.host_id,
+            );
+            return (
+              <li
+                key={node.host_id}
+                aria-label={`${node.label} synchronization`}
+              >
+                <div className="template-node-heading">
+                  <strong>{node.label}</strong>
+                  <span className={`node-status node-${node.status}`}>
+                    {node.status.charAt(0).toUpperCase() + node.status.slice(1)}
+                  </span>
+                </div>
+                {deployment && (
+                  <p className="deployment-status">
+                    Installed revision {deployment.revision} ·{" "}
+                    {node.status === "ready" && deployment.in_sync
+                      ? "Up to date"
+                      : "Awaiting synchronization"}
+                  </p>
+                )}
+                {node.error && <p className="account-error">{node.error}</p>}
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        record.sync && (
+          <p className="catalog-description">
+            No nodes registered. This template will sync when a node joins.
+          </p>
+        )
       )}
     </article>
   );
 }
 
 export function TemplateCatalog({
-  hosts,
   refreshToken,
-  installing,
-  install,
   registered,
   close,
 }: {
-  hosts: Host[];
   refreshToken: number;
-  installing: string[];
-  install: (host: string, template: string) => Promise<boolean>;
   registered: () => void;
   close: () => void;
 }) {
   const [records, setRecords] = useState<TemplateRecord[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [notice, setNotice] = useState("");
   const [source, setSource] = useState("url");
   const [url, setUrl] = useState("");
   const [manifest, setManifest] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const current = useRef<AbortController | null>(null);
   const load = useCallback(async () => {
+    if (current.current) return;
+    const controller = new AbortController();
+    current.current = controller;
     setLoading(true);
     try {
       const data = await api<{ templates: TemplateRecord[] }>(
         "/api/control/v1/templates",
+        { signal: controller.signal },
       );
-      setRecords(data.templates);
-      setError("");
+      if (!controller.signal.aborted) {
+        setRecords(data.templates);
+        setLoadError("");
+      }
     } catch (err) {
-      setError((err as Error).message);
+      if (!controller.signal.aborted) {
+        setLoadError((err as Error).message);
+        setRecords(null);
+      }
     } finally {
-      setLoading(false);
+      if (current.current === controller) current.current = null;
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, []);
   useEffect(() => {
     void load();
+    const timer = setInterval(() => void load(), 2000);
+    return () => {
+      clearInterval(timer);
+      current.current?.abort();
+      current.current = null;
+    };
   }, [load, refreshToken]);
   async function register(event: FormEvent) {
     event.preventDefault();
@@ -217,7 +245,9 @@ export function TemplateCatalog({
         body: JSON.stringify(body),
       });
       await load();
-      setNotice("Template registered. Choose a host to install it.");
+      setNotice(
+        "Template registered. Automatic synchronization is queued across all nodes.",
+      );
       registered();
     } catch (err) {
       setError((err as Error).message);
@@ -230,7 +260,10 @@ export function TemplateCatalog({
       <div className="section-title">
         <div>
           <h2 id="catalog-title">Template catalog</h2>
-          <p>Import a template, then install or sync it on a host.</p>
+          <p>
+            Register once. Templates automatically sync to every registered
+            node, including nodes added later.
+          </p>
         </div>
         <button className="button small" type="button" onClick={close}>
           Close catalog
@@ -239,6 +272,11 @@ export function TemplateCatalog({
       {error && (
         <div className="alert" role="alert">
           {error}
+        </div>
+      )}
+      {loadError && (
+        <div className="alert" role="alert">
+          {loadError}
           <button className="text-button" onClick={load}>
             Retry catalog
           </button>
@@ -291,9 +329,9 @@ export function TemplateCatalog({
         </button>
       </form>
       <p className="workspace-hint">
-        Registration adds a manifest to the catalog. Installation prepares a
-        credential-free base on the selected host; native clients use their own
-        authentication.
+        The controller keeps the canonical template. Each node prepares a
+        credential-free base; workspace creation becomes available only after
+        that node reports ready.
       </p>
       {records === null ? (
         <p className="catalog-description">
@@ -304,13 +342,7 @@ export function TemplateCatalog({
       ) : records.length ? (
         <div className="catalog-grid">
           {records.map((record) => (
-            <TemplateEntry
-              key={record.id}
-              record={record}
-              hosts={hosts}
-              installing={installing}
-              install={install}
-            />
+            <TemplateEntry key={record.id} record={record} refresh={load} />
           ))}
         </div>
       ) : (

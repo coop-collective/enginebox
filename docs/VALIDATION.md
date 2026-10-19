@@ -1,6 +1,6 @@
 # Reference-host validation
 
-October 19, 2026. These are development acceptance results on newly created VMs, not a throughput benchmark or a claim of compatibility with every supported host configuration. Private host names, addresses, inventory and raw evidence are excluded from the repository.
+October 19, 2026. These are development acceptance results on newly created VMs and isolated test directories in an owner-authorized workspace, not a throughput benchmark or a claim of compatibility with every supported host configuration. Private host names, addresses, inventory and raw evidence are excluded from the repository.
 
 ## Tested platform
 
@@ -65,8 +65,122 @@ Live REST checks rejected session access/cancellation under a different provider
 
 The deployed dashboard then started all three native flows through its authenticated proxy, displayed the real provider prompts and cancelled them successfully. Desktop and 390-pixel mobile views were checked without horizontal overflow. The disposable account-test workspace was removed afterward; the two user workspaces retained their states, two fresh reserves remained ready, and the existing GitHub runner stayed active.
 
-Offline validation ran **172 Python tests** with **one opt-in live-browser test skipped**, **8 installer tests**, **19 dashboard unit tests** and **16 browser fixture tests**, plus TypeScript and production builds. Auth regressions include code input without echo/storage, native-status verification after exit, process-group cleanup on cancel/transport EOF/expiry, cancellation during a slow status check, duplicate-login locking, bounded sessions, exact provider URLs and split terminal-control sequences. Fixture browser tests cover workspace selection, session recovery, polling cleanup, reconnect/cancel and mobile layout. Real account authorization, paid-plan entitlement, native credential persistence and inference remain owner acceptance steps.
+Offline validation ran **172 Python tests** with **one opt-in live-browser test skipped**, **8 installer tests**, **19 dashboard unit tests** and **16 browser fixture tests**, plus TypeScript and production builds. Auth regressions include code input without echo/storage, native-status verification after exit, process-group cleanup on cancel/transport EOF/expiry, cancellation during a slow status check, duplicate-login locking, bounded sessions, exact provider URLs and split terminal-control sequences. Fixture browser tests cover workspace selection, session recovery, polling cleanup, reconnect/cancel and mobile layout. These prompt/cancellation checks did not establish inference; the later authorized run below tested it separately.
+
+## Native inference and conversation resume
+
+The owner authorized a small test with existing native account connections in one
+private workspace. Each provider received its own unique test directory. No API
+key override was supplied, no billing setting was changed, and the test did not
+pause the workspace or log out existing accounts. Raw JSON, session identifiers
+and random canaries remain private.
+
+| Native client | Code and assertions | Exact-session resume | Browser MCP |
+| --- | --- | --- | --- |
+| Codex 0.163.0 | Passed after the sandbox diagnostic below | Passed; recalled conversation-only canary | Passed |
+| Claude Code 2.1.302, Haiku | Passed | Passed; recalled conversation-only canary | Passed |
+| Cursor Agent 2026.10.16-e3cb207 | Provider quota blocked | Not attempted after quota rejection | Not attempted |
+
+The first prompt requested a tiny `add` function and native shell assertions. A
+new CLI process resumed the exact saved conversation, recalled a random canary
+that was absent from the resume prompt and project files, added `multiply`, and
+ran four assertions. Independent inspection then executed the generated code and
+confirmed all assertions passed for Codex and Claude.
+
+The command patterns were:
+
+```sh
+codex exec --json --skip-git-repo-check \
+  -c model_reasoning_effort='"low"' -c approval_policy='"never"' \
+  -c sandbox_mode='"workspace-write"' -
+codex exec resume SESSION_ID --json --skip-git-repo-check \
+  -c model_reasoning_effort='"low"' -c approval_policy='"never"' \
+  -c sandbox_mode='"danger-full-access"' -
+claude -p --output-format stream-json --verbose --model haiku \
+  --permission-mode acceptEdits --allowedTools Read,Write,Edit,Bash --max-turns 10
+claude -p --resume SESSION_ID --output-format stream-json --verbose --model haiku \
+  --permission-mode acceptEdits --allowedTools Read,Write,Edit,Bash --max-turns 12
+agent -p --output-format stream-json --force --trust PROMPT
+```
+
+Codex's first `workspace-write` turn authenticated and responded, but its native
+tool sandbox failed with `bwrap: Operation not permitted`. The resumed diagnostic
+used `danger-full-access` inside the existing VM and passed file and command
+execution. That verifies the harness with VM isolation; it does not qualify the
+default inner sandbox or recommend disabling it generally.
+
+The third turn resumed those same Codex/Claude sessions and used only the installed
+browser MCP to open a temporary loopback fixture, type a name, click a button,
+inspect an inline snapshot, and save a screenshot. Both produced a valid PNG and
+observed the expected greeting. No external website or account page was opened.
+Claude used the test's separate browser-home override. Codex did not visibly
+honor that environment override, so per-test browser-profile isolation was not
+established for its native MCP launch; the configured client profile remained
+subject to the browser service's lock.
+
+Cursor returned a team usage-limit error with a provider-reported reset date of
+October 23, 2026. Authentication had succeeded, but usable quota had not. The run
+was not retried, and on-demand billing was not enabled. Its native inference,
+resume and browser integration remain unqualified.
+
+Each invocation had a 180-second limit and process-group cleanup. No invocation
+timed out. A final read-only check found no process still using the test directory
+as its working directory. These results cover original native account credentials;
+the separate central-adoption test below covers delegated access.
+
+## Central adoption and delegated native access
+
+After the owner-authorized adoption into the controller, automatic synchronization
+delivered access to one disposable assigned workspace. Model-free checks verified
+the same pinned native versions, mode-0600 credential files, delivery markers, no
+provider API-key override and no genuine refresh credentials in that workspace.
+
+| Provider | Delivered native material | Native status |
+| --- | --- | --- |
+| Codex | External `chatgptAuthTokens` mode, empty refresh-token field | Connected using ChatGPT |
+| Claude | `settings.env.CLAUDE_CODE_OAUTH_TOKEN`, no native OAuth cache | `loggedIn: true`, `authMethod: oauth_token` |
+| Cursor | Access JWT in both cache slots, matching the pinned native `--auth-token` persistence behavior | `authenticated`, `isAuthenticated: true` |
+
+Cursor's two fields contain the same access credential, not its browser refresh
+credential. This is a tested compatibility format, not a promise that native
+status proves usable quota or that future client versions retain the format.
+
+After the [Ubuntu bubblewrap profile repair](CODEX-SANDBOX.md), Codex's model-free
+sandbox check passed. Two small inference turns then passed with
+`sandbox_mode="workspace-write"` throughout; no sandbox bypass was used. Claude
+also passed two small Haiku turns with the delegated token. Each client created a
+function, executed native assertions, resumed the exact session in a fresh process,
+recalled a conversation-only canary, changed the file and executed the follow-up
+assertions. Independent code execution confirmed the results and the canary's
+absence from the generated code. Cursor received only a status check, with no new
+inference attempt.
+
+The first/resumed process times were **7.824 / 6.731 seconds** for Codex and
+**6.402 / 6.486 seconds** for Claude. These are individual acceptance samples, not
+performance benchmarks. No process timed out; the final inspection found no
+process still using the test directory as its working directory. Automatic
+expiry/renewal and live credential reload remain separate qualification steps.
+
+The authenticated API then hibernated this disposable workspace and resumed it,
+without another inference request. Jobs completed in **15.091 / 12.570 seconds**.
+Machine ID and boot ID were unchanged, as were both native conversation transcript
+checksums, generated code checksums and delegation markers. All three resume-hook
+attachments returned `unchanged`; post-wake native status and access-only checks
+passed for every client. The workspace was left running for the controller's
+separate credential-renewal checks.
+
+## Controller connections and automatic template synchronization
+
+The deployed controller adopted all three existing sign-ins without a new browser login. Both existing private workspaces received access-only credentials automatically. Original native Codex and Claude refresh operations completed successfully, changed the access credentials, and the controller delivered the renewed generations to both workspaces. All three connections remained ready across the final controller restart. This checks explicit native renewal; it does not establish hot token replacement inside an already-running CLI or every elapsed-time expiry case.
+
+Isolated controller homes exercised all three native browser/device prompts and clean cancellation without using the real accounts. The Claude setup-token flow exposed its manual-code input after a regression fix for its cursor-positioned terminal prompt. No test authentication caches or native processes remained.
+
+Registering native development revision 2 automatically queued and completed node installation in **162.068 seconds**, including the documented Codex sandbox fix. A subsequent fresh warm assignment completed in **2.117 seconds** measured by the server job, including delivery of all three connections. The clean template and unassigned reserves received no credentials. Multi-node synchronization, new-node discovery, binding/revision changes, capacity failures and retries were verified offline; this live installation has one node. Inventory changes currently require a controller restart.
+
+The final deployed dashboard passed read-only checks at 1440-pixel desktop and 390-pixel mobile widths: three controller connections ready, no workspace connection selector, template revision 2 ready on 1/1 nodes, no installation-target selector, and no browser/page/HTTP errors. The checks made no control mutations and found no API token or password in the rendered document or browser storage.
+
+Final offline validation: **205 Python tests** with **one opt-in browser test skipped**, **8 installer tests**, **19 dashboard unit tests**, **18 fixture browser tests**, TypeScript and production builds. The sandbox disposable and fresh-allocation disposable were removed. The two original private workspaces remain running, with two ready reserves on the new template. Superseded clean reserves were stopped and quarantined with disks retained; original bases and the separate CI runner were preserved.
 
 ## Remaining qualification
 
-Fresh-host package/bridge installation, an independent operator's second machine, host reboot, off-host backup restore, upgrades/rollback, arbitrary shared mounts, production multitenancy and native subscription inference remain separate gates. Browser control was exercised directly over MCP; no paid model prompt or completed account authorization was used. Interactive noVNC viewer transport remains separate from the working headless browser path.
+Fresh-host package/bridge installation, an independent operator's second machine, host reboot, off-host backup restore, upgrades/rollback, arbitrary shared mounts and production multitenancy remain separate gates. Native inference and central delegation are qualified only as recorded above; automatic expiry/renewal, long-running credential reload and Cursor quota availability require separate validation. Interactive noVNC viewer transport remains separate from the working headless browser path.

@@ -278,13 +278,14 @@ test("native account proxy routes stay scoped to known providers and session ope
   const fetch = t.mock.method(globalThis, "fetch", async () =>
     Response.json({ ok: true }),
   );
-  const base = "v1/hosts/test-host/instances/ebox-test/accounts";
+  const base = "v1/agents";
   const session = "1234567890abcdef1234567890abcdef";
   for (const [method, path] of [
     ["GET", base],
     ["GET", `${base}/codex/sessions/${session}`],
     ["POST", `${base}/codex/login`],
     ["POST", `${base}/cursor/login`],
+    ["POST", "v1/templates/native-dev/sync"],
     ["POST", `${base}/claude/sessions/${session}/input`],
     ["POST", `${base}/cursor/sessions/${session}/cancel`],
   ])
@@ -305,6 +306,7 @@ test("native account proxy routes stay scoped to known providers and session ope
     ["POST", `${base}/claude/sessions/not-a-session/cancel`],
     ["POST", `${base}/claude/sessions/${session}/delete`],
     ["POST", `${base}/claude/logout`],
+    ["GET", "v1/hosts/test-host/instances/ebox-test/accounts"],
   ])
     await assert.rejects(
       proxy(

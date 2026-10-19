@@ -25,6 +25,16 @@ export type TemplateRecord = PreparedTemplate & {
   native_clients?: string[];
   config?: Record<string, boolean>;
   manifest_digest: string;
+  sync?: {
+    desired_revision: number;
+    nodes: {
+      host_id: string;
+      label: string;
+      status: "pending" | "syncing" | "ready" | "failed";
+      error?: string;
+      job_id?: string;
+    }[];
+  };
   deployments: {
     host_id: string;
     source: string;
@@ -110,8 +120,8 @@ export type Job = {
 export type ProviderId = "codex" | "claude" | "cursor";
 export type AuthSession = {
   id: string;
-  host_id: string;
-  name: string;
+  host_id?: string;
+  name?: string;
   provider: ProviderId;
   status:
     "starting" | "waiting" | "succeeded" | "failed" | "cancelled" | "expired";
@@ -129,4 +139,6 @@ export type ProviderAccount = {
   auth_method: "subscription" | "account" | "api_key" | "unknown" | "none";
   detail?: string;
   session?: AuthSession | null;
+  delegation_status?: "ready" | "unsupported" | "reauth_required" | "unknown";
+  workspace_count?: number;
 };

@@ -4,7 +4,14 @@ const GiB = 1024 ** 3;
 const token = "fixture-api-token-server-only-12345";
 const minimum = { cpu: 2, memory_gib: 2, disk_gib: 30 };
 const recommended = { cpu: 4, memory_gib: 4, disk_gib: 40 };
-let mode, jobs, instances, templates, authSessions, connectedAccounts;
+let mode,
+  jobs,
+  instances,
+  templates,
+  authSessions,
+  connectedAccounts,
+  syncProgress,
+  retried;
 function manifest(id = "native", revision = 1) {
   return {
     schema_version: 1,
@@ -20,6 +27,19 @@ function manifest(id = "native", revision = 1) {
     config: { browser: true },
     manifest_digest: String(revision).padStart(64, "0"),
     deployments: [],
+    sync: {
+      desired_revision: revision,
+      nodes: [
+        { host_id: "metal-01", label: "Build machine", status: "pending" },
+        {
+          host_id: "metal-02",
+          label: "Spare machine",
+          status: "pending",
+          error:
+            "Node is offline; synchronization will retry when it reconnects.",
+        },
+      ],
+    },
   };
 }
 function reset() {
@@ -27,6 +47,8 @@ function reset() {
   jobs = new Map();
   authSessions = new Map();
   connectedAccounts = new Set();
+  syncProgress = new Map();
+  retried = new Set();
   const native = manifest();
   native.deployments.push({
     host_id: "metal-01",
@@ -36,6 +58,7 @@ function reset() {
     manifest_digest: native.manifest_digest,
     in_sync: true,
   });
+  native.sync.nodes[0].status = "ready";
   templates = [native];
   instances = [
     {
@@ -91,10 +114,16 @@ createServer(async (req, res) => {
   }
   if (req.url === "/__test/mode") {
     mode = data.mode;
-    if (mode.startsWith("accounts")) {
-      instances.find((item) => item.name === "ebox-review").status = "Running";
-      connectedAccounts.add("ebox-review/codex");
-    }
+    if (mode === "accounts-unsupported") connectedAccounts.add("cursor");
+    if (mode === "accounts-reauth") connectedAccounts.add("claude");
+    if (mode === "catalog-new-node")
+      for (const record of templates) {
+        record.sync.nodes.push({
+          host_id: "metal-03",
+          label: "New machine",
+          status: "pending",
+        });
+      }
     if (poolMode())
       for (const state of ["ready", "preparing", "quarantined"]) {
         if (!instances.some((item) => item.name === `ebox-pool-${state}`))
@@ -118,7 +147,42 @@ createServer(async (req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`)
     return send(401, { error: "Wrong backend token" });
   if (req.url === "/v1/templates") {
-    if (req.method === "GET") return send(200, { templates });
+    if (req.method === "GET") {
+      for (const record of templates)
+        for (const node of record.sync.nodes) {
+          if (
+            node.host_id === "metal-02" ||
+            !["pending", "syncing"].includes(node.status)
+          )
+            continue;
+          const key = `${record.id}/${record.revision}/${node.host_id}`;
+          const count = (syncProgress.get(key) ?? 0) + 1;
+          syncProgress.set(key, count);
+          node.status =
+            count < 3
+              ? "syncing"
+              : mode === "catalog-sync-error" && !retried.has(record.id)
+                ? "failed"
+                : "ready";
+          if (node.status === "failed")
+            node.error = "Not enough disk capacity to prepare this template.";
+          if (node.status === "ready") {
+            delete node.error;
+            record.deployments = record.deployments.filter(
+              (item) => item.host_id !== node.host_id,
+            );
+            record.deployments.push({
+              host_id: node.host_id,
+              source: `ebox-template-${record.id}`,
+              snapshot: "clean",
+              revision: record.revision,
+              manifest_digest: record.manifest_digest,
+              in_sync: true,
+            });
+          }
+        }
+      return send(200, { templates });
+    }
     if (req.method === "POST") {
       const value = data.manifest ?? manifest("url-native");
       if (!value.id || !value.minimum || !value.recommended)
@@ -130,6 +194,23 @@ createServer(async (req, res) => {
         ...value,
         manifest_digest: String(value.revision).padStart(64, "0"),
         deployments: existing?.deployments ?? [],
+        sync: {
+          desired_revision: value.revision,
+          nodes: (existing?.sync.nodes ?? manifest().sync.nodes).map(
+            (node) => ({
+              host_id: node.host_id,
+              label: node.label,
+              status:
+                existing?.revision === value.revision ? node.status : "pending",
+              ...(node.host_id === "metal-02"
+                ? {
+                    error:
+                      "Node is offline; synchronization will retry when it reconnects.",
+                  }
+                : {}),
+            }),
+          ),
+        },
       };
       record.deployments = record.deployments.map((item) => ({
         ...item,
@@ -141,6 +222,18 @@ createServer(async (req, res) => {
       ];
       return send(200, { template: record });
     }
+  }
+  const sync = req.url.match(/^\/v1\/templates\/([a-z][a-z0-9-]*)\/sync$/);
+  if (req.method === "POST" && sync) {
+    const record = templates.find((item) => item.id === sync[1]);
+    if (!record) return send(404, { error: "Unknown template." });
+    retried.add(record.id);
+    for (const node of record.sync.nodes)
+      if (node.status !== "ready") {
+        node.status = "pending";
+        delete node.error;
+      }
+    return send(202, { template: record.id, requested: true });
   }
   if (req.url === "/v1/fleet") {
     if (mode === "error")
@@ -203,7 +296,9 @@ createServer(async (req, res) => {
               },
             ],
       templates: templates
-        .filter((item) => item.deployments.length)
+        .filter((item) =>
+          item.deployments.some((deployment) => deployment.in_sync),
+        )
         .map((item) => ({
           id: item.id,
           label: item.label,
@@ -223,9 +318,9 @@ createServer(async (req, res) => {
                           recommended: item.recommended,
                         },
                 },
-                host_ids: item.deployments.map(
-                  (deployment) => deployment.host_id,
-                ),
+                host_ids: item.deployments
+                  .filter((deployment) => deployment.in_sync)
+                  .map((deployment) => deployment.host_id),
               }
             : {}),
         })),
@@ -237,18 +332,10 @@ createServer(async (req, res) => {
     });
   }
   const accounts = req.url.match(
-    /^\/v1\/hosts\/metal-01\/instances\/(ebox-[a-z0-9-]+)\/accounts(?:\/(codex|claude|cursor)\/(login|sessions)(?:\/([a-f0-9]{32})(?:\/(input|cancel))?)?)?$/,
+    /^\/v1\/agents(?:\/(codex|claude|cursor)\/(login|sessions)(?:\/([a-f0-9]{32})(?:\/(input|cancel))?)?)?$/,
   );
   if (accounts) {
-    const [, name, provider, operation, id, inputAction] = accounts;
-    const vm = instances.find((item) => item.name === name);
-    if (
-      !vm?.managed ||
-      (vm.warm_pool_state && vm.warm_pool_state !== "claimed")
-    )
-      return send(400, { error: "Choose an assigned workspace." });
-    if (vm.status !== "Running")
-      return send(409, { error: "Resume this workspace to connect accounts." });
+    const [, provider, operation, id, inputAction] = accounts;
     const publicSession = (session) => {
       const { polls, ...value } = session;
       return value;
@@ -256,19 +343,18 @@ createServer(async (req, res) => {
     if (req.method === "GET" && !provider) {
       if (mode === "accounts-error")
         return send(503, { error: "Native account status is unavailable." });
-      if (mode === "accounts-delayed" && name === "ebox-editor")
+      if (mode === "accounts-delayed")
         await new Promise((resolve) => setTimeout(resolve, 800));
       return send(200, {
         providers: ["codex", "claude", "cursor"].map((provider) => {
           const installed = !(
             mode === "accounts-unavailable" && provider === "cursor"
           );
-          const connected = connectedAccounts.has(`${name}/${provider}`);
+          const connected = connectedAccounts.has(provider);
           const session = [...authSessions.values()]
             .reverse()
             .find(
               (item) =>
-                item.name === name &&
                 item.provider === provider &&
                 ["starting", "waiting"].includes(item.status),
             );
@@ -283,8 +369,19 @@ createServer(async (req, res) => {
               : "unavailable",
             auth_method: connected ? "account" : "none",
             detail: connected
-              ? `Account connected in ${name}.`
-              : "No account connected in this workspace.",
+              ? "Account connected on the controller."
+              : installed
+                ? "No controller account connected."
+                : "Native client is not installed on the controller.",
+            delegation_status:
+              mode === "accounts-unsupported" && provider === "cursor"
+                ? "unsupported"
+                : mode === "accounts-reauth" && provider === "claude"
+                  ? "reauth_required"
+                  : connected
+                    ? "ready"
+                    : "unknown",
+            ...(connected ? { workspace_count: 2 } : {}),
             ...(session ? { session: publicSession(session) } : {}),
           };
         }),
@@ -294,8 +391,6 @@ createServer(async (req, res) => {
       const id = String(authSessions.size + 1).padStart(32, "0");
       const session = {
         id,
-        host_id: "metal-01",
-        name,
         provider,
         status: "waiting",
         input_required: provider === "claude",
@@ -317,7 +412,7 @@ createServer(async (req, res) => {
       return send(200, { session: publicSession(session) });
     }
     const session = authSessions.get(id);
-    if (!session || session.name !== name || session.provider !== provider)
+    if (!session || session.provider !== provider)
       return send(404, { error: "Unknown sign-in session." });
     if (req.method === "POST" && inputAction === "cancel") {
       session.status = "cancelled";
@@ -348,7 +443,7 @@ createServer(async (req, res) => {
         ) {
           session.status = "succeeded";
           session.message = "Native account sign-in completed.";
-          connectedAccounts.add(`${name}/${provider}`);
+          connectedAccounts.add(provider);
         }
       }
       return send(200, { session: publicSession(session) });

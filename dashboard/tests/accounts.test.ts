@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assignedWorkspace, officialAuthorizationUrl } from "../lib/accounts";
-import type { Instance, ProviderId } from "../lib/types";
+import { delegationLabel, officialAuthorizationUrl } from "../lib/accounts";
+import type { ProviderAccount, ProviderId } from "../lib/types";
 
 test("provider links accept only verified official HTTPS sign-in endpoints", () => {
   const expected: [ProviderId, string][] = [
@@ -58,22 +58,48 @@ test("provider links accept only verified official HTTPS sign-in endpoints", () 
   );
 });
 
-test("only assigned managed workspaces may receive provider credentials", () => {
-  const instance: Instance = {
-    name: "ebox-test",
-    status: "Running",
-    stateful: false,
-    ipv4: [],
-    cpu: 4,
-    memory_bytes: 4 * 1024 ** 3,
-    managed: true,
+test("workspace availability requires both connected account and confirmed delegation", () => {
+  const account: ProviderAccount = {
+    id: "codex",
+    label: "Codex",
+    installed: true,
+    status: "connected",
+    auth_method: "account",
   };
-  assert.equal(assignedWorkspace(instance), true);
   assert.equal(
-    assignedWorkspace({ ...instance, warm_pool_state: "claimed" }),
-    true,
+    delegationLabel(account),
+    "Workspace access has not been confirmed.",
   );
-  for (const warm_pool_state of ["ready", "preparing", "quarantined"] as const)
-    assert.equal(assignedWorkspace({ ...instance, warm_pool_state }), false);
-  assert.equal(assignedWorkspace({ ...instance, managed: false }), false);
+  assert.equal(
+    delegationLabel({
+      ...account,
+      installed: false,
+      delegation_status: "ready",
+    }),
+    "Workspace access has not been confirmed.",
+  );
+  assert.equal(
+    delegationLabel({
+      ...account,
+      delegation_status: "ready",
+      workspace_count: 2,
+    }),
+    "Available to 2 private workspaces.",
+  );
+  assert.equal(
+    delegationLabel({
+      ...account,
+      delegation_status: "ready",
+      status: "disconnected",
+    }),
+    "Workspace access has not been confirmed.",
+  );
+  assert.match(
+    delegationLabel({ ...account, delegation_status: "unsupported" }),
+    /not supported/,
+  );
+  assert.match(
+    delegationLabel({ ...account, delegation_status: "reauth_required" }),
+    /Reconnect/,
+  );
 });

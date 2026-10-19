@@ -138,6 +138,39 @@ class FleetAllocationHTTPTests(unittest.TestCase):
         self.assertEqual(response["job"]["status"], "succeeded", response)
         return response["job"]["result"]
 
+    def test_registration_wakes_global_sync_and_retries_without_host_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.fleet.registry = Registry(Path(directory))
+            with patch.object(self.fleet.template_sync, "wake") as wake:
+                self.assertEqual(self.request("/v1/templates", {"manifest": manifest()})[0], 200)
+                wake.assert_called_once()
+            status, result = self.request("/v1/templates/native/sync", {})
+            self.assertEqual((status, result), (202, {"template": "native", "requested": True}))
+            self.assertEqual(self.request("/v1/templates/native/sync", {"host_id": "primary"})[0], 400)
+            self.assertEqual(self.request("/v1/templates/native/sync", {}, authorized=False)[0], 401)
+
+    def test_assignment_delivers_agents_under_lifecycle_lock_without_failing_vm_on_auth_error(self):
+        self.fleet.agents = Mock()
+        def attach(host_id, name):
+            self.assertTrue(self.fleet.locks[host_id].locked())
+            self.assertEqual(self.host_lock_depth, 1)
+            raise RuntimeError("private provider diagnostic must not reach job journal")
+        self.fleet.agents.attach.side_effect = attach
+        status, body = self.request("/v1/hosts/primary/instances", {"name": "ebox-auth-test", "template": "native", "size": "minimum"})
+        self.assertEqual(status, 202)
+        result = self.fleet.executor.submit(lambda: None)
+        result.result(timeout=2)
+        import time
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            job = self.fleet.job(body["job"]["id"])
+            if job["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(.01)
+        self.assertEqual(job["status"], "succeeded")
+        self.assertIn("retry", job["result"]["agents"]["error"])
+        self.assertNotIn("private provider diagnostic", json.dumps(job))
+
     def test_authenticated_custom_allocation_runs_real_queue_and_warm_claim(self):
         custom = {"cpu": 6, "memory_gib": 8, "disk_gib": 60}
         self.add_warm_member(custom)

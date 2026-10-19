@@ -1,6 +1,6 @@
 # Fleet API and MCP
 
-The fleet service creates prepared Incus VMs and manages their lifecycle through the same capacity checks for the dashboard and MCP clients. It operates as a trusted owner using configured SSH identities and administrative Incus access. It does not schedule agent prompts, share provider accounts or implement public multi-tenant hosting.
+The fleet service creates prepared Incus VMs and manages their lifecycle through the same capacity checks for the dashboard and MCP clients. It operates as a trusted owner using configured SSH identities and administrative Incus access. It does not schedule agent prompts, pool accounts across unrelated owners or implement public multi-tenant hosting.
 
 ## Configure the hosts and templates
 
@@ -81,11 +81,13 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `POST /v1/hosts/{host_id}/instances` | Queue a clone: `{"name":"ebox-work","template":"native-agents","size":"standard"}`. |
 | `POST /v1/hosts/{host_id}/instances/{name}/actions` | Queue `{"action":"pause"}`, `resume`, `hibernate` or `stop`. |
 | `GET /v1/jobs/{job_id}` | Poll the job's `queued`, `running`, `succeeded` or `failed` state. |
-| `GET /v1/hosts/{host_id}/instances/{name}/accounts` | Native Codex, Claude and Cursor sign-in status, with any active sign-in session. |
-| `POST /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/login` | Start native browser/device sign-in using `{}`; returns HTTP 202 with a session. |
-| `GET /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/sessions/{id}` | Poll an in-memory sign-in session. |
-| `POST /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/sessions/{id}/input` | Submit Claude's one-time authorization code as `{"text":"…"}`. |
-| `POST /v1/hosts/{host_id}/instances/{name}/accounts/{provider}/sessions/{id}/cancel` | Cancel pending sign-in using `{}`. |
+| `GET /v1/agents` | Controller Codex, Claude and Cursor connection/delegation status. |
+| `POST /v1/agents/{provider}/login` | Start native controller sign-in using `{}`; HTTP 202 with a session. |
+| `GET /v1/agents/{provider}/sessions/{id}` | Poll the in-memory sign-in session. |
+| `POST /v1/agents/{provider}/sessions/{id}/input` | Submit the one-time authorization code as `{"text":"…"}`. |
+| `POST /v1/agents/{provider}/sessions/{id}/cancel` | Cancel pending sign-in using `{}`. |
+| `POST /v1/templates/{id}/sync` | Retry synchronization on all registered nodes using `{}`. |
+| `GET /v1/hosts/{host_id}/instances/{name}/accounts` | Legacy native workspace status for diagnostics; workspace login creation returns 409. |
 
 Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no arbitrary command-execution, snapshot-restore or deletion endpoint.
 
@@ -97,11 +99,13 @@ For optional prebooted reserves, see [warm pools](WARM-POOLS.md). Allocation ret
 
 ## Provider accounts
 
-Use the dashboard's **Subscriptions** panel for owner sign-in. The account routes accept only `codex`, `claude` and `cursor`, and only assigned, running workspaces in the host's configured admission pool. Bases and unassigned warm reserves cannot receive accounts. Resume a paused or stopped workspace first.
+Use the dashboard's **Agents** panel to connect the owner once. The control-plane installer prepares original CLIs in persistent private storage. Native browser/device authorization runs on the controller; validated links, one-time codes and status are exposed, never credential contents. Refresh credentials stay in controller provider homes. The same owner's assigned private VMs receive compatible native access material after create/allocation/resume and through periodic reconciliation. Frozen/stopped workspaces catch up after resume. Bases and unassigned warm reserves remain credential-free.
 
-The service launches the installed native CLI as the configured guest user. It forwards only a validated provider authorization link, a device code when applicable and session state. Claude's one-time code goes to that native process. Tokens remain in the provider's native guest storage; they are not copied between workspaces or saved in the fleet registry/job journal. Sessions are temporary and expire or cancel on service shutdown. The guest supervisor terminates the login process group when the control connection ends.
+Existing signed-in workspaces are adopted explicitly with `AgentAccess.adopt(host_id, name, provider)` while that provider's native sessions are idle. Adoption retains the native account centrally and converts the source to delegated access without asking for sign-in again. Automatic discovery refuses to overwrite unmarked/manual credentials. Stored attachment receipts bind to host configuration and guest UUID. Host inventory changes take effect on service restart; there is no live node-registration API yet.
 
-Account status reflects the CLI's supported diagnostics. A browser account login is not proof of a paid plan, remaining allowance or successful inference. API-key mode is shown separately. An exit code alone does not establish login success: status is checked again. Complete or cancel active sign-in before using this controller's workspace lifecycle actions; other workspaces remain available. Provider account setup is an owner dashboard/REST operation, not a fleet MCP prompt-delegation tool. See [native-client authentication](NATIVE-CLIENTS.md).
+Private files use owner-only permissions, not application-level encryption. Native credentials never enter template manifests, job journals, API responses or browser storage. Private workspace checkpoints can contain access credentials and must remain private. Expiry/refresh behavior differs by provider; running CLIs may cache access tokens until restarted. See [native-client authentication](NATIVE-CLIENTS.md) and [usage reporting research](AGENT-USAGE.md).
+
+Connection status does not prove remaining quota. The fleet does not schedule prompts or pool unrelated accounts. Provider refresh and experimental version-qualified formats are not a general credential-rotation service.
 
 ## Capacity and coordination
 

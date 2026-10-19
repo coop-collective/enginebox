@@ -81,17 +81,28 @@ def register(mcp):
 
     @mcp.tool()
     def template_register(manifest: dict | None = None, url: str | None = None) -> dict:
-        """Register a template JSON manifest or fetch one from a public HTTPS URL. Does not install it."""
+        """Register controller desired state from JSON or HTTPS; automatically synchronize every registered node."""
         if (manifest is None) == (url is None):
             raise ValueError("Provide exactly one manifest or URL.")
         return request("/v1/templates", {"manifest": manifest} if manifest is not None else {"url": url})
 
     @mcp.tool()
     def template_install(host_id: str, template: str) -> dict:
-        """Queue installation of the registered revision on an already bootstrapped host; poll fleet_job."""
+        """Legacy targeted retry; registered templates already synchronize automatically to every node."""
         identifier(host_id)
         identifier(template)
         return request(f"/v1/hosts/{host_id}/templates/{template}/install", {})
+
+    @mcp.tool()
+    def template_sync(template: str) -> dict:
+        """Retry synchronization of a controller template to every registered node; poll template_catalog."""
+        identifier(template)
+        return request(f"/v1/templates/{template}/sync", {})
+
+    @mcp.tool()
+    def agent_connections() -> dict:
+        """Show controller agent connection readiness without exposing credentials."""
+        return request("/v1/agents")
 
     @mcp.tool()
     def fleet_action(host_id: str, name: str, action: Literal["pause", "resume", "hibernate", "stop"]) -> dict:
