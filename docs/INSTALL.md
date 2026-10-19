@@ -61,6 +61,8 @@ The supervisor configuration is JSON:
 
 Omit `dashboard_listen` to run only the native API. The environment file is parsed as JSON and never sourced as shell code. The service launches a standby controller from the active release, obtains exclusive state ownership, then serves traffic through the stable front door.
 
+On Linux/macOS, an optional absolute `state_dir` in the supervisor configuration preserves an existing controller state root outside the installation. This is useful when migrating a legacy controller without moving native homes or changing installed-client paths. The directory must already exist, belong to the service user, have owner-only permissions, contain no symlink path components, and not overlap the installation (except its normal `PREFIX/state`). A missing path is rejected rather than creating empty accounts. Omit the field for new installations and Windows. Stop the legacy writer before activating Rust against that state; the path setting does not provide a drain protocol for Python. It also does not migrate node helpers, template revisions or provider formats.
+
 ```sh
 PREFIX/releases/0.3.0/bin/enginebox-supervisor --config PREFIX/etc/supervisor.json
 ```

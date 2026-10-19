@@ -20,6 +20,8 @@ struct Args {
 #[serde(deny_unknown_fields)]
 struct Config {
     prefix: PathBuf,
+    #[serde(default)]
+    state_dir: Option<PathBuf>,
     fleet_config: PathBuf,
     token_file: PathBuf,
     #[serde(default)]
@@ -76,6 +78,7 @@ fn main() -> Result<()> {
     ensure!(token.len() >= 32, "API token too short");
     let config = SupervisorConfig {
         install: Installation::inspect(config.prefix)?,
+        state_dir: config.state_dir,
         fleet_config: config.fleet_config,
         api_listen: config.listen,
         dashboard_listen: config.dashboard_listen,

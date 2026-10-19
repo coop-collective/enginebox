@@ -188,24 +188,22 @@ fn release(
     )?;
     Ok(())
 }
-fn seed_state(install: &Installation) -> Result<()> {
-    private_dir(&install.root.join("state/jobs"))?;
+fn seed_state(state: &Path) -> Result<()> {
+    private_dir(&state.join("jobs"))?;
     atomic_json(
-        &install.root.join(format!("state/jobs/{JOB}.json")),
+        &state.join(format!("jobs/{JOB}.json")),
         &json!({"id":JOB,"status":"succeeded","host_id":"fixture","operation":"qualification","name":"ebox-fixture","result":{"proof":"durable-result-before-upgrade"}}),
     )?;
     for directory in [
-        "state/agents",
-        "state/agents/homes",
-        "state/agents/homes/claude",
-        "state/agents/homes/claude/.claude",
+        "agents",
+        "agents/homes",
+        "agents/homes/claude",
+        "agents/homes/claude/.claude",
     ] {
-        private_dir(&install.root.join(directory))?;
+        private_dir(&state.join(directory))?;
     }
     atomic_json(
-        &install
-            .root
-            .join("state/agents/homes/claude/.claude/scratchnotes.json"),
+        &state.join("agents/homes/claude/.claude/scratchnotes.json"),
         &json!({"tenant":"fixture-owner","memory":"preserve across versions"}),
     )?;
     Ok(())
@@ -356,6 +354,7 @@ async fn state_proofs(client: &reqwest::Client, url: &str) -> Result<()> {
 #[ignore = "builds an isolated second controller version and launches disposable real processes"]
 async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
     let repo = repository();
+    fs::create_dir_all(repo.join(".state"))?;
     let old = std::env::var_os("ENGINEBOX_TEST_CONTROLLER_OLD")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo.join("target/debug/enginebox-controller"));
@@ -371,7 +370,9 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let install = fixture_install(&root.join("installation"))?;
-    seed_state(&install)?;
+    let state = root.join("preserved-controller-state");
+    private_dir(&state)?;
+    seed_state(&state)?;
     let path = fake_path(&root)?;
     let fleet = fleet_config(&root)?;
     let token = token_file(&root)?;
@@ -410,7 +411,7 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
         &json!({"ENGINEBOX_DASHBOARD_PASSWORD":PASSWORD,"ENGINEBOX_SESSION_SECRET":"local-qualification-browser-session-secret-32-characters","ENGINEBOX_DASHBOARD_ORIGIN":ui,"PATH":path}),
     )?;
     let config = root.join("supervisor.json");
-    let mut value = json!({"prefix":install.root,"fleet_config":fleet,"token_file":token,"environment_file":environment,"listen":format!("127.0.0.1:{api_port}"),"drain_timeout_seconds":10});
+    let mut value = json!({"prefix":install.root,"state_dir":state,"fleet_config":fleet,"token_file":token,"environment_file":environment,"listen":format!("127.0.0.1:{api_port}"),"drain_timeout_seconds":10});
     if with_ui {
         value["dashboard_listen"] = json!(format!("127.0.0.1:{ui_port}"));
     }
@@ -426,7 +427,11 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
     let owner = File::options()
         .read(true)
         .write(true)
-        .open(install.root.join("state/controller-owner.lock"))?;
+        .open(state.join("controller-owner.lock"))?;
+    ensure!(
+        !install.root.join("state/controller-owner.lock").exists(),
+        "controller unexpectedly used an empty installation state root"
+    );
     ensure!(
         owner.try_lock_exclusive().is_err(),
         "controller did not hold exclusive ownership"
@@ -575,9 +580,7 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
         "not enough continuity requests"
     );
     let scratch: Value = serde_json::from_slice(&fs::read(
-        install
-            .root
-            .join("state/agents/homes/claude/.claude/scratchnotes.json"),
+        state.join("agents/homes/claude/.claude/scratchnotes.json"),
     )?)?;
     ensure!(
         scratch["memory"] == "preserve across versions",
@@ -594,7 +597,7 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
     state_proofs(&client, &url).await?;
     mcp.catalog_proof(8).await?;
     mcp.finish().await?;
-    let receipt = json!({"old_version":OLD,"new_version":NEW,"get_requests":reads.load(Ordering::SeqCst),"post_requests":writes.load(Ordering::SeqCst),"request_errors":0,"dashboard_session_and_assets":with_ui,"failed_version_health_preserved_old":true,"durable_jobs_templates_memory_preserved":true,"rollback":true,"supervisor_crash_recovery":true,"native_stdio_mcp_initialize_tools_catalog_register_and_resume":true});
+    let receipt = json!({"old_version":OLD,"new_version":NEW,"get_requests":reads.load(Ordering::SeqCst),"post_requests":writes.load(Ordering::SeqCst),"request_errors":0,"dashboard_session_and_assets":with_ui,"failed_version_health_preserved_old":true,"durable_jobs_templates_memory_preserved":true,"external_state_root_preserved":true,"rollback":true,"supervisor_crash_recovery":true,"native_stdio_mcp_initialize_tools_catalog_register_and_resume":true});
     atomic_json(
         &repo.join(".state/rust-update-qualification.json"),
         &receipt,
@@ -662,6 +665,7 @@ async fn real_activation_failure(
     let supervisor = Supervisor::new(
         SupervisorConfig {
             install: install.clone(),
+            state_dir: None,
             fleet_config: fleet,
             api_listen: "127.0.0.1:8765".parse()?,
             dashboard_listen: None,
