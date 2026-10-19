@@ -25,7 +25,7 @@ Linux nodes and guests now execute native `enginebox-host` and `enginebox-guest`
 
 The stable supervisor retains the public API/dashboard listeners while a candidate controller starts in standby. A standby controller does not recover active job records. The supervisor gates new mutations, drains admitted jobs and authorization sessions, transfers the exclusive state lock, then switches routing. Read observations and retained immutable dashboard chunks support clients already using the previous release. Failed readiness, activation or incompatible state leave the previous compatible version available. See [update semantics and limits](UPDATES.md).
 
-This mechanism covers service releases. Kernel, Incus, GPU driver, host reboot, supervisor replacement and native provider upgrades have their own lifecycle requirements. A filesystem checkpoint is not a VM memory checkpoint; [LayerFS](LAYERFS.md) remains an evaluated optional backend.
+This mechanism covers service releases. Kernel, Incus, GPU driver, host reboot, supervisor replacement and native provider upgrades have their own lifecycle requirements. A filesystem checkpoint is not a VM memory checkpoint; [LayerFS](LAYERFS.md) is a first-class storage backend requiring explicit provisioning on qualified nodes.
 
 ## Qualification record
 

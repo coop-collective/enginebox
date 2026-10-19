@@ -1,5 +1,6 @@
 //! Native fleet operations. No provider loop, credentials, or Python runtime lives here.
 pub mod bootstrap;
+mod browser_migration;
 pub mod capabilities;
 pub mod capacity;
 pub mod fleet;

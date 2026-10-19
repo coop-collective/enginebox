@@ -48,7 +48,9 @@ creation to that browser executable; the global user-namespace policy is unchang
 ## Native MCP setup
 
 The setup adds missing `enginebox-browser` entries using native Codex/Claude MCP
-commands and Cursor's documented JSON format. Existing entries are left intact.
+commands and Cursor's documented JSON format. Custom entries are left intact.
+Repreparing a guest also migrates the exact legacy Engine Box Python browser entry
+to the native command, preserving its other fields.
 The command is:
 
 ```sh
@@ -61,6 +63,39 @@ speaks MCP on stdin/stdout, so it is not an interactive browser shell.
 [Codex MCP](https://developers.openai.com/codex/mcp),
 [Claude MCP](https://code.claude.com/docs/en/mcp),
 [Cursor MCP](https://cursor.com/docs/cli/mcp).
+
+## Migrating an existing private workspace
+
+After installing current native guest helpers, an administrator can migrate one
+**running, idle, assigned private VM** without restarting or preparing it:
+
+```sh
+sudo enginebox-host migrate-browser-mcp --project enginebox-fleet --name ebox-agent-01
+```
+
+For a non-default guest user/home, pass `--guest-config /absolute/guest.json`
+containing the registered `GuestConfig`. The default is `agent`, UID/GID 1001,
+`/home/agent`, with `/workspace`. This command only recognizes an
+`enginebox-browser` entry whose command is `/usr/bin/python3` and whose entire
+argument list is `[/opt/enginebox-runtime/browser_tools.py, --client, PROVIDER]`
+for that same provider. It preserves custom commands, additional arguments,
+other servers, deny settings, account fields and memory. Missing entries are not
+registered by this migration. `sync-guest-tools` continues to update binaries only.
+
+The operation takes the host lifecycle lease and all native provider run/auth
+leases, refuses active sessions, and atomically replaces only matching config
+files with mode 0600. Codex TOML comments and unrelated formatting are preserved;
+JSON formatting may change. Original bytes are retained under the private
+`~/.local/state/enginebox/browser-migrations/<id>/` directory, with no content
+returned through the command. Those backups may contain account information and
+prevent clean-base publication. Use a fresh credential-free image for a new
+template; do not publish a previously private workspace.
+
+A repeated migration leaves current entries unchanged. Malformed, linked or
+unsafe configs fail before replacement. A later filesystem failure can leave a
+subset migrated; original backups remain and rerunning migrates the remaining
+recognized entries. The leases cover Engine Box sessions; close manually started
+native sessions and config editors first, since they do not take these leases.
 
 ## Optional desktop
 

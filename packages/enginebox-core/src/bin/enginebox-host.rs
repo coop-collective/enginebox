@@ -32,6 +32,18 @@ struct Cli {
 enum Commands {
     /// Report binary protocol support without inspecting or mutating this host.
     Protocol,
+    /// Migrate only recognized legacy browser MCP entries in one idle private VM.
+    MigrateBrowserMcp {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        name: String,
+        /// Optional JSON GuestConfig for a non-default guest identity/home.
+        #[arg(long)]
+        guest_config: Option<PathBuf>,
+    },
+    #[command(hide = true)]
+    MigrateUserBrowserMcp,
     /// Atomically update helper executables in one owned, running VM; homes and native CLIs stay intact.
     SyncGuestTools {
         #[arg(long)]
@@ -105,6 +117,23 @@ fn stdin_json() -> Result<Value> {
 fn execute(cli: Cli) -> Result<Value> {
     match cli.command {
         Some(Commands::Protocol) => Ok(enginebox_core::node_protocol::report()),
+        Some(Commands::MigrateBrowserMcp {
+            project,
+            name,
+            guest_config,
+        }) => {
+            let guest = guest_config
+                .map(|path| -> Result<GuestConfig> {
+                    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let _lease = state::root_host_lock()?;
+            guest::migrate_browser_mcp(&project, &name, &guest)
+        }
+        Some(Commands::MigrateUserBrowserMcp) => {
+            guest::migrate_user_browser_mcp(&serde_json::from_value(stdin_json()?)?)
+        }
         Some(Commands::SyncGuestTools {
             project,
             name,
