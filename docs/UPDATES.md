@@ -57,6 +57,12 @@ Manifests declare the state schema a release writes and the range it can read. A
 
 An incompatible schema change needs a separate, explicitly designed migration, tested restore path and maintenance window. Keeping an older executable is insufficient if a newer version has irreversibly changed its state.
 
+## LayerFS attachment compatibility
+
+Attached Incus VMs require the attachment-aware generation of both fleet/controller and node tools. A rollback to older fleet binaries is unsupported until every checkout is cleanly detached. The LayerFS workspace receipt upgrade to schema 2 makes older storage CLIs refuse those receipts; it does not protect the separate Incus lifecycle API. Older fleet tools ignore the new VM attachment markers and could snapshot, hibernate, restore or copy a VM without coordinating its external files.
+
+Incus checkout attachment therefore remains a node-administrator operation in this release, with no automatic controller/API attachment. Before that promotion, release installation and rollback must enforce a minimum compatible controller/node generation against active attachment inventory. That is an explicit release gate requiring a migration/compatibility design and tests; the shared controller state schema has not been changed implicitly to claim this enforcement.
+
 ## Verification
 
 The installer crate exercises archive/hash/version/target rejection, ownership markers and update locks, rollback schema gates, a failed candidate health check, failed activation, drain timeouts, request continuity with queued mutations and credential-refresh observations, authenticated admission and management routes, blocked direct ownership routes, retained browser assets, and a deterministic release-builder/native-installer round trip. A Windows-only regression additionally grants explicit Everyone access to a disposable directory and verifies that private-directory creation replaces that DACL completely.

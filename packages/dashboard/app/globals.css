@@ -15,6 +15,33 @@
   --muted: #7a878d;
   --dark: #14262b;
 }
+.storage-nodes { display: grid; gap: 20px; }
+.storage-node { min-width: 0; }
+.storage-node .catalog-card-heading { flex-wrap: wrap; }
+.storage-node .catalog-card-heading > div { flex: 1; min-width: 180px; }
+.storage-project-select { max-width: 360px; margin: 20px 0; }
+.storage-source { border: 1px solid var(--line); border-radius: 9px; padding: 16px; margin: 16px 0; }
+.storage-source summary { cursor: pointer; font-weight: 650; }
+.storage-form { display: flex; gap: 14px; align-items: end; flex-wrap: wrap; margin: 18px 0; }
+.storage-form label { flex: 1; min-width: 180px; }
+.storage-review { padding-top: 12px; }
+.storage-review dt { color: var(--muted); font-size: 12px; margin-top: 10px; }
+.storage-review dd { margin: 4px 0 12px; overflow-wrap: anywhere; }
+.storage-files { max-height: 260px; overflow: auto; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #f7f9fa; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.storage-attestation { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; margin: 16px 0; line-height: 1.5; }
+.storage-attestation input { width: 18px; height: 18px; flex-shrink: 0; margin: 2px 0 0; }
+.storage-task { display: grid; gap: 7px; margin: 12px 0; }
+.storage-task > button { justify-self: start; }
+.storage-task small { color: var(--muted); overflow-wrap: anywhere; }
+.storage-checkouts-heading { margin-top: 26px; align-items: start; flex-wrap: wrap; gap: 14px; }
+.storage-checkouts-heading h4 { margin: 0 0 5px; }
+.storage-checkouts-heading label { max-width: 360px; flex: 1; min-width: 200px; }
+.storage-checkouts { display: grid; gap: 12px; }
+.storage-checkout { border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
+.storage-checkout-heading { display: flex; justify-content: space-between; gap: 12px; align-items: start; margin-bottom: 14px; }
+.storage-receipt-status { border-radius: 20px; background: #f0f5f4; color: #406a63; font-size: 12px; padding: 5px 10px; }
+.storage-checkout .action-buttons { flex-wrap: wrap; justify-content: flex-start; }
+.storage-node .workspace-hint { line-height: 1.6; margin: 12px 0; }
 * {
   box-sizing: border-box;
 }

@@ -12,6 +12,7 @@ import type {
 import { api, RequestError } from "@/lib/client";
 import { TemplateCatalog } from "@/components/template-catalog";
 import { AgentsPanel } from "@/components/agents-panel";
+import { StoragePanel } from "@/components/storage-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -39,6 +40,11 @@ const sections = {
     title: "Templates",
     description: "Prepare reusable environments and keep your nodes in sync.",
     icon: "box",
+  },
+  storage: {
+    title: "Storage",
+    description: "Reuse project checkouts and prepared dependencies across agents.",
+    icon: "server",
   },
 };
 type DashboardSection = keyof typeof sections;
@@ -876,7 +882,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates"] as const)
+          {(["fleet", "agents", "templates", "storage"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1034,6 +1040,9 @@ export default function Dashboard() {
                   registered={refresh}
                   close={() => navigate("fleet")}
                 />
+              )}
+              {section === "storage" && (
+                <StoragePanel refreshToken={updated?.getTime() ?? 0} />
               )}
               {section === "fleet" && (
                 <>

@@ -228,9 +228,10 @@ export async function proxy(request: Request, segments: string[]) {
   const allowed =
     request.method === "GET"
       ? accountRead ||
-        /^v1\/(fleet|templates|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
+        /^v1\/(fleet|templates|storage|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
       : request.method === "POST" &&
         (accountWrite ||
+          /^v1\/storage\/hosts\/[a-z0-9][a-z0-9-]{0,48}\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover)$/.test(path) ||
           /^(?:v1\/templates(?:\/[a-z][a-z0-9-]{0,31}\/sync)?|v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/(?:templates\/[a-z][a-z0-9-]{0,31}\/install|allocations|instances(?:\/ebox-[a-z0-9-]{1,49}\/actions)?))$/.test(
             path,
           ));

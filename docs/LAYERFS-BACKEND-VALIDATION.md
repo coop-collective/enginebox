@@ -1,5 +1,7 @@
 # LayerFS CLI backend qualification
 
+This report records the initial backend qualification merged in PR #4. Its capability boundary is historical. Follow-on controller/dashboard/MCP work is described in [Storage API](STORAGE-API.md), live recovery in [the recovery report](LAYERFS-RECOVERY-VALIDATION.md), and the separate [Incus attachment](LAYERFS-INCUS.md) contract records its current qualification boundary. The feature no longer requires an `experimental` configuration flag.
+
 Recorded 2026-10-19. The opt-in Rust `ebox storage layerfs` backend passed a real Docker/LayerFS lifecycle test inside a new disposable Linux VM. This qualifies the [node-local administrator workflow](LAYERFS-BACKEND.md), not fleet VM attachment, production storage durability or authenticated agent sessions.
 
 ## Environment and provenance

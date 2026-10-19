@@ -11,7 +11,10 @@ let mode,
   authSessions,
   connectedAccounts,
   syncProgress,
-  retried;
+  retried,
+  storageRows,
+  storageRequests,
+  storageImported;
 function manifest(id = "native", revision = 1) {
   return {
     schema_version: 1,
@@ -49,6 +52,14 @@ function reset() {
   connectedAccounts = new Set();
   syncProgress = new Map();
   retried = new Set();
+  storageRequests = [];
+  storageImported = new Set(["game"]);
+  storageRows = [
+    { name: "prepared", project: "game", status: "ready", last_checkpoint: { status: "Committed", head: "fixture-head" } },
+    { name: "worker-a", project: "game", status: "ready" },
+    { name: "worker-b", project: "game", status: "ready" },
+    { name: "interrupted", project: "game", status: "exec", last_error: "Interrupted command outcome is unknown." },
+  ];
   const native = manifest();
   native.deployments.push({
     host_id: "metal-01",
@@ -112,6 +123,7 @@ createServer(async (req, res) => {
     reset();
     return send(200, { ok: true });
   }
+  if (req.url === "/__test/storage-requests") return send(200, storageRequests);
   if (req.url === "/__test/mode") {
     mode = data.mode;
     if (mode === "accounts-unsupported") connectedAccounts.add("cursor");
@@ -148,6 +160,49 @@ createServer(async (req, res) => {
   }
   if (req.headers.authorization !== `Bearer ${token}`)
     return send(401, { error: "Wrong backend token" });
+  if (req.url === "/v1/storage" && req.method === "GET") {
+    if (mode === "storage-error") return send(503, { error: "Storage catalog unavailable." });
+    return send(200, { backend: "layerfs", configured: mode !== "storage-empty", nodes: mode === "storage-empty" ? [] : [{ host_id: "metal-01", status: "registered", projects: [{ id: "game" }, { id: "demo" }] }], incus_attachment: false, automatic_replay: false });
+  }
+  const storage = req.url.match(/^\/v1\/storage\/hosts\/metal-01\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover)$/);
+  if (storage && req.method === "POST") {
+    storageRequests.push({ operation: storage[1], body: data });
+    const id = `storage-${jobs.size + 1}`;
+    const job = { id, status: "queued", polls: 0, storage: storage[1], data };
+    jobs.set(id, job);
+    return send(202, { job: { id, status: "queued" } });
+  }
+  const storageJob = req.method === "GET" && req.url.startsWith("/v1/jobs/") && jobs.get(req.url.split("/").at(-1));
+  if (storageJob?.storage) {
+    const job = storageJob;
+    job.polls++;
+    if (job.status === "queued") job.status = "running";
+    if (job.status === "running" && job.polls >= (mode === "storage-slow" && !["list", "preview", "inspect"].includes(job.storage) ? 4 : 2)) {
+      const operation = job.storage;
+      const input = job.data;
+      const row = storageRows.find((row) => row.name === input.name);
+      let result = { ok: true };
+      job.status = "succeeded";
+      if (operation === "list") result = { workspaces: structuredClone(storageRows) };
+      else if (operation === "preview") result = { commit: "a".repeat(40), approval: "b".repeat(64), files: ["package.json", "src/main.ts"], bytes: 5242 };
+      else if (operation === "import") {
+        if (input.revision !== "a".repeat(40) || input.approval !== "b".repeat(64) || input.credential_free !== true || storageImported.has(input.project)) {
+          job.status = "failed"; job.error = "Source approval changed or project already imported.";
+        } else storageImported.add(input.project);
+      } else if (operation === "fork") {
+        if (!storageImported.has(input.project) || row) { job.status = "failed"; job.error = "Import the project first and choose a new checkout name."; }
+        else { storageRows.push({ name: input.name, project: input.project, status: "ready" }); result = { ok: true, workspace: input.name, path: "/project" }; }
+      } else if (operation !== "inspect") {
+        if (!row) { job.status = "failed"; job.error = "Unknown checkout."; }
+        else if (mode === "storage-failed" || (operation === "close" && row.name === "worker-b")) { job.status = "failed"; job.error = "Workspace has uncheckpointed changes; run checkpoint before close."; }
+        else if (operation === "close") row.status = "closed";
+        else if (operation === "checkpoint") row.last_checkpoint = { status: "Committed", head: "fixture-checkpoint" };
+        else if (operation === "recover") { row.status = "ready"; row.last_error = null; }
+      }
+      if (job.status === "succeeded") job.result = { backend: "layerfs", host_id: "metal-01", operation: `storage_${operation}`, result };
+    }
+    return send(200, { job: { id: job.id, status: job.status, error: job.error, result: job.result } });
+  }
   if (req.url === "/v1/templates") {
     if (req.method === "GET") {
       for (const record of templates)

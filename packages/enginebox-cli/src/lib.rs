@@ -177,6 +177,48 @@ pub fn tools() -> Vec<Value> {
             json!({"job_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}),
             &["job_id"],
         ),
+        tool(
+            "storage_catalog",
+            "List controller-registered LayerFS nodes and repository aliases. Registration does not imply live node health.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "storage_inspect",
+            "Queue a node prerequisite check or read its durable workspace receipts; poll fleet_job. List is not a live health probe.",
+            json!({"host_id":{"type":"string"},"operation":{"type":"string","enum":["inspect","list"],"default":"list"}}),
+            &["host_id"],
+        ),
+        tool(
+            "storage_preview",
+            "Review a registered repository's tracked file list and exact commit approval digest before import. Does not fetch Git or import files.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"revision":{"type":"string","default":"HEAD"}}),
+            &["host_id", "project"],
+        ),
+        tool(
+            "storage_import",
+            "Import a reviewed credential-free Git commit once on a registered node. Requires the exact commit and approval digest from storage_preview. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"revision":{"type":"string","pattern":"^([a-f0-9]{40}|[a-f0-9]{64})$"},"approval":{"type":"string","pattern":"^[a-f0-9]{64}$"},"credential_free":{"type":"boolean","const":true}}),
+            &[
+                "host_id",
+                "project",
+                "revision",
+                "approval",
+                "credential_free",
+            ],
+        ),
+        tool(
+            "storage_fork",
+            "Create a private writable LayerFS checkout from a registered project. Optional from explicitly reuses that workspace's completed checkpoint and installed files; it does not publish a fleet template. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"name":{"type":"string"},"from":{"type":"string"}}),
+            &["host_id", "project", "name"],
+        ),
+        tool(
+            "storage_action",
+            "Queue offline dependencies, file checkpoint, clean remount/close, or evidence-checked recovery. Recovery never replays interrupted commands. These are file operations, not VM RAM snapshots. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"name":{"type":"string"},"action":{"type":"string","enum":["deps","checkpoint","remount","close","recover"]},"message":{"type":"string","maxLength":4096}}),
+            &["host_id", "name", "action"],
+        ),
     ]
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
@@ -195,6 +237,14 @@ fn record_id(v: &Value, key: &str) -> Result<String> {
         "Invalid record ID"
     );
     Ok(value.to_owned())
+}
+fn storage_id(v: &Value, key: &str) -> Result<String> {
+    let value = id(v, key, false)?;
+    ensure!(
+        value.len() <= 48 && !value.ends_with('-'),
+        "Invalid storage ID"
+    );
+    Ok(value)
 }
 
 pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)> {
@@ -219,6 +269,101 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         "fleet_inventory" => ("/v1/fleet".into(), None),
         "template_catalog" => ("/v1/templates".into(), None),
         "agent_connections" => ("/v1/agents".into(), None),
+        "storage_catalog" => ("/v1/storage".into(), None),
+        "storage_inspect" | "storage_preview" | "storage_import" | "storage_fork"
+        | "storage_action" => {
+            let mut body = json!({});
+            let operation = match name {
+                "storage_inspect" => {
+                    let operation = args
+                        .get("operation")
+                        .map(|v| v.as_str().context("Invalid storage observation"))
+                        .transpose()?
+                        .unwrap_or("list");
+                    ensure!(
+                        ["list", "inspect"].contains(&operation),
+                        "Unknown storage observation"
+                    );
+                    operation
+                }
+                "storage_preview" | "storage_import" => {
+                    body["project"] = json!(storage_id(args, "project")?);
+                    let revision = args
+                        .get("revision")
+                        .map(|v| v.as_str().context("Invalid revision"))
+                        .transpose()?
+                        .unwrap_or("HEAD");
+                    ensure!(
+                        !revision.is_empty()
+                            && revision.len() <= 256
+                            && !revision.starts_with('-')
+                            && !revision.chars().any(char::is_control),
+                        "Invalid revision"
+                    );
+                    body["revision"] = json!(revision);
+                    if name == "storage_import" {
+                        let approval = field(args, "approval")?;
+                        ensure!(
+                            [40, 64].contains(&revision.len())
+                                && revision
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                            "Exact commit ID required"
+                        );
+                        ensure!(
+                            approval.len() == 64
+                                && approval
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                            "Invalid approval digest"
+                        );
+                        ensure!(
+                            args["credential_free"] == true,
+                            "Explicit credential-free approval required"
+                        );
+                        body["approval"] = json!(approval);
+                        body["credential_free"] = json!(true);
+                        "import"
+                    } else {
+                        "preview"
+                    }
+                }
+                "storage_fork" => {
+                    body = json!({"project":storage_id(args,"project")?,"name":storage_id(args,"name")?});
+                    if object.contains_key("from") {
+                        body["from"] = json!(storage_id(args, "from")?);
+                    }
+                    "fork"
+                }
+                "storage_action" => {
+                    let action = field(args, "action")?;
+                    ensure!(
+                        ["deps", "checkpoint", "remount", "close", "recover"].contains(&action),
+                        "Unsupported storage action"
+                    );
+                    body["name"] = json!(storage_id(args, "name")?);
+                    if object.contains_key("message") {
+                        ensure!(action == "checkpoint", "Only checkpoints accept a message");
+                        let message = field(args, "message")?;
+                        ensure!(
+                            message.len() <= 4096 && !message.contains('\0'),
+                            "Invalid checkpoint message"
+                        );
+                        body["message"] = json!(message);
+                    }
+                    action
+                }
+                _ => unreachable!(),
+            };
+            (
+                format!(
+                    "/v1/storage/hosts/{}/{}",
+                    id(args, "host_id", false)?,
+                    operation
+                ),
+                Some(body),
+            )
+        }
         "fleet_job" => (format!("/v1/jobs/{}", record_id(args, "job_id")?), None),
         "template_register" => {
             ensure!(
@@ -419,7 +564,51 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            12
+            18
         );
+    }
+    #[test]
+    fn storage_tools_preserve_review_and_do_not_expose_shell_or_paths() {
+        let (path, body) = tool_request(
+            "storage_preview",
+            &json!({"host_id":"worker","project":"game"}),
+        )
+        .unwrap();
+        assert_eq!(path, "/v1/storage/hosts/worker/preview");
+        assert_eq!(body.unwrap(), json!({"project":"game","revision":"HEAD"}));
+        let (_, body) = tool_request(
+            "storage_fork",
+            &json!({"host_id":"worker","project":"game","name":"agent-a","from":"prepared"}),
+        )
+        .unwrap();
+        assert_eq!(body.unwrap()["from"], "prepared");
+        for (name, args) in [
+            (
+                "storage_preview",
+                json!({"host_id":"worker","project":"game","repo":"/root"}),
+            ),
+            (
+                "storage_import",
+                json!({"host_id":"worker","project":"game","revision":"HEAD","approval":"a".repeat(64),"credential_free":true}),
+            ),
+            (
+                "storage_import",
+                json!({"host_id":"worker","project":"game","revision":"b".repeat(40),"approval":"a".repeat(64),"credential_free":false}),
+            ),
+            (
+                "storage_action",
+                json!({"host_id":"worker","name":"agent-a","action":"exec"}),
+            ),
+            (
+                "storage_action",
+                json!({"host_id":"worker","name":"agent-a","action":"recover","message":"force"}),
+            ),
+            (
+                "storage_action",
+                json!({"host_id":"worker","name":"../escape","action":"close"}),
+            ),
+        ] {
+            assert!(tool_request(name, &args).is_err(), "{name}: {args}");
+        }
     }
 }

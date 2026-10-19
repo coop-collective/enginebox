@@ -53,10 +53,19 @@ fn real_checkout_lifecycle() -> Result<()> {
         std::env::var("ENGINEBOX_LAYERFS_LIVE").as_deref() == Ok("1"),
         "Explicit opt-in required"
     );
+    let marker = std::env::var("ENGINEBOX_LAYERFS_MARKER")
+        .unwrap_or_else(|_| "/etc/enginebox-layerfs-validation".into());
     ensure!(
-        std::path::Path::new("/etc/enginebox-layerfs-validation").is_file(),
-        "Disposable guest marker required"
+        std::path::Path::new(&marker).is_absolute() && std::path::Path::new(&marker).is_file(),
+        "Disposable fixture marker required"
     );
+    if std::env::var_os("ENGINEBOX_LAYERFS_MARKER").is_some() {
+        let expected = std::env::var("ENGINEBOX_LAYERFS_MARKER_CONTENT")?;
+        ensure!(
+            !expected.is_empty() && fs::read_to_string(&marker)?.trim() == expected,
+            "Disposable fixture marker identity mismatch"
+        );
+    }
     let config_path = std::env::var("ENGINEBOX_LAYERFS_LIVE_CONFIG")?;
     let config = Config::load(std::path::Path::new(&config_path))?;
     ensure!(
@@ -241,7 +250,7 @@ fn real_checkout_lifecycle() -> Result<()> {
         h.call(&["close", "cached"])?;
         // A real operator-process interruption must not turn into an automatic
         // replay, even after the original command finishes independently.
-        h.call(&["fork", "fixture", "interrupted"])?;
+        h.call(&["fork", "fixture", "interrupted", "--from", "a"])?;
         let mut child = Command::new(&h.binary)
             .args([
                 "storage",
@@ -269,7 +278,7 @@ fn real_checkout_lifecycle() -> Result<()> {
             run_process(
                 &[
                     "docker".into(),
-                    "--host=unix:///var/run/docker.sock".into(),
+                    format!("--host=unix://{}", config.docker_socket.display()),
                     "exec".into(),
                     container.into(),
                     "sh".into(),
@@ -290,6 +299,10 @@ fn real_checkout_lifecycle() -> Result<()> {
         }
         child.kill()?;
         child.wait()?;
+        ensure!(
+            h.call(&["recover", "interrupted"]).is_err(),
+            "Recovery accepted an original command that was still running"
+        );
         ensure!(
             h.call(&[
                 "exec",
@@ -316,6 +329,126 @@ fn real_checkout_lifecycle() -> Result<()> {
             "Interrupted receipt was silently made ready"
         );
         h.receipts.lock().unwrap().push(json!({"interrupted_operator":"killed_after_first_write","original_command_finished":true,"replay_refused":true,"retained_status":retained["status"]}));
+        // A completed original command can be reconciled without replaying it.
+        // Wait only for the already bounded helper to exit, never kill/retry it.
+        let project = state::read_json(&config.root.join("projects/fixture/project.json"))?;
+        let owner = project["owner"].as_str().context("Project owner")?;
+        loop {
+            let helpers = run_process(
+                &[
+                    "docker".into(),
+                    format!("--host=unix://{}", config.docker_socket.display()),
+                    "ps".into(),
+                    "--all".into(),
+                    "--filter".into(),
+                    format!("label=enginebox.layerfs.owner={owner}"),
+                    "--format={{.ID}}".into(),
+                ],
+                None,
+                Duration::from_secs(10),
+            )?;
+            if helpers.iter().all(|b| b.is_ascii_whitespace()) {
+                break;
+            }
+            ensure!(Instant::now() < deadline, "Original helper did not finish");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let recovered = h.call(&["recover", "interrupted"])?;
+        ensure!(
+            recovered["recovery"]["command_outcome"] == "original returned; not replayed"
+                && recovered["recovery"]["settled_call"]["exit_code"] == 0,
+            "Recovery did not retain the exact helper result"
+        );
+        h.call(&["exec","interrupted","--","sh","-c","set -eu; test \"$(cat once.txt)\" = once; test -f done.txt; printf checkpointed > recovered.txt"])?;
+        h.call(&["checkpoint", "interrupted"])?;
+        h.call(&[
+            "exec",
+            "interrupted",
+            "--",
+            "sh",
+            "-c",
+            "printf uncheckpointed > unsaved.txt",
+        ])?;
+        let alive_refusal = h
+            .call(&[
+                "restore-checkpoint",
+                "interrupted",
+                "--acknowledge-uncheckpointed",
+            ])
+            .expect_err("Checkpoint restore stopped a running sandbox");
+        ensure!(
+            format!("{alive_refusal:#}").contains("must already be stopped"),
+            "Live-sandbox refusal had an unexpected cause: {alive_refusal:#}"
+        );
+        // Exact fixture container only: simulate loss of its daemon, not a
+        // power failure or whole-node durability guarantee.
+        run_process(
+            &[
+                "docker".into(),
+                format!("--host=unix://{}", config.docker_socket.display()),
+                "kill".into(),
+                "--signal=KILL".into(),
+                container.into(),
+            ],
+            None,
+            Duration::from_secs(15),
+        )?;
+        ensure!(
+            h.call(&["recover", "interrupted"]).is_err(),
+            "Dead daemon was marked ready"
+        );
+        let restored = h.call(&[
+            "restore-checkpoint",
+            "interrupted",
+            "--acknowledge-uncheckpointed",
+        ])?;
+        ensure!(
+            restored["recovery"]["old_container_retained"] == true
+                && restored["recovery"]["uncheckpointed_edits_recovered"] == false,
+            "Restoration misstated data custody"
+        );
+        let replacement = state::read_json(&receipt_path)?;
+        ensure!(
+            replacement["container"] != container && replacement["status"] == "ready",
+            "Stopped sandbox was reused"
+        );
+        let inspected: Value = serde_json::from_slice(&run_process(
+            &[
+                "docker".into(),
+                format!("--host=unix://{}", config.docker_socket.display()),
+                "inspect".into(),
+                container.into(),
+            ],
+            None,
+            Duration::from_secs(10),
+        )?)?;
+        ensure!(
+            inspected[0]["State"]["Running"] == false,
+            "Old container was deleted or restarted"
+        );
+        let overlay = directory.join("retained-overlay.sqlite");
+        run_process(
+            &[
+                "docker".into(),
+                format!("--host=unix://{}", config.docker_socket.display()),
+                "cp".into(),
+                format!("{container}:/layerfs-local/overlay/overlay.sqlite"),
+                overlay.to_string_lossy().into_owned(),
+            ],
+            None,
+            Duration::from_secs(15),
+        )?;
+        ensure!(
+            fs::metadata(&overlay)?.len() > 0,
+            "Original overlay not retained"
+        );
+        let content=h.call(&["exec","interrupted","--","sh","-c","set -eu; test \"$(cat once.txt)\" = once; test \"$(cat recovered.txt)\" = checkpointed; test ! -e unsaved.txt; node node_modules/typescript/bin/tsc --version"])?;
+        ensure!(
+            content["result"]["stdout"].as_str().unwrap_or("").trim() == "Version 5.9.3",
+            "Checkpoint restoration lost prepared dependencies"
+        );
+        h.call(&["close", "interrupted"])?;
+        h.receipts.lock().unwrap().push(json!({"daemon_loss":"SIGKILL exact disposable sandbox","checkpoint_restored":true,"original_command_replayed":false,"old_container_retained":true,"old_overlay_bytes":fs::metadata(&overlay)?.len(),"uncheckpointed_edits_recovered":false}));
         Ok::<_, anyhow::Error>(())
     })();
     state::write_json(

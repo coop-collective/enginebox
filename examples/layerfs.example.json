@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "experimental": true,
   "root": "/var/lib/enginebox-layerfs",
+  "docker_socket": "/var/run/docker.sock",
   "sdk": "/opt/layerfs/sdk/js",
   "daemon": "/opt/layerfs/layerfs-daemon",
   "native_sha256": "REPLACE_WITH_BUILT_ADDON_SHA256",

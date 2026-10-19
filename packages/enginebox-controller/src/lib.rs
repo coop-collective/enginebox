@@ -1,5 +1,6 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
 pub mod jobs;
+pub mod storage;
 
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -42,6 +43,7 @@ impl Mode {
 struct Runtime {
     agents: AgentService,
     jobs: jobs::Jobs,
+    storage: storage::Storage,
 }
 struct Gate {
     mode: Mode,
@@ -130,6 +132,7 @@ impl Controller {
         let runtime = Runtime {
             agents: AgentService::new(&self.root, self.fleet.clone())?,
             jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
+            storage: storage::Storage::open(&self.root, self.fleet.clone())?,
         };
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -445,6 +448,7 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
     match s.as_slice() {
         ["v1", "fleet"] => c.fleet.summary(),
         ["v1", "templates"] => c.fleet.catalog(),
+        ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
         ["v1", "agents"] => c.runtime()?.agents.status(),
         ["v1", "agents", provider, "usage"] => {
             Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
@@ -487,6 +491,13 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
     let runtime = c.runtime()?;
     let mut code = StatusCode::OK;
     let v = match p.as_slice() {
+        ["v1", "storage", "hosts", host, operation] => {
+            let plan = runtime.storage.plan(host, operation, &body)?;
+            let operation = plan.operation.clone();
+            let name = plan.name.clone();
+            code = StatusCode::ACCEPTED;
+            json!({"job":runtime.jobs.submit(host,&operation,&name,move||plan.execute())?})
+        }
         ["v1", "agents", provider, "login"] => {
             empty(&body)?;
             let provider = provider.to_string();
@@ -666,6 +677,112 @@ mod tests {
             app.oneshot(browser).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+    }
+    #[tokio::test]
+    async fn storage_routes_use_registered_targets_and_durable_admitted_jobs() {
+        let (_temp, c) = setup();
+        enginebox_core::state::write_json(&c.root.join("storage/config.json"), &json!({
+            "schema_version":1,"nodes":[{"host_id":"worker","executable":"/usr/local/bin/ebox","config":"/etc/enginebox/layerfs.json","projects":[{"id":"game","repository":"/srv/source/game"}]}]
+        })).unwrap();
+        let app = router(c.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v1/storage", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/storage/hosts/worker/fork",
+                    r#"{"project":"game","name":"agent-a"}"#,
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        c.activate().unwrap();
+        let (started_send, started_receive) = std::sync::mpsc::channel();
+        let (finish_send, finish_receive) = std::sync::mpsc::channel();
+        let finish_receive = Arc::new(Mutex::new(finish_receive));
+        {
+            let mut gate = c.gate.lock().unwrap();
+            let runtime = gate.runtime.as_mut().unwrap();
+            runtime.storage =
+                runtime
+                    .storage
+                    .clone()
+                    .with_runner(Arc::new(move |host, argv, _| {
+                        assert_eq!(host.id, "worker");
+                        assert!(argv.windows(3).any(|v| v == ["fork", "game", "agent-a"]));
+                        started_send.send(()).unwrap();
+                        finish_receive
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        Ok(json!({"ok":true,"workspace":"agent-a","path":"/project"}))
+                    }));
+        }
+        for (path, body) in [
+            (
+                "/v1/storage/hosts/worker/exec",
+                r#"{"name":"agent-a","argv":["id"]}"#,
+            ),
+            (
+                "/v1/storage/hosts/worker/fork",
+                r#"{"project":"game","name":"agent-a","config":"/tmp/foreign"}"#,
+            ),
+            ("/v1/storage/hosts/foreign/list", "{}"),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, body, true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/storage/hosts/worker/fork",
+                r#"{"project":"game","name":"agent-a"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            started_receive
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(c.drain()["drained"], false);
+        finish_send.send(()).unwrap();
+        while c.runtime().unwrap().jobs.pending() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let job = c
+            .runtime()
+            .unwrap()
+            .jobs
+            .get(value["job"]["id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(job["status"], "succeeded");
+        assert_eq!(job["result"]["result"]["workspace"], "agent-a");
+        assert_eq!(c.drain()["drained"], true);
     }
     #[tokio::test]
     async fn standby_never_admits_writes_and_payloads_are_bounded() {

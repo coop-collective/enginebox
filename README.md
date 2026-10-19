@@ -21,6 +21,7 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 | Native packages, terminal installer plans, version pinning and supervised update/rollback | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
 | Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
+| Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
 The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The v0.2 implementation passed real Codex/Claude prompts, tools and exact conversation resume; the Rust port has separate qualification gates. Cursor inference was blocked by the test account’s provider quota. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
@@ -62,7 +63,11 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Versioned updates, draining and rollback](docs/UPDATES.md)
 - [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)
 - [LayerFS workspace storage evaluation](docs/LAYERFS.md)
-- [Experimental LayerFS checkout backend and measured validation](docs/LAYERFS-BACKEND.md)
+- [LayerFS checkout storage and measured validation](docs/LAYERFS-BACKEND.md)
+- [Interrupted-command and daemon recovery qualification](docs/LAYERFS-RECOVERY-VALIDATION.md)
+- [LayerFS checkout attachment to Incus](docs/LAYERFS-INCUS.md)
+- [Storage registration, controller API and MCP](docs/STORAGE-API.md)
+- [Lore, Cloudflare Artifacts and measured game-project storage](docs/LORE-STORAGE.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)

@@ -1,7 +1,6 @@
 //! Process-boundary tests run the actual Fleet against an executable Rust Incus fixture.
 //! Each scenario has its own child environment; tests never replace the parent PATH.
 use anyhow::{Context, Result, bail, ensure};
-#[cfg(unix)]
 use enginebox_core::GIB;
 use enginebox_core::{
     Fleet, Host, Resources, capacity,
@@ -9,7 +8,11 @@ use enginebox_core::{
     warm,
 };
 use serde_json::{Value, json};
-use std::{io::Write, path::PathBuf, process::Command};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+    process::Command,
+};
 fn fixture_root() -> PathBuf {
     PathBuf::from(std::env::var("EBOX_TEST_ROOT").unwrap())
 }
@@ -33,6 +36,13 @@ fn log(args: &[String]) -> Result<()> {
     Ok(())
 }
 fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
+    if kind == "ssh" {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(args.last().context("Missing SSH command")?)
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if kind == "sudo" {
         let args = if args.first().is_some_and(|a| a == "-n") {
             &args[1..]
@@ -44,6 +54,47 @@ fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
     }
     if kind == "enginebox-host" {
         match args.first().map(String::as_str) {
+            Some("bootstrap") => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let c: Value = serde_json::from_str(&input)?;
+                let mut data = load()?;
+                log(args)?;
+                if args.get(1).is_some_and(|arg| arg == "inspect") {
+                    let fp = enginebox_core::bootstrap::fingerprint(&c);
+                    let mut vm = json!({"name":c["workspace"]["name"],"status":"Running","type":"virtual-machine","profiles":[c["incus"]["profile"]],"config":{"user.enginebox.owner":c["incus"]["project"],"user.enginebox.recipe":fp,"user.enginebox.prepared":fp}});
+                    if data["template_guard"] == "preflight" {
+                        vm["expanded_config"]["user.enginebox.layerfs.workspace"] = json!("");
+                    }
+                    let mut profile = enginebox_core::bootstrap::profile_definition(&c);
+                    profile["name"] = c["incus"]["profile"].clone();
+                    data["facts"]["instances"] = json!([vm.clone()]);
+                    save(&data)?;
+                    println!(
+                        "{}",
+                        json!({"system":"Linux","architecture":"x86_64","uid":0,"kvm":true,"cpu_count":32,"memory_available":50*GIB,"incus_present":true,"server":{"environment":{"server_version":"6.0.5","driver":"qemu"},"api_extensions":["migration_stateful"]},"qemu_version":"QEMU 10.2.1","projects":[{"name":c["incus"]["project"],"config":{"user.enginebox.owner":c["incus"]["project"]}}],"profiles":[profile],"instances":[vm],"storage":[{"name":c["storage"]["pool"],"driver":"btrfs","config":{}}],"networks":[{"name":c["network"]["name"],"type":"bridge","managed":true,"config":{"ipv4.address":"10.9.0.1/24"}}]})
+                    );
+                } else {
+                    ensure!(
+                        args.get(1).is_some_and(|arg| arg == "apply"),
+                        "Unexpected bootstrap operation"
+                    );
+                    if data["template_guard"] == "vm" {
+                        data["facts"]["instances"][0]["config"]["user.enginebox.layerfs"] =
+                            json!("export");
+                    } else {
+                        ensure!(
+                            data["template_guard"] == "snapshot",
+                            "Preflight must prevent apply"
+                        );
+                        data["snapshot"]["config"]["user.enginebox.layerfs.workspace"] =
+                            json!("private");
+                    }
+                    save(&data)?;
+                    println!("{{\"ok\":true}}");
+                }
+                return Ok(());
+            }
             Some("inventory") => {
                 println!("{}", load()?["facts"]);
                 return Ok(());
@@ -112,7 +163,7 @@ fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
                     .context("Unknown VM")?;
                 println!(
                     "{}",
-                    json!({"name":vm["name"],"status":vm["status"],"stateful":vm["stateful"].as_bool().unwrap_or(false),"type":"virtual-machine","devices":{"root":{"type":"disk","path":"/","pool":"pool","size":"30GiB","size.state":"4GiB"}},"expanded_devices":{"root":{"type":"disk","path":"/","pool":"pool","size":"30GiB","size.state":"4GiB"}}})
+                    json!({"name":vm["name"],"status":vm["status"],"config":vm["config"],"expanded_config":vm["expanded_config"],"profiles":vm["profiles"],"stateful":vm["stateful"].as_bool().unwrap_or(false),"type":"virtual-machine","devices":{"root":{"type":"disk","path":"/","pool":"pool","size":"30GiB","size.state":"4GiB"}},"expanded_devices":{"root":{"type":"disk","path":"/","pool":"pool","size":"30GiB","size.state":"4GiB"}}})
                 );
             }
         }
@@ -274,6 +325,39 @@ fn scenario() -> Result<()> {
     let name = std::env::var("EBOX_TEST_SCENARIO")?;
     let f = Fleet::from_hosts(vec![host()], &root.join("controller"))?;
     match name.as_str() {
+        "template-checkout-guards" => {
+            let mut h = host();
+            h.target = "fixture".into();
+            h.network = Some("bridge".into());
+            let manifest = json!({"schema_version":1,"id":"native","revision":1,"label":"Native","source_image":"images:ubuntu/24.04/cloud","minimum":{"cpu":2,"memory_gib":2,"disk_gib":30},"recommended":{"cpu":2,"memory_gib":2,"disk_gib":30},"native_clients":["codex"],"config":{"browser":true}});
+            for stage in ["preflight", "vm", "snapshot"] {
+                let mut data = load()?;
+                data["template_guard"] = json!(stage);
+                data["snapshot"]["config"] = json!({"user.enginebox.clean-base":"true"});
+                save(&data)?;
+                std::fs::write(root.join("events.jsonl"), "")?;
+                let result = enginebox_core::bootstrap::install_template(&h, &manifest);
+                let error = result.unwrap_err().to_string();
+                ensure!(
+                    error.contains("Detach the LayerFS"),
+                    "Missing {stage} template guard: {error}"
+                );
+                let events = std::fs::read_to_string(root.join("events.jsonl"))?;
+                if stage == "preflight" {
+                    ensure!(
+                        !events.contains("[\"bootstrap\",\"apply\"]"),
+                        "Attached template reached apply"
+                    );
+                }
+                for line in events.lines() {
+                    let command: Vec<String> = serde_json::from_str(line)?;
+                    ensure!(
+                        ["query", "bootstrap"].contains(&command[0].as_str()),
+                        "Guard allowed Incus mutation: {line}"
+                    );
+                }
+            }
+        }
         "warm-success" | "legacy-warm" => {
             let value = f.operate(
                 "primary",
@@ -367,6 +451,60 @@ fn scenario() -> Result<()> {
                 "Guard failure mutated VM"
             );
         }
+        "external-checkout-guards" => {
+            let mut data = load()?;
+            data["facts"]["instances"][0]["status"] = json!("Running");
+            data["facts"]["instances"][0]["warm_pool_state"] = json!("claimed");
+            data["facts"]["instances"][0]["config"] = json!({"user.enginebox.layerfs":"owned-export","user.enginebox.layerfs.workspace":"agent-a"});
+            save(&data)?;
+            let bx = host().engine_box();
+            for result in [
+                bx.lifecycle("ebox-warm-reserve", "hibernate"),
+                bx.snapshot("ebox-warm-reserve", "private"),
+                bx.fork("ebox-warm-reserve", "prepared", "ebox-copy"),
+                bx.restore("ebox-warm-reserve", "prepared", false),
+                f.operate("primary", "hibernate", &json!({"name":"ebox-warm-reserve"})),
+            ] {
+                ensure!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Detach the LayerFS"),
+                    "External checkout did not block snapshot lifecycle"
+                );
+            }
+            // Even after detaching today, an older snapshot carrying an export
+            // reference cannot be restored, copied or published as a template.
+            data["facts"]["instances"][0]["config"] = json!({});
+            data["facts"]["instances"][0]["status"] = json!("Stopped");
+            data["snapshot"]["config"]["user.enginebox.layerfs.workspace"] = json!("agent-a");
+            save(&data)?;
+            for result in [
+                bx.fork("ebox-warm-reserve", "prepared", "ebox-copy"),
+                bx.restore("ebox-warm-reserve", "prepared", false),
+                f.operate(
+                    "primary",
+                    "create",
+                    &json!({"name":"ebox-copy","template":"native"}),
+                ),
+            ] {
+                ensure!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Detach the LayerFS"),
+                    "External snapshot reference was accepted"
+                );
+            }
+            let events = std::fs::read_to_string(root.join("events.jsonl"))?;
+            for line in events.lines() {
+                let event: Vec<String> = serde_json::from_str(line)?;
+                ensure!(
+                    !["copy", "snapshot", "stop", "start", "config"].contains(&event[0].as_str()),
+                    "Blocked operation reached Incus mutation"
+                );
+            }
+        }
         "quarantine-blocks-refill" => {
             let mut data = load()?;
             data["facts"]["instances"][0]["warm_pool_state"] = json!("quarantined");
@@ -413,12 +551,14 @@ fn tests() -> Result<()> {
         "quarantine-blocks-refill",
         "fresh-refill",
         "legacy-warm",
+        "external-checkout-guards",
+        "template-checkout-guards",
     ] {
         let root = tempfile::tempdir()?;
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin)?;
         let current = std::env::current_exe()?;
-        for name in ["incus", "sudo", "enginebox-host"] {
+        for name in ["incus", "sudo", "enginebox-host", "ssh"] {
             let p = bin.join(name);
             std::fs::write(
                 &p,

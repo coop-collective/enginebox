@@ -1,6 +1,7 @@
-//! Optional Linux checkout backend. It never owns provider homes or VM RAM.
+//! Linux checkout storage backend. It never owns provider homes or VM RAM.
 pub mod cli;
 pub mod config;
+pub mod incus;
 mod runtime;
 pub mod source;
 

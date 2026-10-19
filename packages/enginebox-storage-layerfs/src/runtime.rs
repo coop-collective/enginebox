@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::Duration};
 
 const BRIDGE: &str = include_str!("bridge.mjs");
-const SOCKET: &str = "unix:///var/run/docker.sock";
+#[path = "recovery.rs"]
+mod recovery;
 #[derive(Clone, Serialize, Deserialize)]
 struct Project {
     schema: u32,
@@ -36,23 +37,95 @@ struct Workspace {
     last_error: Option<String>,
     #[serde(default)]
     last_checkpoint: Option<Value>,
+    /// Retained after a transport failure so recovery cannot mistake a partial
+    /// checkpoint/remount for a completed ordinary command.
+    #[serde(default)]
+    last_operation: Option<String>,
+    #[serde(default)]
+    recoveries: Vec<Value>,
+    #[serde(default)]
+    pending_call: Option<String>,
 }
 pub struct Runtime {
     pub config: Config,
 }
-fn docker(args: &[String], input: Option<&[u8]>, seconds: u64) -> Result<Vec<u8>> {
-    let mut command = vec!["docker".into(), "--host".into(), SOCKET.into()];
+fn docker_at(
+    socket: &std::path::Path,
+    args: &[String],
+    input: Option<&[u8]>,
+    seconds: u64,
+) -> Result<Vec<u8>> {
+    let mut command = vec![
+        "docker".into(),
+        "--host".into(),
+        format!("unix://{}", socket.display()),
+    ];
     command.extend_from_slice(args);
     run_process(&command, input, Duration::from_secs(seconds))
 }
-fn d(args: &[&str]) -> Result<Value> {
-    Ok(serde_json::from_slice(&docker(
-        &args.iter().map(|v| (*v).into()).collect::<Vec<_>>(),
-        None,
-        30,
-    )?)?)
+fn docker_api(version: &str) -> Result<(u32, u32)> {
+    let (major, minor) = version
+        .split_once('.')
+        .context("Invalid Docker API version")?;
+    Ok((major.parse()?, minor.parse()?))
+}
+fn require_docker_api(server: &Value) -> Result<()> {
+    let max = server["ApiVersion"]
+        .as_str()
+        .context("Docker maximum API version missing")?;
+    let min = server["MinAPIVersion"]
+        .as_str()
+        .context("Docker minimum API version missing")?;
+    ensure!(
+        docker_api(min)? <= (1, 54) && docker_api(max)? >= (1, 54),
+        "Pinned LayerFS requires Docker API 1.54; server supports {min}–{max}. Provision a compatible dedicated node; this command never upgrades the daemon"
+    );
+    Ok(())
+}
+fn verify_socket(_path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let path = _path;
+        let link = fs::symlink_metadata(path)
+            .context("Provision the configured local Docker Unix socket first")?;
+        ensure!(
+            !link.file_type().is_symlink(),
+            "Docker socket itself must not be a symlink"
+        );
+        if path != crate::config::default_docker_socket() {
+            real_path(path)?;
+        }
+        // /var/run -> /run is the conventional default on Linux. Verify the
+        // resolved socket and parent permissions without rebinding its config.
+        let resolved = path.canonicalize()?;
+        let metadata = fs::metadata(&resolved)?;
+        ensure!(
+            metadata.file_type().is_socket() && metadata.uid() == 0 && metadata.mode() & 0o002 == 0,
+            "Docker endpoint must be an existing root-owned Unix socket, not writable by others"
+        );
+        for parent in resolved.ancestors().skip(1) {
+            let metadata = fs::metadata(parent)?;
+            ensure!(
+                metadata.is_dir() && metadata.mode() & 0o022 == 0,
+                "Docker socket parent must not be group/other writable: {}",
+                parent.display()
+            );
+        }
+    }
+    Ok(())
 }
 impl Runtime {
+    fn docker(&self, args: &[String], input: Option<&[u8]>, seconds: u64) -> Result<Vec<u8>> {
+        docker_at(&self.config.docker_socket, args, input, seconds)
+    }
+    fn d(&self, args: &[&str]) -> Result<Value> {
+        Ok(serde_json::from_slice(&self.docker(
+            &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
+            None,
+            30,
+        )?)?)
+    }
     pub fn new(config: Config) -> Result<Self> {
         ensure!(
             cfg!(target_os = "linux"),
@@ -60,9 +133,10 @@ impl Runtime {
         );
         ensure!(
             run_process(&["id".into(), "-u".into()], None, Duration::from_secs(5))? == b"0\n",
-            "Run this optional node-local backend as root; SDK metadata is written by the trusted root Docker helper"
+            "Run this node-local backend as root; SDK metadata is written by the trusted root Docker helper"
         );
         config.verify_artifacts()?;
+        verify_socket(&config.docker_socket)?;
         Ok(Self { config })
     }
     fn root(&self) -> Result<()> {
@@ -151,16 +225,25 @@ impl Runtime {
     fn workspace(&self, name: &str) -> Result<Workspace> {
         identifier(name)?;
         let w: Workspace = serde_json::from_value(state::read_json(&self.workspace_path(name))?)?;
-        ensure!(w.schema == 1 && w.name == name, "Invalid workspace receipt");
+        ensure!(
+            [1, 2].contains(&w.schema) && w.name == name,
+            "Invalid workspace receipt"
+        );
         identifier(&w.sandbox)?;
         identifier(&w.branch)?;
         Ok(w)
     }
     fn save_workspace(&self, w: &Workspace) -> Result<()> {
-        state::write_json(&self.workspace_path(&w.name), &serde_json::to_value(w)?)
+        // Old runtimes must refuse rather than silently erase recovery custody.
+        let mut upgraded = w.clone();
+        upgraded.schema = 2;
+        state::write_json(
+            &self.workspace_path(&w.name),
+            &serde_json::to_value(upgraded)?,
+        )
     }
     fn owned_volume(&self, p: &Project) -> Result<()> {
-        let v = d(&["volume", "inspect", &p.volume])?;
+        let v = self.d(&["volume", "inspect", &p.volume])?;
         ensure!(
             v[0]["Driver"] == "local"
                 && v[0]["Options"].as_object().is_none_or(|o| o.is_empty())
@@ -171,12 +254,14 @@ impl Runtime {
         Ok(())
     }
     pub fn doctor(&self) -> Result<Value> {
-        let info = d(&["info", "--format", "{{json .}}"])?;
+        let version = self.d(&["version", "--format", "{{json .Server}}"])?;
+        require_docker_api(&version)?;
+        let info = self.d(&["info", "--format", "{{json .}}"])?;
         ensure!(
             info["OSType"] == "linux",
             "Local Linux Docker daemon required"
         );
-        let image = d(&["image", "inspect", &self.config.image])?;
+        let image = self.d(&["image", "inspect", &self.config.image])?;
         ensure!(
             image[0]["Id"] == self.config.image,
             "Image identity mismatch"
@@ -231,7 +316,7 @@ impl Runtime {
             .into_iter()
             .flatten()
         {
-            let value = d(&["volume", "inspect", volume])?;
+            let value = self.d(&["volume", "inspect", volume])?;
             ensure!(
                 value[0]["Driver"] == "local"
                     && value[0]["Options"].as_object().is_none_or(|v| v.is_empty()),
@@ -239,7 +324,7 @@ impl Runtime {
             );
         }
         Ok(
-            json!({"ok":true,"experimental":true,"revision":crate::REVISION,"filesystem":kind,
+            json!({"ok":true,"backend":"layerfs","qualification":"preview","revision":crate::REVISION,"filesystem":kind,"docker_api":version["ApiVersion"],
             "max_workspaces":self.config.max_workspaces,"workspace_cpu_budget":self.config.max_workspaces as u64 * self.config.cpus_per_workspace as u64,
             "workspace_memory_mib_budget":self.config.max_workspaces as u64 * self.config.memory_mib_per_workspace as u64,
             "limitations":["One administrator/trust boundary per root","No VM attachment or RAM checkpoint integration","No crash-durability guarantee","Immutable cache generations require no external writers","Disk reserve is an admission check, not a write quota","SDK helper adds up to 1 CPU and 1 GiB per concurrent operation"]}),
@@ -251,7 +336,7 @@ impl Runtime {
                 >= bytes + self.config.disk_reserve_gib * enginebox_core::GIB,
             "Insufficient free state disk after reserve"
         );
-        let info = d(&["info", "--format", "{{json .}}"])?;
+        let info = self.d(&["info", "--format", "{{json .}}"])?;
         let docker_root = info["DockerRootDir"]
             .as_str()
             .context("Docker root missing")?;
@@ -271,7 +356,11 @@ impl Runtime {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().context("Invalid bridge request")?.clone());
-        let call = format!("ebox-lfs-call-{}", uuid::Uuid::new_v4().simple());
+        let call = extra["_call"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("ebox-lfs-call-{}", uuid::Uuid::new_v4().simple()));
+        identifier(&call)?;
         let mut args = vec![
             "run".into(),
             "--rm".into(),
@@ -302,7 +391,10 @@ impl Runtime {
                 self.config.daemon.display()
             ),
             "--mount".into(),
-            "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock".into(),
+            format!(
+                "type=bind,src={},dst=/var/run/docker.sock",
+                self.config.docker_socket.display()
+            ),
             "--mount".into(),
             format!("type=volume,src={},dst=/layerfs-store", p.volume),
             "-i".into(),
@@ -317,8 +409,29 @@ impl Runtime {
                 .to_string_lossy()
                 .into_owned(),
         ];
+        if extra["_call"].is_string() {
+            let calls = self.project_dir(&p.name).join("calls");
+            state::private_dir(&calls)?;
+            let path = calls.join(&call);
+            state::write_json(
+                &path.with_extension("json"),
+                &json!({"schema":1,"call":call,"owner":p.owner,"project":p.name,"sandbox":extra["sandbox"],"operation":operation}),
+            )?;
+            let result = shell_quote(&path.with_extension("result").to_string_lossy());
+            let done = shell_quote(&path.with_extension("finished").to_string_lossy());
+            let started = shell_quote(&path.with_extension("started").to_string_lossy());
+            let bridge = shell_quote(&self.config.root.join("bridge.mjs").to_string_lossy());
+            // The trusted helper writes completion before returning to its
+            // operator. An absent helper alone cannot prove a delayed launch
+            // will not start, so recovery requires this exact settled result.
+            let script = format!(
+                "umask 077; : > {started}; timeout --kill-after=5s {timeout}s node {bridge} > {result}; code=$?; printf '%s\\n' \"$code\" > {done}; cat {result}; exit \"$code\""
+            );
+            args.truncate(args.len() - 5);
+            args.extend(["sh".into(), "-c".into(), script]);
+        }
         // Explicit argv and stdin JSON: user commands never become host shell text.
-        let result = docker(&args, Some(&serde_json::to_vec(&request)?), timeout + 15);
+        let result = self.docker(&args, Some(&serde_json::to_vec(&request)?), timeout + 15);
         args.clear();
         let output = result.with_context(|| {
             format!("SDK outcome uncertain; inspect retained helper {call}; no automatic replay")
@@ -346,7 +459,7 @@ impl Runtime {
         Ok(id)
     }
     fn verify_container(&self, p: &Project, sandbox: &str, id: &str) -> Result<()> {
-        let v = d(&["inspect", id])?;
+        let v = self.d(&["inspect", id])?;
         let c = &v[0];
         ensure!(
             c["Id"] == id
@@ -362,7 +475,7 @@ impl Runtime {
         Ok(())
     }
     fn limits(&self, id: &str) -> Result<()> {
-        docker(
+        self.docker(
             &[
                 "update".into(),
                 "--cpus".into(),
@@ -377,7 +490,7 @@ impl Runtime {
             None,
             30,
         )?;
-        let v = d(&["inspect", id])?;
+        let v = self.d(&["inspect", id])?;
         ensure!(
             v[0]["HostConfig"]["Memory"]
                 == self.config.memory_mib_per_workspace as u64 * 1024 * 1024
@@ -404,7 +517,7 @@ impl Runtime {
         } else {
             "set -eu; mountpoint -q /project; umount /project".into()
         };
-        docker(
+        self.docker(
             &[
                 "exec".into(),
                 "--user=0".into(),
@@ -465,7 +578,7 @@ impl Runtime {
         let outcome = (|| {
             source::stage(repo, &preview, &directory)?;
             // Docker volume create otherwise silently adopts an existing name.
-            let found = docker(
+            let found = self.docker(
                 &[
                     "volume".into(),
                     "ls".into(),
@@ -479,7 +592,7 @@ impl Runtime {
                 found.iter().all(|b| b.is_ascii_whitespace()),
                 "Store volume already exists"
             );
-            docker(
+            self.docker(
                 &[
                     "volume".into(),
                     "create".into(),
@@ -556,6 +669,7 @@ impl Runtime {
             .transpose()?;
         let source_branch = if let Some(source) = from {
             let parent = self.workspace(source)?;
+            crate::incus::ensure_detached(&self.config.root, source)?;
             ensure!(
                 parent.project == project
                     && ["ready", "closed"].contains(&parent.status.as_str())
@@ -568,7 +682,7 @@ impl Runtime {
         };
         let key = format!("w-{}", uuid::Uuid::new_v4().simple());
         let mut w = Workspace {
-            schema: 1,
+            schema: 2,
             name: name.into(),
             project: project.into(),
             sandbox: key.clone(),
@@ -578,6 +692,9 @@ impl Runtime {
             status: "creating".into(),
             last_error: None,
             last_checkpoint: None,
+            last_operation: Some("creating".into()),
+            recoveries: vec![],
+            pending_call: None,
         };
         self.save_workspace(&w)?;
         let outcome = (|| {
@@ -654,6 +771,7 @@ impl Runtime {
             false,
         )?;
         let mut w = self.workspace(name)?;
+        crate::incus::ensure_detached(&self.config.root, name)?;
         ensure!(
             w.status == "ready",
             "Workspace is {}; inspect its receipt; uncertain operations are never replayed",
@@ -694,11 +812,16 @@ impl Runtime {
         }
         ensure!(message.len() <= 4096, "Checkpoint message too long");
         w.status = operation.into();
+        w.last_operation = Some(operation.into());
         self.save_workspace(&w)?;
         let outcome = (|| {
             let mut request = base.clone();
             match operation {
                 "exec" | "deps" => {
+                    let call = format!("ebox-lfs-call-{}", uuid::Uuid::new_v4().simple());
+                    w.pending_call = Some(call.clone());
+                    self.save_workspace(&w)?;
+                    request["_call"] = json!(call);
                     request["argv"] = json!(arguments);
                     request["timeout"] = json!(timeout);
                     let result = self.bridge(&p, "exec", request, timeout + 10)?;
@@ -746,6 +869,68 @@ impl Runtime {
                 "ready"
             },
         )
+    }
+    pub fn incus_attach(&self, name: &str, target: crate::incus::Target) -> Result<Value> {
+        identifier(name)?;
+        self.root()?;
+        self.verify_binding()?;
+        let _lease = state::lock(
+            &self
+                .config
+                .root
+                .join("workspaces")
+                .join(format!("{name}.lock")),
+            false,
+        )?;
+        let w = self.workspace(name)?;
+        ensure!(
+            w.status == "ready",
+            "Workspace is not ready for Incus attachment"
+        );
+        let p = self.project(&w.project)?;
+        self.owned_volume(&p)?;
+        let id = w.container.as_deref().context("Container missing")?;
+        self.verify_container(&p, &w.sandbox, id)?;
+        self.no_helpers(&p)?;
+        self.probe(&w)?;
+        // Older runtimes do not understand attachment leases. Upgrade before
+        // publishing an export so they refuse this workspace after rollback.
+        self.save_workspace(&w)?;
+        crate::incus::attach(
+            &self.config.root,
+            name,
+            id,
+            target,
+            &self.config.docker_socket,
+        )
+    }
+    pub fn incus_verify(&self, name: &str) -> Result<Value> {
+        identifier(name)?;
+        self.verify_binding()?;
+        let _lease = state::lock(
+            &self
+                .config
+                .root
+                .join("workspaces")
+                .join(format!("{name}.lock")),
+            false,
+        )?;
+        self.workspace(name)?;
+        crate::incus::verify(&self.config.root, name, &self.config.docker_socket)
+    }
+    pub fn incus_detach(&self, name: &str) -> Result<Value> {
+        identifier(name)?;
+        self.verify_binding()?;
+        let _lease = state::lock(
+            &self
+                .config
+                .root
+                .join("workspaces")
+                .join(format!("{name}.lock")),
+            false,
+        )?;
+        self.workspace(name)?;
+        crate::incus::detach(&self.config.root, name, &self.config.docker_socket)
     }
     pub fn list(&self) -> Result<Value> {
         let path = self.config.root.join("workspaces");

@@ -11,7 +11,7 @@ pub struct Storage {
 }
 #[derive(Subcommand)]
 enum Backend {
-    /// Experimental Linux/Docker checkouts, separate from Incus VM storage.
+    /// Shared Linux checkout storage, with pinned preview qualification.
     Layerfs {
         #[arg(long, global = true)]
         config: Option<PathBuf>,
@@ -70,6 +70,33 @@ enum Command {
     Remount { name: String },
     /// Close a clean workspace; refuses uncheckpointed edits, never discards.
     Close { name: String },
+    /// Reconcile an interrupted command after proving the original is finished.
+    Recover { name: String },
+    /// Replace a stopped sandbox from its last completed file checkpoint.
+    RestoreCheckpoint {
+        name: String,
+        /// Edits after that checkpoint remain only in the retained old overlay.
+        #[arg(long, required = true)]
+        acknowledge_uncheckpointed: bool,
+    },
+    /// Attach only this checkout to a stopped owned Incus VM at /project.
+    IncusAttach {
+        name: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, default_value_t = 1001)]
+        uid: u32,
+        #[arg(long, default_value_t = 1001)]
+        gid: u32,
+    },
+    /// Verify the exact VM, Docker process and exported mount identities.
+    IncusVerify { name: String },
+    /// Detach an export after its exact owned VM has stopped without RAM state.
+    IncusDetach { name: String },
     /// Show local receipts, including interrupted operations requiring inspection.
     List,
 }
@@ -79,7 +106,7 @@ pub fn run(args: Storage) -> Result<Value> {
         return Ok(serde_json::to_value(source::preview(&repo, &revision)?)?);
     }
     let runtime = Runtime::new(Config::load(
-        &config.context("Pass --config with an explicit experimental LayerFS configuration")?,
+        &config.context("Pass --config with the node's provisioned LayerFS configuration")?,
     )?)?;
     match command {
         Command::Doctor => runtime.doctor(),
@@ -106,6 +133,30 @@ pub fn run(args: Storage) -> Result<Value> {
         }
         Command::Remount { name } => runtime.operate(&name, "remount", &[], 120, ""),
         Command::Close { name } => runtime.operate(&name, "close", &[], 120, ""),
+        Command::Recover { name } => runtime.recover(&name),
+        Command::RestoreCheckpoint {
+            name,
+            acknowledge_uncheckpointed: _,
+        } => runtime.restore_checkpoint(&name),
+        Command::IncusAttach {
+            name,
+            project,
+            instance,
+            owner,
+            uid,
+            gid,
+        } => runtime.incus_attach(
+            &name,
+            crate::incus::Target {
+                project,
+                instance,
+                owner,
+                uid,
+                gid,
+            },
+        ),
+        Command::IncusVerify { name } => runtime.incus_verify(&name),
+        Command::IncusDetach { name } => runtime.incus_detach(&name),
         Command::List => runtime.list(),
         Command::Preview { .. } => unreachable!(),
     }

@@ -1,8 +1,8 @@
 # LayerFS evaluation
 
-Decision recorded 2026-10-19: keep Incus as the current fleet compute and VM checkpoint backend. The [experimental node-local LayerFS CLI backend](LAYERFS-BACKEND.md) now integrates the pinned checkout workflow separately. LayerFS artifacts are not installed or selected by default, and this does not attach LayerFS storage to Incus workspaces.
+Decision recorded 2026-10-19: make [LayerFS checkout storage](LAYERFS-BACKEND.md) a first-class Engine Box capability, available through controller registration, durable jobs and MCP. Keep Incus responsible for compute and VM lifecycle. Storage nodes must satisfy the pinned runtime and capability checks before allocation; the normal feature does not require an experimental opt-in switch. Provider homes remain private.
 
-The [disposable Linux validation](LAYERFS-VALIDATION.md) now establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. It also records mtime, Git metadata, recovery and topology limits. This is experimental qualification, not a production storage integration.
+The [disposable Linux validation](LAYERFS-VALIDATION.md) establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. Its mtime, Git metadata, recovery and topology limits still apply. Making the backend first-class does not turn that evidence into a production durability guarantee.
 
 The upstream [README](https://github.com/Ephemeral-AI-Lab/layerfs) describes independent writable workspaces over a shared store, copy-on-write branches, content-addressed deduplication, chunking and versioned checkpoints. This matches Engine Box's goal of reusing large checkouts and installed dependencies without giving agents a shared writable project directory. Upstream performance examples are their measurements, not Engine Box benchmarks.
 
@@ -29,7 +29,7 @@ Engine Box already uses the configured Incus pool's snapshot/copy facilities; La
 
 The dependency/build findings are upstream reports at the pinned revision, not our measurements: [F-034 and F-056](https://github.com/Ephemeral-AI-Lab/layerfs/blob/968a5d0be0ea3e9456b06f9148b65523138e9490/core/docs/issues/352/BUGS.md), [pnpm mount-path behavior](https://github.com/Ephemeral-AI-Lab/layerfs/blob/968a5d0be0ea3e9456b06f9148b65523138e9490/core/docs/issues/352/NODE_RULE.md).
 
-The integration direction is therefore optional, node-local, credential-free checkout/dependency storage first. Keep existing Incus VM and private-home persistence. Sharing one store across multiple current workspace VMs requires a new mount/export design that leaves every Store opener in one kernel, plus explicit file/RAM checkpoint ordering. Containers inside one Incus VM could satisfy the same-kernel condition, but would change the compute isolation and per-agent memory-checkpoint model; that is a separate backend decision.
+The implementation uses node-local, credential-free checkout/dependency storage with explicit capability checks. Existing Incus VM and private-home persistence remains. The [Incus adapter](LAYERFS-INCUS.md) leaves every Store opener in the host kernel and exports one checkout through a directory disk. File/RAM checkpoint ordering remains a separate gate; marked attached VMs cannot be hibernated, snapshotted or forked.
 
 ## Placement
 
@@ -37,7 +37,7 @@ Engine Box owns fleet authorization, scheduling, resource limits, native provide
 
 The intended flow is: select an authorized base revision, create a private writable branch, attach it to an isolated workspace, launch the original CLI with that workspace's private home, then checkpoint the file state. This does not replace the native harness or require routing its inference through Engine Box. Tool-call-by-tool-call history is a separate integration decision; the current native CLI launch interface does not expose every internal tool call.
 
-The current documented sandbox path uses Docker. An Incus VM mount adapter is not established by that support: the first experiment must prove how a selected branch reaches the guest, which process owns the mount, and what survives either side restarting. An agent should receive its authorized workspace view, not unrestricted access to the underlying shared Store. Keep this adapter optional until that boundary works with the existing VM lifecycle.
+The upstream sandbox path uses Docker. Engine Box's separately qualified Incus adapter must establish how a selected branch reaches the guest, which process owns the mount, and what survives either side restarting. See the [attachment contract and current boundaries](LAYERFS-INCUS.md). An agent receives its authorized workspace view, never unrestricted access to the underlying shared Store. Attachment is an explicit operator action; fleet allocation does not attach it automatically.
 
 File checkpoints and memory checkpoints must remain separate capabilities. Incus pause/hibernate captures VM process state. A file branch alone cannot restore RAM, active sockets, browser sessions or a running compiler. A combined checkpoint needs a consistency barrier so the filesystem revision and VM memory describe the same state.
 
@@ -49,7 +49,7 @@ File checkpoints and memory checkpoints must remain separate capabilities. Incus
 - Treat `.git`, ignored files, caches and build output as real data that may contain secrets. Upstream import includes more than Git-tracked files; an import policy and preview are required before a reusable base can be published.
 - Do not mount a writable store from arbitrary fleet nodes over NFS or SMB. Storage locking, corruption recovery and network-filesystem support require explicit upstream support and our qualification.
 
-## Qualification before integration
+## Remaining qualification gates
 
 1. Verify the released Linux kernel/filesystem/container requirements and pin the Rust SDK or supported process interface. Current README requirements include a Linux store on ext4, XFS or Btrfs and Docker for its sandbox integration. A laptop Docker VM is not proof of native macOS or Windows filesystem support.
 2. Test a real native Claude, Codex and Cursor session against the mounted tree, including exact-session resume, Git worktrees, symlinks, file watchers, atomic rename, executable bits, locks and large generated files.

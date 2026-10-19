@@ -1,8 +1,10 @@
-# Experimental node-local checkout backend
+# LayerFS checkout storage
 
 `ebox storage layerfs` integrates the qualified LayerFS preview with Engine Box's Rust operator CLI. It imports an approved Git revision, creates isolated writable Docker workspaces, enforces configured CPU/RAM limits, runs ordinary commands, reuses immutable pnpm dependencies, and checkpoints/remounts file state at a stable `/project` path.
 
-This is an **opt-in Linux administrator backend**, not the default Incus workspace filesystem. It does not attach storage to fleet VMs, move native agent homes, delegate credentials, expose new controller/MCP endpoints, or checkpoint RAM. The existing Incus lifecycle and private account state are independent. Authenticated native agent sessions on these mounts remain unqualified.
+LayerFS is Engine Box's first-class checkout storage backend. The controller owns registered storage nodes and source aliases; authenticated API and MCP operations use that registry and the existing durable job queue. See [storage registration and API](STORAGE-API.md). Node execution currently requires Linux and qualified local artifacts. The legacy `experimental` configuration field remains readable for existing receipts but no longer enables or disables the feature.
+
+File storage and VM memory remain distinct. Provider homes and credential delegation keep their existing private lifecycle. Native authenticated sessions on LayerFS mounts and production durability still need separate qualification. Incus attachment and recovery have explicit capability checks; first-class access does not mean every platform or failure mode is supported.
 
 ## Runtime and installation boundary
 
@@ -10,7 +12,7 @@ The Rust package is `packages/enginebox-storage-layerfs`. Rust owns configuratio
 
 The backend pins revision `968a5d0be0ea3e9456b06f9148b65523138e9490`. It checks the full SDK source digest and both configured native artifact hashes before execution. It requires an immutable local Docker image ID. The SDK and daemon are **not downloaded or installed by default**. Build the pinned artifacts using the [disposable validation package](../packages/layerfs-validation/README.md), or explicitly provision those exact inputs on a dedicated Linux test node. This preview still has no supported upstream install; there is no advertised fleet-wide LayerFS installer.
 
-Use local ext4, XFS or Btrfs for both Docker volumes and private SDK metadata. Run the CLI as root on that node with its local Docker socket. A root with existing unrelated files is refused. One private state root is one administrator/trust boundary; projects get separate Store volumes. Root configuration, source revision, immutable artifact hashes and bridge contents are bound to local receipts. A changed binding is refused instead of silently migrating or downgrading a Store.
+Use local ext4, XFS or Btrfs for both Docker volumes and private SDK metadata. The pinned SDK requires Docker API **1.54**; `doctor` and import preflight reject incompatible daemons before creating state. Docker 29.1.3 reporting maximum API 1.52 is incompatible, even though it is a recent Docker release. The CLI does not upgrade a host daemon. Run it as root on a compatible node with its local Docker socket. A root with existing unrelated files is refused. One private state root is one administrator/trust boundary; projects get separate Store volumes. Root configuration, source revision, immutable artifact hashes and bridge contents are bound to local receipts. A changed binding is refused instead of silently migrating or downgrading a Store.
 
 Start from [the example configuration](../examples/layerfs.example.json), replacing paths, image ID and artifact hashes with the build receipts. `max_workspaces × cpus_per_workspace` and `max_workspaces × memory_mib_per_workspace` describe the workspace budget. A temporary SDK helper adds up to 1 CPU and 1 GiB per concurrent operation. Reserve host capacity for that overhead or use a VM with an explicit outer budget. This backend does not enroll a Docker node in the fleet scheduler.
 
@@ -69,7 +71,24 @@ sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
 
 The CLI writes an in-progress receipt before each mutation. A caught transport or SDK failure marks the workspace uncertain. Killing the CLI can leave its recorded action in progress while the bounded Docker helper/command finishes. A later command refuses that workspace even after its original process ends: nothing is automatically replayed, discarded or claimed healthy. `list` reports durable local receipts, not a fresh daemon health probe.
 
-Inspect the exact private project/workspace receipts and their recorded container/volume identities before recovery. Recovery after daemon/host restart, automatic reconciliation and an administrative repair command are not implemented. Retained in-progress/uncertain workspaces count against admission. Do not hand-edit them to ready or remove their locks while an operation might still be running. Preserve their data for inspection.
+`recover NAME` reconciles an interrupted `exec` or `deps` after the original bounded process finishes. Each new command records its exact helper identity before launch; the trusted helper saves its original SDK result and completion marker in private project state before returning. Recovery requires that completed result. An absent helper alone does not prove a delayed launch cannot still begin; missing, timed-out or ambiguous results remain blocked.
+
+Recovery acquires the workspace lease, verifies the exact owned Store/container, refuses while a project SDK helper exists, and checks the container's kernel process and mount tables. Only the expected root init/daemon processes may remain; `/project` must still refer to the recorded FUSE mount. The authenticated SDK must confirm the original daemon instance, the expected branch, idle control state and no unresolved merge. Dirty file edits can stay mounted. The audit records the original saved exit code; it never runs the command again or invents an exit code. Helper result files can contain command output and remain private administrator state, subject to the same retention policy as the workspace.
+
+```sh
+sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json recover worker-a
+```
+
+A dead daemon cannot satisfy that proof. If its container is already stopped and the workspace has a recorded completed file checkpoint, `restore-checkpoint NAME --acknowledge-uncheckpointed` creates a new sandbox and branch. Before accepting it, the backend checks the Store's actual branch head against the saved checkpoint, verifies the new mount, and reapplies CPU/RAM limits. The old stopped container, overlay and identities remain available for inspection. **Edits made after the last checkpoint are not recovered into the replacement.** This command never stops a running agent, deletes an old overlay, or retries an unknown storage mutation.
+
+```sh
+sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
+  restore-checkpoint worker-a --acknowledge-uncheckpointed
+```
+
+These are operator recovery commands, not an automatic startup reconciler or a power-loss guarantee. Partial create, checkpoint, remount, close and restoration operations remain blocked for inspection. A missing/corrupt Store, missing old container, changed checkpoint head, changed configuration or unknown legacy operation is also refused. The preview's SQLite settings still do not guarantee durable writes after host/power failure; preserving a receipt does not reconstruct lost data. Retained active/uncertain workspaces count against admission, and retained stopped containers consume disk until explicitly inspected and removed. Do not hand-edit receipts to ready or remove their locks while an operation might still be running.
+
+The runtime reads existing schema-1 workspace receipts and writes schema 2 on mutation to preserve recovery custody. Older binaries reject schema 2; do not roll a storage root back to a binary that cannot read its receipts. Project/config bindings and the pinned SDK bridge are unchanged. Legacy interrupted commands without an exact helper completion receipt remain blocked.
 
 Closing a workspace deletes its sandbox only after a clean unmount; committed history remains in its project Store. Closed names are not reused. Project deletion and history garbage collection are not automated. The disk reserve checks admission and operations against current free space; it is not a per-workspace write quota and cannot prevent a long command from filling a disk. Do not use this preview for irreplaceable edits or production tenants.
 

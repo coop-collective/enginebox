@@ -4,7 +4,7 @@ use crate::{
     capacity::{number, resource_bytes},
     model::{GuestConfig, Host, Resources},
     state,
-    transport::{EngineBox, host_run, run_process},
+    transport::{EngineBox, ensure_no_external_checkout, host_run, run_process},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -555,6 +555,9 @@ pub fn build_plan(c: &Value, o: &Value) -> Result<Value> {
     match instance {
         None => actions.extend(["create_workspace", "prepare_workspace"]),
         Some(i) => {
+            if let Err(error) = ensure_no_external_checkout(i, "bootstrap preparation") {
+                errors.push(json!(error.to_string()));
+            }
             reject!(
                 !owned(i, &c),
                 "Existing workspace lacks Engine Box ownership"
@@ -733,6 +736,7 @@ fn prepare_workspace(c: &Value, binary_dir: &Path) -> Result<()> {
     let bx = local_box(c)?;
     let name = text(&c["workspace"], "name")?;
     let vm = bx.instance(name)?;
+    ensure_no_external_checkout(&vm, "bootstrap preparation")?;
     if vm["config"].get("user.enginebox.clean-base").is_some() {
         bx.call(&["config", "unset", name, "user.enginebox.clean-base"])?;
     }
@@ -1026,6 +1030,7 @@ pub fn install_template(h: &Host, manifest: &Value) -> Result<Value> {
     let _lock = crate::operation_lock(h)?;
     let bx = h.engine_box();
     let vm = bx.instance(&base)?;
+    ensure_no_external_checkout(&vm, "template publication")?;
     let fp = fingerprint(&c);
     let snapshot = format!("prepared-{}", &fp[..12]);
     ensure!(
@@ -1040,6 +1045,7 @@ pub fn install_template(h: &Host, manifest: &Value) -> Result<Value> {
         "/1.0/instances/{base}/snapshots/{snapshot}?project={}",
         h.project
     ))?;
+    ensure_no_external_checkout(&snap, "template publication")?;
     ensure!(
         snap["config"]["user.enginebox.clean-base"] == "true" && snap["stateful"] != true,
         "Prepared snapshot is not clean disk-only base"
