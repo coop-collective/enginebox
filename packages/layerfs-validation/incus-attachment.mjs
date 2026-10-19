@@ -77,6 +77,19 @@ try {
   await boot();
   assert.equal(guest('stat -c "%u:%g" /project').trim(), '1001:1001');
   guest('cd /project; test -r .git/HEAD; printf private-write > private.txt; mkdir newdir; printf nested > newdir/data; ln private.txt hardlink.txt; mv private.txt renamed.txt; mv renamed.txt private.txt; ln -s newdir/data link.txt; test "$(cat link.txt)" = nested; chmod 600 private.txt; test "$(stat -c %a private.txt)" = 600; ./run.sh; test ! -e /layerfs-store; test ! -S /var/run/docker.sock');
+  guest('cp /bin/true /project/probe-elf; /project/probe-elf; rm /project/probe-elf');
+  guest(`python3 - <<'PY'
+import mmap
+from pathlib import Path
+p = Path('/project/probe-mmap')
+p.write_bytes(b'original' + bytes(4088))
+with p.open('r+b') as f:
+    with mmap.mmap(f.fileno(), 4096, access=mmap.ACCESS_WRITE) as m:
+        m[:7] = b'changed'
+        m.flush()
+assert p.read_bytes().startswith(b'changed')
+# Retain mapped writes for checkpoint/remount and cold-start readback.
+PY`);
   storage(['exec', 'incus-b', '--', 'sh', '-eu', '-c', 'test ! -e private.txt; test ! -e newdir; test -r README.md']);
   storage(['incus-detach', 'incus-a'], { expectFailure: true });
   storage(['remount', 'incus-a'], { expectFailure: true });
@@ -98,11 +111,12 @@ try {
   assert.equal(owned().config['migration.stateful'], undefined);
   assert.equal(owned().expanded_config['migration.stateful'], 'true');
   storage(['checkpoint', 'incus-a', '--message', 'Incus guest writes']);
-  storage(['exec', 'incus-a', '--', 'sh', '-eu', '-c', 'test "$(cat private.txt)" = private-write; test "$(cat resumed.txt)" = resumed; test "$(cat newdir/data)" = nested']);
+  storage(['remount', 'incus-a']);
+  storage(['exec', 'incus-a', '--', 'sh', '-eu', '-c', 'test "$(cat private.txt)" = private-write; test "$(cat resumed.txt)" = resumed; test "$(cat newdir/data)" = nested; test "$(head -c 7 probe-mmap)" = changed']);
   owned(); incus(['config', 'set', vm, 'migration.stateful=false']);
   attach();
   await boot();
-  guest('test "$(cat /project/private.txt)" = private-write; test "$(cat /project/resumed.txt)" = resumed');
+  guest('test "$(cat /project/private.txt)" = private-write; test "$(cat /project/resumed.txt)" = resumed; test "$(head -c 7 /project/probe-mmap)" = changed');
   owned(); incus(['stop', vm, '--timeout=60']);
   storage(['incus-detach', 'incus-a']);
   assert.equal(owned().config['migration.stateful'], 'false', 'Preserve explicit local false');

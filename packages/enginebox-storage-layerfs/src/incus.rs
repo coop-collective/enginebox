@@ -185,7 +185,9 @@ pub fn validate_instance(v: &Value, target: &Target, stopped: bool) -> Result<St
     Ok(id.into())
 }
 fn expected_device(a: &Attachment) -> Value {
-    json!({"type":"disk","source":a.export,"path":"/project","io.bus":"virtiofs","io.cache":"none","required":"true"})
+    // Incus calls virtiofsd cache=always "unsafe". It permits shared mmap, but
+    // requires the exclusive guest writer and stopped-detach guards below.
+    json!({"type":"disk","source":a.export,"path":"/project","io.bus":"virtiofs","io.cache":"unsafe","required":"true"})
 }
 fn ensure_unattached(v: &Value) -> Result<()> {
     ensure!(
@@ -539,7 +541,7 @@ pub fn attach(
                 &format!("source={}", a.export.display()),
                 "path=/project",
                 "io.bus=virtiofs",
-                "io.cache=none",
+                "io.cache=unsafe",
                 "required=true",
             ],
         )?;
@@ -551,8 +553,8 @@ pub fn attach(
     finish(root, &mut a, result, "attached")
 }
 
-/// Verify actual guest mount and unprivileged permissions after normal VM boot.
-/// This never starts, resumes, or changes a guest on the caller's behalf.
+/// Verify guest mount, unprivileged writes and direct execution after normal boot.
+/// The only guest mutation is a unique, cleaned-up checkout readiness probe.
 pub fn verify(root: &Path, name: &str, docker_socket: &Path) -> Result<Value> {
     let _host = state::root_host_lock()?;
     let a = load(root, name)?;
@@ -597,8 +599,12 @@ pub fn verify(root: &Path, name: &str, docker_socket: &Path) -> Result<Value> {
             &format!("--group={}", a.target.gid),
             "--",
             "sh",
+            "-eu",
             "-c",
-            "test -r /project/.git/HEAD && test -w /project && test ! -e /layerfs-store && test ! -S /var/run/docker.sock",
+            &format!(
+                "test -r /project/.git/HEAD; test -w /project; test ! -e /layerfs-store; test ! -S /var/run/docker.sock; umask 077; probe=/project/.enginebox-storage-probe-{}; mkdir \"$probe\"; trap 'rm -f -- \"$probe/run\"; rmdir -- \"$probe\"' EXIT HUP INT TERM; printf '#!/bin/sh\\nexit 0\\n' > \"$probe/run\"; chmod 700 \"$probe/run\"; \"$probe/run\"; rm -- \"$probe/run\"; rmdir -- \"$probe\"; trap - EXIT HUP INT TERM",
+                uuid::Uuid::new_v4()
+            ),
         ],
     )?;
     Ok(
