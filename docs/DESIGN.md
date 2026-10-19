@@ -1,6 +1,6 @@
 # Portable self-hosted environment design
 
-Status: implementation design updated October 19, 2026. Bootstrap, native-client/browser preparation, fleet REST/MCP and the Vinext dashboard are implemented. Portable cache services, CI, upgrades and backup/recovery qualification remain planned. See the operational guides for supported commands.
+Status: implementation design updated October 19, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
 
 ## Outcome
 
@@ -37,7 +37,7 @@ The first backend is Incus. Keep backend-specific operations behind a small inte
 
 | Area | Initial target and evidence |
 |---|---|
-| Operator | Python 3.11+ and OpenSSH on macOS/Linux; other clients need testing. |
+| Operator | Native Rust CLI/controller on Linux, macOS and Windows; OpenSSH for remote Linux nodes. Native builds/tests passed on all three platforms. Personal resource contribution is a separate backend qualification. |
 | Host | Linux x86_64 with `/dev/kvm`, sufficient disk/RAM and administrator access. Reference prototype: Ubuntu 26.04, Incus 6.0.5, QEMU 10.2. |
 | Guest | Ubuntu 24.04 x86_64, configurable non-root user and workspace paths. |
 | Server provider | Dedicated hardware, or a VM exposing usable KVM; provider-independent configuration. |
@@ -48,7 +48,7 @@ Publish a tested host/kernel/Incus/QEMU matrix. Current upstream [Incus requirem
 
 ## Configuration and bootstrap
 
-Use a versioned, secret-free TOML file parsed with Python's standard library. [The bootstrap example](../examples/enginebox.example.toml) is supported by `init`, `doctor`, `plan` and `apply`. [Fleet configuration](../examples/fleet.example.toml) lists hosts, reserves and approved snapshots. The lower-level runtime uses explicit environment variables or internal configuration objects.
+Use a versioned, secret-free TOML file validated by the Rust runtime. [The bootstrap example](../examples/enginebox.example.toml) is supported by `init`, `doctor`, `plan` and `apply`. [Fleet configuration](../examples/fleet.example.toml) lists hosts, reserves and approved snapshots. The lower-level runtime uses explicit environment variables or internal configuration objects.
 
 Configuration describes transport/host, Incus project/profile, existing or managed network, storage pool, guest resources/identity, native-client selection and optional modules. Mount/cache policies remain a separate unimplemented extension. Credentials belong in native clients or short-lived setup input, never this file.
 
