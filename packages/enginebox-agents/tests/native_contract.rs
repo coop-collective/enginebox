@@ -45,8 +45,6 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
             assert_eq!(args[1..4], ["exec", "resume", id]);
             assert_eq!(args.last().unwrap(), "-");
             assert!(!args.contains(&"hello".into()));
-            // A leaf override lets native config preserve explicit per-tool
-            // approvals, disabled_tools and unrelated MCP server policies.
             let overrides: Vec<_> = args
                 .windows(2)
                 .filter(|pair| pair[0] == "-c")
@@ -57,7 +55,6 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
                 [
                     "approval_policy=\"never\"",
                     "sandbox_mode=\"workspace-write\"",
-                    "mcp_servers.enginebox-browser.default_tools_approval_mode=\"approve\"",
                 ]
             );
         }
@@ -88,6 +85,56 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
             );
         }
     }
+}
+#[test]
+fn codex_browser_default_requires_owned_enabled_entry_and_preserves_policy() {
+    let (_t, home) = temp();
+    let request = native::RunRequest::parse(json!({"provider":"codex","prompt":"hello"})).unwrap();
+    let base = native::native_command(&request, "codex");
+    let project = home.join("project");
+    let cwd = project.join("nested");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let make_command = || native::native_command_with_config(&request, "codex", &home, &cwd);
+    assert_eq!(make_command(), base);
+    let canonical = "[mcp_servers.enginebox-browser]\ncommand='/usr/local/bin/enginebox-guest'\nargs=['browser','--client','codex']\n";
+    for text in [
+        "[malformed".to_string(),
+        canonical.replace("enginebox-guest", "custom-browser"),
+        canonical.replace("'codex'", "'claude'"),
+        format!("{canonical}enabled=false\n"),
+        format!("{canonical}default_tools_approval_mode='prompt'\n"),
+        format!("{canonical}default_tools_approval_mode='approve'\n"),
+        format!("{canonical}url='http://localhost:1234'\n"),
+    ] {
+        security::write_bytes(&home, ".codex/config.toml", text.as_bytes(), 65536).unwrap();
+        assert_eq!(make_command(), base, "Must not override {text:?}");
+        assert_eq!(
+            std::fs::read(home.join(".codex/config.toml")).unwrap(),
+            text.as_bytes()
+        );
+    }
+    let configured = format!(
+        "{canonical}disabled_tools=['browser_file_upload']\n[mcp_servers.enginebox-browser.tools.browser_navigate]\napproval_mode='prompt'\n[mcp_servers.custom]\ncommand='custom'\ndefault_tools_approval_mode='prompt'\n"
+    );
+    security::write_bytes(&home, ".codex/config.toml", configured.as_bytes(), 65536).unwrap();
+    let mut expected = base.clone();
+    expected.splice(
+        expected.len() - 1..expected.len() - 1,
+        [
+            "-c".into(),
+            "mcp_servers.enginebox-browser.default_tools_approval_mode=\"approve\"".into(),
+        ],
+    );
+    assert_eq!(make_command(), expected);
+    assert_eq!(
+        std::fs::read(home.join(".codex/config.toml")).unwrap(),
+        configured.as_bytes()
+    );
+    // A trusted or untrusted project override remains Codex's decision. Even an
+    // unrelated project config makes us defer rather than reproducing its merge.
+    std::fs::create_dir(project.join(".codex")).unwrap();
+    std::fs::write(project.join(".codex/config.toml"), "model='configured'\n").unwrap();
+    assert_eq!(make_command(), base);
 }
 #[test]
 fn access_only_material_never_delegates_refresh() {
