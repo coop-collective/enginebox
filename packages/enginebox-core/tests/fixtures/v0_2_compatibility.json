@@ -1,0 +1,124 @@
+{
+  "provenance": "Captured from released v0.2.0 Python functions; input is fabricated, not host inventory",
+  "manifest": {
+    "schema_version": 1,
+    "id": "native",
+    "revision": 3,
+    "label": "Native 🐬 工作",
+    "description": "",
+    "recipe": "native-clients-v1",
+    "source_image": "images:ubuntu/24.04/cloud",
+    "minimum": {
+      "cpu": 2,
+      "memory_gib": 2,
+      "disk_gib": 30
+    },
+    "recommended": {
+      "cpu": 4,
+      "memory_gib": 4,
+      "disk_gib": 30
+    },
+    "native_clients": [
+      "claude",
+      "codex",
+      "cursor"
+    ],
+    "config": {
+      "browser": true,
+      "desktop": false,
+      "guest_computer_mcp": false
+    }
+  },
+  "manifest_digest": "9f419698e17dca8ffd1d746df54d359eaeae5225e93651c086a4a27add4a133b",
+  "host_binding": {
+    "target": "test-server",
+    "project": "enginebox",
+    "pool": "pool",
+    "guest": {
+      "user": "agent",
+      "uid": 1001,
+      "gid": 1001,
+      "home": "/home/agent",
+      "workspace": "/workspace",
+      "display": ":99"
+    },
+    "network": ""
+  },
+  "host_binding_digest": "591654ce057068f86a5534dc0b57c57cca3065d0de77e4b3e6a36bbe871fa11e",
+  "receipt_key": "6739ec23a244e893c6d78c7b94dd0862da933a6b9e3145e9d3b2e9d4617d4fe6",
+  "template": {
+    "id": "native",
+    "label": "Native",
+    "source": "ebox-base",
+    "snapshot": "prepared"
+  },
+  "snapshot": {
+    "name": "ebox-base/prepared",
+    "created_at": "2026-10-19T00:00:00Z",
+    "config": {
+      "user.enginebox.clean-base": "true",
+      "user.description": "工作 🐬"
+    }
+  },
+  "resources": {
+    "cpu": 2,
+    "memory_gib": 2,
+    "disk_gib": 30
+  },
+  "warm_generation": "0198edff02eb5db2beeabc598673c4aa7fd8962665d4ff874a5ec2c2ac1b9431",
+  "bootstrap": {
+    "schema_version": 1,
+    "host": {
+      "transport": "ssh",
+      "target": "builder@example",
+      "data_dir": "/var/lib/enginebox",
+      "install_packages": false,
+      "disk_reserve": "5GiB",
+      "memory_reserve": "1GiB",
+      "admission": {}
+    },
+    "incus": {
+      "project": "ebox-testing",
+      "profile": "ebox-profile"
+    },
+    "storage": {
+      "mode": "existing",
+      "pool": "existing-pool",
+      "size": "120GiB"
+    },
+    "network": {
+      "mode": "existing",
+      "name": "existing-network",
+      "subnet": "10.203.0.1/24"
+    },
+    "workspace": {
+      "name": "ebox-test",
+      "image": "images:ubuntu/24.04/cloud",
+      "cpu": 4,
+      "memory": "4GiB",
+      "disk": "30GiB",
+      "state_disk": "8GiB",
+      "user": "agent",
+      "uid": 1001,
+      "gid": 1001,
+      "home": "/home/agent",
+      "path": "/workspace",
+      "ready_timeout": 300
+    },
+    "agents": {
+      "install": [
+        "codex",
+        "cursor",
+        "claude"
+      ]
+    },
+    "modules": {
+      "desktop": false,
+      "browser": false,
+      "operator_mcp": true,
+      "guest_computer_mcp": false,
+      "ci": false
+    }
+  },
+  "bootstrap_fingerprint": "daea20bfdd58f09fb2ed8952cbfc9b6f76b9a822d20dc8361637a97de271858f"
+}

@@ -17,27 +17,21 @@ Updated October 19, 2026. Scope: portable environments for native Codex, Cursor 
 | P8 | Optional personal-resource node | P1, P7 | Explicit opt-in enrollment; enforce chosen aggregate CPU/RAM budget locally and at admission; one disposable Docker workspace validated on Mac and Windows separately; disconnect/sleep/reconnect cannot duplicate a run; no daemon socket in agent containers. |
 | P9 | Movable tenant state and native engine hosts | P7, P8 | Authenticated tenant authorization, account separation and private volume attach/lease tests before public multi-tenancy; independent Windows/macOS worker and GPU/image qualification. |
 
-Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and upgrade/rollback remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
+Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and initial legacy migration remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
 The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. It does not add agent orchestration or automatic placement.
 
 ## Implemented code boundaries
 
-- `runtime/bootstrap_config.py`: strict schema, defaults and guest/resource validation.
-- `runtime/bootstrap.py`: read-only inventory, deterministic planning, host lock/journal and resumable provisioning.
-- `runtime/enginebox.py`: validated local/SSH Incus lifecycle and guest operations.
-- `runtime/guest_setup.sh` and `browser_tools.py`: official client/browser preparation and private browser profiles.
-- `runtime/fleet.py`, `fleet_api.py`, `fleet_mcp.py`: multi-host inventory, capacity, jobs, authenticated REST and operator MCP.
-- `runtime/templates.py`: strict portable manifests, public HTTPS import, per-host revision receipts and bootstrap installation adapter.
-- `runtime/warm_pool.py`: prebooted reserves, durable one-way claims, refill admission and quarantine.
-- `runtime/agent_access.py`, `agent_sync.py`, `accounts.py`, `guest_auth.py`: controller-owned native connections, private refresh ownership, access-only workspace delivery and supervised browser authorization.
-- `runtime/agent_runs.py`, `guest_agent_run.py`: bounded private native runs and exact native session resume through operator MCP/API.
-- `runtime/agent_usage.py`: read-only provider allowance observations; unsupported usage and billing dates remain explicit.
-- `runtime/host_capabilities.py`: read-only local platform, resource, Docker and GPU inventory; discovery is not node enrollment or GPU execution.
-- `scripts/build-tested-package.py`: test-gated wheel/source artifact build and isolated package smoke checks; no automatic publication or service installation.
-- `dashboard/`: Vinext owner dashboard and authenticated server-side proxy.
-- `examples/`: existing-Incus, fresh-host and fleet configuration.
-- `tests/`: offline regression coverage and opt-in browser integration.
+- `packages/enginebox-core`: validated configuration, SSH/Incus transport, conservative capacity, bootstrap, guest preparation, templates, fresh warm pools and host capability inventory.
+- `packages/enginebox-agents`: original CLI installation, central native credentials, access-only delegation, bounded native runs and exact resume, usage observations, private browser/computer tools.
+- `packages/enginebox-controller`: authenticated REST, private durable jobs, reconciliation and exclusive controller ownership.
+- `packages/enginebox-cli`: operator terminal and fleet MCP access.
+- `packages/enginebox-install`: immutable native release artifacts, checksum-verified installation, platform service plans, supervised upgrade and compatible rollback.
+- `packages/dashboard`: Vinext owner dashboard, session authentication and server-side proxy.
+- `examples/`: host/fleet configuration and portable template manifests. Tests live with their owning package.
+
+The Rust port uses root pnpm with Cargo and JavaScript lockfiles. Real controller upgrade/rollback through the stable supervisor has been tested with concurrent requests and the real dashboard; independent Windows execution, fresh-host bootstrap and initial Python-to-Rust cutover remain distinct gates. See [migration](RUST-MIGRATION.md) and [updates](UPDATES.md).
 
 Do not implement a generic plugin framework before a second backend exists. Keep config parsing and planning independent of live mutation so they can be tested without administrator access.
 
@@ -106,10 +100,14 @@ A clean external-host installation is a separate release gate. Success on the ow
 
 ## Deferred work
 
-Personal computers are an explicit next delivery track, not an implicit consequence of a portable Python wheel. Keep Incus as the tested Linux VM backend. Add a small Docker execution adapter for Linux workloads on laptops after its disposable proof, then a local resource service with authenticated enrollment and enforced owner-selected CPU/RAM limits. Node contribution is opt-in; it must not take over all of a personal machine. Existing physical reserves and other workloads still reduce admissible capacity.
+Personal computers are an explicit next delivery track, not an implicit consequence of a portable native installer. Keep Incus as the tested Linux VM backend. Add a small Docker execution adapter for Linux workloads on laptops after its disposable proof, then a local resource service with authenticated enrollment and enforced owner-selected CPU/RAM limits. Node contribution is opt-in; it must not take over all of a personal machine. Existing physical reserves and other workloads still reduce admissible capacity.
 
 CPU/RAM limits are the first resource contract. GPU contribution is a separate opt-in capability with real driver/workload tests and exclusive device leases by default. Windows/macOS operating-system images and native Unity/Unreal execution require distinct backend, platform and license qualification. Native OS workers do not inherit Incus RAM-restore guarantees. See [portable hosts](PORTABLE-HOSTS.md).
 
 Public multi-tenancy requires real tenant authorization and private account/state storage. The current single-owner controller and per-workspace native homes do not establish that guarantee. Shared writable `.claude`, `.codex` or Cursor state across unrelated users is prohibited. Moving a tenant's state between workspaces needs stable paths, exclusive writer leases and recovery tests; see [native state](TENANT-AGENT-STATE.md).
 
 Automatic placement, swarm orchestration, GPU memory restoration, a new CI scheduler and premium engine recipes remain separate work. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
+
+## Shared filesystem candidate
+
+Evaluate [LayerFS](LAYERFS.md) as an optional filesystem provider for private branches over approved shared repository/dependency bases. Keep file checkpointing separate from Incus RAM checkpointing. It is not yet a bundled dependency or proven storage backend; qualify a pinned supported release before implementation.

@@ -3,12 +3,16 @@
 Engine Box is in early development. Start with the [design](docs/DESIGN.md) and [implementation milestones](docs/IMPLEMENTATION-PLAN.md). The current implementation includes server bootstrap, Incus lifecycle controls, a fleet API/MCP and a Vinext dashboard. Platform qualification and optional CI integration remain open.
 
 ```sh
-uv sync --project runtime --locked
-runtime/.venv/bin/python -m unittest discover -s tests -v
-python3 -m unittest discover -s scripts/control-plane -p 'test_*.py' -v
+pnpm install --frozen-lockfile
+pnpm check
+pnpm test
+pnpm lint:rust
+pnpm build
 ```
 
-For dashboard changes, run `npm ci`, `npm run typecheck`, `npm test`, `npm run build` and `npm run test:e2e` in `dashboard/`. The browser suite requires Playwright Chromium (`npx playwright install chromium`) and uses only test fixture services. Build deployment artifacts on the target platform.
+All programs and tests live under `packages/`; the root contains workspace configuration. The root pins pnpm 12.14.0 and Rust 1.96.0. pnpm's experimental Cargo integration provisions the toolchain and downloads both Rust and JavaScript dependencies. Cargo still compiles Rust and uses its standard `Cargo.lock`; pnpm retains the JavaScript lockfile. Keep both committed. Plain Cargo also works when the optional generated pnpm vendor directory is absent.
+
+For dashboard changes, run `pnpm --filter enginebox-dashboard exec playwright install chromium` and `pnpm test:e2e` after the build. The browser suite uses test fixture services. Build deployment artifacts on the target platform. `cargo fmt --all --check` checks Rust formatting.
 
 Offline tests must not contact a server. Integration tests must use a disposable VM and explicitly identify the host, project and artifacts they create. Never use a signed-in workspace as an integration-test target.
 

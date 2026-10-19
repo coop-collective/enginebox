@@ -7,7 +7,9 @@
 - Bootstrap must inspect before changing a host. Never repartition disks, overwrite unrelated profiles or change global NFS/firewall services implicitly.
 - Preserve the distinction between a credential-free reusable base and a private checkpoint that includes credentials and RAM.
 - Registered template manifests are controller-owned desired state. Synchronize them to every registered node, including nodes added later; retain per-node capacity checks, installation receipts and visible failures.
-- Run offline checks with `uv sync --project runtime --locked` and `runtime/.venv/bin/python -m unittest discover -s tests -v`.
+- All executable code, services, libraries, tests and installer programs belong under `packages/`. Keep root configuration, documentation and example configuration separate.
+- Use the pinned root pnpm workspace for Rust and TypeScript: `pnpm install --frozen-lockfile`, `pnpm check`, `pnpm test`, `pnpm lint:rust`, `pnpm build`. Run `pnpm test:e2e` for dashboard behavior. Rust dependencies remain in `Cargo.lock`; JavaScript dependencies remain in `pnpm-lock.yaml`.
+- Controller releases must stage in standby, drain the current owner before activation, retain compatible prior releases and reject incompatible state rollback. Never recover active job records from a standby process.
 - Live integration tests must create disposable environments. Do not pause, restore or stop a developer's workspace as a test fixture.
 - Use exact provider documentation and record tested versions. Installation success is not proof of subscription eligibility or successful inference.
 - Keep changes small and identify what was verified versus what remains planned.

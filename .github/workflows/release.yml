@@ -1,0 +1,79 @@
+name: Build native releases
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@12.14.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check && pnpm test && pnpm lint:rust && pnpm build
+      - name: Build versioned archive from qualified binaries
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          actual_target=$(pnpm exec rustc -vV | sed -n 's/^host: //p')
+          test "$actual_target" = '${{ matrix.target }}'
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            printf 'Tag must match the workspace version\n' >&2
+            exit 1
+          fi
+          pnpm exec cargo run --locked --release -p enginebox-install --bin enginebox-release -- \
+            --version "$version" --target '${{ matrix.target }}' --bin-dir target/release \
+            --license LICENSE --notice NOTICE \
+            --binary enginebox-api --binary enginebox-fleet-mcp --binary enginebox-guest \
+            --binary enginebox-mcp --binary enginebox-browser --binary enginebox-agent-clients \
+            --dashboard packages/dashboard/dist/standalone \
+            --dashboard-start packages/dashboard/scripts/start.mjs \
+            --output '.state/release/${{ matrix.target }}'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: enginebox-${{ matrix.target }}
+          path: .state/release/${{ matrix.target }}/
+          include-hidden-files: true
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: enginebox-*
+          path: .state/artifacts
+      - name: Assemble checksums and installer entrypoints
+        run: |
+          mkdir -p .state/publish
+          find .state/artifacts -type f -name '*.sha256' -exec cat {} + > .state/publish/SHA256SUMS
+          find .state/artifacts -type f \( -name '*.tar.gz' -o -name '*.json' -o -name '*.sha256' \) -exec cp {} .state/publish/ \;
+          cp packages/enginebox-install/assets/install.sh packages/enginebox-install/assets/install.ps1 .state/publish/
+      - name: Publish a reviewable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" .state/publish/* --verify-tag --prerelease --generate-notes

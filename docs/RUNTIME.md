@@ -25,38 +25,41 @@ The configured guest user/UID/GID/directories must already exist and agree. Thes
 ```sh
 export ENGINEBOX_HOST=my-server
 export ENGINEBOX_PROJECT=enginebox
-runtime/.venv/bin/ebox list
-runtime/.venv/bin/ebox shell ebox-dev
-runtime/.venv/bin/ebox exec ebox-dev -- git status --short
-runtime/.venv/bin/ebox pause ebox-dev
-runtime/.venv/bin/ebox resume ebox-dev
-runtime/.venv/bin/ebox hibernate ebox-dev
-runtime/.venv/bin/ebox resume ebox-dev
-runtime/.venv/bin/ebox snapshot ebox-dev checkpoint-one
-runtime/.venv/bin/ebox fork ebox-dev checkpoint-one ebox-copy
-runtime/.venv/bin/ebox resume ebox-copy
+ebox list
+ebox shell ebox-dev
+ebox exec ebox-dev -- git status --short
+export ENGINEBOX_FLEET_HOST=primary
+export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
+ebox pause ebox-dev
+ebox resume ebox-dev
+ebox hibernate ebox-dev
+ebox resume ebox-dev
 ```
 
-VM names must start with `ebox-`. Pause keeps memory allocated. Hibernate relies on a compatible stateful Incus VM configuration and saves memory to disk. A fork boots independently from the snapshot's disk. Bootstrap creates the VM/profile and configures stateful support; these lower-level commands assume that preparation is complete. They do not apply fleet admission or the fleet/installer host lock, so do not mix direct mutations with active controller jobs.
+VM names must start with `ebox-`. Pause keeps memory allocated. Hibernate relies on a compatible stateful Incus VM configuration and saves memory to disk. A fork boots independently from the snapshot's disk. Bootstrap creates the VM/profile and configures stateful support; these lower-level commands assume that preparation is complete. Normal lifecycle commands require a registered `--fleet-host` (or `ENGINEBOX_FLEET_HOST`) and use the controller API, returning jobs to poll. Direct administrator maintenance requires explicit `--direct` and an SSH host; it takes the host lock and rejects active native leases, but bypasses fleet capacity admission and post-resume credential attachment. Quiesce fleet work before using that maintenance mode.
 
 Snapshotting a running VM requests memory state; snapshotting a cleanly stopped VM captures disk only. Shared external mounts are excluded. A snapshot includes private files and any account state present. Do not turn an authenticated workspace snapshot into a reusable/public base.
 
 Restore replaces later private-disk changes. Stop the target explicitly first:
 
 ```sh
-runtime/.venv/bin/ebox stop ebox-dev
-runtime/.venv/bin/ebox restore ebox-dev checkpoint-one
+ebox stop ebox-dev
+# Wait for the stop job to succeed, then quiesce fleet work.
+unset ENGINEBOX_FLEET_HOST
+ebox --direct restore ebox-dev checkpoint-one
 # For a disk-only snapshot:
-runtime/.venv/bin/ebox restore ebox-dev clean-base --disk-only
+ebox --direct restore ebox-dev clean-base --disk-only
 ```
+
+`ebox --direct snapshot ebox-dev checkpoint-one` and `ebox --direct fork ebox-dev checkpoint-one ebox-copy` are administrator operations. A fork of a private snapshot copies its credentials and private files; it is not a clean template or an automatically admitted fleet allocation. Use the fleet allocation API for a fresh workspace.
 
 Use native `tmux` or the client session mechanisms for long interactive work. The short `exec` operation has a timeout; terminating the local transport does not guarantee the remote process has stopped.
 
 ## MCP and desktop
 
-An operator MCP client can launch the absolute path to `runtime/.venv/bin/enginebox-mcp` with the chosen `ENGINEBOX_HOST` and configuration. It exposes six environment tools plus screenshot, click, typing and key input. It inherits the operator's SSH authority.
+An operator MCP client launches `enginebox-fleet-mcp` with the controller API URL and token; see [fleet MCP](FLEET.md). Lifecycle actions use the controller's capacity checks and ownership locks. Direct `ebox` administration remains available to an operator with SSH authority.
 
-A prepared guest can launch the same entry point with `ENGINEBOX_GUEST=1`. That exposes only four desktop tools and does not require a host target. The mode flag restricts the tool list; actual authorization depends on keeping host credentials and privileges out of the guest. X11, `scrot`, `xdotool` and the display must already exist. The computer controls currently assume a 1440×900 desktop.
+A prepared guest launches `enginebox-mcp` with `ENGINEBOX_GUEST=1`. That exposes only four desktop tools and does not require a host target. The mode flag restricts the tool list; actual authorization depends on keeping host credentials and privileges out of the guest. X11, `scrot`, `xdotool` and the display must already exist. The computer controls currently assume a 1440×900 desktop.
 
 `ebox desktop ebox-dev` prints connection information for an existing guest-network noVNC listener on port 6080. **This legacy tunnel does not reach the new optional desktop recipe's guest-loopback-only listener.** Interactive viewer transport is still pending. Headless [browser MCP](BROWSER.md) works independently, and guest computer MCP can control the optional virtual desktop locally. Do not expose an unauthenticated desktop listener to work around this limitation.
 
@@ -65,10 +68,10 @@ A prepared guest can launch the same entry point with `ENGINEBOX_GUEST=1`. That 
 Run offline tests from the repository root:
 
 ```sh
-uv sync --project runtime --locked
-runtime/.venv/bin/python -m unittest discover -s tests -v
+pnpm install --frozen-lockfile
+pnpm test
 ```
 
-These tests validate configuration, command construction, lifecycle guards, fleet capacity and MCP mode boundaries without contacting a host. They do not establish native account/inference support. The opt-in browser integration test runs only inside an explicitly prepared disposable guest.
+These tests validate configuration, command construction, lifecycle guards, fleet capacity and MCP mode boundaries without contacting a host. They do not establish native account/inference support. Live browser qualification requires an explicitly prepared disposable guest.
 
 Machine-specific inventory, credentials and live evidence remain outside Git. Bootstrap/fleet share a host lock; prepared disk clones regenerate guest identity. Complete cancellation, reboot/backup recovery and generalized shared mount/cache services remain release work.

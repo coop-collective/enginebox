@@ -27,7 +27,7 @@ The new release identifies the licensing transition for subsequent work. It does
 
 New contributions are accepted under the current repository license unless an explicit agreement says otherwise. Contributors must have authority to contribute their work. There is no contributor license agreement or blanket relicensing consent in place; do not assume that a future license change can relicense independent contributions without the necessary rights.
 
-Runtime and dashboard packages carry LICENSE, NOTICE and the historical Apache license. Python metadata uses `LicenseRef-Sustainable-Use-1.0`; npm metadata points to the packaged LICENSE. Third-party licenses remain separate. The n8n-specific enterprise-file and unlicensed-branch exclusions are not part of Engine Box's policy.
+Runtime and dashboard packages carry LICENSE, NOTICE and the historical Apache license. Cargo and npm metadata point to LICENSE. The release builder includes LICENSE, NOTICE and the historical Apache license. Third-party licenses remain separate. The n8n-specific enterprise-file and unlicensed-branch exclusions are not part of Engine Box's policy.
 
 ## Why this license
 

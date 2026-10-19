@@ -1,0 +1,826 @@
+//! Authenticated fleet API, durable jobs and exclusive controller ownership.
+pub mod jobs;
+
+use anyhow::{Context, Result, ensure};
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    extract::State,
+    http::{Method, Request, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::any,
+};
+use enginebox_agents::AgentService;
+use enginebox_core::{Fleet, identifier};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use subtle::ConstantTimeEq;
+
+pub const STATE_SCHEMA: u32 = 1;
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    Standby,
+    Active,
+    Draining,
+    Drained,
+}
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Standby => "standby",
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::Drained => "drained",
+        }
+    }
+}
+#[derive(Clone)]
+struct Runtime {
+    agents: AgentService,
+    jobs: jobs::Jobs,
+}
+struct Gate {
+    mode: Mode,
+    requests: usize,
+    background: usize,
+    owner: Option<enginebox_core::state::StateLock>,
+    runtime: Option<Runtime>,
+}
+pub struct Controller {
+    fleet: Fleet,
+    root: PathBuf,
+    token: String,
+    gate: Mutex<Gate>,
+    observations: Mutex<std::collections::BTreeMap<String, Value>>,
+}
+
+struct Admission(Arc<Controller>);
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.gate.lock().unwrap().requests -= 1;
+    }
+}
+
+impl Controller {
+    pub fn new(config: &Path, root: &Path, token: String) -> Result<Arc<Self>> {
+        ensure!(
+            token.len() >= 32 && token.bytes().all(|c| (33..=126).contains(&c)),
+            "API token must contain at least 32 printable non-space characters"
+        );
+        jobs::private_dir(root)?;
+        // Resolve platform aliases such as macOS /var before setting the
+        // private credential boundary. Descendants remain symlink-rejected.
+        let root = root.canonicalize()?;
+        let fleet = Fleet::load(config, &root)?;
+        Ok(Arc::new(Self {
+            fleet,
+            root,
+            token,
+            gate: Mutex::new(Gate {
+                mode: Mode::Standby,
+                requests: 0,
+                background: 0,
+                owner: None,
+                runtime: None,
+            }),
+            observations: Mutex::new(std::collections::BTreeMap::new()),
+        }))
+    }
+    pub fn activate(self: &Arc<Self>) -> Result<Value> {
+        let mut gate = self.gate.lock().unwrap();
+        if gate.mode == Mode::Active {
+            return Ok(json!({"active":true,"state_schema":STATE_SCHEMA}));
+        }
+        if gate.mode == Mode::Draining && gate.owner.is_some() {
+            gate.mode = Mode::Active;
+            return Ok(json!({"active":true,"state_schema":STATE_SCHEMA}));
+        }
+        ensure!(
+            gate.requests == 0
+                && gate.background == 0
+                && gate
+                    .runtime
+                    .as_ref()
+                    .is_none_or(|r| r.jobs.pending() == 0 && r.agents.pending() == 0),
+            "Controller has not drained"
+        );
+        let owner = enginebox_core::state::lock(&self.root.join("controller-owner.lock"), false)
+            .context("Another controller owns this state; drain it before activation")?;
+        let schema_path = self.root.join("schema.json");
+        if schema_path.exists() {
+            let meta = std::fs::symlink_metadata(&schema_path)?;
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "Invalid state schema record"
+            );
+            let schema = enginebox_core::state::read_json(&schema_path)?;
+            ensure!(
+                schema["state_schema"] == STATE_SCHEMA,
+                "State schema is incompatible with this controller"
+            );
+        } else {
+            jobs::write_private(&schema_path, &json!({"state_schema":STATE_SCHEMA}))?;
+        }
+        // Reload under exclusive ownership on every activation, including rollback.
+        // A standby process must never recover another process's active jobs.
+        let runtime = Runtime {
+            agents: AgentService::new(&self.root, self.fleet.clone())?,
+            jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
+        };
+        let owner_guard = Arc::downgrade(self);
+        self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
+            let owner = owner_guard
+                .upgrade()
+                .context("Controller is shutting down")?;
+            let agent_guard = owner.runtime()?.agents;
+            ensure!(
+                !agent_guard.active(host, name),
+                "Wait for the native agent session to finish before changing this workspace"
+            );
+            Ok(())
+        }));
+        let owner_attach = Arc::downgrade(self);
+        self.fleet.set_post_start(Arc::new(move |host, name| {
+            let owner = owner_attach
+                .upgrade()
+                .context("Controller is shutting down")?;
+            owner.runtime()?.agents.attach_after_start(host, name)
+        }));
+        gate.runtime = Some(runtime);
+        gate.owner = Some(owner);
+        gate.mode = Mode::Active;
+        Ok(json!({"active":true,"state_schema":STATE_SCHEMA}))
+    }
+    fn runtime(&self) -> Result<Runtime> {
+        self.gate
+            .lock()
+            .unwrap()
+            .runtime
+            .clone()
+            .context("Controller is not active")
+    }
+    fn admit(self: &Arc<Self>) -> Result<Admission> {
+        let mut g = self.gate.lock().unwrap();
+        ensure!(
+            g.mode == Mode::Active,
+            "Controller is draining; retry through the supervisor"
+        );
+        g.requests += 1;
+        Ok(Admission(self.clone()))
+    }
+    pub fn drain(&self) -> Value {
+        let mut g = self.gate.lock().unwrap();
+        if g.mode == Mode::Active {
+            g.mode = Mode::Draining;
+        }
+        let pending = g
+            .runtime
+            .as_ref()
+            .map_or(0, |r| r.jobs.pending() + r.agents.pending());
+        if g.requests == 0 && g.background == 0 && pending == 0 {
+            g.owner.take();
+            g.mode = Mode::Drained;
+        }
+        json!({"drained":g.mode==Mode::Drained,"mode":g.mode.name(),"active_jobs":pending,"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA})
+    }
+    pub fn status(&self) -> Value {
+        let g = self.gate.lock().unwrap();
+        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.jobs.pending()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION")})
+    }
+    pub fn start_background(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let runtime = {
+                    let mut g = this.gate.lock().unwrap();
+                    if g.mode != Mode::Active {
+                        continue;
+                    }
+                    g.background += 1;
+                    g.runtime.clone()
+                };
+                let controller = this.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = controller.fleet.reconcile();
+                    if let Some(r) = runtime {
+                        let _ = r.agents.reconcile();
+                    }
+                })
+                .await;
+                this.gate.lock().unwrap().background -= 1;
+            }
+        })
+    }
+    fn authorized(&self, request: &Request<Body>) -> bool {
+        let expected = format!("Bearer {}", self.token);
+        let supplied = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .map(|v| v.as_bytes())
+            .unwrap_or_default();
+        expected.as_bytes().ct_eq(supplied).into()
+    }
+}
+
+fn reply(code: StatusCode, value: Value) -> Response {
+    (
+        code,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        value.to_string(),
+    )
+        .into_response()
+}
+fn error(code: StatusCode, message: &str) -> Response {
+    reply(code, json!({"error":message}))
+}
+pub fn router(controller: Arc<Controller>) -> Router {
+    Router::new().fallback(any(handle)).with_state(controller)
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("Controller operation interrupted")?
+}
+
+// Dropping an HTTP request must not release ownership while its operation
+// continues in a blocking task or has already been admitted to a native client.
+async fn admitted<T: Send + 'static>(
+    admission: Admission,
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    tokio::spawn(async move {
+        let _admission = admission;
+        work.await
+    })
+    .await
+    .context("Admitted operation task failed")?
+}
+
+async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body>) -> Response {
+    let path = request.uri().path().to_owned();
+    let method = request.method().clone();
+    if method == Method::GET && path == "/healthz" {
+        return reply(StatusCode::OK, json!({"ok":true}));
+    }
+    if method == Method::GET && path == "/readyz" {
+        let status = controller.status();
+        return reply(
+            StatusCode::OK,
+            json!({"ready":true,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION"),"mode":status["mode"]}),
+        );
+    }
+    if request.headers().contains_key(header::ORIGIN) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Browser requests must use the authenticated dashboard proxy.",
+        );
+    }
+    if !controller.authorized(&request) {
+        return error(StatusCode::UNAUTHORIZED, "Authentication required.");
+    }
+    if request.uri().query().is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Query parameters are not supported.",
+        );
+    }
+    if method == Method::GET && path == "/internal/status" {
+        return reply(StatusCode::OK, controller.status());
+    }
+    if method == Method::POST && path.starts_with("/internal/") {
+        match path.as_str() {
+            "/internal/drain" => {
+                let result = controller.drain();
+                return reply(
+                    if result["drained"] == true {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::ACCEPTED
+                    },
+                    result,
+                );
+            }
+            "/internal/activate" | "/internal/undrain" => {
+                return match blocking(move || controller.activate()).await {
+                    Ok(v) => reply(StatusCode::OK, v),
+                    Err(_) => error(
+                        StatusCode::CONFLICT,
+                        "Controller activation failed; state remains owned by its current controller.",
+                    ),
+                };
+            }
+            _ => return error(StatusCode::NOT_FOUND, "Unknown endpoint."),
+        }
+    }
+    let parts: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if format!("/{}", parts.join("/")) != path {
+        return error(StatusCode::NOT_FOUND, "Unknown endpoint.");
+    }
+    if method == Method::GET {
+        // Native auth/status programs may refresh their own home. Keep them in
+        // the ownership barrier; serve the last observation during handoff.
+        let native_observation =
+            path == "/v1/agents" || path.ends_with("/usage") || path.ends_with("/accounts");
+        let admission = if native_observation {
+            match controller.admit() {
+                Ok(a) => Some(a),
+                Err(_) => {
+                    return match controller.observations.lock().unwrap().get(&path).cloned() {
+                        Some(v) => reply(
+                            StatusCode::OK,
+                            if path.ends_with("/usage") {
+                                enginebox_agents::usage::handoff_snapshot(&v)
+                            } else {
+                                v
+                            },
+                        ),
+                        None => error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Agent observation is pending controller activation.",
+                        ),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let operation = controller.clone();
+        let result = blocking(move || {
+            let _admission = admission;
+            read(&operation, &parts)
+        })
+        .await;
+        if let Ok(value) = &result
+            && native_observation
+        {
+            controller
+                .observations
+                .lock()
+                .unwrap()
+                .insert(path, value.clone());
+        }
+        return match result {
+            Ok(v) => reply(StatusCode::OK, v),
+            Err(_) => error(
+                StatusCode::NOT_FOUND,
+                "Resource unavailable or unknown endpoint.",
+            ),
+        };
+    }
+    if method != Method::POST {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "Use GET or POST.");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        != Some("application/json")
+    {
+        return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Use application/json.");
+    }
+    if request.headers().contains_key(header::TRANSFER_ENCODING) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Chunked requests are not supported.",
+        );
+    }
+    let maximum = if path == "/v1/templates" {
+        1024 * 1024
+    } else {
+        16384
+    };
+    let body = match to_bytes(request.into_body(), maximum).await {
+        Ok(b) if !b.is_empty() => b,
+        _ => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body is missing or too large.",
+            );
+        }
+    };
+    let body = match enginebox_core::templates::decode_json(&body) {
+        Ok(v) if v.is_object() => v,
+        _ => return error(StatusCode::BAD_REQUEST, "Body must be a JSON object."),
+    };
+    let admission = match controller.admit() {
+        Ok(a) => a,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Controller is draining; retry through the supervisor.",
+            );
+        }
+    };
+    let result = admitted(admission, write(controller, parts, body)).await;
+    match result {
+        Ok((code, v)) => reply(code, v),
+        Err(_) => error(
+            StatusCode::BAD_REQUEST,
+            "Request could not be admitted. Check its fields, workspace state and configured capacity.",
+        ),
+    }
+}
+
+fn read(c: &Controller, p: &[String]) -> Result<Value> {
+    let s: Vec<_> = p.iter().map(String::as_str).collect();
+    match s.as_slice() {
+        ["v1", "fleet"] => c.fleet.summary(),
+        ["v1", "templates"] => c.fleet.catalog(),
+        ["v1", "agents"] => c.runtime()?.agents.status(),
+        ["v1", "agents", provider, "usage"] => {
+            Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
+        }
+        ["v1", "agents", provider, "sessions", session] => {
+            Ok(json!({"session":c.runtime()?.agents.session(provider,session)?}))
+        }
+        ["v1", "jobs", id] => Ok(json!({"job":c.runtime()?.jobs.get(id)?})),
+        ["v1", "hosts", host, "instances", name, "agent-runs", id] => {
+            Ok(json!({"run":c.runtime()?.agents.get_run(host,name,id)?}))
+        }
+        ["v1", "hosts", host, "instances", name, "accounts"] => {
+            c.runtime()?.agents.workspace_status(host, name)
+        }
+        _ => anyhow::bail!("Unknown endpoint"),
+    }
+}
+fn empty(body: &Value) -> Result<()> {
+    ensure!(
+        body.as_object().is_some_and(|m| m.is_empty()),
+        "Request accepts an empty object"
+    );
+    Ok(())
+}
+fn keys(body: &Value, allowed: &[&str], required: &[&str]) -> Result<()> {
+    let object = body.as_object().context("Expected object")?;
+    ensure!(
+        object.keys().all(|k| allowed.contains(&k.as_str()))
+            && required.iter().all(|k| object.contains_key(*k)),
+        "Unsupported fields"
+    );
+    Ok(())
+}
+fn string<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
+    body[key].as_str().context("Expected string field")
+}
+
+async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(StatusCode, Value)> {
+    let p: Vec<_> = parts.iter().map(String::as_str).collect();
+    let runtime = c.runtime()?;
+    let mut code = StatusCode::OK;
+    let v = match p.as_slice() {
+        ["v1", "agents", provider, "login"] => {
+            empty(&body)?;
+            let provider = provider.to_string();
+            code = StatusCode::ACCEPTED;
+            json!({"session":blocking(move||runtime.agents.start(&provider)).await?})
+        }
+        ["v1", "agents", provider, "sessions", session, action] => {
+            let provider = provider.to_string();
+            let session = session.to_string();
+            let result = match *action {
+                "input" => {
+                    keys(&body, &["text"], &["text"])?;
+                    let text = string(&body, "text")?.to_owned();
+                    blocking(move || runtime.agents.input(&provider, &session, &text)).await?
+                }
+                "cancel" => {
+                    empty(&body)?;
+                    blocking(move || runtime.agents.cancel(&provider, &session)).await?
+                }
+                _ => anyhow::bail!("Unknown session operation"),
+            };
+            json!({"session":result})
+        }
+        ["v1", "hosts", host, "instances", name, "agent-runs"] => {
+            let host = host.to_string();
+            let name = name.to_string();
+            identifier(&host, false)?;
+            identifier(&name, true)?;
+            code = StatusCode::ACCEPTED;
+            json!({"run":blocking(move||runtime.agents.launch(&host,&name,body)).await?})
+        }
+        ["v1", "templates"] => {
+            let fleet = c.fleet.clone();
+            let record = if body.as_object().unwrap().len() == 1 && body["manifest"].is_object() {
+                blocking(move || fleet.register_template(body["manifest"].clone())).await?
+            } else {
+                keys(&body, &["url"], &["url"])?;
+                let url = string(&body, "url")?.to_owned();
+                blocking(move || fleet.import_template(&url)).await?
+            };
+            json!({"template":record})
+        }
+        ["v1", "templates", template, "sync"] => {
+            empty(&body)?;
+            identifier(template, false)?;
+            let mut jobs = vec![];
+            for host in c.fleet.hosts() {
+                jobs.push(submit(
+                    &c,
+                    &runtime.jobs,
+                    &host.id,
+                    "install_template",
+                    json!({"template":template}),
+                )?);
+            }
+            code = StatusCode::ACCEPTED;
+            json!({"template":template,"jobs":jobs})
+        }
+        [
+            "v1",
+            "hosts",
+            host,
+            operation @ ("instances" | "allocations"),
+        ] => {
+            keys(
+                &body,
+                &["name", "template", "size", "resources"],
+                &["name", "template"],
+            )?;
+            let op = if *operation == "instances" {
+                "create"
+            } else {
+                "allocate"
+            };
+            code = StatusCode::ACCEPTED;
+            json!({"job":submit(&c,&runtime.jobs,host,op,body)?})
+        }
+        ["v1", "hosts", host, "templates", template, "install"] => {
+            empty(&body)?;
+            code = StatusCode::ACCEPTED;
+            json!({"job":submit(&c,&runtime.jobs,host,"install_template",json!({"template":template}))?})
+        }
+        ["v1", "hosts", host, "instances", name, "actions"] => {
+            keys(&body, &["action"], &["action"])?;
+            let action = string(&body, "action")?;
+            ensure!(
+                ["pause", "resume", "hibernate", "stop"].contains(&action),
+                "Unsupported action"
+            );
+            code = StatusCode::ACCEPTED;
+            json!({"job":submit(&c,&runtime.jobs,host,action,json!({"name":name}))?})
+        }
+        ["v1", "hosts", _, "instances", _, "accounts", _, "login"] => {
+            return Ok((
+                StatusCode::CONFLICT,
+                json!({"error":"Connect agents on the controller through /v1/agents; workspaces receive access automatically."}),
+            ));
+        }
+        _ => return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown endpoint."}))),
+    };
+    Ok((code, v))
+}
+fn submit(
+    c: &Controller,
+    jobs: &jobs::Jobs,
+    host: &str,
+    operation: &str,
+    params: Value,
+) -> Result<Value> {
+    c.fleet.validate_operation(host, operation, &params)?;
+    let name = params[if operation == "install_template" {
+        "template"
+    } else {
+        "name"
+    }]
+    .as_str()
+    .context("Required name missing")?
+    .to_owned();
+    let fleet = c.fleet.clone();
+    let host_id = host.to_owned();
+    let op = operation.to_owned();
+    jobs.submit(host, operation, &name, move || {
+        fleet.operate(&host_id, &op, &params)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+    fn setup() -> (tempfile::TempDir, Arc<Controller>) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("fleet.toml");
+        std::fs::write(
+            &config,
+            "schema_version=1\n[[hosts]]\nid='worker'\ntarget='unused-fixture-host'\n",
+        )
+        .unwrap();
+        let c = Controller::new(&config, &temp.path().join("state"), "x".repeat(32)).unwrap();
+        (temp, c)
+    }
+    fn request(method: Method, path: &str, body: &str, authorized: bool) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if authorized {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {}", "x".repeat(32)));
+        }
+        builder.body(Body::from(body.to_owned())).unwrap()
+    }
+    #[tokio::test]
+    async fn auth_and_origin_are_checked_before_body_or_state() {
+        let (_temp, c) = setup();
+        let app = router(c);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/healthz", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v1/agents", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut browser = request(Method::POST, "/internal/activate", "{}", true);
+        browser
+            .headers_mut()
+            .insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        assert_eq!(
+            app.oneshot(browser).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn standby_never_admits_writes_and_payloads_are_bounded() {
+        let (_temp, c) = setup();
+        let app = router(c);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/hosts/worker/instances",
+                    "{}",
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/hosts/worker/instances",
+                    &"a".repeat(20000),
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::POST, "/v1/templates", "[]", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.oneshot(request(
+                Method::POST,
+                "/v1/templates",
+                r#"{"manifest":{"revision":1,"revision":2}}"#,
+                true
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    #[tokio::test]
+    async fn handoff_observations_cannot_present_cached_allowance_as_current() {
+        let (_temp, c) = setup();
+        c.activate().unwrap();
+        c.observations.lock().unwrap().insert(
+            "/v1/agents/codex/usage".into(),
+            json!({"usage":{"provider":"codex","freshness":"current","observed_at":"2026-10-19T00:00:00Z","allowance_windows":[{"used_percentage":25,"remaining_percentage":75,"freshness":"current","resets_at":"2000-01-01T00:00:00Z"}]}}),
+        );
+        assert_eq!(c.drain()["drained"], true);
+        let response = router(c.clone())
+            .oneshot(request(Method::GET, "/v1/agents/codex/usage", "", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["usage"]["freshness"], "stale");
+        assert!(value["usage"]["allowance_windows"][0]["remaining_percentage"].is_null());
+        assert_eq!(c.status()["mode"], "drained");
+    }
+    #[tokio::test]
+    async fn only_one_controller_can_activate_and_rollback_reloads_state() {
+        let (temp, old) = setup();
+        old.activate().unwrap();
+        let next = Controller::new(
+            &temp.path().join("fleet.toml"),
+            &temp.path().join("state"),
+            "x".repeat(32),
+        )
+        .unwrap();
+        assert!(next.activate().is_err());
+        assert_eq!(old.drain()["drained"], true);
+        next.activate().unwrap();
+        assert!(old.activate().is_err());
+        let job = next
+            .runtime()
+            .unwrap()
+            .jobs
+            .submit("worker", "test", "ebox-test", || Ok(json!({"done":true})))
+            .unwrap();
+        while next.runtime().unwrap().jobs.pending() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(next.drain()["drained"], true);
+        old.activate().unwrap();
+        assert_eq!(
+            old.runtime()
+                .unwrap()
+                .jobs
+                .get(job["id"].as_str().unwrap())
+                .unwrap()["status"],
+            "succeeded"
+        );
+    }
+    #[tokio::test]
+    async fn drain_waits_for_admitted_jobs_and_timeout_can_resume_old_owner() {
+        let (_temp, c) = setup();
+        c.activate().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        c.runtime()
+            .unwrap()
+            .jobs
+            .submit("worker", "test", "ebox-test", move || {
+                receive.recv().unwrap();
+                Ok(json!({"done":true}))
+            })
+            .unwrap();
+        assert_eq!(c.drain()["drained"], false);
+        assert!(c.admit().is_err());
+        c.activate().unwrap();
+        assert_eq!(c.status()["accepting_mutations"], true);
+        send.send(()).unwrap();
+        while c.runtime().unwrap().jobs.pending() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let request = c.admit().unwrap();
+        assert_eq!(c.drain()["drained"], false);
+        drop(request);
+        assert_eq!(c.drain()["drained"], true);
+    }
+
+    #[tokio::test]
+    async fn cancelled_http_waiter_does_not_release_an_unfinished_operation() {
+        let (_temp, c) = setup();
+        c.activate().unwrap();
+        let admission = c.admit().unwrap();
+        let (started, begun) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(admitted(admission, async move {
+            started.send(()).unwrap();
+            wait.await.unwrap();
+            Ok(())
+        }));
+        begun.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(c.drain()["drained"], false);
+        assert_eq!(c.status()["active_requests"], 1);
+        release.send(()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while c.drain()["drained"] != true {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+    }
+}

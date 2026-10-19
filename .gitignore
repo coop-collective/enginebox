@@ -19,3 +19,6 @@ dist/
 *.tar
 *.tar.gz
 enginebox.local.toml
+target/
+node_modules/
+.pnpm/

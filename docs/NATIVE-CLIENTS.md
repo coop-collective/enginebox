@@ -9,45 +9,15 @@ to that owner's assigned private workspaces; refresh ownership stays central.
 
 ## Guest setup contract
 
-The bootstrap copies `runtime/` into `/opt/enginebox-runtime`, then runs
-`bash /opt/enginebox-runtime/guest_setup.sh` as root **inside the guest**.
-Do not run that script on a developer's laptop or the Incus host.
+The Rust bootstrap stages Linux-native `enginebox-host`, `enginebox-guest` and `enginebox-mcp` binaries, then invokes the guest preparation helper inside the owned Ubuntu 24.04 VM. Configuration comes from validated bootstrap JSON; there is no Python runtime or guest setup shell script. Use [bootstrap](BOOTSTRAP.md) or a registered [template](TEMPLATES.md) instead of invoking preparation on a laptop or host.
 
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `EBOX_USER`, `EBOX_UID`, `EBOX_GID` | `agent`, `1001`, `1001` | Private non-root account; existing mismatched identities fail |
-| `EBOX_HOME`, `EBOX_WORKSPACE` | `/home/agent`, `/workspace` | Private home and working directory |
-| `EBOX_INSTALL_CODEX`, `EBOX_INSTALL_CLAUDE`, `EBOX_INSTALL_CURSOR` | `1` | Select native clients independently |
-| `EBOX_MCP`, `EBOX_BROWSER` | `1` | Configure native MCP entries/Python test runtime; install headless Chromium and browser MCP |
-| `EBOX_DESKTOP` | `0` | Optional X11 desktop and loopback-only noVNC |
-| `EBOX_COMPUTER_MCP` | Same as `EBOX_DESKTOP` | Register guest computer tools; requires the desktop |
-| `EBOX_UPDATE_CLIENTS` | `0` | Existing clients are preserved; `1` explicitly reinstalls requested clients |
-| `EBOX_CODEX_VERSION`, `EBOX_CLAUDE_VERSION` | `0.163.0`, `2.1.302` | Exact versions for new installs/reinstalls |
-| `EBOX_NODE_VERSION` | `22.23.3` | Install this official Node distribution if no Node 18+ exists |
-| `EBOX_PLAYWRIGHT_MCP_VERSION` | `0.0.83` | Exact official browser MCP package |
+The host guest mapping selects the ordinary user, UID/GID, private home and workspace. The template selects native clients and optional browser/desktop/computer MCP. Existing mismatched identities fail. Existing native clients and unrelated MCP entries are preserved. Native clients install as the ordinary user, and their resolved versions are recorded without account data in `/opt/enginebox-runtime/installed-versions.json`; this historical data path is retained for compatibility.
 
-The script preserves existing native configuration, login state and other MCP
-entries. It adds an Engine Box entry only when that name is absent. Set a flag to
-`0` to skip installing/configuring that component; this does not uninstall an
-existing component. Existing native clients and a compatible Node installation
-are recorded as found rather than silently replaced. The result is saved to
-`/opt/enginebox-runtime/installed-versions.json`; account details are excluded.
-The bootstrap sets `EBOX_MCP=1` when either browser MCP or computer MCP is requested;
-browser installation alone without `EBOX_MCP` does not register client entries.
-Browser and computer MCP entries are distinct. Computer MCP runs with
-`ENGINEBOX_GUEST=1` and exposes only the guest's screenshot/click/type/key tools;
-it receives no host SSH identity or Incus socket. Operator lifecycle MCP is
-configured separately. Native client tool-approval settings remain in force.
+New installations target Codex 0.163.0 and Claude Code 2.1.302. The Cursor official installer is checked against 2026.10.16-e3cb207; upstream update behavior is separate from Engine Box versioning. Browser setup uses the pinned official Playwright MCP package. Guest computer MCP exposes only guest desktop tools and receives no host SSH identity or Incus socket. Native approval settings remain in force.
 
-Codex and Claude support pinned official installs. Claude background updates are
-disabled in prepared shell sessions; an owner can deliberately update using the
-native CLI. Cursor's official installer currently installs its published version
-and its CLI can update itself. Strict Cursor version pinning is **not implemented**.
-The manifest records what actually installed. Linux x64 is the integration target;
-ARM64 selects corresponding installer artifacts but requires its own integration
-run before being considered tested. [Codex installation](https://developers.openai.com/codex/cli),
-[Claude installation and updates](https://code.claude.com/docs/en/setup),
-[Cursor installation](https://cursor.com/docs/cli/installation).
+For controller clients, run `enginebox-agent-clients --state-dir /private/controller-root --plan`, then the same command with `--apply`. It prepares the providers' original binaries under controller-owned persistent storage. The managed native-client installer currently supports Linux/macOS; Windows operator packaging does not qualify Windows native sign-in.
+
+Existing v0.2 guests can receive the three native helpers using the guarded [migration procedure](RUST-MIGRATION.md). Helper installation preserves homes, credentials, native CLI binaries and existing identity services. New recipe changes use template revision 4; old prepared images are not silently reprovisioned.
 
 ## Owner sign-in and Agent Access
 

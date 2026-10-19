@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+cargo:
+  enabled: true
+overrides:
+  fflate: 0.7.5
+allowBuilds:
+  esbuild: true
+  sharp: true

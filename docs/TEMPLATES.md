@@ -1,8 +1,8 @@
 # Portable workspace templates
 
-A template describes a supported workspace recipe, its resource requirements and its revision. Register it once, then install it on each selected host. Registering or importing a manifest writes local registry records; installation is a separate operation that creates a prepared base on the chosen server. Existing workspaces keep their current environment.
+A template describes a supported workspace recipe, its resource requirements and its revision. Register it once on the controller. Its reconciler installs that desired revision on every registered node and reports each node's capacity or installation failures. Existing workspaces keep their current environment.
 
-The registry and installer live in `runtime/templates.py`. They are independent of the dashboard and can be called by the API or another operator application. The installer reuses the existing bootstrap library for guest preparation; it does not reinstall the host or require editing its original bootstrap configuration.
+The registry and installer live in `packages/enginebox-core/src/templates.rs`. They are independent of the dashboard and can be called by the API or another operator application. The installer reuses the existing bootstrap library for guest preparation; it does not reinstall the host or require editing its original bootstrap configuration.
 
 ## Manifest v1
 
@@ -12,7 +12,7 @@ Start with [`native-dev.json`](../examples/templates/native-dev.json) or [`nativ
 {
   "schema_version": 1,
   "id": "native-dev",
-  "revision": 1,
+  "revision": 4,
   "label": "Native development",
   "description": "Official native clients and a browser MCP.",
   "recipe": "native-clients-v1",
@@ -42,40 +42,19 @@ These are declared template requirements, not an automatic workload benchmark. T
 
 Installation provisions the base with **recommended CPU/RAM and minimum root-disk size**. This keeps later requests at the declared minimum possible without shrinking a filesystem. Clones can expand the root disk to their requested size. Saved-memory storage is separate from the root disk; base preparation reserves recommended RAM plus 2 GiB for it. Fleet admission must include that additional commitment.
 
-```python
-from templates import validate_manifest, resolve_resources
-
-manifest = validate_manifest(open("examples/templates/native-dev.json").read())
-default_request = resolve_resources(manifest)
-minimum_request = resolve_resources(manifest, preset="minimum")
-custom_request = resolve_resources(
-    manifest, {"cpu": 8, "memory_gib": 12, "disk_gib": 100}
-)
-```
+Use `size: "minimum"`, `size: "recommended"`, or an explicit `resources` object on the fleet allocation API.
 
 ## Registry and deployments
 
-```python
-from pathlib import Path
-from fleet import load_hosts
-from templates import Registry, host_binding_digest
+Register from the dashboard or `POST /v1/templates` with `{ "manifest": { ... } }`. Use `GET /v1/templates` to read installation receipts and `POST /v1/templates/native-dev/sync` with `{}` to retry all nodes.
 
-registry = Registry(Path(".state"))
-record = registry.register(Path("examples/templates/native-dev.json").read_bytes())
-catalog = registry.list()
-record = registry.get("native-dev")
-
-host = load_hosts("fleet.toml")[0]
-receipt = registry.install(host, "native-dev")
-```
-
-`Registry.install` is a blocking provisioning operation and belongs in a background job. It accepts an existing fleet `Host` object. Its prepared source and snapshot can then be exposed as a fleet template. Hosts must already provide a Linux x86_64 KVM/Incus environment supported by bootstrap, an Engine Box owned project, an existing storage pool and a managed bridge. Creating those host resources is explicitly refused by this adapter.
+`Fleet::install_template` is a blocking provisioning operation and belongs in a background job. It accepts an existing fleet `Host` object. Its prepared source and snapshot can then be exposed as a fleet template. Hosts must already provide a Linux x86_64 KVM/Incus environment supported by bootstrap, an Engine Box owned project, an existing storage pool and a managed bridge. Creating those host resources is explicitly refused by this adapter.
 
 Set `network` on the host to select its bridge. If omitted, the installer inspects the NICs of the host's configured template bases, including their profiles, and accepts one unambiguous network. It understands managed NIC `network` and bridged NIC `parent`. A new host without an existing template base needs an explicit network. Guest user, UID/GID, home and workspace paths come from the host's guest mapping, not from an imported manifest.
 
 Installation creates a separate deterministic `ebox-template-…` base and profile, with names derived from the manifest and host binding. Bootstrap checks ownership, configuration, KVM, available RAM and free disk before preparing them. After bootstrap succeeds, the installer reacquires the shared host lock, verifies that this exact base and its disk-only clean snapshot were prepared, and stops the base to release active RAM. It publishes a receipt only after successful finalization. It never signs into a provider, copies user credentials, changes unrelated profiles or rolls back by deleting resources. A failed or interrupted installation retains its owned resources for an idempotent retry.
 
-Do not wrap installation in `host_operation_lock`: bootstrap and finalization acquire `/run/lock/enginebox-host.lock` themselves. The adapter serializes the host's commitment policy as `host.admission`. Bootstrap checks active CPU/RAM allocations across every Incus project, full root/state disk commitments in the selected pool, actual available memory/disk, configured reserves and the managed instance limit. It repeats those checks while holding the shared host lock before creating or preparing the base. Frozen and unknown VM states keep their CPU/RAM commitments. Retrying the same base does not charge a second disk or instance slot. A completed base reinstall is a no-op for admission. The host lock coordinates Engine Box operations; independent Incus administrator commands do not participate in that lock.
+Do not wrap installation in an outer host operation lock: bootstrap and finalization acquire `/run/lock/enginebox-host.lock` themselves. The adapter serializes the host's commitment policy as `host.admission`. Bootstrap checks active CPU/RAM allocations across every Incus project, full root/state disk commitments in the selected pool, actual available memory/disk, configured reserves and the managed instance limit. It repeats those checks while holding the shared host lock before creating or preparing the base. Frozen and unknown VM states keep their CPU/RAM commitments. Retrying the same base does not charge a second disk or instance slot. A completed base reinstall is a no-op for admission. The host lock coordinates Engine Box operations; independent Incus administrator commands do not participate in that lock.
 
 Registry files live under `<state_dir>/templates/`, with private directories and mode-0600 JSON records. Writes use an atomic rename after flushing. Registration uses a process-shared file lock; concurrent installation of the same host/template is rejected. The registry retains previous manifests and the latest deployment receipt per host/template. Jobs and their transient progress belong to the calling service.
 
@@ -90,15 +69,11 @@ A backend must compare the receipt's `host_binding_digest` with `host_binding_di
 
 ## Remote imports
 
-```python
-record = registry.import_url(
-    "https://raw.githubusercontent.com/your-org/workspaces/main/native-dev.json"
-)
-```
+Submit `{ "url": "https://raw.githubusercontent.com/your-org/workspaces/main/native-dev.json" }` to `POST /v1/templates`.
 
 Imports accept UTF-8 JSON up to 1 MiB from HTTPS port 443. The importer rejects URL credentials, fragments, redirects, compressed responses and non-public DNS addresses. It pins the validated public IP for the TLS connection while verifying the original hostname, sends no authorization/cookies, and ignores proxy environment variables. Network reads use a 15-second deadline and socket timeouts; DNS resolution uses the operating system resolver. URL query values and response contents are not included in download errors or registry records.
 
-The low-level `Registry.import_url` only stores the specification. Through the fleet API/dashboard, registration immediately establishes controller desired state and triggers synchronization to every registered node. The reconciler retries failures with backoff and discovers newly configured hosts after controller restart. The catalog exposes desired revision and per-node pending/syncing/ready/failed state; `POST /v1/templates/{id}/sync` requests an immediate fleet-wide retry. Node selection is unnecessary. HTTPS authenticates the serving origin; manifests do not currently carry publisher signatures. A reviewed manifest can also be registered from raw JSON without any download.
+The low-level Rust registry only stores the specification. Through the fleet API/dashboard, registration immediately establishes controller desired state and triggers synchronization to every registered node. The reconciler retries failures with backoff and discovers newly configured hosts after controller restart. The catalog exposes desired revision and per-node pending/syncing/ready/failed state; `POST /v1/templates/{id}/sync` requests an immediate fleet-wide retry. Node selection is unnecessary. HTTPS authenticates the serving origin; manifests do not currently carry publisher signatures. A reviewed manifest can also be registered from raw JSON without any download.
 
 ## Current boundaries
 

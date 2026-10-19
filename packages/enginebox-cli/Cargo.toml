@@ -1,0 +1,26 @@
+[package]
+name = "enginebox-cli"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[[bin]]
+name = "ebox"
+path = "src/main.rs"
+
+[[bin]]
+name = "enginebox-fleet-mcp"
+path = "src/mcp.rs"
+
+[dependencies]
+enginebox-core = { path = "../enginebox-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
