@@ -739,6 +739,9 @@ fn windows_junction_ancestors_are_still_rejected() {
     let link = tmp.path().join("junction");
     fs::create_dir(&target).unwrap();
     let result = std::process::Command::new("powershell.exe")
+        // A pwsh 7 parent can export module paths incompatible with Windows
+        // PowerShell 5. Let the child reconstruct its own default module path.
+        .env_remove("PSModulePath")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -785,9 +788,11 @@ fn windows_private_directory_replaces_explicit_everyone_permissions() {
     fs::create_dir(directory.join("child")).unwrap();
     fs::write(directory.join("child/secret.txt"), "retained private state").unwrap();
     // Native calls accept the canonical verbatim path. Independently inspect
-    // the same directory through PowerShell's ordinary filesystem path.
-    let check = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=Get-Acl -LiteralPath $env:ENGINEBOX_PRIVATE_DIRECTORY; if(-not $acl.AreAccessRulesProtected){throw 'DACL is not protected'}; if($acl.GetOwner([System.Security.Principal.SecurityIdentifier]) -ne $sid){throw 'Owner is not current user'}; $rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); if($rules.Count -ne 1){throw 'Expected exactly one owner ACE'}; foreach($rule in $rules){if($rule.IdentityReference -ne $sid -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl' -or $rule.InheritanceFlags -ne 'ContainerInherit,ObjectInherit'){throw 'Unexpected owner ACE'}}; $child=Get-Acl -LiteralPath (Join-Path $env:ENGINEBOX_PRIVATE_DIRECTORY 'child/secret.txt'); $childRules=$child.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); if($childRules.Count -ne 1 -or $childRules[0].IdentityReference -ne $sid -or -not $childRules[0].IsInherited){throw 'Child file did not inherit private owner access'}"#;
+    // the same directory through .NET using its ordinary filesystem path.
+    // Direct framework APIs avoid a dependency on PowerShell module loading.
+    let check = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=[System.IO.Directory]::GetAccessControl($env:ENGINEBOX_PRIVATE_DIRECTORY); if(-not $acl.AreAccessRulesProtected){throw 'DACL is not protected'}; if($acl.GetOwner([System.Security.Principal.SecurityIdentifier]) -ne $sid){throw 'Owner is not current user'}; $rules=$acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); if($rules.Count -ne 1){throw 'Expected exactly one owner ACE'}; foreach($rule in $rules){if($rule.IdentityReference -ne $sid -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl' -or $rule.InheritanceFlags -ne 'ContainerInherit,ObjectInherit'){throw 'Unexpected owner ACE'}}; $child=[System.IO.File]::GetAccessControl([System.IO.Path]::Combine($env:ENGINEBOX_PRIVATE_DIRECTORY,'child/secret.txt')); $childRules=$child.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]); if($childRules.Count -ne 1 -or $childRules[0].IdentityReference -ne $sid -or -not $childRules[0].IsInherited){throw 'Child file did not inherit private owner access'}"#;
     let result = std::process::Command::new("powershell.exe")
+        .env_remove("PSModulePath")
         .args(["-NoProfile", "-NonInteractive", "-Command", check])
         .env("ENGINEBOX_PRIVATE_DIRECTORY", tmp.path().join("private"))
         .output()

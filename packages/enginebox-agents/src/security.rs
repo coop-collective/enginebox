@@ -235,7 +235,8 @@ impl Lease {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         #[cfg(unix)]
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let f = opts.open(path)?;
         let m = f.metadata()?;
         ensure!(m.is_file(), "Invalid private lease.");

@@ -110,11 +110,88 @@ fn private_state_and_symlink_guard() {
 fn workspace_private_lease_excludes_second_writer() {
     let (_t, root) = temp();
     let lease = security::Lease::acquire(&root, "state/run.lock").unwrap();
+    #[cfg(unix)]
+    assert_ne!(
+        unsafe { libc::fcntl(lease.fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
     assert!(security::Lease::active(&root, "state/run.lock").unwrap());
     assert!(security::Lease::acquire(&root, "state/run.lock").is_err());
     drop(lease);
-    assert!(!security::Lease::active(&root, "state/run.lock").unwrap());
-    security::Lease::acquire(&root, "state/run.lock").unwrap();
+    // A concurrent fork may retain this CLOEXEC descriptor until its exec.
+    // Closing the parent must preserve such child ownership, then release it.
+    let _reacquired = acquire_after_exec_transitions(&root, "state/run.lock");
+    assert!(security::Lease::active(&root, "state/run.lock").unwrap());
+}
+fn acquire_after_exec_transitions(root: &std::path::Path, relative: &str) -> security::Lease {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match security::Lease::acquire(root, relative) {
+            Ok(lease) => return lease,
+            Err(error)
+                if error.to_string().contains("active operation")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("Lease did not release after the fork/exec transition: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unselected_lease_survives_fork_only_until_exec() {
+    use std::{
+        io::{Read, Write},
+        os::{
+            fd::AsRawFd,
+            unix::{net::UnixStream, process::CommandExt},
+        },
+    };
+    let (_temporary, root) = temp();
+    let lease = security::Lease::acquire(&root, "unselected.lock").unwrap();
+    assert_ne!(
+        unsafe { libc::fcntl(lease.fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    let (mut ready, child_ready) = UnixStream::pair().unwrap();
+    let (mut release, child_release) = UnixStream::pair().unwrap();
+    ready
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let thread = std::thread::spawn(move || {
+        let ready_fd = child_ready.as_raw_fd();
+        let release_fd = child_release.as_raw_fd();
+        let mut command = process::command(&["/bin/sleep".into(), "5".into()], None, None).unwrap();
+        unsafe {
+            command.pre_exec(move || {
+                let mut byte = 1u8;
+                if libc::write(ready_fd, (&byte as *const u8).cast(), 1) != 1
+                    || libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    });
+    ready.read_exact(&mut [0]).unwrap();
+    drop(lease);
+    assert!(
+        security::Lease::active(&root, "unselected.lock").unwrap(),
+        "pre-exec child must still own the inherited descriptor"
+    );
+    release.write_all(&[1]).unwrap();
+    let mut child = thread.join().unwrap();
+    let _reacquired = acquire_after_exec_transitions(&root, "unselected.lock");
+    let child_still_running = child.try_wait().unwrap().is_none();
+    process::stop(&mut child);
+    assert!(
+        child_still_running,
+        "lease must close at exec, before the child exits"
+    );
 }
 #[cfg(windows)]
 #[test]

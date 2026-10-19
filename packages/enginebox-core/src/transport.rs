@@ -2,10 +2,14 @@ use crate::model::{GuestConfig, Host, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use wait_timeout::ChildExt;
 
@@ -31,9 +35,29 @@ pub fn run_process(argv: &[String], input: Option<&[u8]>, timeout: Duration) -> 
         !argv.is_empty() && argv.iter().all(|v| !v.contains('\0')),
         "Invalid command argv"
     );
+    let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(&argv[0]);
+    #[cfg(windows)]
+    if std::path::Path::new(&argv[0])
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("powershell.exe"))
+    {
+        // A PowerShell 7 parent can export module paths that Windows
+        // PowerShell 5 cannot load. Reconstruct this child's default paths.
+        cmd.env_remove("PSModulePath");
+    }
+    // A child can stop reading stdin while its descendant retains that handle.
+    // An anonymous private file removes the otherwise unbounded writer thread.
+    if let Some(data) = input.filter(|data| !data.is_empty()) {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(data)?;
+        file.seek(SeekFrom::Start(0))?;
+        cmd.stdin(file);
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     cmd.args(&argv[1..])
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -46,29 +70,46 @@ pub fn run_process(argv: &[String], input: Option<&[u8]>, timeout: Duration) -> 
         .with_context(|| format!("Cannot start {}", argv[0]))?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let out = thread::spawn(move || read_bounded(stdout, 16 * 1024 * 1024));
-    let err = thread::spawn(move || read_bounded(stderr, 64 * 1024));
-    let mut stdin = child.stdin.take().unwrap();
-    let data = input.unwrap_or_default().to_vec();
-    let writer = thread::spawn(move || {
-        if !data.is_empty() {
-            stdin.write_all(&data)
-        } else {
-            Ok(())
-        }
+    let stdout_raw = pipe_handle(&stdout);
+    let stderr_raw = pipe_handle(&stderr);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_out = cancel.clone();
+    let cancel_err = cancel.clone();
+    let out = thread::spawn(move || {
+        read_bounded(stdout, stdout_raw, 16 * 1024 * 1024, deadline, &cancel_out)
     });
-    let status = child.wait_timeout(timeout)?;
-    if status.is_none() {
-        kill_tree(&mut child);
-    }
-    let status = status.unwrap_or_else(|| child.wait().expect("reap command"));
-    let _ = writer.join();
+    let err =
+        thread::spawn(move || read_bounded(stderr, stderr_raw, 64 * 1024, deadline, &cancel_err));
+    // Keep the parent unreaped until its streams finish. If a descendant keeps
+    // a pipe open, the original process-group ID cannot be recycled before kill.
     let stdout = out
         .join()
-        .map_err(|_| anyhow::anyhow!("Output reader failed"))??;
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Output reader failed")));
+    if stdout.is_err() {
+        cancel.store(true, Ordering::SeqCst);
+        kill_tree(&mut child);
+    }
     let stderr = err
         .join()
-        .map_err(|_| anyhow::anyhow!("Error reader failed"))??;
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Error reader failed")));
+    if stdout.is_err() || stderr.is_err() {
+        kill_tree(&mut child);
+        let _ = child.wait_timeout(Duration::from_secs(1));
+        stdout?;
+        stderr?;
+        unreachable!("A stream failed");
+    }
+    let status = match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Some(status)) => status,
+        other => {
+            kill_tree(&mut child);
+            let _ = child.wait_timeout(Duration::from_secs(1));
+            other?;
+            bail!("Command exceeded its deadline; operation outcome is uncertain");
+        }
+    };
+    let stdout = stdout?;
+    let stderr = stderr?;
     ensure!(
         status.success(),
         "Command failed: {}",
@@ -80,12 +121,87 @@ pub fn run_process(argv: &[String], input: Option<&[u8]>, timeout: Duration) -> 
     );
     Ok(stdout)
 }
-fn read_bounded(mut stream: impl Read, max: usize) -> Result<Vec<u8>> {
+#[cfg(unix)]
+fn pipe_handle<T: std::os::fd::AsRawFd>(pipe: &T) -> usize {
+    pipe.as_raw_fd() as usize
+}
+#[cfg(windows)]
+fn pipe_handle<T: std::os::windows::io::AsRawHandle>(pipe: &T) -> usize {
+    pipe.as_raw_handle() as usize
+}
+fn read_bounded(
+    mut stream: impl Read,
+    raw: usize,
+    max: usize,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    unsafe {
+        let flags = libc::fcntl(raw as i32, libc::F_GETFL);
+        ensure!(
+            flags >= 0 && libc::fcntl(raw as i32, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0,
+            "Cannot configure bounded command output"
+        );
+    }
     let mut result = Vec::new();
     let mut buf = [0; 8192];
     let mut exceeded = false;
     loop {
-        let n = stream.read(&mut buf)?;
+        ensure!(
+            !cancel.load(Ordering::SeqCst) && Instant::now() < deadline,
+            "Command output did not close before its deadline; operation outcome is uncertain"
+        );
+        #[allow(unused_mut)]
+        let mut available = buf.len();
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn PeekNamedPipe(
+                    handle: *mut std::ffi::c_void,
+                    buffer: *mut std::ffi::c_void,
+                    size: u32,
+                    read: *mut u32,
+                    available: *mut u32,
+                    left: *mut u32,
+                ) -> i32;
+            }
+            let mut count = 0;
+            if PeekNamedPipe(
+                raw as *mut _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut count,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(109) {
+                    break;
+                }
+                return Err(error.into());
+            }
+            if count == 0 {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            available = available.min(count as usize);
+        }
+        let n = match stream.read(&mut buf[..available]) {
+            Ok(n) => n,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if n == 0 {
             break;
         }

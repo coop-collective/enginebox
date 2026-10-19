@@ -517,6 +517,53 @@ fn private_temp() -> tempfile::TempDir {
     dir
 }
 
+#[cfg(unix)]
+#[test]
+fn exited_parent_cannot_leave_output_drain_unbounded() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    use wait_timeout::ChildExt;
+    const CHILD: &str = "ENGINEBOX_PIPE_HOLDER_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let started = Instant::now();
+        let result = enginebox_core::transport::run_process(
+            &["sh".into(), "-c".into(), "sleep 3 & exit 0".into()],
+            None,
+            Duration::from_millis(100),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "An exited parent left its background child's output pipes open beyond the command deadline"
+        );
+        assert!(
+            result.is_err(),
+            "Incomplete output must not be reported as command success"
+        );
+        return;
+    }
+    // Isolate the reproduction so a regression cannot hang the complete test
+    // runner; the deliberately inherited pipe holder also exits after 3 seconds.
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exited_parent_cannot_leave_output_drain_unbounded",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = child.wait_timeout(Duration::from_secs(5)).unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "Isolated output-drain regression failed or exceeded its outer watchdog"
+    );
+}
+
 #[test]
 fn manifest_decoder_rejects_duplicate_keys_at_any_depth() {
     use enginebox_core::templates::decode_json;
@@ -531,6 +578,47 @@ fn manifest_decoder_rejects_duplicate_keys_at_any_depth() {
         decode_json(br#"{"items":[1,true,null,"ok"]}"#).unwrap(),
         json!({"items":[1,true,null,"ok"]})
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_process_streams_preserve_input_and_enforce_deadlines() {
+    use enginebox_core::transport::run_process;
+    use std::time::{Duration, Instant};
+    let command = |script: &str| {
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ]
+        .map(str::to_owned)
+    };
+    let input = "private stdin round trip\n".repeat(4096);
+    let output = run_process(
+        &command("[Console]::Out.Write([Console]::In.ReadToEnd()); [Console]::Error.Write('separate diagnostic')"),
+        Some(input.as_bytes()),
+        Duration::from_secs(15),
+    )
+    .unwrap();
+    assert_eq!(output, input.as_bytes());
+    let error = run_process(
+        &command("[Console]::Error.Write('expected child failure'); exit 7"),
+        None,
+        Duration::from_secs(15),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("expected child failure"));
+    let started = Instant::now();
+    let error = run_process(
+        &command("[System.Threading.Thread]::Sleep(3000)"),
+        None,
+        Duration::from_millis(100),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("deadline"));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
