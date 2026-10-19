@@ -131,8 +131,7 @@ model quota.
 Run the offline allocation, admission and recovery regressions with:
 
 ```sh
-PYTHONPATH=runtime runtime/.venv/bin/python -m unittest discover -s tests -p 'test_warm_pool.py' -v
-PYTHONPATH=runtime runtime/.venv/bin/python -m unittest discover -s tests -p 'test_fleet_templates.py' -v
+pnpm exec cargo test -p enginebox-core
 ```
 
 These checks include the real authenticated API and job queue with an in-memory

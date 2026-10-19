@@ -8,37 +8,40 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 
 ## Status
 
-**Early development: working server bootstrap, capacity-aware fleet API, Vinext dashboard and headless browser MCP.**
+**Early development: native Rust services and tools, a capacity-aware fleet API, Vinext dashboard and headless browser MCP.** See [Rust migration and qualification](docs/RUST-MIGRATION.md) for the current release boundary.
 
 | Available in this repository | Planned |
 |---|---|
-| Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Independently qualified fresh-host installs and upgrade/rollback |
+| Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Additional qualified host/guest combinations |
 | Controller-synchronized templates, resource presets and prebooted fresh workspace pools | Additional image/recipe formats |
 | Official client preparation and reusable clean VM snapshots | Shared mount/cache services and off-host backup workflows |
 | Fleet REST API, operator MCP and authenticated Vinext dashboard | Automatic placement, public tenant authorization and billing |
 | Native CLI launch/resume through operator MCP; persistent private workspace state | Movable tenant state volumes and authenticated multi-tenant service |
 | Account usage cards with native Codex allowance reads and provider links | Claude/Cursor allowance ingestion and subscription renewal dates |
-| Portable hardware preflight and test-gated runtime package builds | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
+| Native packages, terminal installer plans, version pinning and supervised update/rollback | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
 | Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 
-The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Real Codex/Claude prompts, tools and exact conversation resume have been tested; Cursor inference is currently blocked by the test account’s provider quota. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The v0.2 implementation passed real Codex/Claude prompts, tools and exact conversation resume; the Rust port has separate qualification gates. Cursor inference was blocked by the test account’s provider quota. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
 [Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 
 ## Bootstrap a server
 
-Prerequisites: Python 3.11+, `uv`, OpenSSH and a Linux x86_64 server with usable KVM and administrative access. Start with the [bootstrap guide](docs/BOOTSTRAP.md). Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
+Use the [terminal installer](docs/INSTALL.md) for release binaries. Admin/operator tools can run on Linux, macOS and Windows; the current compute backend needs a Linux server with usable KVM, Incus and administrative access. The controller and Linux node have separate installation roles. Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
+
+To build from source, install Node 22.12+ and pnpm, then use the root workspace. Python is not a runtime prerequisite.
 
 ```sh
 git clone https://github.com/coop-collective/enginebox.git
 cd enginebox
-uv sync --project runtime --locked
-runtime/.venv/bin/ebox init --output enginebox.toml
+pnpm install --frozen-lockfile
+pnpm build
+target/release/ebox init --output enginebox.toml
 # Edit enginebox.toml for your host, storage and networking.
-runtime/.venv/bin/ebox doctor --config enginebox.toml
-runtime/.venv/bin/ebox plan --config enginebox.toml
-runtime/.venv/bin/ebox apply --config enginebox.toml
+target/release/ebox doctor --config enginebox.toml
+target/release/ebox plan --config enginebox.toml
+target/release/ebox apply --config enginebox.toml
 ```
 
 Inside a prepared guest, launch `codex`, `agent` or `claude` directly. Provider subscriptions and limits remain with the provider; Engine Box does not pool credentials or resell inference.
@@ -55,6 +58,10 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 
 ## Design and implementation
 
+- [Terminal installation and platform roles](docs/INSTALL.md)
+- [Versioned updates, draining and rollback](docs/UPDATES.md)
+- [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)
+- [LayerFS workspace storage evaluation](docs/LAYERFS.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)

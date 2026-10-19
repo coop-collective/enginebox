@@ -16,7 +16,7 @@ helper in [this first-party diagnosis](https://forum.cursor.com/t/agent-cli-linu
 
 ## Scoped repair
 
-`runtime/cursor_sandbox.py` creates an Engine Box-owned AppArmor profile attached
+The Rust `enginebox-guest cursor-sandbox` helper creates an Engine Box-owned AppArmor profile attached
 only to the configured guest home's Cursor helper path:
 
 ```text
@@ -46,11 +46,11 @@ produce a ready template.
 ## Repair an existing authorized private guest
 
 Run the following **inside that guest as root**, with its actual configured user,
-home and workspace. The script is included in the runtime package and copied to
-`/opt/enginebox-runtime` during guest preparation:
+home and workspace. The helper is included in the native release and staged into
+`/usr/local/bin` during guest preparation:
 
 ```sh
-python3 /opt/enginebox-runtime/cursor_sandbox.py \
+enginebox-guest cursor-sandbox \
   --home /home/agent --user agent --workspace /workspace --apply
 ```
 
@@ -62,7 +62,7 @@ ordinary guest user using a clean environment. No model request or provider logi
 is needed. Existing clients, account state, services and VM execution state are
 not reinstalled or restarted.
 
-The script refuses malformed attachment paths, a different user's home, symlink
+The helper refuses malformed attachment paths, a different user's home, symlink
 or nonregular profile files, writable-by-others profiles, an unexpected existing
 attachment, local disable/complain overrides, or an already loaded vendor CLI
 profile requiring reconciliation. An existing matching Engine Box profile is
@@ -72,7 +72,7 @@ distributions or desktop operating systems.
 
 ## Verification
 
-On 2026-10-19, Cursor Agent `2026.10.16-e3cb207` in a disposable Ubuntu 24.04
+During v0.2 qualification on 2026-10-19, Cursor Agent `2026.10.16-e3cb207` in a disposable Ubuntu 24.04
 workspace failed its native preflight with `uid_map` permission errors before
 this profile was loaded. The same ordinary-user command passed afterward.
 
@@ -86,7 +86,7 @@ A script executed through `agent sandbox run` then verified:
 - `kernel.apparmor_restrict_unprivileged_userns` stayed `1`; ordinary
   `unshare -Ur /bin/true` still failed.
 
-The exact reusable helper applied twice and passed preflight both times. Offline
+The historical Python helper applied twice and passed preflight both times. Offline
 regressions cover constrained attachment construction, dry runs, idempotency,
 preservation of matching operator edits, local override/symlink/foreign-profile
 rejection and inclusion in bootstrap assets. This verifies the tested sandbox

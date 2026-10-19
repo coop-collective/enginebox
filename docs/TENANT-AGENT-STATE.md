@@ -161,22 +161,6 @@ workspace is implemented; cross-workspace continuity is the next storage feature
 
 ## Verification
 
-`tests/test_agent_runs.py` launches real subprocesses using disposable executable
-fixtures named `codex`, `claude` and `agent`; it never reads personal credentials
-or invokes provider inference. A real stdio MCP client initializes the fleet MCP,
-lists tools, calls all three launch paths through a loopback authenticated HTTP
-API, polls their runs and resumes each exact fixture conversation.
+Rust regression tests under `packages/enginebox-agents/tests/` launch disposable executable fixtures named `codex`, `claude` and `agent`. They cover native prompt/resume arguments, private state, stripped credentials/environment, same-provider writer exclusion, symlink/path boundaries, bounded output, timeout/descendant cleanup and retained leases. They do not contact providers or read personal credentials.
 
-The checks cover private-home memory/scratch reuse, empty state in a separate
-home, credential/environment stripping, same-provider writer rejection, scoped
-run lookup, lifecycle admission, reserve/base rejection, path/symlink escape,
-timeout/descendant termination, retained native lease after supervisor SIGKILL,
-bounded guest and controller output, restart
-lease recovery, unrelated-client rejection and private record validation. These prove
-the Engine Box transport/process/state plumbing, not model behavior or subscription
-eligibility. The new MCP path also passed live Codex/Claude inference and exact
-conversation resume in a disposable private VM, including conversation-only
-context recall and independently checked file writes. Cursor reached its
-provider with the native sandbox enabled after the scoped Ubuntu helper repair,
-but its team quota blocked inference and resume. Exact versions and outcomes
-are recorded separately in [VALIDATION.md](VALIDATION.md).
+The v0.2 release separately passed real operator MCP and Codex/Claude inference with exact-session resume, conversation-only recall and checked file edits. Cursor reached its provider with the native sandbox enabled but quota blocked inference/resume. Those results do not automatically qualify the Rust port. Current Rust update tests preserve durable jobs and a private Claude scratchnote across actual controller upgrade/rollback. See [validation](VALIDATION.md) and [updates](UPDATES.md) for the individual acceptance records.

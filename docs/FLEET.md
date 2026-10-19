@@ -45,26 +45,18 @@ Guest settings must match the prepared image. Unknown keys are rejected; in part
 Install the runtime from the checkout, then create a private token file without printing the token:
 
 ```sh
-uv sync --project runtime --locked
-python3 - <<'PY'
-from pathlib import Path
-import os, secrets
-directory = Path.home() / '.local/state/enginebox'
-directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-path = directory / 'api.token'
-descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-with os.fdopen(descriptor, 'w') as stream:
-    stream.write(secrets.token_urlsafe(48) + '\n')
-PY
+umask 077
+mkdir -p "$HOME/.local/state/enginebox"
+(set -C; openssl rand -hex 32 > "$HOME/.local/state/enginebox/api.token")
 export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
-runtime/.venv/bin/enginebox-api --config fleet.toml
+enginebox-controller --config fleet.toml
 ```
 
 The token-generation command refuses to replace an existing token. The service accepts `ENGINEBOX_API_TOKEN_FILE` or `ENGINEBOX_API_TOKEN`; the file takes precedence. Tokens must contain at least 32 printable non-space ASCII characters. Generate a random token rather than choosing a memorable string.
 
 The API binds `127.0.0.1:8765`; `--port` changes the port. Remote access should use an SSH tunnel or a separately authenticated TLS proxy. The API itself does not expose a public listener or configure TLS. Direct requests with a browser `Origin` header are rejected; the [dashboard](DASHBOARD.md) uses its authenticated server-side proxy.
 
-The default job directory is `~/.local/state/enginebox/jobs`; override it with `--state-dir`. It must belong to the service user and have mode `0700`. Job records are private, atomically written files with mode `0600`. Do not put this directory or token files in Git.
+The controller root defaults to `~/.local/state/enginebox`; override it with `--state-dir`. Jobs live in its `jobs/` child. Unlike v0.2, `--state-dir` selects the parent controller root, not the jobs directory. It must belong to the service user and have mode `0700`. Job records are private, atomically written files with mode `0600`. Do not put this directory or token files in Git.
 
 ## Endpoints
 
@@ -104,7 +96,7 @@ For optional prebooted reserves, see [warm pools](WARM-POOLS.md). Allocation ret
 
 Use the dashboard's **Agents** panel to connect the owner once. The control-plane installer prepares original CLIs in persistent private storage. Native browser/device authorization runs on the controller; validated links, one-time codes and status are exposed, never credential contents. Refresh credentials stay in controller provider homes. The same owner's assigned private VMs receive compatible native access material after create/allocation/resume and through periodic reconciliation. Frozen/stopped workspaces catch up after resume. Bases and unassigned warm reserves remain credential-free.
 
-Existing signed-in workspaces are adopted explicitly with `AgentAccess.adopt(host_id, name, provider)` while that provider's native sessions are idle. Adoption retains the native account centrally and converts the source to delegated access without asking for sign-in again. Automatic discovery refuses to overwrite unmarked/manual credentials. Stored attachment receipts bind to host configuration and guest UUID. Host inventory changes take effect on service restart; there is no live node-registration API yet.
+Existing signed-in workspaces are adopted explicitly with the Rust `AgentService::adopt(host_id, name, provider)` administrative interface while that provider's native sessions are idle. Adoption retains the native account centrally and converts the source to delegated access without asking for sign-in again. Automatic discovery refuses to overwrite unmarked/manual credentials. Stored attachment receipts bind to host configuration and guest UUID. Host inventory changes take effect on service restart; there is no live node-registration API yet.
 
 Private files use owner-only permissions, not application-level encryption. Native credentials never enter template manifests, job journals, API responses or browser storage. Private workspace checkpoints can contain access credentials and must remain private. Expiry/refresh behavior differs by provider; running CLIs may cache access tokens until restarted. See [native-client authentication](NATIVE-CLIENTS.md) and [usage reporting research](AGENT-USAGE.md).
 
@@ -155,17 +147,17 @@ Run the operator MCP server with the same API token and origin:
 ```sh
 export ENGINEBOX_API_URL=http://127.0.0.1:8765
 export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
-runtime/.venv/bin/enginebox-fleet-mcp
+enginebox-fleet-mcp
 ```
 
-Register that command through your client's ordinary MCP configuration. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch` and `agent_run`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate bounded run queue and private result endpoint; see [native runs and state](TENANT-AGENT-STATE.md).
+Register that command through your client's ordinary MCP configuration. The current stdio implementation supports handshake revisions through `2025-11-25`; it does not advertise the separate `2026-07-28` discovery/per-request versioning protocol. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch` and `agent_run`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate bounded run queue and private result endpoint; see [native runs and state](TENANT-AGENT-STATE.md).
 
 The MCP client only permits HTTP for loopback origins, requires HTTPS for remote origins, rejects URL credentials and disables redirects and ambient forward proxies. A redirect must not forward the bearer token to another service. Use a direct API connection or SSH tunnel. Do not install fleet API tokens or operator SSH authority inside agent guests; guest computer/browser MCP is a separate interface.
 
 ## Verification and current limits
 
 ```sh
-PYTHONPATH=runtime runtime/.venv/bin/python -m unittest discover -s tests -p 'test_fleet.py' -v
+pnpm exec cargo test -p enginebox-core -p enginebox-controller -p enginebox-cli
 ```
 
 The tests cover reserve accounting, cross-project/frozen allocations, template trust and pool selection, disk-shrink rejection, exact guest mapping, readiness-contract handling, serialized jobs, restart records, queue-slot recovery and bearer authentication/redirect protection. They do not create live VMs. Real clone, networking, identity and RAM continuity checks are reported separately in [validation](VALIDATION.md).

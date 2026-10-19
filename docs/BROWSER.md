@@ -52,7 +52,7 @@ commands and Cursor's documented JSON format. Existing entries are left intact.
 The command is:
 
 ```sh
-/usr/bin/python3 /opt/enginebox-runtime/browser_tools.py --client codex
+/usr/local/bin/enginebox-guest browser --client codex
 ```
 
 Use `claude` or `cursor` for the corresponding client. An owner's MCP settings can
@@ -64,7 +64,7 @@ speaks MCP on stdin/stdout, so it is not an interactive browser shell.
 
 ## Optional desktop
 
-Headless Chromium is the default. With `EBOX_DESKTOP=1`, the guest has a virtual
+Headless Chromium is the default. With the template's `config.desktop` enabled, the guest has a virtual
 display at `:99`; configure the browser entry with `--headed` to display that
 profile there. Close its existing MCP session first. A headless browser cannot
 become visible without relaunching; persisted cookies/storage remain available.
@@ -77,26 +77,11 @@ purpose. Automated screenshot/click/type tools can still control the virtual
 desktop. Direct human viewer transport is separate work until that guest tunnel
 is configured. Neither browser CDP nor noVNC should be published unauthenticated.
 
-## Run the browser acceptance check
+## Validation
 
-Copy `tests/test_browser_live.py` into the disposable guest, then run as its
-non-root workspace user:
+Rust browser/profile tests live under `packages/enginebox-agents/tests/`. Run `pnpm exec cargo test -p enginebox-agents` for private-profile ownership, concurrent-writer locking, native child cleanup and protocol boundaries. A live browser acceptance run must use a disposable guest and profile, serve a local fixture, navigate/type/click through the official MCP, verify a screenshot and restart MCP to check cookie/storage persistence. Unit tests alone do not prove that browser installation works on a new platform.
 
-```sh
-ENGINEBOX_BROWSER_LIVE=1 /opt/enginebox-runtime/.venv/bin/python /path/to/test_browser_live.py -v
-```
-
-This test serves a fixture on guest loopback, navigates through the official MCP,
-finds input/button references in the accessibility snapshot, types and clicks,
-checks a PNG screenshot, then restarts MCP and verifies browser storage persisted.
-It uses a temporary private profile and deletes its fixture/profile after closing
-the browser. No account or model inference is involved. Ordinary test discovery
-skips this check unless `ENGINEBOX_BROWSER_LIVE=1` is explicitly set.
-
-Validated on October 19, 2026 in the newly prepared Ubuntu 24.04 x64 VM as its
-non-root user: the full fixture passed in 2.672 seconds, including a fresh MCP
-process reusing browser storage. This does not validate provider login, model
-inference, internet sites, or a human desktop viewer.
+The v0.2 Python implementation passed that live Chromium fixture on October 19, 2026 in Ubuntu 24.04 x64 in 2.672 seconds. That is historical evidence; it is not automatically qualification of the Rust launcher. See [validation](VALIDATION.md) for release-specific evidence.
 
 An optional existing browser installation can be selected for a test with
 `ENGINEBOX_BROWSER_PACKAGE=/absolute/package/directory`; that directory must have

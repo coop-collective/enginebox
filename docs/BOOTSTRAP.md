@@ -2,18 +2,18 @@
 
 The bootstrap creates one Ubuntu VM with official Codex, Cursor Agent and Claude Code clients. It uses a versioned TOML configuration, read-only inspection, ownership checks and a resumable apply. It does not sign in to providers or register CI runners.
 
-The server needs Linux x86_64, usable `/dev/kvm`, Python 3.11+, SSH and noninteractive administrative access. The operator needs Python 3.11+ and OpenSSH. Existing Incus deployments must provide Incus 6.0+, its stateful-migration capability and QEMU 8.2+. Automatic package installation is explicitly limited to Ubuntu 24.04/26.04 repository packages. The guest is Ubuntu 24.04; other guest images are rejected before mutation. These are enforced target bounds, not a claim that every host/kernel/package combination has been tested.
+The server needs Linux x86_64, usable `/dev/kvm`, the native `enginebox-host` release, SSH and noninteractive administrative access. The operator uses the native `ebox`/`enginebox-host` binaries and OpenSSH; Python is not required. Existing Incus deployments must provide Incus 6.0+, its stateful-migration capability and QEMU 8.2+. Automatic host package installation is explicitly limited to Ubuntu 24.04/26.04 repository packages. The guest is Ubuntu 24.04; other guest images are rejected before mutation. These are enforced target bounds, not a claim that every host/kernel/package combination has been tested.
 
 ## Configure, inspect and apply
 
-From a complete checkout:
+First install a platform release on the operator and the Linux target using [INSTALL.md](INSTALL.md). On a dedicated target, expose the root-owned node helper through the installer's `expose-host` command. The SSH transport invokes `sudo -n enginebox-host`; the installer does not grant this administrative permission implicitly. Then run:
 
 ```sh
-python3 runtime/bootstrap.py init --output enginebox.toml
+ebox init --output enginebox.toml
 # Edit the SSH target, resource names and sizes before continuing.
-python3 runtime/bootstrap.py doctor --config enginebox.toml
-python3 runtime/bootstrap.py plan --config enginebox.toml
-python3 runtime/bootstrap.py apply --config enginebox.toml
+ebox doctor --config enginebox.toml
+ebox plan --config enginebox.toml
+ebox apply --config enginebox.toml
 ```
 
 `init` only creates a local file and refuses to overwrite one. `doctor` and `plan` inspect the host without writing files or changing services. They return JSON, with a failing exit status when blockers exist. `apply` rechecks the live host under an exclusive lock before changes. Repeating the same configuration converges from verified resources; a completed workspace is a no-op.
@@ -26,7 +26,7 @@ For direct operation on the server, set `host.transport = "local"`. For SSH, `ho
 
 1. If Incus is absent and `host.install_packages=true`, install Incus/QEMU packages from the server's configured Ubuntu repositories. Check package candidates first; do not add repositories. Existing working Incus installations are reused.
 2. Create only requested, missing owned resources: optional loop pool, optional managed bridge, private project/profile and VM.
-3. Push the runtime/provisioning files into `/opt/enginebox-runtime` and invoke `guest_setup.sh` as guest root. It creates the configured ordinary user, installs selected clients and prepares optional browser/desktop tools.
+3. Copy qualified Linux native helpers into the guest's `/usr/local/bin` and run the Rust `enginebox-host prepare-guest` entrypoint as guest root. It creates the configured ordinary user, installs selected official clients and prepares optional browser/desktop tools. The target's installed release supplies its guest binaries; Mac/Windows operator binaries are not copied into Linux guests.
 4. Stop the new VM cleanly, capture the prepared disk snapshot and start it again. The response names the workspace, snapshot and environment variables for ordinary runtime access.
 
 The native clients run directly as the guest user. With the controller installed, connect providers once in **Agents** and assigned workspaces receive native access automatically. A standalone bootstrap without a controller still uses each client's normal native sign-in in the private guest. Successful provisioning proves installation and preparation; it does not prove subscription inference or quota behavior.
@@ -45,7 +45,7 @@ No global NFS, UFW, nftables or Docker configuration is replaced. Existing rules
 
 ## Recovery and snapshots
 
-The default root-owned journal is `/var/lib/enginebox/<project>-bootstrap.json`. It contains operation status and non-secret errors. A failed apply retains newly created resources for diagnosis and can be rerun with the same config. Live inventory is authoritative; the journal is not trusted as proof a command completed. There is no automatic destructive rollback or deletion command.
+The default root-owned journal is `/var/lib/enginebox/bootstrap/<workspace>.json`. It contains operation status and bounded errors. A failed apply retains newly created resources for diagnosis and can be rerun with the same config. Live inventory is authoritative; the journal is not trusted as proof a command completed. There is no automatic destructive rollback or deletion command.
 
 The reusable disk snapshot is named `prepared-<configuration-fingerprint-prefix>`. It is captured before provider/Git login and marked `user.enginebox.clean-base=true`. That marker is removed from the running source immediately after capture so future private snapshots do not inherit a clean-base claim. A final guard refuses known provider/Git/cloud credential files and nonempty browser profiles; it is an additional check, not a universal secret scanner. Only a newly bootstrap-owned VM is eligible. Never sign into an incomplete workspace while bootstrap is running or before recovery finishes. Provider credentials in private snapshots must remain within the owner's access boundary.
 
@@ -67,7 +67,8 @@ Browser or computer-tool selection enables the required guest MCP runtime. Optio
 ## Offline verification
 
 ```sh
-PYTHONPATH=runtime runtime/.venv/bin/python -m unittest discover -s tests -p 'test_bootstrap*.py' -v
+cargo test -p enginebox-core bootstrap
+cargo test -p enginebox-core --test transport_contract
 ```
 
-These tests cover malformed configuration, ownership collisions, drift, stateful prerequisites, capacity/reserve accounting, subnet conflicts, no-op/resume behavior and transport argument handling. They do not contact SSH or execute privileged commands. Live validation must use a newly named disposable workspace; never use a signed-in or actively edited workspace as a restoration fixture.
+The Rust tests exercise malformed configuration, ownership/admission checks and transport behavior using controlled fixtures. They do not prove that a particular real host supports memory restore or that a provider subscription can complete inference. Live validation must use a newly named disposable workspace; never use a signed-in or actively edited workspace as a restoration fixture. Current Rust controller update qualification is recorded separately in [UPDATES.md](UPDATES.md); the first Python-to-Rust control-plane migration is not a rolling-update proof.

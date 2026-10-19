@@ -1,0 +1,46 @@
+[package]
+name = "enginebox-install"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+flate2 = "1"
+futures-util = "0.3"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tar = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "enginebox-install"
+path = "src/bin/install.rs"
+
+[[bin]]
+name = "enginebox-supervisor"
+path = "src/bin/supervisor.rs"
+
+[[bin]]
+name = "enginebox-release"
+path = "src/bin/release.rs"

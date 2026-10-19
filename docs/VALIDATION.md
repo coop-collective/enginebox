@@ -2,6 +2,18 @@
 
 October 19, 2026. These are development acceptance results on newly created VMs and isolated test directories in an owner-authorized workspace, not a throughput benchmark or a claim of compatibility with every supported host configuration. Private host names, addresses, inventory and raw evidence are excluded from the repository.
 
+## Rust migration qualification
+
+The 0.3 development branch passes the Rust workspace tests, strict Clippy, TypeScript checks, 20 dashboard unit tests and 19 dashboard browser tests on macOS. Native release binaries also build on Linux x86_64. A Windows GNU cross-target check covers every package and test target, but does not establish Windows execution, service installation or native provider sign-in.
+
+The actual native supervisor/controller/dashboard test stages a separately compiled next controller version, continuously calls authenticated GET/POST endpoints through upgrade and rollback, and verifies exclusive ownership, retained jobs/templates/private Claude scratchnotes, valid browser cookies and previous immutable browser assets. Failed version health and failed activation retain or restore the prior controller. Killing/restarting the supervisor releases old children through their lifelines. An actual stdio fleet MCP process also survives those transitions. See [UPDATES.md](UPDATES.md) for the reproducible opt-in test and its receipt.
+
+These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. Current live Linux guest qualification is recorded separately as it completes. LayerFS remains an [evaluated candidate](LAYERFS.md), not a qualified dependency.
+
+## Historical v0.2 qualification
+
+The remaining sections record the Python v0.2 implementation. They describe prior evidence, not automatic acceptance of rewritten Rust paths.
+
 ## Tested platform
 
 | Component | Observed version/configuration |
