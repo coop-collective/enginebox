@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "remote_node": "/usr/bin/node",
+  "controller": {
+    "prefix": "/opt/enginebox-rust/controller",
+    "installer": "/opt/enginebox-rust/controller/releases/0.3.0/bin/enginebox-install",
+    "supervisor_config": "/opt/enginebox-rust/controller/etc/supervisor.json",
+    "state_dir": "/opt/enginebox-control/state",
+    "token_file": "/opt/enginebox-rust/controller/etc/api-token",
+    "url": "http://127.0.0.1:8765"
+  },
+  "templates": {
+    "namespace": "live",
+    "allow_ids": [],
+    "files": [],
+    "timeout_seconds": 3600
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@enginebox/deploy",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "engines": { "node": ">=22.12" },
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}
