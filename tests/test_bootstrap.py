@@ -207,6 +207,74 @@ class BootstrapPlanTests(unittest.TestCase):
 
 
 class BootstrapExecutionTests(unittest.TestCase):
+    def test_marker_clearing_handles_fresh_and_interrupted_bases_with_strict_incus(self):
+        config = configuration()
+        key = "user.enginebox.clean-base"
+        snapshot = "prepared-" + fingerprint(config)[:12]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+                (source / filename).touch()
+            for stale_marker in [False, True]:
+                for existing_snapshot in [False, True]:
+                    with self.subTest(stale_marker=stale_marker, existing_snapshot=existing_snapshot):
+                        local_config = {key: "true"} if stale_marker else {}
+                        unsets = []
+                        starts = []
+                        def strict_incus(_config, *argv, **kwargs):
+                            if argv[0] == "query":
+                                if "/snapshots?" in argv[1]:
+                                    return json.dumps([{"name": snapshot}] if existing_snapshot else []).encode()
+                                return json.dumps({"status": "Stopped", "config": local_config}).encode()
+                            if argv[:2] == ("config", "set"):
+                                name, value = argv[3].split("=", 1)
+                                local_config[name] = value
+                            if argv[:2] == ("config", "unset"):
+                                name = argv[3]
+                                if name not in local_config:
+                                    raise RuntimeError(f"Can't unset key {name}: it's not currently set")
+                                del local_config[name]
+                                unsets.append(name)
+                            if argv[0] == "start":
+                                self.assertNotIn(key, local_config, "Never start a source labelled as a reusable clean base")
+                                starts.append(argv)
+                            if argv[0] == "snapshot":
+                                self.assertEqual(local_config[key], "true")
+                            return b""
+                        with patch("bootstrap.incus", side_effect=strict_incus), patch("bootstrap.wait_guest"):
+                            bootstrap.prepare_workspace(config, source)
+                        self.assertEqual(len(unsets), int(stale_marker) + int(not existing_snapshot))
+                        self.assertEqual(len(starts), 2)
+                        self.assertNotIn(key, local_config)
+                        self.assertEqual(local_config[bootstrap.PREPARED_KEY], fingerprint(config))
+
+    def test_failed_snapshot_still_clears_marker_without_setting_prepared(self):
+        config = configuration()
+        key = "user.enginebox.clean-base"
+        local_config = {}
+        def strict_incus(_config, *argv, **kwargs):
+            if argv[0] == "query":
+                return b"[]" if "/snapshots?" in argv[1] else json.dumps({"status": "Running", "config": local_config}).encode()
+            if argv[:2] == ("config", "set"):
+                name, value = argv[3].split("=", 1)
+                local_config[name] = value
+            if argv[:2] == ("config", "unset"):
+                if argv[3] not in local_config:
+                    raise RuntimeError("Can't unset a missing key")
+                del local_config[argv[3]]
+            if argv[0] == "snapshot":
+                raise RuntimeError("Snapshot failed")
+            return b""
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            for filename in ["enginebox.py", "mcp_server.py", "browser_tools.py", "requirements.lock", "guest_setup.sh"]:
+                (source / filename).touch()
+            with patch("bootstrap.incus", side_effect=strict_incus), patch("bootstrap.wait_guest"):
+                with self.assertRaisesRegex(RuntimeError, "Snapshot failed"):
+                    bootstrap.prepare_workspace(config, source)
+        self.assertNotIn(key, local_config)
+        self.assertNotIn(bootstrap.PREPARED_KEY, local_config)
+
     def test_credential_guard_failure_never_stops_or_labels_base(self):
         config = configuration()
         calls = []

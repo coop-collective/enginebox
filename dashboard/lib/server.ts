@@ -164,10 +164,10 @@ export function requireSession(request: Request) {
     throw new HttpError(401, "Sign in to access your fleet.");
 }
 
-export async function bodyJson(request: Request) {
+export async function bodyJson(request: Request, maxBytes = 8192) {
   if (!request.headers.get("content-type")?.startsWith("application/json"))
     throw new HttpError(415, "Send an application/json request.");
-  if (Number(request.headers.get("content-length") ?? 0) > 8192)
+  if (Number(request.headers.get("content-length") ?? 0) > maxBytes)
     throw new HttpError(413, "Request is too large.");
   const reader = request.body?.getReader();
   if (!reader) throw new HttpError(400, "Request body is required.");
@@ -177,7 +177,7 @@ export async function bodyJson(request: Request) {
     const { value, done } = await reader.read();
     if (done) break;
     bytes += value.byteLength;
-    if (bytes > 8192) {
+    if (bytes > maxBytes) {
       await reader.cancel();
       throw new HttpError(413, "Request is too large.");
     }
@@ -219,9 +219,9 @@ export async function proxy(request: Request, segments: string[]) {
   const path = segments.join("/");
   const allowed =
     request.method === "GET"
-      ? /^v1\/(fleet|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
+      ? /^v1\/(fleet|templates|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
       : request.method === "POST" &&
-        /^v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/instances(?:\/ebox-[a-z0-9-]{1,49}\/actions)?$/.test(
+        /^(?:v1\/templates|v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/(?:templates\/[a-z][a-z0-9-]{0,31}\/install|allocations|instances(?:\/ebox-[a-z0-9-]{1,49}\/actions)?))$/.test(
           path,
         );
   if (
@@ -232,7 +232,9 @@ export async function proxy(request: Request, segments: string[]) {
   const { apiUrl, apiToken } = config();
   const body =
     request.method === "POST"
-      ? JSON.stringify(await bodyJson(request))
+      ? JSON.stringify(
+          await bodyJson(request, path === "v1/templates" ? 1024 * 1024 : 8192),
+        )
       : undefined;
   let response: Response;
   try {

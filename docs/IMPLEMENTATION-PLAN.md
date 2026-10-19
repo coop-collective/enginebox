@@ -16,7 +16,7 @@ Updated October 19, 2026. Scope: portable environments for native Codex, Cursor 
 
 Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and upgrade/rollback remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
-The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls and owner authentication. It does not add agent orchestration or automatic placement.
+The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. It does not add agent orchestration or automatic placement.
 
 ## Implemented code boundaries
 
@@ -25,6 +25,8 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 - `runtime/enginebox.py`: validated local/SSH Incus lifecycle and guest operations.
 - `runtime/guest_setup.sh` and `browser_tools.py`: official client/browser preparation and private browser profiles.
 - `runtime/fleet.py`, `fleet_api.py`, `fleet_mcp.py`: multi-host inventory, capacity, jobs, authenticated REST and operator MCP.
+- `runtime/templates.py`: strict portable manifests, public HTTPS import, per-host revision receipts and bootstrap installation adapter.
+- `runtime/warm_pool.py`: prebooted reserves, durable one-way claims, refill admission and quarantine.
 - `dashboard/`: Vinext owner dashboard and authenticated server-side proxy.
 - `examples/`: existing-Incus, fresh-host and fleet configuration.
 - `tests/`: offline regression coverage and opt-in browser integration.
@@ -32,6 +34,14 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 Do not implement a generic plugin framework before a second backend exists. Keep config parsing and planning independent of live mutation so they can be tested without administrator access.
 
 P1 is done when an explicit example config can inspect a fresh supported host and the owner's existing server, produce useful diagnostics, and leave both unchanged. Test custom project names, UID/GID, paths and subnets, plus malformed config and absent/unreachable hosts. For stateful VMs, inspect memory-state capacity against RAM plus overhead, available disk reserve and device compatibility; reject a hibernation configuration the host cannot support.
+
+## Template and warm workspace slice
+
+Implemented: Minimum/Recommended/Custom resource selection, API-enforced floors, serialized JSON recipes independent of host bootstrap, explicit per-host installation and revision status, and warm allocation with cold fallback. Template imports do not run arbitrary scripts; the initial recipe supports official native clients and optional browser/desktop on Ubuntu 24.04.
+
+A registered revision is offered only on hosts whose installation receipt matches that revision and their current host/project/pool/guest binding. Installation consumes normal host admission under the shared lock. Existing workspaces retain their original image and files.
+
+Warm reserves are booted and paused fresh clones with independent identities. Assignment commits a permanent claim before resume; signed-in workspaces are never recycled. Refill releases the mutation lock during guest readiness, respects reserves and quarantines interrupted/stale artifacts. Frozen RAM occupies real capacity; deletion and stale-generation cleanup remain explicit operator operations. Automatic placement, arbitrary template plugins and cross-host image replication remain separate work.
 
 ## Safe bootstrap slice
 

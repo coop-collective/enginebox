@@ -1,3 +1,46 @@
+export type Resources = {
+  cpu: number;
+  memory_gib: number;
+  disk_gib: number;
+};
+export type PreparedTemplate = {
+  id: string;
+  label: string;
+  minimum?: Resources;
+  recommended?: Resources;
+  host_ids?: string[];
+  host_resources?: Record<
+    string,
+    { minimum: Resources; recommended: Resources }
+  >;
+};
+export type TemplateRecord = PreparedTemplate & {
+  schema_version: number;
+  revision: number;
+  description?: string;
+  recipe: string;
+  source_image: string;
+  minimum: Resources;
+  recommended: Resources;
+  native_clients?: string[];
+  config?: Record<string, boolean>;
+  manifest_digest: string;
+  deployments: {
+    host_id: string;
+    source: string;
+    snapshot: string;
+    manifest_digest: string;
+    revision: number;
+    in_sync: boolean;
+    installed_at?: string;
+  }[];
+};
+export type Allocation = {
+  name: string;
+  template: string;
+} & (
+  { size: string; resources?: never } | { resources: Resources; size?: never }
+);
 export type Instance = {
   name: string;
   status: string;
@@ -8,6 +51,8 @@ export type Instance = {
   memory_usage_bytes?: number | null;
   template?: string;
   managed?: boolean;
+  workspace_name?: string;
+  warm_pool_state?: "preparing" | "ready" | "claimed" | "quarantined";
 };
 export type Host = {
   id: string;
@@ -23,22 +68,41 @@ export type Host = {
     reserve_memory_bytes: number;
     allocated_cpu: number;
     allocated_memory_bytes: number;
+    cpu_available?: number;
+    memory_budget_available_bytes?: number;
     disk_budget_available_bytes?: number;
+    instance_slots_available?: number;
     max_additional: Record<string, number>;
   };
   instances: Instance[];
+  warm_pools?: {
+    template: string;
+    size: string;
+    resources?: Resources;
+    target: number;
+    ready: number;
+    preparing: number;
+    error?: string;
+  }[];
 };
 export type Fleet = {
   hosts: Host[];
-  templates: { id: string; label: string }[];
+  templates: PreparedTemplate[];
   sizes: Record<string, { cpu: number; memory_gib: number }>;
 };
 export type Job = {
   id: string;
   status: "queued" | "running" | "succeeded" | "failed";
-  result?: unknown;
+  result?: {
+    name?: string;
+    workspace_name?: string;
+    startup?: "warm" | "cold";
+    ready_seconds?: number;
+    [key: string]: unknown;
+  } | null;
   error?: string;
   label?: string;
   host?: string;
   instance?: string;
+  kind?: "workspace" | "template";
 };

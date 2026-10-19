@@ -211,3 +211,65 @@ test("oversized mutation bodies are refused before reaching the backend", async 
   );
   assert.equal(fetch.mock.callCount(), 0);
 });
+
+test("allocation and template endpoints are allowed without widening other proxy paths", async (t) => {
+  const fetch = t.mock.method(
+    globalThis,
+    "fetch",
+    async (_url: string, options: RequestInit) => {
+      assert.equal(
+        (options.headers as Record<string, string>).Authorization,
+        `Bearer ${token}`,
+      );
+      return Response.json(
+        { job: { id: "job-2", status: "queued" } },
+        { status: 202 },
+      );
+    },
+  );
+  for (const [method, path] of [
+    ["GET", "v1/templates"],
+    ["POST", "v1/templates"],
+    ["POST", "v1/hosts/test-host/templates/native-dev/install"],
+    ["POST", "v1/hosts/test-host/allocations"],
+  ]) {
+    const response = await proxy(
+      request(undefined, method, method === "POST" ? {} : undefined),
+      path.split("/"),
+    );
+    assert.equal(response.status, 202);
+  }
+  assert.equal(fetch.mock.callCount(), 4);
+  for (const path of [
+    "v1/hosts/test-host/allocations/ebox-test/actions",
+    "v1/hosts/test-host/templates/native-dev/delete",
+    "v1/templates/arbitrary",
+  ])
+    await assert.rejects(
+      proxy(request(undefined, "POST", {}), path.split("/")),
+      (err: unknown) => err instanceof HttpError && err.status === 404,
+    );
+  assert.equal(fetch.mock.callCount(), 4);
+});
+
+test("template registration alone accepts larger manifests up to one MiB", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ ok: true }),
+  );
+  const manifest = { description: "a".repeat(9000) };
+  assert.equal(
+    (await proxy(request(undefined, "POST", { manifest }), ["v1", "templates"]))
+      .status,
+    200,
+  );
+  await assert.rejects(
+    proxy(
+      request(undefined, "POST", {
+        manifest: { description: "a".repeat(1024 * 1024) },
+      }),
+      ["v1", "templates"],
+    ),
+    (err: unknown) => err instanceof HttpError && err.status === 413,
+  );
+  assert.equal(fetch.mock.callCount(), 1);
+});

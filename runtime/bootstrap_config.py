@@ -12,7 +12,7 @@ import tomllib
 DEFAULTS = {
     "schema_version": 1,
     "host": {"transport": "ssh", "target": "", "data_dir": "/var/lib/enginebox",
-             "install_packages": False, "disk_reserve": "5GiB", "memory_reserve": "1GiB"},
+             "install_packages": False, "disk_reserve": "5GiB", "memory_reserve": "1GiB", "admission": {}},
     "incus": {"project": "enginebox", "profile": "enginebox"},
     "storage": {"mode": "existing", "pool": "", "size": "120GiB"},
     "network": {"mode": "existing", "name": "", "subnet": "10.203.0.1/24"},
@@ -75,6 +75,14 @@ def normalize(raw: dict) -> dict:
     absolute_path(host["data_dir"], "host.data_dir")
     for key in ["disk_reserve", "memory_reserve"]:
         size_bytes(host[key])
+    policy = host["admission"]
+    if policy:
+        if set(policy) != {"reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "max_instances"}:
+            raise ValueError("host.admission requires reserve_cpu, reserve_memory_gib, reserve_disk_gib and max_instances.")
+        for key, value in policy.items():
+            low, high = (1, 256) if key == "max_instances" else (0, 16384)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"host.admission.{key} must be an integer from {low} through {high}.")
     for key in ["project", "profile"]:
         name(config["incus"][key], f"incus.{key}")
     storage, network, ws = config["storage"], config["network"], config["workspace"]

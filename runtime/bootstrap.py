@@ -106,6 +106,22 @@ result = {
     'instances': (query('/1.0/instances' + project_query) or []) if project_exists else [],
     'routes': routes, 'firewall_tools': firewalls, 'errors': errors,
 }
+if config['host'].get('admission') and server:
+    # Reduced allocation metadata only: no other project's cloud-init, account
+    # settings, disks or guest-agent state are returned to the operator.
+    allocated = query('/1.0/instances?recursion=1&all-projects=true')
+    if allocated is not None:
+        commitments = []
+        for vm in allocated:
+            cfg = vm.get('expanded_config', vm.get('config', {}))
+            root = next((v for v in vm.get('expanded_devices', {}).values()
+                         if v.get('type') == 'disk' and v.get('path') == '/'), {})
+            commitments.append({'name': vm['name'], 'project': vm.get('project', 'default'),
+                                'status': vm['status'], 'pool': root.get('pool'),
+                                'cpu': cfg.get('limits.cpu'), 'memory': cfg.get('limits.memory'),
+                                'disk': root.get('size'), 'state_disk': root.get('size.state'),
+                                'managed': cfg.get('user.enginebox.fleet') == 'true'})
+        result['admission_instances'] = commitments
 print(json.dumps(result))
 '''
 
@@ -132,6 +148,71 @@ def inventory(config: dict) -> dict:
 
 def owned(resource: dict, config: dict) -> bool:
     return resource.get("config", {}).get(OWNER_KEY) == config["incus"]["project"]
+
+
+def admission_errors(config: dict, observed: dict) -> list[str]:
+    """Full commitments, evaluated again under the host flock before mutations."""
+    import re
+    policy = config["host"].get("admission")
+    if not policy:
+        return []
+    items = observed.get("admission_instances")
+    if not isinstance(items, list):
+        return ["Fleet admission requires complete allocation metadata from every Incus project."]
+    pool, project, ws = config["storage"]["pool"], config["incus"]["project"], config["workspace"]
+    space = (observed.get("pool_resources") or {}).get("space", {})
+    total_disk, used_disk = space.get("total", 0), space.get("used", 0)
+    total_cpu, total_memory = observed.get("cpu_count", 0), observed.get("memory_total", 0)
+
+    def allocation_size(value, fallback):
+        match = re.fullmatch(r"([0-9]+)([KMGT]i?B)?", str(value))
+        if not match:
+            return fallback
+        unit = match[2] or ""
+        return int(match[1]) * {"": 1, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
+                               "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}[unit]
+
+    def allocation_cpu(value):
+        if str(value).isdigit():
+            return int(value) or total_cpu
+        if not value:
+            return total_cpu
+        cpus = set()
+        try:
+            for part in value.split(","):
+                low, *high = part.split("-")
+                first, last = int(low), int(high[0] if high else low)
+                if first < 0 or last < first or last - first > 4096:
+                    return total_cpu
+                cpus.update(range(first, last + 1))
+            return len(cpus) or total_cpu
+        except (ValueError, AttributeError):
+            return total_cpu
+
+    existing = next((item for item in items if item["project"] == project and item["name"] == ws["name"]), None)
+    active = [item for item in items if item["status"] != "Stopped"]
+    cpu_committed = sum(allocation_cpu(item.get("cpu")) for item in active)
+    memory_committed = sum(allocation_size(item.get("memory"), total_memory) for item in active)
+    disk_committed = sum(allocation_size(item.get("disk"), total_disk) + allocation_size(item.get("state_disk"), 0)
+                         for item in items if item.get("pool") == pool)
+    count = sum(item.get("managed", False) and item["project"] == project for item in items)
+    already_active = existing is not None and existing["status"] != "Stopped"
+    cpu_required = 0 if already_active else ws["cpu"]
+    memory_required = 0 if already_active else size_bytes(ws["memory"])
+    disk_required = 0 if existing else size_bytes(ws["disk"]) + size_bytes(ws["state_disk"])
+    gib = 1024**3
+    errors = []
+    if cpu_committed + cpu_required + policy["reserve_cpu"] > total_cpu:
+        errors.append("Fleet admission: CPU commitments across all projects exceed the host reserve.")
+    if (memory_committed + memory_required + policy["reserve_memory_gib"] * gib > total_memory
+            or observed.get("memory_available", 0) < memory_required + policy["reserve_memory_gib"] * gib):
+        errors.append("Fleet admission: RAM commitments or available RAM exceed the host reserve.")
+    disk_budget = min(observed.get("incus_disk_free", 0), total_disk - used_disk, total_disk - disk_committed)
+    if disk_required + policy["reserve_disk_gib"] * gib > disk_budget:
+        errors.append("Fleet admission: full root/state disk commitments exceed storage capacity or reserve.")
+    if not existing and count >= policy["max_instances"]:
+        errors.append("Fleet admission: the configured managed instance limit is reached.")
+    return errors
 
 
 def profile_definition(config: dict) -> dict:
@@ -298,6 +379,8 @@ def build_plan(config: dict, observed: dict) -> dict:
         warnings.append("Host firewall/Docker configuration is preserved. Existing policies must permit guest DHCP/DNS and egress; bootstrap never changes global rules.")
     if not config["modules"]["desktop"] and config["modules"]["browser"]:
         warnings.append("Browser installation is enabled; headed computer use requires desktop=true.")
+    if any(operation["action"] in {"create_workspace", "prepare_workspace"} for operation in operations):
+        errors.extend(admission_errors(config, observed))
     return {"schema_version": 1, "config_fingerprint": fingerprint(config), "ok": not errors,
             "errors": errors, "warnings": warnings, "operations": operations,
             "runtime_environment": runtime_environment(config)}
@@ -441,7 +524,10 @@ def prepare_workspace(config: dict, source: Path) -> None:
     state = json.loads(incus(config, "query", f"/1.0/instances/{name}?project={config['incus']['project']}"))
     # A process killed after snapshot labelling can leave this temporary marker
     # on the source. Only the immutable pre-login snapshot may retain it.
-    incus(config, "config", "unset", name, "user.enginebox.clean-base", project=True)
+    # Incus 6.0 rejects unsetting a missing key. Read the instance-local config
+    # instead of assuming either a fresh base or an interrupted marked base.
+    if "user.enginebox.clean-base" in state.get("config", {}):
+        incus(config, "config", "unset", name, "user.enginebox.clean-base", project=True)
     if state["status"] == "Stopped" and not state.get("stateful"):
         incus(config, "start", name, project=True)
     elif state["status"] != "Running":
@@ -479,7 +565,6 @@ def prepare_workspace(config: dict, source: Path) -> None:
             # Only the immutable pre-login snapshot is clean. Future user-created
             # snapshots must not inherit this label after a provider login.
             incus(config, "config", "unset", name, "user.enginebox.clean-base", project=True)
-    incus(config, "config", "unset", name, "user.enginebox.clean-base", project=True)
     incus(config, "start", name, project=True)
     wait_guest(config)
     # Completion must follow successful restart/readiness. Otherwise a failed

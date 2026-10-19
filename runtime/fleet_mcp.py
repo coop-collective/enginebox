@@ -61,6 +61,39 @@ def register(mcp):
         return request(f"/v1/hosts/{host_id}/instances", {"name": name, "template": template, "size": size})
 
     @mcp.tool()
+    def fleet_allocate(host_id: str, name: str, template: str,
+                       size: Literal["minimum", "recommended", "small", "standard", "large"] = "recommended",
+                       resources: dict[str, int] | None = None) -> dict:
+        """Assign a fresh warm VM or create a cold clone. Custom cpu/memory_gib/disk_gib must meet the template minimum.
+
+        Poll fleet_job. Use result.name (the physical VM name) for later actions;
+        workspace_name is its friendly label. An assigned VM is never recycled.
+        """
+        identifier(host_id)
+        identifier(name, instance=True)
+        selection = {"resources": resources} if resources is not None else {"size": size}
+        return request(f"/v1/hosts/{host_id}/allocations", {"name": name, "template": template, **selection})
+
+    @mcp.tool()
+    def template_catalog() -> dict:
+        """List portable template manifests, resource requirements and per-host installed revisions."""
+        return request("/v1/templates")
+
+    @mcp.tool()
+    def template_register(manifest: dict | None = None, url: str | None = None) -> dict:
+        """Register a template JSON manifest or fetch one from a public HTTPS URL. Does not install it."""
+        if (manifest is None) == (url is None):
+            raise ValueError("Provide exactly one manifest or URL.")
+        return request("/v1/templates", {"manifest": manifest} if manifest is not None else {"url": url})
+
+    @mcp.tool()
+    def template_install(host_id: str, template: str) -> dict:
+        """Queue installation of the registered revision on an already bootstrapped host; poll fleet_job."""
+        identifier(host_id)
+        identifier(template)
+        return request(f"/v1/hosts/{host_id}/templates/{template}/install", {})
+
+    @mcp.tool()
     def fleet_action(host_id: str, name: str, action: Literal["pause", "resume", "hibernate", "stop"]) -> dict:
         """Queue a lifecycle change for a fleet-created VM. Stop discards process memory; hibernate preserves it."""
         identifier(host_id)

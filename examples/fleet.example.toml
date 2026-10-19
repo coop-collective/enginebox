@@ -17,3 +17,14 @@ id = "native-agents"
 label = "Codex, Cursor and Claude with browser"
 source = "ebox-base"
 snapshot = "prepared-REPLACE" # Use the exact snapshot returned by ebox apply.
+
+# Optional template-specific resources for an existing prepared base:
+# minimum = { cpu = 2, memory_gib = 2, disk_gib = 30 }
+# recommended = { cpu = 4, memory_gib = 4, disk_gib = 30 }
+
+# Optional prebooted fresh workspaces. Frozen reserves retain their RAM/CPU
+# allocation and full disk commitment. They are disabled unless configured.
+# [[hosts.warm_pools]]
+# template = "native-agents"
+# size = "recommended"
+# ready = 2

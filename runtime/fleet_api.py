@@ -61,6 +61,8 @@ def handler_for(fleet: Fleet, token: str):
             try:
                 if self.path == "/v1/fleet":
                     return self.respond(200, fleet.summary())
+                if self.path == "/v1/templates":
+                    return self.respond(200, fleet.catalog())
                 match = re.fullmatch(r"/v1/jobs/([a-f0-9]{32})", self.path)
                 if match:
                     return self.respond(200, {"job": fleet.job(match[1])})
@@ -79,17 +81,39 @@ def handler_for(fleet: Fleet, token: str):
                 if self.headers.get("Transfer-Encoding"):
                     return self.respond(400, {"error": "Chunked requests are not supported."})
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 1 <= length <= 16384:
-                    return self.respond(413, {"error": "Request must contain 1–16384 bytes."})
+                maximum = 1024 * 1024 if self.path == "/v1/templates" else 16384
+                if not 1 <= length <= maximum:
+                    return self.respond(413, {"error": f"Request must contain 1–{maximum} bytes."})
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError("Body must be an object.")
-                create = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances", self.path)
+                if self.path == "/v1/templates":
+                    if not fleet.registry:
+                        raise ValueError("Configure a persistent template registry first.")
+                    if set(body) == {"manifest"} and isinstance(body["manifest"], dict):
+                        record = fleet.registry.register(body["manifest"])
+                    elif set(body) == {"url"} and isinstance(body["url"], str):
+                        record = fleet.registry.import_url(body["url"])
+                    else:
+                        raise ValueError("Provide a manifest object or an HTTPS URL.")
+                    for host in fleet.hosts:
+                        fleet.warm.wake(host)
+                    return self.respond(200, {"template": record})
+                create = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/(instances|allocations)", self.path)
+                install = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/templates/([a-z][a-z0-9-]{0,31})/install", self.path)
                 action = re.fullmatch(r"/v1/hosts/([a-z0-9][a-z0-9-]{0,48})/instances/(ebox-[a-z0-9][a-z0-9-]{0,48})/actions", self.path)
                 if create:
-                    if set(body) != {"name", "template", "size"} or not all(isinstance(v, str) for v in body.values()):
-                        raise ValueError("Provide string fields name, template and size.")
-                    job = fleet.submit(create[1], "create", **body)
+                    if (not {"name", "template"} <= set(body) or set(body) - {"name", "template", "size", "resources"}
+                            or ("size" in body and "resources" in body)
+                            or not isinstance(body["name"], str) or not isinstance(body["template"], str)
+                            or ("size" in body and not isinstance(body["size"], str))
+                            or ("resources" in body and not isinstance(body["resources"], dict))):
+                        raise ValueError("Provide name, template and either a size preset or custom resources.")
+                    job = fleet.submit(create[1], "allocate" if create[2] == "allocations" else "create", **body)
+                elif install:
+                    if body:
+                        raise ValueError("Template installation accepts an empty object; resources come from its manifest.")
+                    job = fleet.submit(install[1], "install_template", template=install[2])
                 elif action:
                     if set(body) != {"action"} or body["action"] not in {"pause", "resume", "hibernate", "stop"}:
                         raise ValueError("Choose pause, resume, hibernate or stop.")
@@ -118,6 +142,7 @@ def main(argv=None):
         token = api_token()
         fleet = Fleet(load_hosts(args.config), state_dir=args.state_dir)
         server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(fleet, token))
+        fleet.warm.start()
         print(f"Engine Box API listening on http://127.0.0.1:{server.server_port}", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
@@ -130,6 +155,7 @@ def main(argv=None):
         if fleet:
             # Graceful shutdown lets admitted jobs finish. Abrupt termination is
             # recovered as failed/inspect-required from the persisted journal.
+            fleet.warm.stop()
             fleet.executor.shutdown(wait=True)
 
 

@@ -28,7 +28,7 @@
     "build": "vite build",
     "start": "node --env-file-if-exists=.env.local scripts/start.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/server.test.ts",
+    "test": "tsx --test tests/*.test.ts",
     "test:e2e": "playwright test"
   },
   "license": "Apache-2.0",

@@ -68,7 +68,10 @@ test("live inventory, template creation and all lifecycle actions follow asynchr
     page.getByText("Create ebox-new-project", { exact: true }),
   ).toBeVisible();
   const created = page.getByRole("row").filter({ hasText: "ebox-new-project" });
-  await expect(created.getByText("Stopped", { exact: true })).toBeVisible();
+  await expect(created.getByText("Running", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Cold start · ready in 12.40 s", { exact: false }),
+  ).toBeVisible();
   const row = page.getByRole("row").filter({ hasText: "ebox-editor" });
   for (const [action, expected] of [
     ["Pause", "Paused"],
@@ -117,6 +120,63 @@ test("failed jobs, empty fleet and API errors are visible", async ({
   );
 });
 
+test("pending lifecycle operations only change controls on their target workspace", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "slow-actions" },
+  });
+  await signIn(page);
+  const editor = page.getByRole("row").filter({ hasText: "ebox-editor" });
+  const review = page.getByRole("row").filter({ hasText: "ebox-review" });
+  const submitted: string[] = [];
+  page.on("request", (req) => {
+    if (req.method() === "POST" && req.url().endsWith("/actions"))
+      submitted.push(new URL(req.url()).pathname);
+  });
+  for (const [action, status] of [
+    ["Hibernate", "Hibernated"],
+    ["Resume", "Running"],
+  ]) {
+    await editor.getByRole("button", { name: action, exact: true }).click();
+    await expect(editor.getByText("Working", { exact: true })).toBeVisible();
+    expect(
+      await review
+        .getByRole("button", { name: "Resume", exact: true })
+        .isVisible(),
+    ).toBe(true);
+    await expect(
+      review.getByRole("button", { name: "Resume", exact: true }),
+    ).toBeEnabled();
+    await expect(review.getByText("Paused", { exact: true })).toBeVisible();
+    await expect(review.getByText("Working", { exact: true })).toHaveCount(0);
+    await expect(editor.getByText(status, { exact: true })).toBeVisible();
+  }
+  expect(submitted).toEqual([
+    "/api/control/v1/hosts/metal-01/instances/ebox-editor/actions",
+    "/api/control/v1/hosts/metal-01/instances/ebox-editor/actions",
+  ]);
+});
+
+test("top resource cards distinguish CPU allocation from actual host memory usage", async ({
+  page,
+}) => {
+  await signIn(page);
+  const cpu = page.locator(".stat-card").filter({ hasText: "CPU allocated" });
+  await expect(cpu.locator("strong")).toHaveText("12 / 32");
+  await expect(cpu.locator("small")).toHaveText(
+    "37.5% allocated · logical cores",
+  );
+  const memory = page
+    .locator(".stat-card")
+    .filter({ hasText: "Host memory used" });
+  await expect(memory.locator("strong")).toHaveText("24 GiB / 128 GiB");
+  await expect(memory.locator("small")).toHaveText(
+    "18.8% used · across online hosts",
+  );
+});
+
 test("authenticated mutations reject missing or different Origin", async ({
   page,
   context,
@@ -127,15 +187,259 @@ test("authenticated mutations reject missing or different Origin", async ({
     {},
   ];
   for (const headers of attempts) {
-    const response = await context.request.post(
-      `${origin}/api/control/v1/hosts/metal-01/instances`,
-      {
-        headers,
-        data: { name: "ebox-nope", template: "native", size: "small" },
-      },
-    );
-    expect(response.status()).toBe(403);
+    for (const endpoint of ["instances", "allocations"]) {
+      const response = await context.request.post(
+        `${origin}/api/control/v1/hosts/metal-01/${endpoint}`,
+        {
+          headers,
+          data: { name: "ebox-nope", template: "native", size: "small" },
+        },
+      );
+      expect(response.status()).toBe(403);
+    }
   }
+});
+
+test("warm reserve is separate inventory and custom resources can claim it with no cold capacity", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "warm" },
+  });
+  await signIn(page);
+  const assigned = page
+    .locator(".stat-card")
+    .filter({ hasText: "Assigned workspaces" });
+  await expect(assigned.locator("strong")).toHaveText("2");
+  await expect(assigned).toContainText("1 ready in reserve");
+  await expect(
+    page.getByText("1 ready · 1 preparing · target 2"),
+  ).toBeVisible();
+  for (const state of ["ready", "preparing", "quarantined"]) {
+    const row = page.getByRole("row").filter({ hasText: `ebox-pool-${state}` });
+    await expect(row.getByText("Reserved for allocation")).toBeVisible();
+    await expect(row.getByRole("button")).toHaveCount(0);
+  }
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await page.getByLabel("Workspace name").fill("ebox-my-project");
+  await page
+    .getByRole("combobox", { name: "Size", exact: true })
+    .selectOption("custom");
+  await expect(
+    page.getByText(
+      "No cold-start capacity remains; another request may claim the reserve first.",
+    ),
+  ).toBeVisible();
+  const button = page.getByRole("button", {
+    name: "Create workspace",
+    exact: true,
+  });
+  await expect(button).toBeEnabled();
+  const submitted = page.waitForRequest(
+    (req) => req.method() === "POST" && req.url().endsWith("/allocations"),
+  );
+  await button.click();
+  expect((await submitted).postDataJSON()).toEqual({
+    name: "ebox-my-project",
+    template: "native",
+    resources: { cpu: 4, memory_gib: 4, disk_gib: 40 },
+  });
+  const claimed = page.getByRole("row").filter({ hasText: "ebox-my-project" });
+  await expect(claimed.getByText("Running", { exact: true })).toBeVisible();
+  await expect(
+    claimed.getByText("VM: ebox-pool-ready", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Warm allocation · ready in 0.15 s", { exact: false }),
+  ).toBeVisible();
+  await expect(assigned.locator("strong")).toHaveText("3");
+  const action = page.waitForRequest(
+    (req) => req.method() === "POST" && req.url().endsWith("/actions"),
+  );
+  await claimed.getByRole("button", { name: "Pause", exact: true }).click();
+  expect(new URL((await action).url()).pathname).toBe(
+    "/api/control/v1/hosts/metal-01/instances/ebox-pool-ready/actions",
+  );
+  await expect(claimed.getByText("Paused", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await expect(
+    page.getByRole("button", { name: "Create workspace", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByText(
+      "1 matching workspace is preparing. Availability refreshes automatically.",
+    ),
+  ).toBeVisible();
+  await page.screenshot({
+    path: "test-results/warm-reserve-desktop.png",
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/warm-reserve-mobile.png",
+    fullPage: true,
+  });
+});
+
+test("template minimum and custom resources validate before a cold allocation", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "typed" },
+  });
+  await signIn(page);
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await page.getByLabel("Workspace name").fill("ebox-sized-project");
+  const size = page.getByRole("combobox", { name: "Size", exact: true });
+  await expect(size).toHaveValue("recommended");
+  await expect(size.locator('option[value="minimum"]')).toHaveText(
+    "Minimum · 2 vCPU / 3 GiB / 35 GiB disk",
+  );
+  await expect(size.locator('option[value="recommended"]')).toHaveText(
+    "Recommended · 4 vCPU / 6 GiB / 50 GiB disk",
+  );
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await expect(
+    page.getByText("4 vCPU · 6 GiB RAM · 50 GiB disk", { exact: true }),
+  ).toBeVisible();
+  await size.selectOption("minimum");
+  await expect(
+    page.getByText("2 vCPU · 3 GiB RAM · 35 GiB disk", { exact: true }),
+  ).toBeVisible();
+  await size.selectOption("custom");
+  await page.getByLabel("CPU cores").fill("1");
+  const button = page.getByRole("button", {
+    name: "Create workspace",
+    exact: true,
+  });
+  await expect(button).toBeDisabled();
+  await expect(
+    page.getByText(
+      "Custom resources must be whole numbers at or above the template minimum.",
+    ),
+  ).toBeVisible();
+  await page.getByLabel("CPU cores").fill("3");
+  await page.getByLabel("Memory (GiB)").fill("5");
+  await page.getByLabel("Disk (GiB)").fill("35");
+  await expect(button).toBeEnabled();
+  const submitted = page.waitForRequest(
+    (req) => req.method() === "POST" && req.url().endsWith("/allocations"),
+  );
+  await button.click();
+  expect((await submitted).postDataJSON()).toEqual({
+    name: "ebox-sized-project",
+    template: "native",
+    resources: { cpu: 3, memory_gib: 5, disk_gib: 35 },
+  });
+  await expect(
+    page.getByText("Cold start · ready in 12.40 s", { exact: false }),
+  ).toBeVisible();
+});
+
+test("preparing reserves remain unavailable and refill errors are visible", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "pool-preparing" },
+  });
+  await signIn(page);
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await expect(
+    page.getByRole("button", { name: "Create workspace", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByText(
+      "2 matching workspaces are preparing. Availability refreshes automatically.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Refill is waiting for host capacity.").first(),
+  ).toBeVisible();
+});
+
+test("template catalog imports JSON and URLs, installs and syncs changed revisions", async ({
+  page,
+  request,
+}) => {
+  await request.post("http://127.0.0.1:18765/__test/mode", {
+    data: { mode: "catalog" },
+  });
+  await signIn(page);
+  await page.getByRole("button", { name: "Templates", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Template catalog" }),
+  ).toBeVisible();
+  await page.getByLabel("Import from").selectOption("json");
+  await page.getByLabel("Template JSON").fill("{invalid");
+  await page.getByRole("button", { name: "Register template" }).click();
+  await expect(page.getByRole("alert")).toContainText("must be valid JSON");
+  const manifest = {
+    schema_version: 1,
+    id: "web-dev",
+    revision: 1,
+    label: "Web development",
+    recipe: "native-clients-v1",
+    source_image: "images:ubuntu/24.04/cloud",
+    minimum: { cpu: 2, memory_gib: 2, disk_gib: 30 },
+    recommended: { cpu: 4, memory_gib: 4, disk_gib: 40 },
+  };
+  await page.getByLabel("Template JSON").fill(JSON.stringify(manifest));
+  await page.getByRole("button", { name: "Register template" }).click();
+  const card = page
+    .locator(".catalog-card")
+    .filter({ hasText: "Web development" });
+  await expect(card.getByText("Not installed on this host.")).toBeVisible();
+  await card.getByRole("button", { name: "Install template" }).click();
+  await expect(
+    card.getByText("Installed revision 1 · Up to date"),
+  ).toBeVisible();
+  await page
+    .getByLabel("Template JSON")
+    .fill(JSON.stringify({ ...manifest, revision: 2 }));
+  await page.getByRole("button", { name: "Register template" }).click();
+  await expect(
+    card.getByText("Installed revision 1 · Out of sync"),
+  ).toBeVisible();
+  await card.getByRole("button", { name: "Sync template" }).click();
+  await expect(
+    card.getByText("Installed revision 2 · Up to date"),
+  ).toBeVisible();
+  await page.getByLabel("Import from").selectOption("url");
+  await page
+    .getByLabel("Template URL")
+    .fill("https://example.com/template.json");
+  await page.getByRole("button", { name: "Register template" }).click();
+  await expect(
+    page.locator(".catalog-card").filter({ hasText: "url-native" }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: "test-results/template-catalog-desktop.png",
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/template-catalog-mobile.png",
+    fullPage: true,
+  });
 });
 
 test("mobile layout has no page overflow and remains operable", async ({

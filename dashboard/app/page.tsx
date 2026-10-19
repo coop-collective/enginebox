@@ -1,11 +1,23 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import type { Fleet, Host, Instance, Job } from "@/lib/types";
+import type {
+  Allocation,
+  Fleet,
+  Host,
+  Instance,
+  Job,
+  Resources,
+} from "@/lib/types";
+import { api, RequestError } from "@/lib/client";
+import { TemplateCatalog } from "@/components/template-catalog";
+import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
 const active = (job: Job) =>
   job.status === "queued" || job.status === "running";
+const poolReserve = (instance: Instance) =>
+  !!instance.warm_pool_state && instance.warm_pool_state !== "claimed";
 const bytes = (value?: number) =>
   typeof value === "number" && Number.isFinite(value)
     ? `${(value / GiB).toLocaleString(undefined, { maximumFractionDigits: 1 })} GiB`
@@ -78,34 +90,6 @@ function Icon({ name = "box", size = 20 }: { name?: string; size?: number }) {
       {paths[name] ?? paths.box}
     </svg>
   );
-}
-
-class RequestError extends Error {
-  constructor(
-    message: string,
-    public status: number,
-  ) {
-    super(message);
-  }
-}
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options.headers },
-    credentials: "same-origin",
-    cache: "no-store",
-  });
-  const data = await response.json();
-  if (!response.ok)
-    throw new RequestError(
-      typeof data.error === "string"
-        ? data.error
-        : (data.error?.message ??
-          data.detail ??
-          "The request failed. Try again."),
-      response.status,
-    );
-  return data as T;
 }
 
 function Status({ status, stateful }: { status: string; stateful?: boolean }) {
@@ -193,9 +177,39 @@ function HostCard({ host }: { host: Host }) {
               {c.reserve_cpu} cores · {bytes(c.reserve_memory_bytes)} reserved
             </span>
             <span className="capacity-badge">
-              {c.max_additional.standard ?? 0} standard slots
+              {c.max_additional.standard ?? 0} standard cold slots
             </span>
           </div>
+          {!!host.warm_pools?.length && (
+            <div
+              className="pool-summary"
+              aria-label="Prepared workspace reserve"
+            >
+              <h4>Prepared reserve</h4>
+              {host.warm_pools.map((pool) => (
+                <div
+                  className="pool-summary-item"
+                  key={`${pool.template}/${pool.size}`}
+                >
+                  <strong>
+                    {pool.template} · {title(pool.size)}
+                  </strong>
+                  {pool.resources && (
+                    <span>
+                      {pool.resources.cpu} vCPU · {pool.resources.memory_gib}{" "}
+                      GiB RAM · {pool.resources.disk_gib} GiB disk
+                    </span>
+                  )}
+                  <span>
+                    {pool.ready} ready · {pool.preparing} preparing · target{" "}
+                    {pool.target}
+                  </span>
+                  {pool.error && <p className="pool-error">{pool.error}</p>}
+                </div>
+              ))}
+              <p>Ready workspaces are paused and keep memory allocated.</p>
+            </div>
+          )}
         </>
       )}
     </article>
@@ -215,15 +229,20 @@ function WorkspaceRow({
 }) {
   const running = instance.status === "Running";
   const resumable = ["Stopped", "Frozen"].includes(instance.status);
+  const reserved = poolReserve(instance);
   return (
-    <tr>
+    <tr className={reserved ? "pool-reserve-row" : undefined}>
       <td>
         <div className="workspace-name">
           <span className="workspace-icon">
             <Icon name="terminal" size={18} />
           </span>
           <div>
-            <strong>{instance.name}</strong>
+            <strong>{instance.workspace_name || instance.name}</strong>
+            {instance.workspace_name &&
+              instance.workspace_name !== instance.name && (
+                <span className="instance-id">VM: {instance.name}</span>
+              )}
             <span>{instance.ipv4?.join(", ") || "No address reported"}</span>
           </div>
         </div>
@@ -233,6 +252,11 @@ function WorkspaceRow({
       </td>
       <td>
         <Status status={instance.status} stateful={instance.stateful} />
+        {reserved && (
+          <span className={`pool-state pool-state-${instance.warm_pool_state}`}>
+            Pool reserve · {title(instance.warm_pool_state!)}
+          </span>
+        )}
       </td>
       <td>
         <strong className="allocation">
@@ -246,7 +270,14 @@ function WorkspaceRow({
       </td>
       <td className="actions">
         <div className="action-buttons">
-          {!instance.managed ? (
+          {reserved ? (
+            <span
+              className="subtle"
+              title="Prepared reserve is managed by the warm pool. Allocate a new workspace to claim a ready instance."
+            >
+              Reserved for allocation
+            </span>
+          ) : !instance.managed ? (
             <span
               className="subtle"
               title="This instance is not managed by Engine Box. Lifecycle controls are disabled."
@@ -321,25 +352,92 @@ function CreateWorkspace({
   fleet: Fleet;
   busy: boolean;
   close: () => void;
-  create: (
-    host: string,
-    name: string,
-    template: string,
-    size: string,
-  ) => Promise<void>;
+  create: (host: string, request: Allocation) => Promise<void>;
 }) {
-  const [host, setHost] = useState(fleet.hosts.find((h) => h.online)?.id ?? "");
-  const [template, setTemplate] = useState(fleet.templates[0]?.id ?? "");
-  const [size, setSize] = useState(
-    fleet.sizes.standard ? "standard" : (Object.keys(fleet.sizes)[0] ?? ""),
+  const [host, setHost] = useState(
+    fleet.hosts.find((item) => item.online)?.id ?? "",
   );
+  const available = fleet.templates.filter(
+    (item) => !item.host_ids || item.host_ids.includes(host),
+  );
+  const [template, setTemplate] = useState(available[0]?.id ?? "");
+  const selectedTemplate = available.find((item) => item.id === template);
+  const requirements =
+    selectedTemplate?.host_resources?.[host] ?? selectedTemplate;
+  const [size, setSize] = useState(
+    requirements?.recommended
+      ? "recommended"
+      : fleet.sizes.standard
+        ? "standard"
+        : (Object.keys(fleet.sizes)[0] ?? ""),
+  );
+  const [custom, setCustom] = useState({
+    cpu: "4",
+    memory_gib: "4",
+    disk_gib: "40",
+  });
   const [name, setName] = useState("");
-  const selectedHost = fleet.hosts.find((h) => h.id === host);
-  const slots = selectedHost?.capacity?.max_additional[size] ?? 0;
-  const valid = !!host && !!template && !!size && slots > 0;
+  const selectedHost = fleet.hosts.find((item) => item.id === host);
+  useEffect(() => {
+    if (!available.some((item) => item.id === template))
+      setTemplate(available[0]?.id ?? "");
+  }, [host, template, fleet.templates]);
+  useEffect(() => {
+    const recommended = requirements?.recommended;
+    setSize(
+      recommended
+        ? "recommended"
+        : fleet.sizes.standard
+          ? "standard"
+          : (Object.keys(fleet.sizes)[0] ?? ""),
+    );
+    if (recommended)
+      setCustom({
+        cpu: String(recommended.cpu),
+        memory_gib: String(recommended.memory_gib),
+        disk_gib: String(recommended.disk_gib),
+      });
+  }, [template, host]);
+  const minimum = requirements?.minimum;
+  const resources: Resources | undefined =
+    size === "custom"
+      ? {
+          cpu: Number(custom.cpu),
+          memory_gib: Number(custom.memory_gib),
+          disk_gib: Number(custom.disk_gib),
+        }
+      : size === "minimum"
+        ? minimum
+        : size === "recommended"
+          ? requirements?.recommended
+          : undefined;
+  const resourceValid =
+    !resources ||
+    validResources(
+      resources,
+      minimum ?? { cpu: 1, memory_gib: 1, disk_gib: 1 },
+    );
+  const slots = resources
+    ? coldSlots(selectedHost, resources)
+    : (selectedHost?.capacity?.max_additional[size] ?? 0);
+  const pools = matchingPools(selectedHost, template, size, resources);
+  const ready = pools.reduce((sum, pool) => sum + pool.ready, 0);
+  const preparing = pools.reduce((sum, pool) => sum + pool.preparing, 0);
+  const valid =
+    !!selectedHost?.online &&
+    !!selectedTemplate &&
+    !!size &&
+    resourceValid &&
+    (ready > 0 || slots > 0);
   async function submit(event: FormEvent) {
     event.preventDefault();
-    await create(host, name, template, size);
+    if (!valid || busy) return;
+    await create(
+      host,
+      size === "custom" && resources
+        ? { name, template, resources }
+        : { name, template, size },
+    );
   }
   return (
     <section className="create-panel" aria-labelledby="create-title">
@@ -363,7 +461,7 @@ function CreateWorkspace({
             <input
               required
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(event) => setName(event.target.value)}
               placeholder="ebox-my-project"
               pattern={"ebox-[a-z0-9][a-z0-9\\-]{0,48}"}
               title="Start with ebox-, then use lowercase letters, digits or hyphens."
@@ -375,16 +473,16 @@ function CreateWorkspace({
             Host
             <select
               value={host}
-              onChange={(e) => setHost(e.target.value)}
+              onChange={(event) => setHost(event.target.value)}
               required
             >
               <option value="" disabled>
                 Select a host
               </option>
-              {fleet.hosts.map((h) => (
-                <option key={h.id} value={h.id} disabled={!h.online}>
-                  {h.label}
-                  {!h.online ? " (offline)" : ""}
+              {fleet.hosts.map((item) => (
+                <option key={item.id} value={item.id} disabled={!item.online}>
+                  {item.label}
+                  {!item.online ? " (offline)" : ""}
                 </option>
               ))}
             </select>
@@ -393,15 +491,15 @@ function CreateWorkspace({
             Prepared template
             <select
               value={template}
-              onChange={(e) => setTemplate(e.target.value)}
+              onChange={(event) => setTemplate(event.target.value)}
               required
             >
               <option value="" disabled>
-                No templates configured
+                No installed templates
               </option>
-              {fleet.templates.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.label}
+              {available.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
                 </option>
               ))}
             </select>
@@ -410,25 +508,104 @@ function CreateWorkspace({
             Size
             <select
               value={size}
-              onChange={(e) => setSize(e.target.value)}
+              onChange={(event) => setSize(event.target.value)}
               required
             >
-              {Object.entries(fleet.sizes).map(([id, s]) => (
-                <option key={id} value={id}>
-                  {title(id)} · {s.cpu} vCPU / {s.memory_gib} GiB
-                </option>
-              ))}
+              {minimum && requirements?.recommended ? (
+                <>
+                  <option value="minimum">
+                    Minimum · {minimum.cpu} vCPU / {minimum.memory_gib} GiB /{" "}
+                    {minimum.disk_gib} GiB disk
+                  </option>
+                  <option value="recommended">
+                    Recommended · {requirements.recommended.cpu} vCPU /{" "}
+                    {requirements.recommended.memory_gib} GiB /{" "}
+                    {requirements.recommended.disk_gib} GiB disk
+                  </option>
+                  <option value="custom">Custom</option>
+                </>
+              ) : (
+                Object.entries(fleet.sizes).map(([id, value]) => (
+                  <option key={id} value={id}>
+                    {title(id)} · {value.cpu} vCPU / {value.memory_gib} GiB
+                  </option>
+                ))
+              )}
             </select>
           </label>
         </div>
-        <div className="create-footer">
-          <p>
-            {!fleet.templates.length
-              ? "Add a prepared template to the fleet configuration first."
-              : slots > 0
-                ? `${slots} ${size} workspace${slots === 1 ? "" : "s"} fit within this host's configured capacity.`
-                : "This host has no capacity for the selected size."}
+        {size === "custom" && minimum && (
+          <div className="custom-resources">
+            {(
+              [
+                ["cpu", "CPU cores"],
+                ["memory_gib", "Memory (GiB)"],
+                ["disk_gib", "Disk (GiB)"],
+              ] as const
+            ).map(([key, label]) => (
+              <label key={key}>
+                {label}
+                <input
+                  type="number"
+                  min={minimum[key]}
+                  step="1"
+                  required
+                  value={custom[key]}
+                  onChange={(event) =>
+                    setCustom((current) => ({
+                      ...current,
+                      [key]: event.target.value,
+                    }))
+                  }
+                />
+                <span>Minimum {minimum[key]}</span>
+              </label>
+            ))}
+          </div>
+        )}
+        {resources && resourceValid && (
+          <p className="resource-preview">
+            {resources.cpu} vCPU · {resources.memory_gib} GiB RAM ·{" "}
+            {resources.disk_gib} GiB disk
           </p>
+        )}
+        <div className="create-footer">
+          <div className="allocation-hint" aria-live="polite">
+            <p>
+              {!available.length
+                ? "Install a template on this host from the template catalog first."
+                : !selectedHost?.online
+                  ? "Choose an online host."
+                  : !resourceValid
+                    ? "Custom resources must be whole numbers at or above the template minimum."
+                    : ready > 0
+                      ? `${ready} ready paused workspace${ready === 1 ? " matches" : "s match"} this template and resource allocation. A ready workspace will be claimed if still available.`
+                      : slots > 0
+                        ? `Cold start: no matching workspace is ready. Capacity is available for ${slots} more workspace${slots === 1 ? "" : "s"} with these resources.`
+                        : "No ready workspace or cold-start capacity is available for this selection."}
+            </p>
+            {ready > 0 && (
+              <p>
+                {slots > 0
+                  ? "If the reserve is claimed first, the request may use a cold start."
+                  : "No cold-start capacity remains; another request may claim the reserve first."}
+              </p>
+            )}
+            {preparing > 0 && (
+              <p>
+                {preparing} matching workspace
+                {preparing === 1 ? " is" : "s are"} preparing. Availability
+                refreshes automatically.
+              </p>
+            )}
+            {pools
+              .filter((pool) => pool.error)
+              .map((pool) => (
+                <p className="pool-error" key={`${pool.template}/${pool.size}`}>
+                  {pool.error}
+                </p>
+              ))}
+          </div>
           <button
             className="button primary"
             disabled={!valid || busy}
@@ -456,7 +633,9 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [pendingInstances, setPendingInstances] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
+  const [catalogOpen, setCatalogOpen] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const loading = useRef(false);
@@ -548,6 +727,8 @@ export default function Dashboard() {
       setSession("login");
       setFleet(null);
       setJobs([]);
+      setPendingInstances([]);
+      setCatalogOpen(false);
       setError("");
     } catch (err) {
       setError((err as Error).message);
@@ -559,8 +740,10 @@ export default function Dashboard() {
     label: string,
     host: string,
     instance: string,
+    kind: Job["kind"] = "workspace",
   ) {
-    setSubmitting(true);
+    const target = `${host}/${instance}`;
+    setPendingInstances((current) => [...current, target]);
     setError("");
     try {
       const { job } = await api<{ job: Job }>(`/api/control/${path}`, {
@@ -568,32 +751,39 @@ export default function Dashboard() {
         body: JSON.stringify(body),
       });
       setJobs((current) =>
-        [{ ...job, label, host, instance }, ...current].slice(0, 20),
+        [{ ...job, label, host, instance, kind }, ...current].slice(0, 20),
       );
       return true;
     } catch (err) {
       setError((err as Error).message);
       return false;
     } finally {
-      setSubmitting(false);
+      setPendingInstances((current) => current.filter((key) => key !== target));
     }
   }
-  async function create(
-    host: string,
-    name: string,
-    template: string,
-    size: string,
-  ) {
+  async function create(host: string, request: Allocation) {
+    setSubmitting(true);
     if (
       await queue(
-        `v1/hosts/${encodeURIComponent(host)}/instances`,
-        { name, template, size },
-        `Create ${name}`,
+        `v1/hosts/${encodeURIComponent(host)}/allocations`,
+        request,
+        `Create ${request.name}`,
         host,
-        name,
+        request.name,
       )
     )
       setCreating(false);
+    setSubmitting(false);
+  }
+  async function installTemplate(host: string, template: string) {
+    return queue(
+      `v1/hosts/${encodeURIComponent(host)}/templates/${encodeURIComponent(template)}/install`,
+      {},
+      `Install ${template}`,
+      host,
+      template,
+      "template",
+    );
   }
   function action(host: string, name: string, operation: string) {
     void queue(
@@ -609,8 +799,39 @@ export default function Dashboard() {
     fleet?.hosts.flatMap((host) =>
       host.instances.map((instance) => ({ host, instance })),
     ) ?? [];
-  const sum = (key: "cpu_total" | "memory_total_bytes") =>
+  const assigned = instances.filter(
+    ({ instance }) => instance.managed && !poolReserve(instance),
+  );
+  const readyReserve = online.reduce(
+    (total, host) =>
+      total +
+      (host.warm_pools ?? []).reduce((count, pool) => count + pool.ready, 0),
+    0,
+  );
+  const sum = (key: "cpu_total" | "allocated_cpu" | "memory_total_bytes") =>
     online.reduce((total, host) => total + (host.capacity?.[key] ?? 0), 0);
+  const cpuTotal = sum("cpu_total");
+  const cpuAllocated = sum("allocated_cpu");
+  const memoryTotal = sum("memory_total_bytes");
+  const memoryUsed = online.reduce((total, host) => {
+    const capacity = host.capacity;
+    return (
+      total +
+      (capacity
+        ? Math.max(
+            0,
+            Math.min(
+              capacity.memory_total_bytes,
+              capacity.memory_total_bytes - capacity.memory_available_bytes,
+            ),
+          )
+        : 0)
+    );
+  }, 0);
+  const percent = (used: number, total: number) =>
+    total > 0
+      ? `${Math.min(100, Math.max(0, (used / total) * 100)).toFixed(1)}%`
+      : "—";
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -738,6 +959,14 @@ export default function Dashboard() {
                 <div className="heading-actions">
                   <button
                     className="button"
+                    onClick={() => setCatalogOpen((value) => !value)}
+                    disabled={!fleet}
+                    aria-expanded={catalogOpen}
+                  >
+                    Templates
+                  </button>
+                  <button
+                    className="button"
                     onClick={refresh}
                     disabled={refreshing}
                   >
@@ -773,21 +1002,37 @@ export default function Dashboard() {
                     icon: "server",
                   },
                   {
-                    label: "CPU capacity",
-                    value: fleet ? `${sum("cpu_total")}` : "—",
-                    note: "logical cores online",
+                    label: "CPU allocated",
+                    value: fleet ? (
+                      <>
+                        {cpuAllocated}{" "}
+                        <span className="stat-total">/ {cpuTotal}</span>
+                      </>
+                    ) : (
+                      "—"
+                    ),
+                    note: `${percent(cpuAllocated, cpuTotal)} allocated · logical cores`,
                     icon: "cpu",
                   },
                   {
-                    label: "Memory capacity",
-                    value: fleet ? bytes(sum("memory_total_bytes")) : "—",
-                    note: "across connected hosts",
+                    label: "Host memory used",
+                    value: fleet ? (
+                      <>
+                        {bytes(memoryUsed)}{" "}
+                        <span className="stat-total">
+                          / {bytes(memoryTotal)}
+                        </span>
+                      </>
+                    ) : (
+                      "—"
+                    ),
+                    note: `${percent(memoryUsed, memoryTotal)} used · across online hosts`,
                     icon: "memory",
                   },
                   {
-                    label: "Workspaces",
-                    value: fleet ? `${instances.length}` : "—",
-                    note: `${instances.filter(({ instance }) => instance.status === "Running").length} running`,
+                    label: "Assigned workspaces",
+                    value: fleet ? `${assigned.length}` : "—",
+                    note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
                     icon: "box",
                   },
                 ].map((stat) => (
@@ -807,6 +1052,18 @@ export default function Dashboard() {
                   busy={submitting}
                   close={() => setCreating(false)}
                   create={create}
+                />
+              )}
+              {catalogOpen && fleet && (
+                <TemplateCatalog
+                  hosts={fleet.hosts}
+                  refreshToken={updated?.getTime() ?? 0}
+                  installing={jobs
+                    .filter((job) => active(job) && job.kind === "template")
+                    .map((job) => `${job.host}/${job.instance}`)}
+                  install={installTemplate}
+                  registered={refresh}
+                  close={() => setCatalogOpen(false)}
                 />
               )}
               <section className="hosts-section">
@@ -861,11 +1118,11 @@ export default function Dashboard() {
               <section className="workspaces-section">
                 <div className="section-title">
                   <div className="section-heading">
-                    <h2>Workspaces</h2>
+                    <h2>Instance inventory</h2>
                     <span className="count">{instances.length}</span>
                   </div>
                   <span className="section-caption">
-                    Private environments · Shared foundations
+                    Assigned workspaces · Prepared reserves · Bases
                   </span>
                 </div>
                 <div className="table-container">
@@ -886,12 +1143,16 @@ export default function Dashboard() {
                           host={host}
                           instance={instance}
                           busy={
-                            submitting ||
+                            pendingInstances.includes(
+                              `${host.id}/${instance.name}`,
+                            ) ||
                             jobs.some(
                               (job) =>
                                 active(job) &&
                                 job.host === host.id &&
-                                job.instance === instance.name,
+                                (job.instance === instance.name ||
+                                  (!!instance.workspace_name &&
+                                    job.instance === instance.workspace_name)),
                             )
                           }
                           action={action}
@@ -948,6 +1209,22 @@ export default function Dashboard() {
                           {job.error && (
                             <p className="job-error">{job.error}</p>
                           )}
+                          {job.status === "succeeded" &&
+                            job.result?.startup && (
+                              <p className="job-detail">
+                                {job.result.startup === "warm"
+                                  ? "Warm allocation"
+                                  : "Cold start"}
+                                {typeof job.result.ready_seconds === "number" &&
+                                  Number.isFinite(job.result.ready_seconds) &&
+                                  ` · ready in ${job.result.ready_seconds.toFixed(2)} s`}
+                                {job.result.name && (
+                                  <span className="mono">
+                                    VM: {job.result.name}
+                                  </span>
+                                )}
+                              </p>
+                            )}
                           <small className="mono">{job.id}</small>
                         </div>
                         <span className={`status status-${job.status}`}>

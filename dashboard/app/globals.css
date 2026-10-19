@@ -309,6 +309,7 @@ h1 {
   margin-bottom: 31px;
 }
 .stat-card {
+  min-width: 0;
   background: white;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -339,6 +340,14 @@ h1 {
   font-size: 9px;
   color: #95a1a6;
   margin-top: 4px;
+}
+.stat-total {
+  display: inline-block;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: normal;
+  color: #83959c;
 }
 .section-title {
   display: flex;
@@ -531,6 +540,195 @@ h2 {
   line-height: 1.8;
   color: #a07971;
   padding: 0 0 25px;
+}
+.pool-summary {
+  border-top: 1px solid var(--line);
+  padding: 14px 0 18px;
+  font-size: 10px;
+  color: #748990;
+}
+.pool-summary h4 {
+  font-size: 11px;
+  font-weight: 550;
+  margin: 0 0 10px;
+  color: #47616a;
+}
+.pool-summary-item {
+  margin-bottom: 10px;
+}
+.pool-summary-item strong,
+.pool-summary-item span {
+  display: block;
+  margin-bottom: 5px;
+}
+.pool-summary-item strong {
+  font-weight: 500;
+}
+.pool-summary > p {
+  font-size: 9px;
+  line-height: 1.6;
+}
+.pool-error {
+  color: #a86e5c !important;
+  line-height: 1.6;
+}
+.pool-reserve-row {
+  background: #f8fbfa;
+}
+.pool-state {
+  display: block;
+  font-size: 9px;
+  margin-top: 7px;
+  color: #648b7f;
+}
+.pool-state-quarantined {
+  color: #a86e5c;
+}
+.allocation-hint {
+  max-width: 650px;
+}
+.allocation-hint p + p {
+  margin-top: 7px;
+}
+.allocation-hint p {
+  line-height: 1.7;
+}
+.job-detail {
+  font-size: 10px;
+  color: #648b7f;
+  margin-top: 6px;
+}
+.job-detail > span {
+  display: block;
+  margin-top: 5px;
+}
+.custom-resources {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-top: 18px;
+}
+.custom-resources label > span {
+  font-size: 9px;
+  color: #8d9e9f;
+}
+.resource-preview {
+  font-size: 11px;
+  color: #648b7f;
+  margin-top: 15px;
+}
+.catalog-panel {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 22px;
+  margin-bottom: 28px;
+  background: #fff;
+}
+.catalog-panel .section-title p {
+  color: #8d9e9f;
+  font-size: 11px;
+  margin-top: 6px;
+}
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  gap: 16px;
+  margin-top: 20px;
+}
+.catalog-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 18px;
+  min-width: 0;
+}
+.catalog-card-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.catalog-card h3 {
+  font-size: 13px;
+  color: #47616a;
+  margin-bottom: 6px;
+}
+.catalog-card-heading .mono {
+  color: #8d9e9f;
+}
+.catalog-recipe {
+  font-size: 9px;
+  color: #748990;
+}
+.catalog-description {
+  font-size: 11px;
+  line-height: 1.8;
+  color: #748990;
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+}
+.template-resources {
+  margin: 15px 0;
+  font-size: 10px;
+  line-height: 1.7;
+}
+.template-resources div + div {
+  margin-top: 8px;
+}
+.template-resources dt {
+  color: #8d9e9f;
+}
+.template-resources dd {
+  color: #47616a;
+  margin: 0;
+}
+.template-install,
+.template-import {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+.template-install label {
+  flex: 1;
+  min-width: 140px;
+}
+.template-import > label:first-child {
+  min-width: 150px;
+}
+.import-content {
+  flex: 1;
+  min-width: 220px;
+}
+textarea {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  border: 1px solid #dbe5e7;
+  border-radius: 5px;
+  color: #47616a;
+  padding: 10px;
+  font-size: 11px;
+  font-family: monospace;
+}
+.deployment-status {
+  margin-top: 12px;
+  font-size: 10px;
+  color: #648b7f;
+}
+.deployment-status.out-of-sync {
+  color: #a97743;
+}
+.deployment-source {
+  margin-top: 6px;
+  color: #8d9e9f;
+  overflow-wrap: anywhere;
+}
+.catalog-notice {
+  font-size: 11px;
+  color: #648b7f;
+  margin-bottom: 14px;
 }
 .workspaces-section {
   margin-top: 31px;
@@ -996,6 +1194,22 @@ input::placeholder {
   }
   .create-grid {
     grid-template-columns: 1fr;
+  }
+  .custom-resources {
+    grid-template-columns: 1fr;
+  }
+  .catalog-panel {
+    padding: 20px;
+  }
+  .catalog-grid {
+    grid-template-columns: 1fr;
+  }
+  .import-content {
+    min-width: 0;
+    flex-basis: 100%;
+  }
+  .template-import > button {
+    width: 100%;
   }
   .create-footer {
     flex-direction: column;

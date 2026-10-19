@@ -19,6 +19,8 @@ import uuid
 from urllib.parse import quote
 
 from enginebox import EngineBox, GuestConfig, identifier
+from templates import Registry, host_binding_digest, validate_resources
+from warm_pool import WarmPool
 
 GIB = 1024**3
 SIZES = {"small": {"cpu": 2, "memory_gib": 2},
@@ -47,6 +49,8 @@ class Host:
     max_instances: int
     templates: tuple[dict, ...]
     guest: GuestConfig = GuestConfig(1001, 1001, "agent", "/home/agent", "/workspace", ":99")
+    network: str | None = None
+    warm_pools: tuple[dict, ...] = ()
 
     def box(self):
         return EngineBox(self.target, project=self.project, guest=self.guest)
@@ -61,10 +65,10 @@ def load_hosts(path: str | Path) -> list[Host]:
         raise ValueError("Unknown fleet configuration sections.")
     hosts, ids, targets = [], set(), set()
     for entry in config["hosts"]:
-        allowed = {"id", "label", "target", "project", "pool", "reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "disk_gib", "max_instances", "templates", "guest"}
+        allowed = {"id", "label", "target", "project", "pool", "reserve_cpu", "reserve_memory_gib", "reserve_disk_gib", "disk_gib", "max_instances", "templates", "guest", "network", "warm_pools"}
         if not isinstance(entry, dict) or set(entry) - allowed or not {"id", "target"} <= set(entry):
             raise ValueError("Each host requires id/target and only supported host fields.")
-        for key in ["id", "target", "label", "project", "pool"]:
+        for key in ["id", "target", "label", "project", "pool", "network"]:
             if key in entry and not isinstance(entry[key], str):
                 raise ValueError(f"hosts.{key} must be a string.")
         host_id = identifier(entry["id"])
@@ -86,12 +90,14 @@ def load_hosts(path: str | Path) -> list[Host]:
         ids.add(host_id)
         targets.add(target)
         pool = identifier(entry.get("pool", "enginebox"))
+        network = identifier(entry["network"]) if "network" in entry else None
         templates, template_ids = [], set()
         if not isinstance(entry.get("templates", []), list):
             raise ValueError("hosts.templates must be an array of template tables.")
         for template in entry.get("templates", []):
-            if (not isinstance(template, dict) or set(template) - {"id", "label", "source", "snapshot"}
-                    or not {"id", "source", "snapshot"} <= set(template) or not all(isinstance(v, str) for v in template.values())):
+            if (not isinstance(template, dict) or set(template) - {"id", "label", "source", "snapshot", "minimum", "recommended"}
+                    or not {"id", "source", "snapshot"} <= set(template)
+                    or not all(isinstance(v, str) for k, v in template.items() if k not in {"minimum", "recommended"})):
                 raise ValueError("Templates require string id/source/snapshot and optional label.")
             for field in ("id", "snapshot"):
                 identifier(template[field])
@@ -101,13 +107,35 @@ def load_hosts(path: str | Path) -> list[Host]:
             template_ids.add(template["id"])
             templates.append({"id": template["id"], "label": template.get("label", template["id"]),
                               "source": template["source"], "snapshot": template["snapshot"]})
+            if "minimum" in template or "recommended" in template:
+                if not {"minimum", "recommended"} <= set(template):
+                    raise ValueError("Template minimum and recommended resources must be supplied together.")
+                templates[-1]["minimum"] = validate_resources(template["minimum"])
+                templates[-1]["recommended"] = validate_resources(template["recommended"], template["minimum"])
+        policies, policy_ids = [], set()
+        if not isinstance(entry.get("warm_pools", []), list):
+            raise ValueError("hosts.warm_pools must be an array of pool tables.")
+        for policy in entry.get("warm_pools", []):
+            if not isinstance(policy, dict) or set(policy) != {"template", "size", "ready"}:
+                raise ValueError("Warm pools require template, size and ready fields.")
+            if not isinstance(policy["template"], str) or not isinstance(policy["size"], str):
+                raise ValueError("Warm pool template and size must be strings.")
+            identifier(policy["template"])
+            if policy["size"] not in {*SIZES, "minimum", "recommended"}:
+                raise ValueError("Choose a minimum/recommended or legacy size for a warm pool.")
+            positive(policy["ready"], "warm_pools.ready", maximum=32)
+            key = (policy["template"], policy["size"])
+            if key in policy_ids:
+                raise ValueError("Warm pool template/size pairs must be unique.")
+            policy_ids.add(key)
+            policies.append(dict(policy))
         hosts.append(Host(host_id, entry.get("label", host_id), target, project, pool,
                           positive(entry.get("reserve_cpu", 2), "reserve_cpu"),
                           positive(entry.get("reserve_memory_gib", 4), "reserve_memory_gib"),
                           positive(entry.get("reserve_disk_gib", 10), "reserve_disk_gib"),
                           positive(entry.get("disk_gib", 30), "disk_gib", minimum=8),
                           positive(entry.get("max_instances", 16), "max_instances", minimum=1, maximum=256),
-                          tuple(templates), guest_config))
+                          tuple(templates), guest_config, network, tuple(policies)))
     return hosts
 
 
@@ -165,6 +193,26 @@ def addresses(vm):
             address=lease.get('address','')
             if str(lease.get('hwaddr','')).lower()==mac.lower() and ':' not in address and address: found.append(address)
     return sorted(set(found))
+def pool_metadata(vm, cfg):
+    state=cfg.get('user.enginebox.pool.state')
+    claim=None
+    description=vm.get('description','')
+    if description.startswith('enginebox-pool:v1:'):
+        try:
+            claim=json.loads(description[len('enginebox-pool:v1:'):])
+            if not isinstance(claim,dict) or claim.get('state') not in {'claimed','quarantined'}: raise ValueError()
+            if claim['state']=='claimed' and not re.fullmatch(r'ebox-[a-z0-9][a-z0-9-]{0,48}',str(claim.get('workspace_name',''))): raise ValueError()
+            state=claim['state']
+        except (ValueError,TypeError):
+            state='quarantined'; claim={'state':state,'reason':'Invalid pool reservation; inspect before reuse.'}
+    # A claim in either durable location permanently excludes this VM from reuse.
+    if cfg.get('user.enginebox.workspace') and not claim:
+        state='claimed'; claim={'state':state,'workspace_name':cfg['user.enginebox.workspace']}
+    return {'warm_pool_state':state,'pool_claim':claim,
+            'workspace_name':(claim or {}).get('workspace_name') or cfg.get('user.enginebox.workspace'),
+            'pool_generation':cfg.get('user.enginebox.pool.generation'),
+            'pool_size':cfg.get('user.enginebox.pool.size'),
+            'pool_created_at':cfg.get('user.enginebox.pool.created_at')}
 items=[]
 for vm in data:
     cfg=vm.get('expanded_config', vm.get('config',{}))
@@ -178,7 +226,7 @@ for vm in data:
       'state_disk_bytes':size(root.get('size.state'),0),
       'managed':cfg.get('user.enginebox.fleet')=='true',
       'template':cfg.get('user.enginebox.template'),
-      'ipv4':addresses(vm)})
+      'ipv4':addresses(vm),**pool_metadata(vm,cfg)})
 space=query('/1.0/storage-pools/'+quote(pool,safe='')+'/resources')['space']
 fs=os.statvfs('/var/lib/incus')
 print(json.dumps({'cpu_total':os.cpu_count(),'memory_total_bytes':mem['MemTotal'],
@@ -274,6 +322,13 @@ def resource_bytes(value: str | int, fallback: int) -> int:
     return int(match[1]) * factors[match[2] or ""]
 
 
+def resource_fits(host: Host, facts: dict, resources: dict) -> bool:
+    room = capacity(host, facts)
+    return (room["instance_slots_available"] >= 1 and room["cpu_available"] >= resources["cpu"]
+            and room["memory_budget_available_bytes"] >= resources["memory_gib"] * GIB
+            and room["disk_budget_available_bytes"] >= (resources["disk_gib"] + resources["memory_gib"] + 2) * GIB)
+
+
 def root_device(box, instance: dict, project: str) -> tuple[str, dict]:
     devices = instance.get("expanded_devices")
     if devices is None:
@@ -334,7 +389,7 @@ print(json.dumps({'ready':True,'ipv4':addresses,'native_clients':sorted(clients)
 
 
 class Fleet:
-    def __init__(self, hosts: list[Host], *, state_dir: Path | None = None):
+    def __init__(self, hosts: list[Host], *, state_dir: Path | None = None, registry=None):
         if not hosts or len({host.id for host in hosts}) != len(hosts) or len({host.target for host in hosts}) != len(hosts):
             raise ValueError("Fleet needs at least one host with unique IDs and targets.")
         self.hosts = {host.id: host for host in hosts}
@@ -344,6 +399,8 @@ class Fleet:
         self.jobs_lock = threading.Lock()
         self.jobs: dict[str, dict] = {}
         self.state_dir = state_dir.expanduser().resolve() if state_dir else None
+        self.registry = registry if registry is not None else (Registry(self.state_dir.parent) if self.state_dir else None)
+        self.warm = WarmPool(self)
         if state_dir:
             state_dir = self.state_dir
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -373,6 +430,7 @@ class Fleet:
         try:
             facts = inventory(host)
             return {"id": host.id, "label": host.label, "online": True, "capacity": capacity(host, facts),
+                    "warm_pools": self.warm.summary(host, facts),
                     "instances": [item for item in facts["instances"]
                                   if item["project"] == host.project and item["name"].startswith("ebox-")]}
         except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired):
@@ -385,10 +443,77 @@ class Fleet:
             hosts = list(pool.map(self._host_status, self.hosts.values()))
         templates = {}
         for host in self.hosts.values():
-            for item in host.templates:
-                entry = templates.setdefault(item["id"], {"id": item["id"], "label": item["label"], "host_ids": []})
+            for item in self.templates_for(host):
+                entry = templates.setdefault(item["id"], {key: item[key] for key in ("id", "label", "minimum", "recommended")} | {"host_ids": [], "host_resources": {}})
                 entry["host_ids"].append(host.id)
+                entry["host_resources"][host.id] = {key: item[key] for key in ("minimum", "recommended")}
         return {"hosts": hosts, "templates": list(templates.values()), "sizes": SIZES}
+
+    def catalog(self):
+        records = self.registry.list() if self.registry else []
+        for record in records:
+            for deployment in record["deployments"]:
+                host = self.hosts.get(deployment["host_id"])
+                deployment["in_sync"] = bool(deployment["in_sync"] and host
+                    and deployment["host_binding_digest"] == host_binding_digest(host))
+        return {"templates": records}
+
+    def templates_for(self, host):
+        # Static bases remain supported for existing installations. Registering
+        # the same ID transfers its resource/version contract to the registry.
+        records = {item["id"]: item for item in self.registry.list()} if self.registry else {}
+        result = []
+        for item in host.templates:
+            if item["id"] in records:
+                continue
+            result.append(dict(item) | {
+                "minimum": item.get("minimum", SIZES["small"] | {"disk_gib": host.disk_gib}),
+                "recommended": item.get("recommended", SIZES["standard"] | {"disk_gib": host.disk_gib})})
+        if self.registry:
+            binding = host_binding_digest(host)
+            for installed in self.registry.deployments(host.id):
+                record = records.get(installed["id"])
+                if (record and installed["manifest_digest"] == record["manifest_digest"]
+                        and installed["host_binding_digest"] == binding):
+                    result.append({key: installed[key] for key in ("id", "label", "source", "snapshot", "minimum", "recommended",
+                                                                  "revision", "manifest_digest")})
+        return result
+
+    def template(self, host, template_id):
+        result = next((t for t in self.templates_for(host) if t["id"] == template_id), None)
+        if result is None:
+            raise ValueError("Select a template installed at the current revision on this host.")
+        return result
+
+    @staticmethod
+    def resources(host, template, size=None, resources=None):
+        if resources is not None:
+            if size is not None:
+                raise ValueError("Choose a size preset or custom resources, not both.")
+            return validate_resources(resources, template["minimum"])
+        size = size or "recommended"
+        if size in {"minimum", "recommended"}:
+            return validate_resources(template[size], template["minimum"])
+        if size in SIZES:
+            return validate_resources(SIZES[size] | {"disk_gib": host.disk_gib}, template["minimum"])
+        raise ValueError("Choose minimum, recommended, or custom resources.")
+
+    @staticmethod
+    def template_snapshot(host, source):
+        snapshot = json.loads(host.box().run("query", f"/1.0/instances/{source['source']}/snapshots/{source['snapshot']}?project={quote(host.project, safe='')}"))
+        if snapshot.get("config", {}).get("user.enginebox.clean-base") != "true":
+            raise ValueError("Template must be prepared before login and marked user.enginebox.clean-base=true at snapshot time.")
+        if snapshot.get("stateful"):
+            raise ValueError("Reusable templates must be disk-only snapshots.")
+        if snapshot.get("type", "virtual-machine") != "virtual-machine":
+            raise ValueError("Reusable fleet templates must be virtual machines.")
+        return snapshot
+
+    @staticmethod
+    def check_name(host, name, facts):
+        identifier(name, instance=True)
+        if any(vm["project"] == host.project and name in {vm["name"], vm.get("workspace_name")} for vm in facts["instances"]):
+            raise ValueError("Instance or workspace name already exists; choose a new name.")
 
     def _save(self, job):
         if self.state_dir:
@@ -415,18 +540,32 @@ class Fleet:
 
     def submit(self, host_id, operation, **params):
         host = self.host(host_id)
-        if operation not in {"create", "pause", "resume", "hibernate", "stop"}:
+        if operation not in {"create", "allocate", "install_template", "pause", "resume", "hibernate", "stop"}:
             raise ValueError("Unsupported fleet operation.")
-        required = {"name", "template", "size"} if operation == "create" else {"name"}
-        if set(params) != required or not all(isinstance(value, str) for value in params.values()):
-            raise ValueError("Provide only the operation's required string fields.")
-        identifier(params["name"], instance=True)
-        if operation == "create":
-            if params.get("size") not in SIZES or params.get("template") not in {t["id"] for t in host.templates}:
-                raise ValueError("Select a configured template and size for this host.")
+        if operation in {"create", "allocate"}:
+            if (not {"name", "template"} <= set(params) or set(params) - {"name", "template", "size", "resources"}
+                    or ("size" in params and "resources" in params)
+                    or not isinstance(params["name"], str) or not isinstance(params["template"], str)
+                    or ("size" in params and not isinstance(params["size"], str))):
+                raise ValueError("Provide name, template and either a size preset or custom resources.")
+            if "resources" in params and not isinstance(params["resources"], dict):
+                raise ValueError("Custom resources must be an object.")
+            identifier(params["name"], instance=True)
+            self.resources(host, self.template(host, params["template"]), params.get("size"), params.get("resources"))
+            name = params["name"]
+        elif operation == "install_template":
+            if set(params) != {"template"} or not isinstance(params["template"], str) or not self.registry:
+                raise ValueError("Provide a registered template ID; configure a persistent registry first.")
+            self.registry.get(params["template"])
+            name = params["template"]
+        else:
+            if set(params) != {"name"} or not isinstance(params["name"], str):
+                raise ValueError("Provide only the required string field name.")
+            identifier(params["name"], instance=True)
+            name = params["name"]
         if not self.pending.acquire(blocking=False):
             raise ValueError("Fleet queue is full; wait for existing jobs.")
-        job = {"id": uuid.uuid4().hex, "host_id": host_id, "operation": operation, "name": params["name"],
+        job = {"id": uuid.uuid4().hex, "host_id": host_id, "operation": operation, "name": name,
                "status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
         try:
             with self.jobs_lock:
@@ -444,12 +583,25 @@ class Fleet:
 
     def _work(self, host, job_id, operation, params):
         try:
-            with self.locks[host.id], host_operation_lock(host):
+            with self.locks[host.id]:
                 with self.jobs_lock:
                     self.jobs[job_id]["status"] = "running"
                     self._save(self.jobs[job_id])
                 started = time.monotonic()
-                result = self._create(host, **params) if operation == "create" else self._action(host, params["name"], operation)
+                if operation == "install_template":
+                    # The installer owns the same host flock internally and
+                    # performs admission inside it. Never double-acquire it.
+                    installed = self.registry.install(host, params["template"])
+                    result = {key: installed[key] for key in ("id", "revision", "source", "snapshot", "installed_at")}
+                else:
+                    with host_operation_lock(host):
+                        if operation == "create":
+                            result = self._create(host, **params)
+                        elif operation == "allocate":
+                            result = self.warm.allocate(host, params["name"], params["template"], params.get("size"),
+                                                        params.get("resources"), job_id=job_id)
+                        else:
+                            result = self._action(host, params["name"], operation)
                 with self.jobs_lock:
                     self.jobs[job_id].update(status="succeeded", result=result,
                                              duration_seconds=round(time.monotonic() - started, 3))
@@ -460,53 +612,42 @@ class Fleet:
                 self._save(self.jobs[job_id])
         finally:
             self.pending.release()
+            self.warm.wake(host.id)
 
-    def _create(self, host, name, template, size):
+    def _create(self, host, name, template, size=None, *, resources=None, pool_metadata=None, wait=True):
         facts = inventory(host)
-        if any(vm["project"] == host.project and vm["name"] == name for vm in facts["instances"]):
-            raise ValueError("Instance already exists; choose a new name.")
-        if capacity(host, facts)["max_additional"][size] < 1:
+        self.check_name(host, name, facts)
+        source = self.template(host, template)
+        config = self.resources(host, source, size, resources)
+        if not resource_fits(host, facts, config):
             raise ValueError("Insufficient CPU, memory, disk budget or instance slots; preserve configured reserves.")
-        source = next(t for t in host.templates if t["id"] == template)
         box = host.box()
-        snapshot = json.loads(box.run("query", f"/1.0/instances/{source['source']}/snapshots/{source['snapshot']}?project={quote(host.project, safe='')}"))
-        if snapshot.get("config", {}).get("user.enginebox.clean-base") != "true":
-            raise ValueError("Template must be prepared before login and marked user.enginebox.clean-base=true at snapshot time.")
-        if snapshot.get("stateful"):
-            raise ValueError("Reusable templates must be disk-only snapshots.")
-        if snapshot.get("type", "virtual-machine") != "virtual-machine":
-            raise ValueError("Reusable fleet templates must be virtual machines.")
+        snapshot = self.template_snapshot(host, source)
         root_name, template_root = root_device(box, snapshot, host.project)
         source_vm = next((vm for vm in facts["instances"] if vm["project"] == host.project and vm["name"] == source["source"]), None)
         source_disk = resource_bytes(template_root.get("size"), source_vm["disk_bytes"] if source_vm else 0)
-        if not source_disk or host.disk_gib * GIB < source_disk:
-            raise ValueError("Fleet disk_gib must cover the template root disk; automatic shrinking is not supported.")
+        if not source_disk or config["disk_gib"] * GIB < source_disk:
+            raise ValueError("Requested disk_gib must cover the template root disk; automatic shrinking is not supported.")
         started = time.monotonic()
-        config = SIZES[size]
-        # Admission is for host.pool; copy must use that exact pool even when the
-        # prepared template lives elsewhere. Mark ownership and clear clean-base
-        # atomically on creation, so partial failures remain visible/accounted.
+        # Ownership and reserve metadata are committed as part of the copy, so
+        # even partial failures remain visible to the next admission decision.
+        metadata = []
+        for key, value in (pool_metadata or {}).items():
+            metadata.extend(["-c", f"user.enginebox.pool.{key}={value}"])
         box.run("copy", f"{source['source']}/{source['snapshot']}", name, "--stateless", "--storage", host.pool,
                 "-c", f"limits.cpu={config['cpu']}", "-c", f"limits.memory={config['memory_gib']}GiB",
                 "-c", "user.enginebox.fleet=true", "-c", f"user.enginebox.template={template}",
-                "-c", "user.enginebox.clean-base=false", "-c", "boot.autostart=false")
+                "-c", "user.enginebox.clean-base=false", "-c", "boot.autostart=false", *metadata)
         copy_seconds = time.monotonic() - started
         clone = json.loads(box.run("query", f"/1.0/instances/{name}?project={quote(host.project, safe='')}"))
         root_name, clone_root = root_device(box, clone, host.project)
         if clone_root.get("pool") != host.pool:
             raise RuntimeError("Clone storage differs from the admitted pool; VM remains stopped for inspection.")
-        # --storage can introduce a local root override; inspect the clone rather
-        # than assuming its device layout still matches the source snapshot.
-        if root_name in clone.get("devices", {}):
-            box.run("config", "device", "set", name, root_name, f"size={host.disk_gib}GiB",
-                    f"size.state={config['memory_gib'] + 2}GiB")
-        else:
-            box.run("config", "device", "override", name, root_name, f"size={host.disk_gib}GiB",
-                    f"size.state={config['memory_gib'] + 2}GiB")
-        # The clean image's clone-preparation service derives a fresh machine ID
-        # from Incus' per-clone UUID before networking. Never edit a signed-in VM.
+        operation = "set" if root_name in clone.get("devices", {}) else "override"
+        box.run("config", "device", operation, name, root_name, f"size={config['disk_gib']}GiB",
+                f"size.state={config['memory_gib'] + 2}GiB")
         box.run("start", name)
-        readiness = self._wait_ready(box, name)
+        readiness = self._wait_ready(box, name) if wait else None
         return {"name": name, "status": "Running", "copy_seconds": round(copy_seconds, 3),
                 "ready_seconds": round(time.monotonic() - started, 3), "readiness": readiness}
 
@@ -515,6 +656,8 @@ class Fleet:
         vm = next((v for v in facts["instances"] if v["project"] == host.project and v["name"] == name), None)
         if not vm or not vm.get("managed"):
             raise ValueError("Fleet actions are limited to fleet-created VMs; use the explicit operator CLI for other workspaces.")
+        if vm.get("warm_pool_state") in {"preparing", "ready", "quarantined"}:
+            raise ValueError("Unassigned warm reserves cannot be changed through workspace lifecycle controls.")
         if vm.get("pool") != host.pool:
             raise ValueError("Workspace moved outside this host's admission pool; update the fleet configuration explicitly.")
         if action == "resume" and vm["status"] == "Stopped":

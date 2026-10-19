@@ -38,7 +38,7 @@ snapshot = "prepared-example"
 
 Replace the snapshot name with the prepared snapshot returned by [bootstrap](BOOTSTRAP.md). The template must be a disk-only VM snapshot marked `user.enginebox.clean-base=true`, captured before provider login. It must contain the installed-version manifest and completed clone-identity setup. A configured template is checked when a creation job runs; appearing in inventory is not proof that its snapshot still exists or is valid.
 
-Guest settings must match the prepared image. Unknown keys are rejected; in particular the guest path key is `workspace`, not `path`. Defaults are independent of environment variables used by another operator terminal. Each template must fit `disk_gib`; the fleet refuses automatic disk shrinking. Copies explicitly use the configured admission pool, even if the source template resides in another pool.
+Guest settings must match the prepared image. Unknown keys are rejected; in particular the guest path key is `workspace`, not `path`. Defaults are independent of environment variables used by another operator terminal. Legacy size presets use the host `disk_gib`; template Minimum/Recommended/Custom selections carry their own CPU, RAM and disk values. The fleet refuses automatic disk shrinking. Copies explicitly use the configured admission pool, even if the source template resides in another pool.
 
 ## Start the API
 
@@ -68,19 +68,27 @@ The default job directory is `~/.local/state/enginebox/jobs`; override it with `
 
 ## Endpoints
 
-Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must be JSON objects and cannot exceed 16 KiB. Additional payload fields are rejected.
+Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must be JSON objects and cannot exceed 16 KiB, except template registration which accepts up to 1 MiB. Additional payload fields are rejected.
 
 | Request | Result |
 |---|---|
 | `GET /healthz` | Unauthenticated process-health response containing only `{"ok":true}`; does not check hosts. |
 | `GET /v1/fleet` | Configured hosts, capacity estimates, instance metadata, template choices and sizes. |
+| `GET /v1/templates` | Portable manifests and per-host installed revisions; see [templates](TEMPLATES.md). |
+| `POST /v1/templates` | Register `{"manifest":{...}}` or import `{"url":"https://…/template.json"}` without installing it. |
+| `POST /v1/hosts/{host_id}/templates/{template}/install` | Queue installation using `{}`. |
+| `POST /v1/hosts/{host_id}/allocations` | Assign a never-used warm VM, or create a cold clone. Body: `{"name":"ebox-work","template":"native-agents","size":"recommended"}`. |
 | `POST /v1/hosts/{host_id}/instances` | Queue a clone: `{"name":"ebox-work","template":"native-agents","size":"standard"}`. |
 | `POST /v1/hosts/{host_id}/instances/{name}/actions` | Queue `{"action":"pause"}`, `resume`, `hibernate` or `stop`. |
 | `GET /v1/jobs/{job_id}` | Poll the job's `queued`, `running`, `succeeded` or `failed` state. |
 
 Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no arbitrary command-execution, snapshot-restore or deletion endpoint.
 
-`small`, `standard` and `large` currently select 2/4/8 vCPUs and 2/4/8 GiB RAM respectively. `disk_gib` is configured per host. Saved-memory storage is the selected RAM size plus 2 GiB.
+Use `size: "minimum"` or `size: "recommended"` for template-defined resources, or replace `size` with `resources: {"cpu":4,"memory_gib":8,"disk_gib":40}`. All three custom values must be integers at or above the registered minimum. Registered templates become allocatable only after the current manifest revision is installed on that exact host/project/pool/guest binding.
+
+Legacy `small`, `standard` and `large` select 2/4/8 vCPUs and 2/4/8 GiB RAM respectively. `disk_gib` is configured per host. Saved-memory storage is the selected RAM size plus 2 GiB.
+
+For optional prebooted reserves, see [warm pools](WARM-POOLS.md). Allocation returns the actual Incus VM `name` plus the requested `workspace_name`; subsequent lifecycle calls use the actual name. Assigned VMs never return to the fresh pool.
 
 ## Capacity and coordination
 
@@ -130,7 +138,7 @@ export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
 runtime/.venv/bin/enginebox-fleet-mcp
 ```
 
-Register that command through your client's ordinary MCP configuration. It exposes `fleet_inventory`, `fleet_create`, `fleet_action` and `fleet_job`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them.
+Register that command through your client's ordinary MCP configuration. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register` and `template_install`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them.
 
 The MCP client only permits HTTP for loopback origins, requires HTTPS for remote origins, rejects URL credentials and disables redirects and ambient forward proxies. A redirect must not forward the bearer token to another service. Use a direct API connection or SSH tunnel. Do not install fleet API tokens or operator SSH authority inside agent guests; guest computer/browser MCP is a separate interface.
 

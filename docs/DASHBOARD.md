@@ -4,14 +4,22 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 
 ## What is implemented
 
-- Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size.
+- Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size. The top CPU card shows allocated cores and percentage, not CPU utilization. Host memory usage is total minus available memory, clamped to the reported total.
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.
-- Creating a workspace from a configured prepared template and named size.
-- Pause, resume, hibernate and stop controls for managed workspaces. Unmanaged instances and prepared bases are read-only. Stop asks for confirmation because it ends running processes.
+- Allocating a workspace from a matching ready, paused reserve, with an explicit cold-start fallback. Completed operations show the actual startup mode and ready time reported by the API. Availability is advisory; another request can claim a ready instance before submission.
+- Template minimum/recommended presets and custom CPU, RAM and disk allocations. Custom values must be whole numbers at or above the template minimum. Older templates without resource metadata retain the legacy named sizes.
+- A template catalog panel for registering JSON manifests or HTTPS URLs, installing templates on a selected host, and syncing deployments whose digest differs from the registered revision.
+- Pause, resume, hibernate and stop controls for assigned managed workspaces. Unmanaged bases and preparing, ready or quarantined pool instances have no lifecycle controls. Each pending operation affects only its target row. Stop asks for confirmation because it ends running processes.
 - Asynchronous operation status, error messages, loading states, empty fleet instructions and responsive mobile layouts.
 - A separate operator sign-in, an eight-hour signed HttpOnly session, and exact Origin checks for login, logout and mutations.
 
 The page reads `/v1/fleet` every ten seconds while signed in. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. There is no cancellation button or multi-user account system.
+
+The assigned-workspace count excludes unmanaged bases and pool reserves. The instance inventory still shows all of them, with reserve state clearly marked. Claimed reserves keep their Incus VM ID; the requested workspace name appears above that ID, and lifecycle requests always use the actual VM ID. Host cards show each configured reserve's ready/preparing/target counts and refill errors. Paused reserves retain their memory allocation.
+
+Warm matching compares template and resolved CPU/RAM/disk requirements, so a custom allocation can match a reserve prepared under a named preset. Sizing prefers the selected host's `host_resources` requirements when present. Cold capacity uses the API's available CPU, memory, disk and instance-count budgets. Disk admission includes the requested root disk plus RAM size and 2 GiB of checkpoint overhead. The backend enforces all limits and readiness checks.
+
+Registration alone does not install anything on a host. The catalog shows the registered revision and the selected host's installed revision/sync state. Installation and synchronization are asynchronous jobs. Only templates installed on a host are offered in its workspace form. The backend validates manifests, supported recipes and remote imports; templates do not carry provider credentials.
 
 The app has no demo mode and no production fallback to synthetic inventory. Test fixtures live only in `dashboard/tests/fixtures/`.
 
@@ -97,7 +105,7 @@ Cookies use `HttpOnly`, `SameSite=Strict`, an eight-hour expiry and `Secure` whe
 
 For access through a TLS reverse proxy, set an HTTPS dashboard origin. The start script refuses non-loopback binding unless that HTTPS origin is set. TLS must be provided by the reverse proxy, and direct access to the plain HTTP upstream must be restricted by the operator. The dashboard does not enable TLS itself. Plain HTTP fleet API URLs are accepted only for loopback; remote API connections require HTTPS.
 
-Only the configured fleet endpoints are proxied. Browser-supplied Authorization headers are not forwarded. The server uses the configured API token, rejects upstream redirects, bounds JSON request bodies and disables response caching. This is a single-operator control plane, not tenant authorization.
+Only the configured fleet endpoints are proxied. Browser-supplied Authorization headers are not forwarded. The server uses the configured API token, rejects upstream redirects, bounds ordinary JSON request bodies to 8 KiB and template-registration bodies to 1 MiB, and disables response caching. This is a single-operator control plane, not tenant authorization.
 
 The dashboard does not embed noVNC, open desktop ports, install agents or proxy provider authentication. Lifecycle buttons call the environment API; official native harnesses retain their own authentication. In particular, publishing the dashboard does not make an unauthenticated desktop listener safe.
 
@@ -106,11 +114,15 @@ The dashboard does not embed noVNC, open desktop ports, install agents or proxy 
 | Browser operation | Fleet endpoint |
 | --- | --- |
 | Read capacity, templates, sizes and instances | `GET /v1/fleet` |
-| Create a workspace | `POST /v1/hosts/{id}/instances` with `{name, template, size}` |
+| Allocate a workspace | `POST /v1/hosts/{id}/allocations` with `{name, template, size}` or `{name, template, resources: {cpu, memory_gib, disk_gib}}` |
+| Explicit cold creation (API compatibility) | `POST /v1/hosts/{id}/instances` with `{name, template, size}` |
+| Read template catalog and deployment receipts | `GET /v1/templates` |
+| Register a template | `POST /v1/templates` with `{manifest}` or `{url}` |
+| Install/sync a template on a host | `POST /v1/hosts/{id}/templates/{template_id}/install` with `{}` |
 | Change workspace state | `POST /v1/hosts/{id}/instances/{name}/actions` with `{action}` |
 | Poll operation state | `GET /v1/jobs/{id}` |
 
-Mutation responses are HTTP 202 with `{job: {id, status}}`. Job status is `queued`, `running`, `succeeded` or `failed`. The frontend treats failed inventory and job requests as visible errors. It does not infer success from a timeout. Capacity is advisory in the UI; the fleet service must enforce it and reject conflicting concurrent mutations.
+Workspace mutations and template installation return HTTP 202 with `{job: {id, status}}`; template registration returns synchronously. Job status is `queued`, `running`, `succeeded` or `failed`. Allocation results contain the actual `name`, requested `workspace_name`, `startup` (`warm` or `cold`) and `ready_seconds`. The frontend treats failed inventory and job requests as visible errors. It does not infer success from a timeout. Capacity is advisory in the UI; the fleet service must enforce it and reject conflicting concurrent mutations.
 
 ## Validation
 
@@ -123,7 +135,7 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-The Node tests cover signed sessions, expiry, credential rotation, exact origins, proxy authentication, path restrictions, backend failure handling and body limits. Playwright runs the production build with a test-only API on `127.0.0.1:18765` and dashboard on `127.0.0.1:3007`. It exercises login/logout, token separation, unmanaged instance restrictions, workspace creation, each lifecycle operation, async job failures, empty/error states and mobile layout. It never calls a real fleet API or stops a developer workspace.
+The Node tests cover signed sessions, expiry, credential rotation, exact origins, proxy authentication, path restrictions, backend failure handling, body limits, custom resource validation, cold capacity and warm matching. Playwright runs the production build with a test-only API on `127.0.0.1:18765` and dashboard on `127.0.0.1:3007`. It exercises login/logout, token separation, row-isolated lifecycle operations, resource-card math, reserve restrictions, warm/cold allocation, custom minimums, template import/install/sync, async job failures, empty/error states and mobile layout. It never calls a real fleet API or stops a developer workspace.
 
 Tested initial dependency versions: Vinext 1.2.1, React 19.3.1, Vite 8.3.4. Exact versions and transitive integrity hashes are in `package-lock.json`. The scaffold was generated with the official `create-vinext-app --platform=node` workflow; see the [upstream setup and Node hosting docs](https://github.com/cloudflare/vinext#starting-a-new-vinext-project).
 
