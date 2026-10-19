@@ -16,6 +16,19 @@ const MARKER: &str = "user.enginebox.layerfs";
 const WORKSPACE_MARKER: &str = "user.enginebox.layerfs.workspace";
 const MAPPED: &str = "/enginebox-incus";
 const STATEFUL: &str = "migration.stateful";
+/// New attachment receipts carry operation intent for bounded reconciliation.
+pub const ATTACHMENT_SCHEMA: u32 = 3;
+
+#[path = "incus_recovery.rs"]
+mod recovery;
+pub use recovery::reconcile;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Operation {
+    Attach,
+    Detach,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +78,10 @@ struct Attachment {
     mount_inode: Option<u64>,
     state: String,
     last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_operation: Option<Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_reconciliation: Option<String>,
 }
 
 fn receipt(root: &Path, name: &str) -> PathBuf {
@@ -78,7 +95,7 @@ fn load(root: &Path, name: &str) -> Result<Attachment> {
     let a: Attachment = serde_json::from_value(state::read_json(&receipt(root, name))?)?;
     a.target.validate()?;
     ensure!(
-        a.schema == 2
+        [2, ATTACHMENT_SCHEMA].contains(&a.schema)
             && a.workspace == name
             && a.export == root.join("exports").join(name)
             && digest(&a.container),
@@ -92,6 +109,31 @@ fn load(root: &Path, name: &str) -> Result<Attachment> {
         matches!(a.prior_stateful.as_deref(), None | Some("true" | "false")),
         "Invalid saved VM stateful configuration"
     );
+    ensure!(
+        matches!(
+            a.state.as_str(),
+            "attaching" | "attached" | "detaching" | "detached" | "uncertain"
+        ),
+        "Invalid attachment state"
+    );
+    ensure!(
+        a.schema != 2 || (a.last_operation.is_none() && a.last_reconciliation.is_none()),
+        "Legacy attachment receipt cannot carry newer recovery metadata"
+    );
+    if a.schema == ATTACHMENT_SCHEMA {
+        ensure!(
+            matches!(
+                (a.state.as_str(), a.last_operation),
+                ("attaching" | "attached", Some(Operation::Attach))
+                    | ("detaching" | "detached", Some(Operation::Detach))
+                    | ("uncertain", Some(_))
+            ),
+            "Attachment state and operation intent differ"
+        );
+    }
+    if let Some(id) = &a.last_reconciliation {
+        uuid::Uuid::parse_str(id).context("Invalid attachment reconciliation identity")?;
+    }
     Ok(a)
 }
 
@@ -461,7 +503,7 @@ pub fn attach(
     let export = root.join("exports").join(name);
     ensure!(!export.exists(), "Export path already exists");
     let mut a = Attachment {
-        schema: 2,
+        schema: ATTACHMENT_SCHEMA,
         workspace: name.into(),
         id: uuid::Uuid::new_v4().to_string(),
         target,
@@ -476,6 +518,8 @@ pub fn attach(
         mount_inode: None,
         state: "attaching".into(),
         last_error: None,
+        last_operation: Some(Operation::Attach),
+        last_reconciliation: None,
     };
     if receipt(root, name).exists() {
         let prior = load(root, name)?;
@@ -624,6 +668,8 @@ pub fn detach(root: &Path, name: &str, docker_socket: &Path) -> Result<Value> {
     );
     check_instance(&a, true)?;
     check_export(docker_socket, &a)?;
+    a.schema = ATTACHMENT_SCHEMA;
+    a.last_operation = Some(Operation::Detach);
     a.state = "detaching".into();
     save(root, &a)?;
     let result = (|| {
@@ -792,6 +838,8 @@ mod tests {
             mount_inode: None,
             state: String::new(),
             last_error: None,
+            last_operation: None,
+            last_reconciliation: None,
         };
         for status in ["attaching", "attached", "detaching", "uncertain"] {
             a.state = status.into();

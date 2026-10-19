@@ -82,7 +82,7 @@ fn require_docker_api(server: &Value) -> Result<()> {
     );
     Ok(())
 }
-fn verify_socket(_path: &std::path::Path) -> Result<()> {
+pub(crate) fn verify_socket(_path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -931,6 +931,46 @@ impl Runtime {
         )?;
         self.workspace(name)?;
         crate::incus::detach(&self.config.root, name, &self.config.docker_socket)
+    }
+    /// Metadata reconciliation must still report a stopped Docker daemon or
+    /// missing SDK artifact after reboot. It executes no SDK or mount operation,
+    /// so use the bound configuration without the runtime artifact preflight.
+    pub fn reconcile_incus(config: Config, name: &str, apply: bool) -> Result<Value> {
+        ensure!(
+            cfg!(target_os = "linux"),
+            "Incus reconciliation requires Linux"
+        );
+        ensure!(
+            run_process(&["id".into(), "-u".into()], None, Duration::from_secs(5))? == b"0\n",
+            "Run node-local reconciliation as root"
+        );
+        config.validate()?;
+        identifier(name)?;
+        let runtime = Self { config };
+        runtime.verify_binding()?;
+        state::private_dir(&runtime.config.root)?;
+        let _lease = state::lock(
+            &runtime
+                .config
+                .root
+                .join("workspaces")
+                .join(format!("{name}.lock")),
+            false,
+        )?;
+        let w = runtime.workspace(name)?;
+        ensure!(
+            w.status == "ready",
+            "Workspace storage operation needs separate recovery before attachment reconciliation"
+        );
+        crate::incus::reconcile(
+            &runtime.config.root,
+            name,
+            w.container
+                .as_deref()
+                .context("Workspace container missing")?,
+            &runtime.config.docker_socket,
+            apply,
+        )
     }
     pub fn list(&self) -> Result<Value> {
         let path = self.config.root.join("workspaces");
