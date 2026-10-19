@@ -37,6 +37,62 @@ quota-blocked test result does not qualify that provider's inference or resume.
 Claude's `total_cost_usd`, when present, is saved as a native-reported cumulative
 session estimate; resumed totals must not be summed or shown as account balance.
 
+## Results on 2026-10-20
+
+The real calls used original subscription access in disposable 2-vCPU / 2-GiB
+Ubuntu workspaces, with 30-GiB root disks and Rust 0.3.0 candidate helpers. Each
+clone passed a credential-free source check, current Rust guest preparation and a
+reboot before credential delivery. These results qualify ordinary Incus guest
+filesystems; they do not qualify inference on a LayerFS attachment.
+
+| Native CLI | First coding turn | Exact resumed turn | Browser turn | Outcome |
+| --- | ---: | ---: | ---: | --- |
+| Codex 0.163.0 | 12.422 s | 8.372 s | 19.818 s | Code, conversation memory, native MCP and PNG passed |
+| Claude Code 2.1.302 (`haiku`) | 7.869 s | 6.048 s | 12.828 s | Code, conversation memory, native MCP and PNG passed |
+| Cursor 2026.10.16-e3cb207 | 49.082 s | Not attempted | Not attempted | Provider usage limit blocked inference |
+
+Codex produced 12 browser MCP events and a 12,187-byte PNG; Claude produced six
+browser MCP events and an 11,693-byte PNG. Both observed the expected greeting and
+retained the exact conversation ID. The browser calls used the Rust guest MCP
+launcher after exact legacy-entry migration. Claude's final native-reported
+cumulative session cost estimate was $0.00554646. No billing settings changed.
+These are individual end-to-end run observations, including service admission and
+model latency, not inference benchmarks or service latency guarantees.
+
+Cursor reached the native provider service, which reported a team usage limit
+with a reset date of **2026-10-23**. The failed call was not retried. Installation,
+authentication transport and session-ID allocation do not establish successful
+inference; Cursor's tool use, exact resume and browser checks remain blocked.
+
+The first Claude browser probe successfully used MCP and saved a relative
+screenshot in the working directory. Its strict output-directory assertion
+correctly failed. The final probe supplied an exact absolute screenshot filename
+and independently verified that file. A separate follow-up was rejected by the
+host lock before any run record existed; no admitted prompt was replayed.
+
+After native work drained, the same disposable guest completed three samples of
+each lifecycle path:
+
+| Starting state | Full readiness samples (s) | Median (s) |
+| --- | --- | ---: |
+| Frozen RAM | 0.495, 0.505, 0.520 | 0.505 |
+| Clean stop | 6.288, 6.313, 6.245 | 6.288 |
+
+The timer covers the host-local Rust resume call plus helper, identity, network
+and DNS readiness. It excludes lock wait, preparation, the preceding stop/pause,
+HTTP, credential delivery and inference. Boot identity changed on all cold starts
+and remained unchanged for all freeze/resume samples. Host load averages stayed
+low (one-minute load 0.76 before and 0.90 after). These six smoke samples are
+consistent with the earlier [0.512-second Rust warm median](RUST-BOOT-BENCHMARKS.md),
+not a controlled Python comparison, saturation test or hibernation measurement.
+
+The final fixture exited successfully, released guest leases and removed its
+owned VM/project. All qualification access copies were removed after sanitized
+receipt export. Original controller credentials and existing user VMs were not
+modified. Local agents tests passed (22 native-contract cases and six service
+cases), as did strict agents Clippy; the real fixture remains explicitly ignored
+in ordinary test runs.
+
 ## Findings from the migration
 
 The legacy prepared native-dev revision 3 snapshot lacked the distro bubblewrap
@@ -56,6 +112,21 @@ does not use bypass-permissions or bare mode. The latter would skip native memor
 and subscription authentication. See the official
 [headless CLI guidance](https://code.claude.com/docs/en/headless) and
 [permission rules](https://code.claude.com/docs/en/permissions).
+
+Codex's noninteractive `never` approval policy rejected browser navigation even
+after the native MCP server connected. For a private home config containing the
+exact enabled Engine Box browser command and arguments, the launch supplies
+`mcp_servers.enginebox-browser.default_tools_approval_mode="approve"` only when
+that server default is absent. It retains `workspace-write` and leaves per-tool
+approval overrides, disabled tools and other MCP servers unchanged. Missing,
+custom, disabled or malformed entries receive no override. If an ancestor of the
+working directory contains a project `.codex/config.toml`, the launch defers to
+native configuration instead of overriding project policy; those projects need
+an explicit native browser approval default for unattended navigation.
+Codex 0.163.0 accepted this leaf override in a model-free
+`mcp get --json` probe and retained a configured `disabled_tools` list. That output
+omits approval-policy fields, so it cannot independently attest per-tool policy.
+See the official [MCP configuration reference](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 Legacy browser MCP entries may still point at the Python launcher. Binary sync
 does not migrate those configuration entries; they must be migrated through the
@@ -89,6 +160,11 @@ pnpm exec cargo test --release -p enginebox-agents \
 the actual Rust guest setup, then reboots only the disposable VM before auth is
 delivered. Browser qualification enables browser preparation as well. Each native
 turn is bounded to 180 seconds; there are no automatic inference retries.
+The fixture can wait up to 60 seconds for the specific host-lock admission guard,
+only while no worker is pending and the durable run-file set is unchanged.
+Provider failures, transport failures and admitted runs are never replayed.
+`ENGINEBOX_NATIVE_TEST_PROVIDERS=codex,claude` can select distinct providers for a
+focused follow-up, avoiding another request to an account already quota-blocked.
 The boot-samples option runs three clean-stop/start and three freeze/resume
 readiness samples after native work has drained. Timing includes the Rust
 lifecycle call and helper/identity/network/DNS readiness, and excludes lock wait,

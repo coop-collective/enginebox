@@ -133,8 +133,46 @@ fn copy_access(source: &Path, state_root: &Path, providers: &[&str]) -> Result<V
     }
     Ok(Value::Object(report))
 }
-fn wait_run(service: &AgentService, host: &Host, name: &str, request: Value) -> Result<Value> {
-    let queued = service.launch(&host.id, name, request)?;
+fn run_files(root: &Path) -> Result<std::collections::BTreeSet<std::ffi::OsString>> {
+    std::fs::read_dir(root.join("agent-runs"))?
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.path().extension().is_some_and(|ext| ext == "json") => {
+                Some(Ok(entry.file_name()))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error.into())),
+        })
+        .collect()
+}
+fn wait_run(
+    service: &AgentService,
+    root: &Path,
+    host: &Host,
+    name: &str,
+    request: Value,
+) -> Result<Value> {
+    let admitted_before = run_files(root)?;
+    let admission_deadline = Instant::now() + Duration::from_secs(60);
+    let queued = loop {
+        match service.launch(&host.id, name, request.clone()) {
+            Ok(queued) => break queued,
+            // This exact local guard runs before attach/save/spawn in launch.
+            // Never retry an admitted run, provider rejection or transport error.
+            Err(error)
+                if error.to_string()
+                    == "Cannot acquire host operation lock; another controller or installer may be active"
+                    && service.pending() == 0
+                    && Instant::now() < admission_deadline =>
+            {
+                ensure!(
+                    run_files(root)? == admitted_before,
+                    "Admission error left a run record; never replay the request"
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let id = queued["id"].as_str().context("Run ID missing")?;
     let until = Instant::now() + Duration::from_secs(210);
     loop {
@@ -545,7 +583,7 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
                 request["model"] = json!("haiku");
             }
             let started = Instant::now();
-            let first = wait_run(&service, &host, &name, request)?;
+            let first = wait_run(&service, &root, &host, &name, request)?;
             report["providers"][provider] =
                 json!({"first":summarized(&first,started.elapsed().as_secs_f64())});
             security::write_json(&root, "report.json", &report)?;
@@ -590,7 +628,7 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
                 request["model"] = json!("haiku");
             }
             let started = Instant::now();
-            let resumed = wait_run(&service, &host, &name, request)?;
+            let resumed = wait_run(&service, &root, &host, &name, request)?;
             let recalled = resumed["result"]["output"]
                 .as_str()
                 .is_some_and(|output| output.contains(&canary));
@@ -616,16 +654,19 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
             );
             if browser_qualification && resumed["status"] == "succeeded" {
                 let browser_name = format!("enginebox-{}", &canary[..8]);
-                let screenshot = format!("qualification-{provider}.png");
+                let screenshot = format!(
+                    "{}/.local/share/enginebox/browser/{provider}/output/qualification-{provider}.png",
+                    host.guest.home
+                );
                 let prompt = format!(
-                    "Use only the enginebox-browser MCP tools for this browser task, without shell, Python, file edits, or other browser libraries. Navigate to http://127.0.0.1:8765/index.html, enter {browser_name} in the Name field, click Greet, read the displayed greeting, then save a PNG screenshot named {screenshot} in the MCP output directory. Include the observed greeting in your final answer."
+                    "Use only the enginebox-browser MCP tools for this browser task, without shell, Python, file edits, or other browser libraries. Navigate to http://127.0.0.1:8765/index.html, enter {browser_name} in the Name field, click Greet, read the displayed greeting, then save a PNG screenshot with the exact absolute filename {screenshot} in the MCP output directory. Include the observed greeting in your final answer."
                 );
                 let mut request = json!({"provider":provider,"prompt":prompt,"workdir":workdir,"resume_id":session,"timeout_seconds":180});
                 if provider == "claude" {
                     request["model"] = json!("haiku");
                 }
                 let started = Instant::now();
-                let browser = wait_run(&service, &host, &name, request)?;
+                let browser = wait_run(&service, &root, &host, &name, request)?;
                 let mut proof = summarized(&browser, started.elapsed().as_secs_f64());
                 proof["mcp_tool_events"] = json!(browser_calls(&browser));
                 proof["greeting_observed"] = json!(
@@ -642,10 +683,7 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
                         &name,
                         &format!(
                             "import json,pathlib; p=pathlib.Path({:?}); b=p.read_bytes(); assert b.startswith(b'\\x89PNG\\r\\n\\x1a\\n') and len(b)>1000; print(json.dumps({{'valid_png':True,'bytes':len(b)}}))",
-                            format!(
-                                "{}/.local/share/enginebox/browser/{provider}/output/{screenshot}",
-                                host.guest.home
-                            )
+                            screenshot
                         ),
                     )?;
                 }
