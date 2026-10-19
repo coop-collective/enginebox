@@ -373,6 +373,16 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
                 None,
             )?;
             report["helper_install"] = serde_json::from_slice(&result)?;
+            bx.call(&[
+                "exec",
+                &name,
+                "--",
+                "enginebox-host",
+                "clean-base-check",
+                "--home",
+                &host.guest.home,
+            ])?;
+            report["credential_free_source_verified"] = json!(true);
             if std::env::var("ENGINEBOX_NATIVE_PREPARE_GUEST").as_deref() == Ok("1") {
                 let mut config = enginebox_core::bootstrap::defaults();
                 config["host"]["transport"] = json!("local");
@@ -424,15 +434,8 @@ fn real_native_launch_and_exact_resume() -> Result<()> {
                     "Wrong guest helper version"
                 );
             }
-            bx.call(&[
-                "exec",
-                &name,
-                "--",
-                "enginebox-host",
-                "clean-base-check",
-                "--home",
-                &host.guest.home,
-            ])?;
+            // Preparation may migrate a legacy MCP entry and retain a private
+            // config backup. This assigned fixture is never published as a base.
             fleet::wait_ready(&bx, &name)?;
             guest::assert_remote_idle(&host, &name)?;
             report["instance_uuid"] = bx.instance(&name)?["config"]["volatile.uuid"].clone();
