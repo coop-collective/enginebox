@@ -88,6 +88,8 @@ sudo /opt/enginebox-node/releases/0.3.0/bin/enginebox-install --prefix /opt/engi
 
 This creates only an installer-owned `/usr/local/bin/enginebox-host` symlink after checking root ownership and non-writable ancestors. It refuses unrelated executables and links owned by another prefix. It does not grant sudo permissions, add users to Incus administrator groups, or modify an existing SSH policy.
 
+A controller using a local node executes this helper through noninteractive `sudo`. Its generated Linux user service therefore does not set `NoNewPrivileges`, which would prevent that administrator-approved elevation. The controller itself still runs as the unprivileged service user. Configure the intended sudo policy separately; a remote node instead applies its own SSH and privilege policy.
+
 Use `enginebox-host bootstrap init`, `doctor`, `plan` and `apply` to inspect and provision owned Incus resources from the host configuration. The Linux host's release supplies its Linux guest binaries; a Mac or Windows controller's executables are never uploaded into a Linux guest. Fleet credentials, host inventories, customer repositories and private checkpoints are not included in release archives.
 
 ## Build an archive from source
