@@ -1,36 +1,55 @@
 # Implementation plan
 
-October 18, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; optional CI optimization; reusable open-source foundation. This plan distinguishes the extracted runtime from the complete bootstrap still to build.
+Updated October 19, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
 
 ## Milestones
 
 | ID | Deliverable | Depends on | Acceptance |
 |---|---|---|---|
-| P0 | Clean OSS repository and reusable runtime | None | No owner host defaults or private artifacts; explicit license; offline config/command/lifecycle tests; honest capability documentation. |
+| P0 | Clean source-available repository and reusable runtime | None | No owner host defaults or private artifacts; Sustainable Use License and historical Apache notices; offline config/command/lifecycle tests; honest capability documentation. |
 | P1 | Versioned config, inventory and `doctor` | P0 | Validate host/guest parameters and capabilities without mutation; actionable results for missing KVM, incompatible versions, low disk and conflicting networks/resources. |
 | P2 | Deterministic `plan` and resumable `apply` | P1 | Fresh supported host gets one workspace; second apply is unchanged; failure injection resumes; unrelated Incus/Docker/NFS resources remain intact. |
 | P3 | Native-client preparation and clean base | P2 | Official Codex/Cursor/Claude clients launch directly; version/update policy recorded; no auth in reusable base; supported MCP config merges without overwriting user entries. |
 | P4 | Storage, desktop and lifecycle acceptance | P2, P3 | Disposable tests prove RAM continuity, disk isolation, identity uniqueness, eligible cache reuse, authenticated desktop, host reboot behavior and backup restore. |
 | P5 | Optional GitHub Actions module | P2, P4 | Separate job state, explicit runner registration, compatible persistent caches, graceful drain and measured build/test feedback; core works with module disabled. |
 | P6 | Self-hosting release | P1–P4 | Another person bootstraps a second supported machine from documentation alone; upgrade/rollback tested; supported versions and remaining limits published. CI can remain optional/experimental. |
+| P7 | Native session API and private state | P3 | MCP launches all three native harnesses; exact conversation resume; bounded execution/output; state persists in the private workspace; overlapping writers and conflicting lifecycle actions rejected. Protocol fixtures and live provider inference are reported separately. |
+| P8 | Optional personal-resource node | P1, P7 | Explicit opt-in enrollment; enforce chosen aggregate CPU/RAM budget locally and at admission; one disposable Docker workspace validated on Mac and Windows separately; disconnect/sleep/reconnect cannot duplicate a run; no daemon socket in agent containers. |
+| P9 | Movable tenant state and native engine hosts | P7, P8 | Authenticated tenant authorization, account separation and private volume attach/lease tests before public multi-tenancy; independent Windows/macOS worker and GPU/image qualification. |
 
-P0 is the initial repository milestone. No later milestone is complete merely because similar behavior worked on the original private host. Login/inference acceptance is recorded separately from installation and environment tests.
+Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and upgrade/rollback remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
-## First implementation slice: configuration and inspection
+The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. It does not add agent orchestration or automatic placement.
 
-Proposed code boundaries (names may change during implementation):
+## Implemented code boundaries
 
-- `runtime/config.py`: schema, defaults, explicit config loading and environment overrides.
-- `runtime/transport.py`: local/SSH argv execution, structured results, timeout and cancellation contract.
-- `runtime/backends/incus.py`: inventory and existing lifecycle operations.
-- `runtime/doctor.py`: read-only host/guest capability checks and diagnostics.
-- `runtime/planner.py`: desired-state diff, operation ordering, ownership/conflict checks.
-- `examples/`: minimal existing-Incus and fresh-dedicated-server configurations.
-- `tests/`: offline regression tests; disposable integration harness added separately.
+- `runtime/bootstrap_config.py`: strict schema, defaults and guest/resource validation.
+- `runtime/bootstrap.py`: read-only inventory, deterministic planning, host lock/journal and resumable provisioning.
+- `runtime/enginebox.py`: validated local/SSH Incus lifecycle and guest operations.
+- `runtime/guest_setup.sh` and `browser_tools.py`: official client/browser preparation and private browser profiles.
+- `runtime/fleet.py`, `fleet_api.py`, `fleet_mcp.py`: multi-host inventory, capacity, jobs, authenticated REST and operator MCP.
+- `runtime/templates.py`: strict portable manifests, public HTTPS import, per-host revision receipts and bootstrap installation adapter.
+- `runtime/warm_pool.py`: prebooted reserves, durable one-way claims, refill admission and quarantine.
+- `runtime/agent_access.py`, `agent_sync.py`, `accounts.py`, `guest_auth.py`: controller-owned native connections, private refresh ownership, access-only workspace delivery and supervised browser authorization.
+- `runtime/agent_runs.py`, `guest_agent_run.py`: bounded private native runs and exact native session resume through operator MCP/API.
+- `runtime/agent_usage.py`: read-only provider allowance observations; unsupported usage and billing dates remain explicit.
+- `runtime/host_capabilities.py`: read-only local platform, resource, Docker and GPU inventory; discovery is not node enrollment or GPU execution.
+- `scripts/build-tested-package.py`: test-gated wheel/source artifact build and isolated package smoke checks; no automatic publication or service installation.
+- `dashboard/`: Vinext owner dashboard and authenticated server-side proxy.
+- `examples/`: existing-Incus, fresh-host and fleet configuration.
+- `tests/`: offline regression coverage and opt-in browser integration.
 
 Do not implement a generic plugin framework before a second backend exists. Keep config parsing and planning independent of live mutation so they can be tested without administrator access.
 
 P1 is done when an explicit example config can inspect a fresh supported host and the owner's existing server, produce useful diagnostics, and leave both unchanged. Test custom project names, UID/GID, paths and subnets, plus malformed config and absent/unreachable hosts. For stateful VMs, inspect memory-state capacity against RAM plus overhead, available disk reserve and device compatibility; reject a hibernation configuration the host cannot support.
+
+## Template and warm workspace slice
+
+Implemented: Minimum/Recommended/Custom resource selection, API-enforced floors, serialized JSON recipes independent of host bootstrap, controller-owned desired state, automatic synchronization to all registered nodes and per-node revision status, and warm allocation with cold fallback. Template imports do not run arbitrary scripts; the initial recipe supports official native clients and optional browser/desktop on Ubuntu 24.04.
+
+A registered revision is offered only on hosts whose installation receipt matches that revision and their current host/project/pool/guest binding. Installation consumes normal host admission under the shared lock. Existing workspaces retain their original image and files.
+
+Warm reserves are booted and paused fresh clones with independent identities. Assignment commits a permanent claim before resume; signed-in workspaces are never recycled. Refill releases the mutation lock during guest readiness, respects reserves and quarantines interrupted/stale artifacts. Frozen RAM occupies real capacity; deletion and stale-generation cleanup remain explicit operator operations. Automatic placement, arbitrary template plugins and cross-host image replication remain separate work.
 
 ## Safe bootstrap slice
 
@@ -47,6 +66,8 @@ Create provider-specific installation recipes and a resolved manifest, not a har
 Add desktop MCP only when selected. Merge an Engine Box entry through each client's supported configuration interface; repeated setup must neither duplicate it nor erase unrelated servers. Create the reusable base before any provider or Git login.
 
 For each client, the operator then validates native sign-in, one bounded prompt, reconnect/session resume and account state after a VM restart. Document quota/expiry behavior from supported diagnostics or real observations; do not consume an allowance merely to force exhaustion. Account tokens and raw auth logs stay out of Git and public CI.
+
+The dashboard **Agents** panel connects the owner once at the controller. Assigned private workspaces receive native access credentials after create, allocation and resume, with periodic reconciliation for existing workspaces and refreshed tokens. Clean bases and unassigned warm reserves remain credential-free. Provider-specific compatibility and expiry limitations are documented in [native clients](NATIVE-CLIENTS.md); this does not add a prompt router or account pooling across unrelated owners.
 
 ## Disposable environment validation
 
@@ -85,4 +106,10 @@ A clean external-host installation is a separate release gate. Success on the ow
 
 ## Deferred work
 
-Managed tenancy/billing, fleet placement, swarm orchestration, GPU memory restoration, Windows/ARM support, provider credential brokering, a new CI scheduler and premium engine recipes are outside the initial bootstrap. Unreal/Unity and Cloudflare preparations can use the resulting interfaces later.
+Personal computers are an explicit next delivery track, not an implicit consequence of a portable Python wheel. Keep Incus as the tested Linux VM backend. Add a small Docker execution adapter for Linux workloads on laptops after its disposable proof, then a local resource service with authenticated enrollment and enforced owner-selected CPU/RAM limits. Node contribution is opt-in; it must not take over all of a personal machine. Existing physical reserves and other workloads still reduce admissible capacity.
+
+CPU/RAM limits are the first resource contract. GPU contribution is a separate opt-in capability with real driver/workload tests and exclusive device leases by default. Windows/macOS operating-system images and native Unity/Unreal execution require distinct backend, platform and license qualification. Native OS workers do not inherit Incus RAM-restore guarantees. See [portable hosts](PORTABLE-HOSTS.md).
+
+Public multi-tenancy requires real tenant authorization and private account/state storage. The current single-owner controller and per-workspace native homes do not establish that guarantee. Shared writable `.claude`, `.codex` or Cursor state across unrelated users is prohibited. Moving a tenant's state between workspaces needs stable paths, exclusive writer leases and recovery tests; see [native state](TENANT-AGENT-STATE.md).
+
+Automatic placement, swarm orchestration, GPU memory restoration, a new CI scheduler and premium engine recipes remain separate work. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.

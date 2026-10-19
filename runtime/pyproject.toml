@@ -1,8 +1,9 @@
 [project]
 name = "enginebox-runtime"
-version = "0.1.0"
+version = "0.2.0"
 description = "Environment lifecycle and computer tools; native agent clients stay native"
-license = "Apache-2.0"
+license = "LicenseRef-Sustainable-Use-1.0"
+license-files = ["LICENSE", "LICENSE-APACHE-2.0", "NOTICE"]
 requires-python = ">=3.11"
 dependencies = ["mcp==2.3.0"]
 
@@ -13,10 +14,16 @@ Issues = "https://github.com/coop-collective/enginebox/issues"
 [project.scripts]
 ebox = "enginebox:main"
 enginebox-mcp = "mcp_server:main"
+enginebox-api = "fleet_api:main"
+enginebox-fleet-mcp = "fleet_mcp:main"
+enginebox-host = "host_capabilities:main"
 
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["enginebox", "mcp_server"]
+py-modules = ["enginebox", "mcp_server", "fleet", "fleet_api", "fleet_mcp", "bootstrap", "bootstrap_config", "browser_tools", "cursor_sandbox", "templates", "warm_pool", "accounts", "guest_auth", "template_sync", "agent_access", "agent_sync", "agent_usage", "host_capabilities", "agent_runs", "guest_agent_run"]
+
+[tool.setuptools.data-files]
+"share/enginebox" = ["guest_setup.sh", "requirements.lock"]

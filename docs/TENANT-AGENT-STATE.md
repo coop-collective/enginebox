@@ -1,0 +1,182 @@
+# Native agent state and private sessions
+
+Engine Box currently has **one controller owner**, authenticated by its dashboard
+session/operator API token. It is not a public multi-tenant service. Every assigned
+workspace belongs to that owner; the API cannot choose a different tenant or mount
+an arbitrary home. Separate VMs provide the present isolation boundary. A second
+person must not receive the operator token as a substitute for tenant authorization.
+
+## Implemented: native runs and workspace persistence
+
+The operator fleet MCP exposes `agent_launch` and `agent_run` for Codex, Claude
+Code and Cursor Agent. They start the installed official CLI with its existing
+private guest HOME and a directory inside the configured workspace. They do not
+replace its agent loop or proxy model requests. Controller access delegation runs
+before admission; refresh credentials stay on the controller.
+
+```json
+{
+  "host_id": "primary",
+  "name": "ebox-example",
+  "provider": "claude",
+  "prompt": "Read this project's instructions and summarize its structure.",
+  "workdir": ".",
+  "timeout_seconds": 120
+}
+```
+
+Call `agent_launch` with that object; poll `agent_run` using its `run.id` and the
+same host/workspace. Start another run with `resume_id` set to the returned
+`native_session_id` to continue that exact conversation. IDs must be native UUIDs;
+conversation names and filesystem paths are rejected. There is no implicit
+"latest conversation" lookup, which could resume another parallel task.
+
+Equivalent authenticated API endpoints are:
+
+- `POST /v1/hosts/{host}/instances/{workspace}/agent-runs`
+- `GET /v1/hosts/{host}/instances/{workspace}/agent-runs/{run_id}`
+
+Launches reject reusable bases, unassigned/quarantined reserves, stopped VMs,
+unknown hosts, and workspaces outside the registered storage pool. Relative
+`workdir` values must stay inside the workspace after symlink resolution.
+The request cannot replace HOME, environment variables, executable, permissions
+flags, or tenant identity. A model name is optional; plan/model eligibility and
+charges remain provider decisions.
+
+A bounded `--version` preflight verifies the expected native product before a
+prompt is sent. This matters because unrelated products also install a binary
+named `agent`. Claude runs with unattended permission prompts disabled; Codex and
+Cursor retain their workspace sandbox. Missing approvals fail through the native
+client rather than enabling a global permission bypass.
+
+The controller admits at most 16 queued/running jobs and executes at most four
+simultaneously. Each workspace/provider permits one writer at a time, covering
+new conversations as well as explicit resumes. A guest file lock independently
+protects native state if another controller process or a restarted controller
+tries to launch into that same home. This lease covers Engine Box launches;
+direct terminal processes do not participate automatically.
+
+The normal supervised run has a 300-second maximum and returns at most 256 KiB of
+combined native output. Timeout or excessive output terminates its process group and reports a
+failed run. Lifecycle actions wait for an admitted run to finish. Conversation
+history remains under the native home; it can be resumed in another bounded run.
+This API does not yet offer interactive approvals, streaming, cancellation or
+indefinite sessions. Direct native terminals remain available for those workflows.
+
+Private controller records use mode 0600 in a mode 0700 directory, keep at most
+100 completed outputs, and never enter fleet inventory or lifecycle-job output.
+They may contain generated code, prompts echoed by a provider, or other private
+conversation text. Treat them like native chat history. A controller restart
+marks incomplete runs failed and uncertain. A read-only guest lease probe must
+confirm the old process is gone before another launch or lifecycle change is
+allowed. A failed transport has the same recovery rule. An unreachable/frozen
+guest fails closed and may require an explicit operator inspection outside this
+API. The guest timeout remains independent of the controller process. The native
+child inherits the writer lease: if the guest supervisor itself is force-killed,
+that surviving child continues to hold it. The supervisor's timeout no longer
+exists in that failure mode, so manual process inspection/cleanup may be needed.
+This is deliberately fail-closed recovery, not a guarantee of automatic cleanup
+after SIGKILL. A hostile native program can also deliberately close inherited
+descriptors; this local lease is not a security boundary against a hostile guest.
+
+## What state survives
+
+Preserving the whole private home avoids an incomplete allowlist of changing
+provider files. Engine Box does not reset that home between native runs. The
+workspace disk also retains repository instructions, project skills, scratchnotes,
+build outputs and other files the agent creates.
+
+| Native client | State to retain | Current resume command |
+| --- | --- | --- |
+| Codex | `~/.codex`, user skills in `~/.agents`, project instructions/configuration | `codex exec resume SESSION_ID` |
+| Claude Code | `~/.claude`, `~/.claude.json` when present, project `.claude` and `CLAUDE.md` | `claude -p --resume SESSION_ID` |
+| Cursor Agent | `~/.cursor`, `~/.config/cursor`, project `.cursor` and instructions | `agent -p --resume SESSION_ID` |
+
+Codex stores its user state under `CODEX_HOME` (normally `~/.codex`). Configuration,
+history and file-backed auth belong there; an OS keychain may separately hold
+credentials. The launcher preserves the native default home and strips inherited
+operator `CODEX_HOME`/API-key overrides. See
+[Codex configuration and state](https://learn.chatgpt.com/docs/config-file/config-advanced),
+[Codex noninteractive resume](https://learn.chatgpt.com/docs/non-interactive-mode).
+
+Claude's auto memory is normally under
+`~/.claude/projects/<project>/memory/`. Its project identity can depend on the
+repository/path; moving checkouts must preserve that identity or explicitly
+migrate it. Memory files and conversation transcripts have different retention
+behavior. Mounting a memory file alone does not preserve sessions, settings,
+skills and other native state. See
+[Claude memory](https://code.claude.com/docs/en/memory) and
+[Claude CLI](https://code.claude.com/docs/en/cli-reference).
+
+Cursor documents exact chat-ID resume, global CLI configuration, and project MCP
+configuration. Its complete on-disk chat store is not treated as a stable public
+format here: preserve the private home instead of parsing or merging that store.
+See [Cursor parameters](https://cursor.com/docs/cli/reference/parameters) and
+[Cursor configuration](https://cursor.com/docs/cli/reference/configuration).
+
+Native conversation resume reloads saved context. VM hibernation retains the
+process's RAM as well. Neither means sharing model inference/KV caches across
+tenants. Provider-side prompt caching is independent of these filesystem mounts.
+
+## Next: movable tenant state volumes — design, not implemented
+
+The desired unit is an opaque, authorization-bound tenant state volume, not a
+host-global `.claude`/`.codex` mount. The storage/control-plane relationship is:
+
+| Data | Scope and mounting rule |
+| --- | --- |
+| OAuth refresh credentials | Controller vault, keyed by authenticated tenant/provider; never in templates or general guest mounts |
+| Native homes, personal skills, settings, chat stores | Private tenant state volume; mount only into authorized tenant VMs, at stable guest paths |
+| Project memory, scratchnotes, repository-local configuration | Tenant + project, stable project directory; no shared writable cross-tenant state |
+| Public package artifacts and credential-free templates | Shareable immutable/read-only cache; private package artifacts require tenant-scoped caches |
+| Private checkpoints, browser cookies and RAM | Same tenant authorization and encryption policy as the original workspace; never promoted to a public base |
+
+Build this in the following order:
+
+1. Add actual user identities, tenant/workspace membership and scoped capabilities.
+   Resolve the tenant from authenticated server-side ownership, never an arbitrary
+   `tenant_id` supplied by a prompt or MCP call. Associate workspace UUIDs and
+   state-volume IDs with that ownership before exposing shared controllers.
+2. Attach a tenant-owned persistent volume to a dedicated VM, retaining a stable
+   home and project path. A mount must not expose the parent directory containing
+   other tenants' volumes. Revocation must prevent new mounts and credential
+   delegation, including after node registration or restart.
+3. Implement a fenced storage lease before moving that home between nodes. Start
+   with **one active mount writer per native home/provider**. A naive writable
+   network mount of a provider's databases into many VMs is not a qualified
+   concurrency strategy. The current local guest lock is insufficient for
+   distributed storage, split brain or a partitioned node.
+4. Give parallel agents separate conversation/session stores and private writable
+   overlays. Distribute immutable skill/config bundles; synchronize selected
+   project memory through an explicit merge/version policy. Do not merge SQLite
+   files, token caches or entire native homes with last-write-wins copying.
+5. Add tenant-scoped export/import, backup, retention and deletion. Test that
+   another tenant cannot list, mount, restore, resume, read logs from or receive
+   credentials for the first tenant's data, including hostile symlinks and stale
+   workspace names.
+
+The current code does **not** synchronize an owner's memory between different
+workspaces or attach portable tenant volumes. Reusing two native sessions in one
+workspace is implemented; cross-workspace continuity is the next storage feature.
+
+## Verification
+
+`tests/test_agent_runs.py` launches real subprocesses using disposable executable
+fixtures named `codex`, `claude` and `agent`; it never reads personal credentials
+or invokes provider inference. A real stdio MCP client initializes the fleet MCP,
+lists tools, calls all three launch paths through a loopback authenticated HTTP
+API, polls their runs and resumes each exact fixture conversation.
+
+The checks cover private-home memory/scratch reuse, empty state in a separate
+home, credential/environment stripping, same-provider writer rejection, scoped
+run lookup, lifecycle admission, reserve/base rejection, path/symlink escape,
+timeout/descendant termination, retained native lease after supervisor SIGKILL,
+bounded guest and controller output, restart
+lease recovery, unrelated-client rejection and private record validation. These prove
+the Engine Box transport/process/state plumbing, not model behavior or subscription
+eligibility. The new MCP path also passed live Codex/Claude inference and exact
+conversation resume in a disposable private VM, including conversation-only
+context recall and independently checked file writes. Cursor reached its
+provider with the native sandbox enabled after the scoped Ubuntu helper repair,
+but its team quota blocked inference and resume. Exact versions and outcomes
+are recorded separately in [VALIDATION.md](VALIDATION.md).

@@ -8,31 +8,48 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 
 ## Status
 
-**Early development: a reusable runtime and implementation design, not yet a general-purpose server installer.**
+**Early development: working server bootstrap, capacity-aware fleet API, Vinext dashboard and headless browser MCP.**
 
 | Available in this repository | Planned |
 |---|---|
-| Incus environment controls over SSH or locally | Configurable, repeatable server bootstrap with `doctor`, `plan` and `apply` |
-| Pause, hibernate, disk/memory snapshots, forks and restore | Versioned preparation recipes for the three native clients |
-| Operator MCP tools and restricted guest desktop tools | Safe desktop provisioning, cache/mount setup and backup workflows |
-| Offline runtime tests | Optional GitHub Actions runner/cache module |
+| Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Independently qualified fresh-host installs and upgrade/rollback |
+| Controller-synchronized templates, resource presets and prebooted fresh workspace pools | Additional image/recipe formats |
+| Official client preparation and reusable clean VM snapshots | Shared mount/cache services and off-host backup workflows |
+| Fleet REST API, operator MCP and authenticated Vinext dashboard | Automatic placement, public tenant authorization and billing |
+| Native CLI launch/resume through operator MCP; persistent private workspace state | Movable tenant state volumes and authenticated multi-tenant service |
+| Account usage cards with native Codex allowance reads and provider links | Claude/Cursor allowance ingestion and subscription renewal dates |
+| Portable hardware preflight and test-gated runtime package builds | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
+| Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
+| Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 
-The original private-host prototype installed all three clients and passed 28 environment, mounted-Git and desktop checks. Those results apply to that prototype; this extraction needs its own disposable-VM validation. Native subscription login/inference, portable bootstrap and public tenancy have not been validated here.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Real Codex/Claude prompts, tools and exact conversation resume have been tested; Cursor inference is currently blocked by the test account’s provider quota. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
-## Try the runtime
+[Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 
-Prerequisites: Python 3.11+, `uv`, OpenSSH, and a prepared Linux Incus VM with the guest conventions below. This checkout does not install Incus or create a VM yet.
+## Bootstrap a server
+
+Prerequisites: Python 3.11+, `uv`, OpenSSH and a Linux x86_64 server with usable KVM and administrative access. Start with the [bootstrap guide](docs/BOOTSTRAP.md). Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
 
 ```sh
 git clone https://github.com/coop-collective/enginebox.git
 cd enginebox
 uv sync --project runtime --locked
-export ENGINEBOX_HOST=my-server # your SSH config alias, or local
-runtime/.venv/bin/ebox list
-runtime/.venv/bin/ebox shell ebox-dev
+runtime/.venv/bin/ebox init --output enginebox.toml
+# Edit enginebox.toml for your host, storage and networking.
+runtime/.venv/bin/ebox doctor --config enginebox.toml
+runtime/.venv/bin/ebox plan --config enginebox.toml
+runtime/.venv/bin/ebox apply --config enginebox.toml
 ```
 
 Inside a prepared guest, launch `codex`, `agent` or `claude` directly. Provider subscriptions and limits remain with the provider; Engine Box does not pool credentials or resell inference.
+
+## Manage workspaces
+
+The [fleet service](docs/FLEET.md) clones configured clean snapshots, checks CPU/RAM/storage reserves and serializes mutations per host. Installed tools and dependencies are inherited through storage-level copies; repeated forks do not rerun the installers. Frozen VMs retain their RAM allocation. Stopped and hibernated VMs release compute but keep disk commitments.
+
+The [Vinext dashboard](docs/DASHBOARD.md) provides inventory, creation, lifecycle controls and template installation. [Portable template manifests](docs/TEMPLATES.md) define Minimum/Recommended resources and install independently on each host. Optional [warm pools](docs/WARM-POOLS.md) preboot fresh workspaces so allocation can resume a ready VM instead of waiting for a cold boot. Its server holds the API token; the browser authenticates with a separate owner password. The [operator MCP](docs/FLEET.md) exposes the same fleet operations to local tools. Both use the same backend and admission checks.
+
+[Browser MCP](docs/BROWSER.md) gives each native CLI its own persistent headless Chromium profile. Agents can navigate, inspect pages, type, click and take screenshots. It controls the workspace browser; personal laptop browser sessions are not imported.
 
 The runtime targets an Incus project named `enginebox` by default, with `ebox-` prefixed VMs and an `agent` user (UID/GID 1001), `/home/agent`, `/workspace` and optional display `:99`. See [runtime configuration](docs/RUNTIME.md) for overrides and capability boundaries. The operator needs administrative Incus access through noninteractive `sudo`; this is a trusted-owner tool.
 
@@ -41,13 +58,25 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)
+- [Persistent private agent state and native session launching](docs/TENANT-AGENT-STATE.md)
+- [Portable host capabilities and platform qualification](docs/PORTABLE-HOSTS.md)
+- [Provider allowance and billing visibility](docs/AGENT-USAGE.md)
+- [License and commercial boundary](docs/LICENSING.md)
+- [Server bootstrap](docs/BOOTSTRAP.md)
+- [Fleet API and MCP](docs/FLEET.md)
+- [Template catalog and resource requirements](docs/TEMPLATES.md)
+- [Warm workspace pools](docs/WARM-POOLS.md)
+- [Vinext dashboard](docs/DASHBOARD.md)
+- [Headless browser control](docs/BROWSER.md)
 - [Runtime operations and configuration](docs/RUNTIME.md)
 - [Contributing](CONTRIBUTING.md)
 
 The first host target is Linux x86_64 with KVM; the reference prototype used Ubuntu 26.04, Incus 6.0.5 and an Ubuntu 24.04 guest. Other supported combinations will be added after testing. A dedicated server or a VM exposing hardware virtualization can be a candidate; macOS can operate the server over SSH.
 
-## Open-source and commercial boundary
+Personal computers are an optional resource-contribution track. Owners choose how much CPU and memory to contribute. The current Linux fleet enforces configured contribution ceilings in admission in addition to physical reserves and per-VM limits. macOS/Windows Docker and native workers are not yet enrollment targets; `enginebox-host` reports hardware and planning budgets without installing a worker or allocating resources. See the [platform matrix and installation gates](docs/PORTABLE-HOSTS.md).
 
-This repository contains the open-source environment foundation. Reusable optional modules, including CI integration, will live here as they are implemented. Self-hosting remains useful on its own. Managed hosting and proprietary, maintained workspace recipes can be separate offerings. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
+## Source-available and commercial boundary
 
-Licensed under [Apache-2.0](LICENSE).
+This repository contains the source-available environment foundation. Personal and internal company self-hosting are permitted under the community license. Commercial hosting, selling access and commercial redistribution require a separate agreement. Reusable optional modules, including CI integration, will live here as they are implemented. Managed hosting and proprietary workspace recipes can be separate offerings. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
+
+New versions use the [Sustainable Use License 1.0](LICENSE), originally published by n8n. This is not OSI open source. Previously published Apache-2.0 code retains its existing rights; see the [licensing boundary](docs/LICENSING.md).

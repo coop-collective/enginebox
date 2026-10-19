@@ -1,0 +1,38 @@
+schema_version = 1
+
+[[hosts]]
+id = "primary"
+label = "My server"
+target = "my-server" # SSH alias or local
+project = "enginebox"
+pool = "enginebox"
+reserve_cpu = 2
+reserve_memory_gib = 4
+reserve_disk_gib = 10
+disk_gib = 30
+max_instances = 16
+
+# Optional aggregate Engine Box CPU/RAM ceilings for a personal machine. Supply both.
+# Active/frozen managed workspaces, warm reserves and owned template preparation
+# instances count across projects. Unrelated workloads still consume host capacity.
+# Host reserves, actual available RAM, disk admission and max_instances still
+# apply. Lowering the caps blocks new work; existing instances are not stopped.
+# contribution_cpu = 8
+# contribution_memory_gib = 16
+
+[[hosts.templates]]
+id = "native-agents"
+label = "Codex, Cursor and Claude with browser"
+source = "ebox-base"
+snapshot = "prepared-REPLACE" # Use the exact snapshot returned by ebox apply.
+
+# Optional template-specific resources for an existing prepared base:
+# minimum = { cpu = 2, memory_gib = 2, disk_gib = 30 }
+# recommended = { cpu = 4, memory_gib = 4, disk_gib = 30 }
+
+# Optional prebooted fresh workspaces. Frozen reserves retain their RAM/CPU
+# allocation and full disk commitment. They are disabled unless configured.
+# [[hosts.warm_pools]]
+# template = "native-agents"
+# size = "recommended"
+# ready = 2
