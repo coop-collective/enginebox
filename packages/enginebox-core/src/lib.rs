@@ -5,6 +5,8 @@ pub mod capacity;
 pub mod fleet;
 pub mod guest;
 pub mod model;
+pub mod node_protocol;
+pub mod preparation;
 pub mod state;
 pub mod templates;
 pub mod transport;

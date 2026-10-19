@@ -18,6 +18,33 @@ fn node_local_storage_cannot_ignore_a_remote_host_selection() {
 }
 
 #[test]
+fn node_protocol_does_not_claim_a_remote_nodes_capabilities() {
+    let binary = env!("CARGO_BIN_EXE_ebox");
+    for selection in [
+        vec!["--host", "unused.invalid"],
+        vec!["--fleet-host", "registered"],
+    ] {
+        let result = Command::new(binary)
+            .env_clear()
+            .args(selection)
+            .arg("node-protocol")
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("reports are local"));
+    }
+    let result = Command::new(binary)
+        .env_clear()
+        .args(["--host", "local", "node-protocol"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["layerfs"]["automatic_attachment"], false);
+}
+
+#[test]
 fn lifecycle_commands_cannot_silently_bypass_the_controller() {
     for action in ["pause", "resume", "hibernate", "stop"] {
         let result = Command::new(env!("CARGO_BIN_EXE_ebox"))

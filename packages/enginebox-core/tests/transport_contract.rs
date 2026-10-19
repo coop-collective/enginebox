@@ -54,6 +54,16 @@ fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
     }
     if kind == "enginebox-host" {
         match args.first().map(String::as_str) {
+            Some("protocol") => {
+                log(args)?;
+                let mut report = enginebox_core::node_protocol::report();
+                report["os"] = json!("linux");
+                if std::env::var("EBOX_TEST_SCENARIO").as_deref() == Ok("prepare-incompatible") {
+                    report["capabilities"] = json!({});
+                }
+                println!("{report}");
+                return Ok(());
+            }
             Some("bootstrap") => {
                 let mut input = String::new();
                 std::io::stdin().read_to_string(&mut input)?;
@@ -155,6 +165,20 @@ fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
                     .split('?')
                     .next()
                     .unwrap();
+                if name == "ebox-base" {
+                    let mut source = data["snapshot"].clone();
+                    source["name"] = json!(name);
+                    source["status"] = json!("Stopped");
+                    if std::env::var("EBOX_TEST_SCENARIO").as_deref()
+                        == Ok("prepare-inherited-claim")
+                    {
+                        source["description"] = json!(
+                            "enginebox-pool:v1:{\"state\":\"claimed\",\"workspace_name\":\"ebox-private\"}"
+                        );
+                    }
+                    println!("{source}");
+                    return Ok(());
+                }
                 let vm = data["facts"]["instances"]
                     .as_array()
                     .unwrap()
@@ -269,10 +293,12 @@ fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
             vm["warm_pool_state"] = Value::Null;
             vm["pool_claim"] = Value::Null;
             vm["workspace_name"] = Value::Null;
+            vm["config"] = json!({"volatile.uuid":uuid::Uuid::new_v4().to_string()});
             for pair in args.windows(2) {
                 if pair[0] == "-c"
                     && let Some((k, v)) = pair[1].split_once('=')
                 {
+                    vm["config"][k] = json!(v);
                     match k {
                         "user.enginebox.pool.state" => vm["warm_pool_state"] = json!(v),
                         "user.enginebox.pool.generation" => vm["pool_generation"] = json!(v),
@@ -282,8 +308,14 @@ fn fixture_program(kind: &str, args: &[String]) -> Result<()> {
                     }
                 }
             }
+            if std::env::var("EBOX_TEST_SCENARIO").as_deref() == Ok("prepare-foreign-copy") {
+                vm["config"]["user.enginebox.allocation.id"] = json!("foreign");
+            }
             data["facts"]["instances"].as_array_mut().unwrap().push(vm);
             save(&data)?;
+            if std::env::var("EBOX_TEST_SCENARIO").as_deref() == Ok("prepare-copy-failure") {
+                bail!("Injected lost response after copy completed");
+            }
         }
         _ => bail!("Unexpected Incus command: {}", args[0]),
     };
@@ -325,6 +357,136 @@ fn scenario() -> Result<()> {
     let name = std::env::var("EBOX_TEST_SCENARIO")?;
     let f = Fleet::from_hosts(vec![host()], &root.join("controller"))?;
     match name.as_str() {
+        "prepare-foreign-copy" => {
+            ensure!(
+                enginebox_core::preparation::prepare(
+                    &f,
+                    "primary",
+                    "game",
+                    &json!({"name":"ebox-layerfs","template":"native"})
+                )
+                .unwrap_err()
+                .chain()
+                .any(|error| error.to_string().contains("custody changed")),
+                "Foreign clone accepted"
+            );
+            let events = std::fs::read_to_string(root.join("events.jsonl"))?;
+            ensure!(
+                !events.contains("[\"config\"")
+                    && !events.contains("[\"start\"")
+                    && !events.contains("[\"delete\""),
+                "Foreign clone was mutated"
+            );
+        }
+        "prepare-success"
+        | "prepare-copy-failure"
+        | "prepare-incompatible"
+        | "prepare-inherited-claim"
+        | "prepare-interrupted" => {
+            use enginebox_core::{preparation, state};
+            let params = json!({"name":"ebox-layerfs","template":"native"});
+            let receipt_path = root.join("controller/allocations").join(format!(
+                "{}.json",
+                state::digest(&json!(["primary", "ebox-layerfs"]))
+            ));
+            if name == "prepare-interrupted" {
+                state::write_json(&receipt_path, &json!({"status":"preparing"}))?;
+            }
+            let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = starts.clone();
+            f.set_post_start(std::sync::Arc::new(move |_, _| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({}))
+            }));
+            let result = preparation::prepare(&f, "primary", "game", &params);
+            if name == "prepare-success" {
+                let value = result?;
+                ensure!(
+                    value["workspace"]["status"] == "Stopped"
+                        && value["allocation"]["status"] == "prepared",
+                    "Prepared allocation became ready"
+                );
+                ensure!(
+                    preparation::inspect(&f, "primary", "ebox-layerfs")?["result"]["instance_uuid"]
+                        .is_string(),
+                    "Missing durable VM identity"
+                );
+            } else {
+                ensure!(result.is_err(), "Preparation failure accepted");
+            }
+            if name == "prepare-success" || name == "prepare-copy-failure" {
+                let data = load()?;
+                ensure!(
+                    data["facts"]["instances"].as_array().unwrap().len() == 2,
+                    "Warm reserve was reused or orphan removed"
+                );
+                let prepared = &data["facts"]["instances"][1];
+                ensure!(
+                    prepared["status"] == "Stopped" && prepared["warm_pool_state"] == "preparing",
+                    "Incomplete VM was not reserved"
+                );
+                let receipt = state::read_json(&receipt_path)?;
+                ensure!(
+                    prepared["config"]["user.enginebox.allocation.id"] == receipt["id"],
+                    "VM and durable receipt custody differ"
+                );
+                if name == "prepare-copy-failure" {
+                    ensure!(receipt["status"] == "uncertain", "Partial copy hidden");
+                }
+                let reopened = Fleet::from_hosts(vec![host()], &root.join("controller"))?;
+                ensure!(
+                    preparation::prepare(&reopened, "primary", "game", &params).is_err(),
+                    "Interrupted preparation replayed"
+                );
+                ensure!(
+                    reopened
+                        .account_workspace("primary", "ebox-layerfs")
+                        .is_err(),
+                    "Reserved VM authorized for credentials"
+                );
+                for action in ["resume", "stop", "hibernate", "pause"] {
+                    ensure!(
+                        reopened
+                            .operate("primary", action, &json!({"name":"ebox-layerfs"}))
+                            .is_err(),
+                        "Reserved VM accepted ordinary lifecycle"
+                    );
+                }
+                // Losing controller metadata still cannot make the orphan reusable.
+                std::fs::remove_file(&receipt_path)?;
+                ensure!(
+                    reopened.operate("primary", "allocate", &params).is_err(),
+                    "Orphan VM name reused after receipt loss"
+                );
+                warm::reconcile_once(&reopened, &host())?;
+                ensure!(
+                    load()?["facts"]["instances"][1]["status"] == "Stopped",
+                    "Reconciler woke reserved preparation"
+                );
+            } else {
+                ensure!(
+                    load()?["facts"]["instances"].as_array().unwrap().len() == 1,
+                    "Incompatible or interrupted allocation mutated node"
+                );
+                if name == "prepare-incompatible" {
+                    ensure!(
+                        !receipt_path.exists(),
+                        "Compatibility failure wrote allocation state"
+                    );
+                }
+            }
+            ensure!(
+                starts.load(std::sync::atomic::Ordering::SeqCst) == 0,
+                "Preparation delegated agent access"
+            );
+            let events = std::fs::read_to_string(root.join("events.jsonl"))?;
+            ensure!(
+                !events.contains("[\"start\"")
+                    && !events.contains("[\"exec\"")
+                    && !events.contains("[\"delete\""),
+                "Preparation started guest, invoked harness or cleaned ambiguous resources"
+            );
+        }
         "template-checkout-guards" => {
             let mut h = host();
             h.target = "fixture".into();
@@ -545,6 +707,12 @@ fn scenario() -> Result<()> {
 fn tests() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     for scenario_name in [
+        "prepare-success",
+        "prepare-foreign-copy",
+        "prepare-copy-failure",
+        "prepare-incompatible",
+        "prepare-inherited-claim",
+        "prepare-interrupted",
         "warm-success",
         "wake-failure",
         "active-session",

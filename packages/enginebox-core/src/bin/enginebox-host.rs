@@ -30,6 +30,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Report binary protocol support without inspecting or mutating this host.
+    Protocol,
     /// Atomically update helper executables in one owned, running VM; homes and native CLIs stay intact.
     SyncGuestTools {
         #[arg(long)]
@@ -102,6 +104,7 @@ fn stdin_json() -> Result<Value> {
 }
 fn execute(cli: Cli) -> Result<Value> {
     match cli.command {
+        Some(Commands::Protocol) => Ok(enginebox_core::node_protocol::report()),
         Some(Commands::SyncGuestTools {
             project,
             name,

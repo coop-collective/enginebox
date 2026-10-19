@@ -39,6 +39,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Report binary storage compatibility; does not imply host readiness.
+    NodeProtocol,
     /// Optional checkout storage, independent of VM and private agent state.
     Storage(enginebox_storage_layerfs::cli::Storage),
     /// Inspect this computer's fleet capabilities without modifying it.
@@ -165,6 +167,17 @@ fn output(v: Value) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
+        Commands::NodeProtocol => {
+            ensure!(
+                args.host.as_deref().is_none_or(|host| host == "local")
+                    && args.fleet_host.is_none(),
+                "Node protocol reports are local; SSH to the selected node and use --host local"
+            );
+            let mut report = enginebox_core::node_protocol::report();
+            report["component"] = json!("ebox");
+            report["layerfs"] = json!({"revision":enginebox_storage_layerfs::REVISION,"workspace_schema":2,"attachment_schema":2,"exclusive_guest_writer":true,"automatic_attachment":false});
+            return output(report);
+        }
         Commands::Storage(storage) => {
             ensure!(
                 args.host.as_deref().is_none_or(|host| host == "local")
