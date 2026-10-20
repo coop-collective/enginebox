@@ -25,7 +25,7 @@ The [product site and developer guide](packages/site/README.md) run locally with
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 | Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
-The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Rust qualification passed real Codex/Claude coding, exact conversation resume and browser MCP use. Cursor inference remains blocked by the test account’s provider quota. The reference fleet now runs Rust 0.3.0 with account state preserved; inference through the deployed operator MCP and on LayerFS attachments remain separate checks. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Rust qualification passed real Codex/Claude coding, exact conversation resume and browser MCP use. Cursor inference remains blocked by the test account’s provider quota. The reference fleet now runs Rust 0.3.0 with account state preserved; Codex/Claude coding and exact resume also passed through the deployed operator MCP. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
 [Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 
@@ -85,6 +85,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Vinext dashboard](docs/DASHBOARD.md)
 - [Headless browser control](docs/BROWSER.md)
 - [Runtime operations and configuration](docs/RUNTIME.md)
+- [Research experiments and storage benchmarks](research/README.md)
 - [Contributing](CONTRIBUTING.md)
 
 The first host target is Linux x86_64 with KVM; the reference prototype used Ubuntu 26.04, Incus 6.0.5 and an Ubuntu 24.04 guest. Other supported combinations will be added after testing. A dedicated server or a VM exposing hardware virtualization can be a candidate; macOS can operate the server over SSH.

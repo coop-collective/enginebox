@@ -1,6 +1,6 @@
 # Disposable LayerFS validation
 
-This package contains the Linux experiment used for [LayerFS qualification](../../docs/LAYERFS-VALIDATION.md). It is test tooling, not an Engine Box storage provider, production installer or fleet backend. The runtime and native agent homes do not depend on LayerFS.
+This research directory contains the Linux experiment used for [LayerFS qualification](../../docs/LAYERFS-VALIDATION.md). It is test tooling, not an Engine Box storage provider, production installer or fleet backend. The runtime and native agent homes do not depend on LayerFS.
 
 The pinned upstream revision is `968a5d0be0ea3e9456b06f9148b65523138e9490`. The experiment uses the actual Rust daemon and Node native binding, Docker/FUSE mounts, a real Git repository, TypeScript dependencies, independent file manifests and explicit content assertions. It preserves failed outcomes in JSONL rather than treating a completed campaign as every case passing.
 
@@ -23,9 +23,9 @@ Give the fixture a unique `ebox-layerfs-...` name and a unique `user.enginebox.e
 The optional transport helper takes this file as its first argument:
 
 ```sh
-node packages/layerfs-validation/remote.mjs .state/layerfs-config.json check-config
-node packages/layerfs-validation/remote.mjs .state/layerfs-config.json inspect
-node packages/layerfs-validation/remote.mjs .state/layerfs-config.json exec /usr/bin/true
+node research/layerfs-validation/remote.mjs .state/layerfs-config.json check-config
+node research/layerfs-validation/remote.mjs .state/layerfs-config.json inspect
+node research/layerfs-validation/remote.mjs .state/layerfs-config.json exec /usr/bin/true
 ```
 
 It refuses a mismatched experiment marker before guest execution, quotes remote arguments, bounds SSH and remote commands, and writes private receipts. It does not provision, adopt or delete VMs and does not implement a second capacity policy. Use the fleet's existing admission and ownership mechanisms for provisioning and cleanup. Long preparation/build jobs should be launched as scoped services **inside the disposable guest**, then inspected; the transport intentionally limits a foreground remote operation to 180 seconds.
@@ -48,7 +48,7 @@ git -C .state/layerfs-evaluation/upstream archive \
 
 The tested archive SHA-256 was `0515f69c92ba1c5a049f3546c61249b355596743f1d7c0d7b39ca060e3eafb4e`. The extra benchmark manifests satisfy upstream workspace references; the retired benchmark is not built or run.
 
-Inside the admitted guest, create `/etc/enginebox-layerfs-validation` as the explicit disposable-machine marker, and a root-owned mode-0700 `/opt/layerfs-validation/`. Extract the archive into its `upstream/` directory. Copy this package's `.mjs` files into `harness/`, and its Dockerfile and shell scripts into `/opt/layerfs-validation/`. The transport's `push LOCAL GUEST` action only permits destinations beneath this directory.
+Inside the admitted guest, create `/etc/enginebox-layerfs-validation` as the explicit disposable-machine marker, and a root-owned mode-0700 `/opt/layerfs-validation/`. Extract the archive into its `upstream/` directory. Copy this directory's `.mjs` files into `harness/`, and its Dockerfile and shell scripts into `/opt/layerfs-validation/`. The transport's `push LOCAL GUEST` action only permits destinations beneath this directory.
 
 Run `prepare-guest.sh`, verify it succeeded, then run `build.sh`. The build installs Rust 1.85.1 in a builder container, fetches Cargo's locked dependencies, validates upstream's vendored FUSE provenance and builds the daemon and native addon with `--release --offline --locked`. It records binary hashes and tool versions. The Docker base image is digest-pinned and pnpm is pinned to 12.14.0; apt repositories and installer downloads still require network access, so a later rebuild is not claimed to be byte-identical.
 

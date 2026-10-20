@@ -52,7 +52,7 @@ The second cache grew by 971,211 bytes instead of another complete payload. Each
 
 The warm checkout is useful but still takes almost 39 seconds. That supports preparing a host checkout once and qualifying LayerFS forks over it. Copying Lore content into LayerFS can retain content in both stores; budget and measure that duplication rather than assuming shared chunk formats or direct backing-store compatibility.
 
-Reproduction: [manual benchmark](../packages/storage-benchmarks/README.md). Verified macOS archive digests:
+Reproduction: [manual benchmark](../research/storage-benchmarks/README.md). Verified macOS archive digests:
 
 ```text
 lore-v0.10.1-aarch64-apple-darwin.tar.gz
