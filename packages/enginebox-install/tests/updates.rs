@@ -45,6 +45,77 @@ fn fixture_release(install: &Installation, version: &str, schema: u32) {
     fs::create_dir_all(&dir).unwrap();
     atomic_json(&dir.join("manifest.json"), &manifest(version, schema)).unwrap();
 }
+#[test]
+fn supervisor_state_selection_refuses_missing_or_overlapping_roots() {
+    let tmp = temp();
+    let install = installation(&tmp);
+    let root = tmp.path().canonicalize().unwrap();
+    let mut config = SupervisorConfig {
+        install: install.clone(),
+        state_dir: None,
+        fleet_config: root.join("fleet.toml"),
+        api_listen: "127.0.0.1:8765".parse().unwrap(),
+        dashboard_listen: None,
+        token: "private-fixture-token-longer-than-32-characters".into(),
+        drain_timeout: Duration::from_secs(1),
+    };
+    assert_eq!(config.state_root().unwrap(), install.root.join("state"));
+    for path in [
+        root.join("missing-state"),
+        install.root.clone(),
+        install.root.join("releases"),
+        root.clone(),
+        "relative-state".into(),
+    ] {
+        config.state_dir = Some(path);
+        assert!(config.state_root().is_err());
+    }
+    assert!(!root.join("missing-state").exists());
+    let file = root.join("regular-file");
+    fs::write(&file, "preserve me").unwrap();
+    config.state_dir = Some(file.clone());
+    assert!(config.state_root().is_err());
+    assert_eq!(fs::read_to_string(file).unwrap(), "preserve me");
+}
+
+#[cfg(unix)]
+#[test]
+fn external_state_preserves_homes_and_refuses_symlinks_or_shared_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let tmp = temp();
+    let install = installation(&tmp);
+    let root = tmp.path().canonicalize().unwrap();
+    let state = root.join("legacy-state");
+    enginebox_install::release::private_dir(&state).unwrap();
+    fs::write(state.join("memory"), "same private memory").unwrap();
+    let mut config = SupervisorConfig {
+        install,
+        state_dir: Some(state.clone()),
+        fleet_config: root.join("fleet.toml"),
+        api_listen: "127.0.0.1:8765".parse().unwrap(),
+        dashboard_listen: None,
+        token: "private-fixture-token-longer-than-32-characters".into(),
+        drain_timeout: Duration::from_secs(1),
+    };
+    assert_eq!(config.state_root().unwrap(), state);
+    assert_eq!(
+        fs::read_to_string(state.join("memory")).unwrap(),
+        "same private memory"
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(config.state_root().is_err());
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = root.join("state-alias");
+    symlink(&state, &alias).unwrap();
+    config.state_dir = Some(alias);
+    assert!(config.state_root().is_err());
+    config.state_dir = Some(state.join("../legacy-state"));
+    assert!(config.state_root().is_err());
+}
 fn archive(tmp: &Path, entries: &[(&str, &[u8], tar::EntryType)]) -> std::path::PathBuf {
     let path = tmp.join(format!("{}.tar.gz", uuid::Uuid::new_v4()));
     let encoder =
@@ -363,6 +434,7 @@ async fn fixture() -> Fixture {
     let (new_url, new_task) = mock_server(new.clone()).await;
     let config = SupervisorConfig {
         install,
+        state_dir: None,
         fleet_config: tmp.path().join("fleet.toml"),
         api_listen: "127.0.0.1:8765".parse().unwrap(),
         dashboard_listen: None,

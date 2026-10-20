@@ -31,11 +31,45 @@ use tokio::{
 #[derive(Clone)]
 pub struct SupervisorConfig {
     pub install: Installation,
+    /// Existing private controller state, when migrating without moving native homes.
+    /// Omitted installations retain PREFIX/state.
+    pub state_dir: Option<PathBuf>,
     pub fleet_config: PathBuf,
     pub api_listen: SocketAddr,
     pub dashboard_listen: Option<SocketAddr>,
     pub token: String,
     pub drain_timeout: Duration,
+}
+impl SupervisorConfig {
+    pub fn state_root(&self) -> Result<PathBuf> {
+        let default = self.install.root.join("state");
+        let Some(path) = &self.state_dir else {
+            return Ok(default);
+        };
+        crate::release::reject_symlink_components(path)?;
+        ensure!(
+            path == &default
+                || (!path.starts_with(&self.install.root) && !self.install.root.starts_with(path)),
+            "external controller state must not overlap the installation"
+        );
+        let meta = std::fs::metadata(path)
+            .context("configured controller state must already exist; refusing to create an empty replacement")?;
+        ensure!(meta.is_dir(), "controller state must be a directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            ensure!(
+                meta.uid() == unsafe { libc::geteuid() } && meta.permissions().mode() & 0o077 == 0,
+                "configured controller state must be owned by the service user with owner-only permissions"
+            );
+        }
+        #[cfg(not(unix))]
+        ensure!(
+            path == &default,
+            "external controller state is currently qualified only on Unix; use the installer-owned state directory"
+        );
+        Ok(path.clone())
+    }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Ready {
@@ -623,6 +657,7 @@ fn log_file(
     Ok(file)
 }
 pub async fn spawn_candidate(config: &SupervisorConfig, manifest: &Manifest) -> Result<Candidate> {
+    let state = config.state_root()?;
     let directory = config.install.release_dir(&manifest.version);
     let port = unused_port()?;
     let binary = directory.join("bin").join(if cfg!(windows) {
@@ -636,7 +671,7 @@ pub async fn spawn_candidate(config: &SupervisorConfig, manifest: &Manifest) -> 
         .args(["--config"])
         .arg(&config.fleet_config)
         .args(["--listen", &format!("127.0.0.1:{port}")])
-        .env("ENGINEBOX_STATE_DIR", config.install.root.join("state"))
+        .env("ENGINEBOX_STATE_DIR", state)
         .env("ENGINEBOX_START_STANDBY", "1")
         .env("ENGINEBOX_API_TOKEN", &config.token)
         .env_remove("ENGINEBOX_API_TOKEN_FILE")

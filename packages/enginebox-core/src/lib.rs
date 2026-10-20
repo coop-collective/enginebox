@@ -1,10 +1,13 @@
 //! Native fleet operations. No provider loop, credentials, or Python runtime lives here.
 pub mod bootstrap;
+mod browser_migration;
 pub mod capabilities;
 pub mod capacity;
 pub mod fleet;
 pub mod guest;
 pub mod model;
+pub mod node_protocol;
+pub mod preparation;
 pub mod state;
 pub mod templates;
 pub mod transport;

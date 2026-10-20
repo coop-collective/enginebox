@@ -97,6 +97,13 @@ enum Command {
     IncusVerify { name: String },
     /// Detach an export after its exact owned VM has stopped without RAM state.
     IncusDetach { name: String },
+    /// Inspect interrupted attachment effects; never replay commands or mounts.
+    IncusReconcile {
+        name: String,
+        /// Finalize only a fully proved attached/detached receipt.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Show local receipts, including interrupted operations requiring inspection.
     List,
 }
@@ -105,9 +112,13 @@ pub fn run(args: Storage) -> Result<Value> {
     if let Command::Preview { repo, revision } = command {
         return Ok(serde_json::to_value(source::preview(&repo, &revision)?)?);
     }
-    let runtime = Runtime::new(Config::load(
+    let config = Config::load(
         &config.context("Pass --config with the node's provisioned LayerFS configuration")?,
-    )?)?;
+    )?;
+    if let Command::IncusReconcile { name, apply } = command {
+        return Runtime::reconcile_incus(config, &name, apply);
+    }
+    let runtime = Runtime::new(config)?;
     match command {
         Command::Doctor => runtime.doctor(),
         Command::Import {
@@ -157,6 +168,7 @@ pub fn run(args: Storage) -> Result<Value> {
         ),
         Command::IncusVerify { name } => runtime.incus_verify(&name),
         Command::IncusDetach { name } => runtime.incus_detach(&name),
+        Command::IncusReconcile { .. } => unreachable!(),
         Command::List => runtime.list(),
         Command::Preview { .. } => unreachable!(),
     }

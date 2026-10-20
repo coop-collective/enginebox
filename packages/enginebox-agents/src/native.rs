@@ -108,6 +108,8 @@ pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
                     "acceptEdits",
                     "--permission-prompts",
                     "none",
+                    "--allowedTools",
+                    "Read,Write,Edit,Bash,mcp__enginebox-browser__*",
                     "--max-turns",
                     "20",
                 ]
@@ -143,6 +145,70 @@ pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
         args.push("-".into());
     }
     args
+}
+pub fn native_command_with_config(
+    r: &RunRequest,
+    exe: &str,
+    home: &Path,
+    cwd: &Path,
+) -> Vec<String> {
+    let mut args = native_command(r, exe);
+    if r.provider == "codex" && codex_browser_needs_default(home, cwd) {
+        // A leaf override preserves per-tool policies and disabled_tools. Never
+        // create a transport for browser-free homes or override an explicit
+        // server policy. Unreadable/malformed configs retain native diagnostics.
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            [
+                "-c".into(),
+                "mcp_servers.enginebox-browser.default_tools_approval_mode=\"approve\"".into(),
+            ],
+        );
+    }
+    args
+}
+fn codex_browser_needs_default(home: &Path, cwd: &Path) -> bool {
+    // Native project configuration has higher precedence than the home. Without
+    // reproducing Codex's trust/config resolution, conservatively defer to it.
+    for directory in cwd.ancestors().filter(|directory| *directory != home) {
+        match std::fs::symlink_metadata(directory.join(".codex/config.toml")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return false,
+        }
+    }
+    let Ok(Some(bytes)) = security::read_bytes(home, ".codex/config.toml", 1024 * 1024, true)
+    else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(entry) = config
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("enginebox-browser"))
+        .and_then(toml::Value::as_table)
+    else {
+        return false;
+    };
+    entry.get("command").and_then(toml::Value::as_str) == Some("/usr/local/bin/enginebox-guest")
+        && entry.get("args")
+            == Some(&toml::Value::Array(
+                ["browser", "--client", "codex"]
+                    .into_iter()
+                    .map(|value| toml::Value::String(value.into()))
+                    .collect(),
+            ))
+        && entry
+            .get("enabled")
+            .is_none_or(|value| value.as_bool() == Some(true))
+        && entry
+            .get("type")
+            .is_none_or(|value| value.as_str() == Some("stdio"))
+        && !entry.contains_key("url")
+        && !entry.contains_key("default_tools_approval_mode")
 }
 pub fn environment(home: &Path) -> Result<BTreeMap<String, String>> {
     let home = home
@@ -255,7 +321,7 @@ pub fn execute(r: &RunRequest, home: &Path, workspace: &Path) -> Result<process:
         .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
     verify_client(&exe, &r.provider, &env, &cwd)?;
     process::bounded(
-        &native_command(r, &exe),
+        &native_command_with_config(r, &exe, &home, &cwd),
         Some(&env),
         Some(&cwd),
         if r.provider == "cursor" {
