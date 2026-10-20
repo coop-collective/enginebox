@@ -2,13 +2,14 @@ import { mkdir, realpath, lstat, writeFile, rm } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { check, json } from './lib.mjs';
+import { check, json, requireUnixClient } from './lib.mjs';
 
 async function identity(env) {
   check(typeof env.RUNNER_TEMP === 'string' && /^[1-9][0-9]*$/.test(env.GITHUB_RUN_ID) && /^[1-9][0-9]*$/.test(env.GITHUB_RUN_ATTEMPT), 'workflow-temporary-identity');
   return { root: await realpath(env.RUNNER_TEMP), run: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT };
 }
 export async function workflowTemporary(operation, env = process.env) {
+  requireUnixClient();
   check(['create', 'check', 'cleanup'].includes(operation), 'temporary-operation');
   const owner = await identity(env);
   const directory = join(owner.root, `enginebox-deploy-${owner.run}-${owner.attempt}`);
@@ -26,6 +27,7 @@ export async function workflowTemporary(operation, env = process.env) {
   return directory;
 }
 export function cleanupOnSignal(directory) {
+  requireUnixClient();
   const handlers = new Map([['SIGINT', 130], ['SIGTERM', 143]].map(([signal, code]) => {
     const handler = () => { try { rmSync(directory, { recursive: true, force: true }); } finally { process.exit(code); } };
     process.once(signal, handler);
@@ -34,5 +36,8 @@ export function cleanupOnSignal(directory) {
   return () => { for (const [signal, handler] of handlers) process.removeListener(signal, handler); };
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  workflowTemporary(process.argv[2]).catch(() => { process.stderr.write('workflow-temporary-cleanup-or-create-failed\n'); process.exitCode = 1; });
+  workflowTemporary(process.argv[2]).catch(error => {
+    const code = /^[a-z0-9-]+$/.test(error.message) ? error.message : 'workflow-temporary-cleanup-or-create-failed';
+    process.stderr.write(`${code}\n`); process.exitCode = 1;
+  });
 }

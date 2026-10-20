@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, resolve, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isIP } from 'node:net';
-import { check, cli, loadConfig, version, selectArtifact, command, run } from './lib.mjs';
+import { check, cli, loadConfig, version, selectArtifact, command, run, requireUnixClient } from './lib.mjs';
 import { workflowTemporary, cleanupOnSignal } from './temporary.mjs';
 
 export function sshSettings(env) {
@@ -27,6 +27,7 @@ export function sshArgs(settings, temporary, remoteCommand) {
   return ['-F', '/dev/null', '-T', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes', '-o', `UserKnownHostsFile=${join(temporary, 'known_hosts')}`, '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'ForwardAgent=no', '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no', '-o', 'ConnectTimeout=15', '-i', join(temporary, 'identity'), '-p', String(settings.port), '-l', settings.user, '--', settings.host, remoteCommand];
 }
 export async function main(args = process.argv.slice(2)) {
+  requireUnixClient();
   const options = cli(args, ['config', 'version', 'operation', 'artifacts']);
   check(options.config && ['update', 'rollback', 'status'].includes(options.operation), 'deployment-arguments');
   const pin = options.operation === 'status' ? null : version(options.version);

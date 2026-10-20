@@ -5,10 +5,10 @@ import { check, cli, version, run, selectArtifact } from './lib.mjs';
 
 export function pinnedSources(cargo, lock, pin) {
   version(pin);
-  const section = /(^\[workspace\.package\][\s\S]*?^version = ")[^"]+("$)/m;
+  const section = /(^\[workspace\.package\][\s\S]*?^version = ")[^"\r\n]+(")(?=\r?$)/m;
   check(section.test(cargo), 'workspace-version-missing');
   let packages = 0;
-  const nextLock = lock.replace(/(\[\[package\]\]\nname = "enginebox-[^"]+"\nversion = ")[^"]+("\n)/g, (_, before, after) => { packages++; return `${before}${pin}${after}`; });
+  const nextLock = lock.replace(/(\[\[package\]\]\r?\nname = "enginebox-[^"]+"\r?\nversion = ")[^"\r\n]+("\r?\n)/g, (_, before, after) => { packages++; return `${before}${pin}${after}`; });
   check(packages >= 5, 'workspace-lock-records-missing');
   return { cargo: cargo.replace(section, (_, before, after) => `${before}${pin}${after}`), lock: nextLock };
 }

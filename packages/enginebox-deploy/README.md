@@ -7,6 +7,13 @@ and exposed node helper. Initial host provisioning, the first Python-to-Rust
 cutover, node binaries, supervisor binaries, operating-system updates and VM
 retirement remain explicit maintenance operations.
 
+Release builds, CI deployment runners and the managed server run Linux x86-64.
+The SSH client can also run from macOS or another Unix environment with OpenSSH
+and owner-only file permissions. Native Windows deployment is rejected before
+reading configuration or creating credential files: this client does not manage
+Windows ACLs. This restriction applies to these deployment scripts; Rust Windows
+controller and node support has its own platform qualification.
+
 The GitHub workflow is dormant by default. Enabled deployments run on pushes to
 `main`; manual dispatch supports an exact update version, an exact installed
 rollback version, or a health check. A failed template installation marks the

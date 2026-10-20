@@ -89,15 +89,36 @@ test('template synchronization waits for every registered node and exposes termi
   assert.throws(() => syncState(catalog('ready'), [{ ...expected[0], revision: 3 }]), /revision-changed/);
   assert.throws(() => syncState({ templates: [{ ...expected[0], sync: { nodes: [] } }] }, expected), /no-registered-nodes/);
 });
-test('isolated version patch changes every workspace lock package and leaves external dependencies alone', async () => {
+test('isolated version patch preserves LF and CRLF while changing only workspace versions', async () => {
   const workspace = resolve(root, '../..');
-  const cargo = await readFile(join(workspace, 'Cargo.toml'), 'utf8');
-  const lock = await readFile(join(workspace, 'Cargo.lock'), 'utf8');
-  const patched = pinnedSources(cargo, lock, '0.3.1-live.7');
-  assert.match(patched.cargo, /\[workspace.package\]\nversion = "0.3.1-live.7"/);
-  assert.ok([...patched.lock.matchAll(/name = "enginebox-[^"]+"\nversion = "([^"]+)"/g)].every(match => match[1] === '0.3.1-live.7'));
-  const normalize = text => text.replace(/(name = "enginebox-[^"]+"\nversion = ")[^"]+/g, '$1VERSION');
-  assert.equal(normalize(patched.lock), normalize(lock));
+  const cargoSource = await readFile(join(workspace, 'Cargo.toml'), 'utf8');
+  const lockSource = await readFile(join(workspace, 'Cargo.lock'), 'utf8');
+  for (const newline of ['\n', '\r\n']) {
+    const cargo = cargoSource.replace(/\r?\n/g, newline);
+    const lock = lockSource.replace(/\r?\n/g, newline);
+    const patched = pinnedSources(cargo, lock, '0.3.1-live.7');
+    assert.ok(patched.cargo.includes(`[workspace.package]${newline}version = "0.3.1-live.7"`));
+    const versions = [...patched.lock.matchAll(/name = "enginebox-[^"]+"\r?\nversion = "([^"]+)"/g)];
+    assert.ok(versions.length >= 5 && versions.every(match => match[1] === '0.3.1-live.7'));
+    const normalizeLock = text => text.replace(/(name = "enginebox-[^"]+"\r?\nversion = ")[^"]+/g, '$1VERSION');
+    const normalizeCargo = text => text.replace(/(\[workspace.package\]\r?\nversion = ")[^"]+/, '$1VERSION');
+    assert.equal(normalizeLock(patched.lock), normalizeLock(lock));
+    assert.equal(normalizeCargo(patched.cargo), normalizeCargo(cargo));
+    for (const text of [patched.lock, patched.cargo]) assert.ok([...text.matchAll(/\r?\n/g)].every(match => match[0] === newline));
+  }
+});
+test('Windows deployment entrypoints reject before reading config or creating credential files', async () => {
+  const deployUrl = new URL('../src/deploy.mjs', import.meta.url).href;
+  const temporaryUrl = new URL('../src/temporary.mjs', import.meta.url).href;
+  // Exercise the same fail-closed path on every CI platform without changing the parent process.
+  const script = `Object.defineProperty(process,'platform',{value:'win32'});Object.defineProperty(process,'getuid',{value:undefined});
+    const {main}=await import(${JSON.stringify(deployUrl)});
+    const {workflowTemporary,cleanupOnSignal}=await import(${JSON.stringify(temporaryUrl)});
+    const outcomes=[];for(const action of [()=>main([]),()=>workflowTemporary('create',{}),()=>cleanupOnSignal('unused')]){
+      try{await action();outcomes.push('unexpected-success');}catch(error){outcomes.push(error.message);}
+    }process.stdout.write(JSON.stringify(outcomes));`;
+  const output = await run(process.execPath, ['--input-type=module', '-e', script]);
+  assert.deepEqual(JSON.parse(output), Array(3).fill('deployment-client-requires-unix-permissions'));
 });
 test('remote fixture updates, verifies template sync, preserves private paths, and rolls back by exact pin', { skip: process.platform !== 'linux' || process.arch !== 'x64' }, async t => {
   const dir = await temporary(t); const prefix = join(dir, 'controller'); const state = join(dir, 'legacy-state');
@@ -149,7 +170,7 @@ test('health and rollback configuration do not need template recipes to exist', 
   await assert.rejects(loadConfig(selected, dir));
   assert.deepEqual((await loadConfig(selected, dir, false)).templates, []);
 });
-test('workflow cleanup refuses unowned directories and signal cleanup removes credentials', async t => {
+test('workflow cleanup refuses unowned directories and signal cleanup removes credentials', { skip: process.platform === 'win32' }, async t => {
   const dir = await temporary(t); const env = { RUNNER_TEMP: dir, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' };
   const owned = await workflowTemporary('create', env);
   await writeFile(join(owned, 'identity'), 'fixture-key', { mode: 0o600 });

@@ -5,6 +5,10 @@ import { resolve, dirname, basename, join, isAbsolute } from 'node:path';
 import { spawn } from 'node:child_process';
 
 export function check(ok, code) { if (!ok) throw new Error(code); }
+export function requireUnixClient() {
+  // Windows chmod/getuid do not enforce this client's owner-only credential contract.
+  check(process.platform !== 'win32' && typeof process.getuid === 'function', 'deployment-client-requires-unix-permissions');
+}
 export function fields(value, allowed, required = allowed) {
   check(value && typeof value === 'object' && !Array.isArray(value), 'expected-object');
   check(Object.keys(value).every(k => allowed.includes(k)) && required.every(k => k in value), 'unexpected-or-missing-fields');
