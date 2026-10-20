@@ -1,0 +1,17 @@
+{
+  "name": "enginebox-site",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node --check build.mjs && node --check serve.mjs && node --check public/app.js && node --check public/demo-model.mjs && node --check src/guides.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:e2e": "playwright test",
+    "dev": "node build.mjs && node serve.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}

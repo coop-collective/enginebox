@@ -6,6 +6,8 @@ Engine Box manages the environment around **Codex, Cursor Agent and Claude Code*
 
 The goal is less repeated setup and faster, trustworthy feedback from builds and tests. Self-hosted CI optimization is an optional module on the same foundation.
 
+The [product site and developer guide](packages/site/README.md) run locally with `pnpm dev:site`. They explain the environment model, getting started, native agent state, templates, storage and the API. The [persistent development environment design](docs/DEV-ENVIRONMENTS.md) describes the next step: a core app that retains development data while agents work in disposable private forks.
+
 ## Status
 
 **Early development: native Rust services and tools, a capacity-aware fleet API, Vinext dashboard and headless browser MCP.** See [Rust migration and qualification](docs/RUST-MIGRATION.md) for the current release boundary.
@@ -23,7 +25,7 @@ The goal is less repeated setup and faster, trustworthy feedback from builds and
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 | Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
-The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The v0.2 implementation passed real Codex/Claude prompts, tools and exact conversation resume; the Rust port has separate qualification gates. Cursor inference was blocked by the test account’s provider quota. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Rust qualification passed real Codex/Claude coding, exact conversation resume and browser MCP use. Cursor inference remains blocked by the test account’s provider quota. The reference fleet now runs Rust 0.3.1-live.0 with account state preserved; Codex/Claude coding and exact resume also passed through the deployed operator MCP. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
 [Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 
@@ -31,7 +33,7 @@ The first target is one trusted owner operating Linux/KVM servers. Connect Codex
 
 Use the [terminal installer](docs/INSTALL.md) for release binaries. Admin/operator tools can run on Linux, macOS and Windows; the current compute backend needs a Linux server with usable KVM, Incus and administrative access. The controller and Linux node have separate installation roles. Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
 
-To build from source, install Node 22.12+ and pnpm, then use the root workspace. Python is not a runtime prerequisite.
+To build from source, install Rust, Node 22.12+ and the pinned pnpm version, then use the root workspace. Python is not a runtime prerequisite.
 
 ```sh
 git clone https://github.com/coop-collective/enginebox.git
@@ -59,6 +61,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 
 ## Design and implementation
 
+- [Persistent development environments and private data forks](docs/DEV-ENVIRONMENTS.md)
 - [Terminal installation and platform roles](docs/INSTALL.md)
 - [Versioned updates, draining and rollback](docs/UPDATES.md)
 - [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)
