@@ -10,7 +10,7 @@ pnpm lint:rust
 pnpm build
 ```
 
-All programs and tests live under `packages/`; the root contains workspace configuration. The root pins pnpm 12.14.0 and Rust 1.96.0. pnpm's experimental Cargo integration provisions the toolchain and downloads both Rust and JavaScript dependencies. Cargo still compiles Rust and uses its standard `Cargo.lock`; pnpm retains the JavaScript lockfile. Keep both committed. Plain Cargo also works when the optional generated pnpm vendor directory is absent.
+Product programs and their unit, integration and release-qualification tests live under `packages/`. Standalone research, comparison benchmarks and disposable experiments live under [`research/`](research/README.md), outside the product workspace and release artifacts. Keep tests that verify a shipped service with that service; a disposable fixture alone does not make a regression test research. The root contains workspace configuration. The root pins pnpm 12.14.0 and Rust 1.96.0. pnpm's experimental Cargo integration provisions the toolchain and downloads both Rust and JavaScript dependencies. Cargo still compiles Rust and uses its standard `Cargo.lock`; pnpm retains the JavaScript lockfile. Keep both committed. Plain Cargo also works when the optional generated pnpm vendor directory is absent.
 
 For dashboard changes, run `pnpm --filter enginebox-dashboard exec playwright install chromium` and `pnpm test:e2e` after the build. The browser suite uses test fixture services. Build deployment artifacts on the target platform. `cargo fmt --all --check` checks Rust formatting.
 
