@@ -9,7 +9,7 @@
     "build": "pnpm build:rust && pnpm --filter enginebox-dashboard build",
     "build:rust": "cargo build --workspace --release --locked",
     "check": "cargo check --workspace --all-targets --locked && pnpm --filter enginebox-dashboard typecheck",
-    "test": "cargo test --workspace --no-fail-fast --locked && pnpm --filter enginebox-dashboard test",
+    "test": "cargo test --workspace --no-fail-fast --locked && pnpm --filter enginebox-dashboard test && pnpm --filter @enginebox/deploy test",
     "test:e2e": "pnpm --filter enginebox-dashboard test:e2e",
     "fmt": "cargo fmt --all",
     "lint:rust": "cargo clippy --workspace --all-targets --locked -- -D warnings",
