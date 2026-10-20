@@ -91,3 +91,5 @@ cargo test -p enginebox-install --test real_process_updates -- --ignored --nocap
 ```
 
 Reference packaging research: [cargo-dist installer formats](https://axodotdev.github.io/cargo-dist/book/installers/index.html) cover shell, PowerShell and native package-manager distribution. Engine Box's state ownership, draining and rollback protocol is application-specific; downloading a new binary alone does not provide it. [Windows Task Scheduler](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create) documents the user task mechanism used here.
+
+On October 20, the reference deployment completed a live update → rollback → update sequence, ending on `0.3.1-live.0`. The observer recorded 398 requests with zero errors and retained the authenticated dashboard cookie. This qualifies that live controller/dashboard handoff; it does not establish host, supervisor, node-helper or VM upgrades. The [deployment package](../packages/enginebox-deploy/README.md) provides the pinned update/status/rollback workflow.

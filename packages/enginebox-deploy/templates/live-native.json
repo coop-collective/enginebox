@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "live-native",
+  "revision": 1,
+  "label": "Native agents",
+  "description": "Private deployment recipe with native coding clients and a headless browser.",
+  "recipe": "native-clients-v1",
+  "source_image": "images:ubuntu/24.04/cloud",
+  "minimum": { "cpu": 2, "memory_gib": 2, "disk_gib": 30 },
+  "recommended": { "cpu": 4, "memory_gib": 4, "disk_gib": 30 },
+  "native_clients": ["claude", "codex", "cursor"],
+  "config": { "browser": true, "desktop": false, "guest_computer_mcp": false }
+}

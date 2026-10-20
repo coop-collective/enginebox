@@ -1,0 +1,99 @@
+name: Deploy private controller
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Update controller, roll back to an installed version, or check health
+        type: choice
+        options: [update, rollback, status]
+        default: update
+      version:
+        description: Exact version (required for rollback; update defaults to VERSION_BASE-live.RUN_NUMBER)
+        type: string
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: enginebox-controller-deployment
+  cancel-in-progress: false
+jobs:
+  plan:
+    if: vars.ENGINEBOX_DEPLOY_ENABLED == 'true' && (github.event.repository.private == true || vars.ENGINEBOX_DEPLOY_ALLOW_PUBLIC == 'true') && github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
+    outputs:
+      operation: ${{ steps.plan.outputs.operation }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - id: plan
+        env:
+          ENGINEBOX_DEPLOY_OPERATION: ${{ inputs.operation || 'update' }}
+          ENGINEBOX_DEPLOY_VERSION: ${{ inputs.version }}
+          ENGINEBOX_DEPLOY_VERSION_BASE: ${{ vars.ENGINEBOX_DEPLOY_VERSION_BASE || '0.3.1' }}
+        run: node packages/enginebox-deploy/src/ci-plan.mjs
+  build:
+    needs: plan
+    if: needs.plan.outputs.operation == 'update'
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@12.14.0
+      - run: node --test packages/enginebox-deploy/test/*.test.mjs
+      - name: Build isolated versioned release and verify workspace
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: node packages/enginebox-deploy/src/build.mjs --version "$VERSION" --output .state/deploy-artifact
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: enginebox-controller-${{ github.run_id }}
+          path: .state/deploy-artifact/
+          retention-days: 30
+          if-no-files-found: error
+  deploy:
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.plan.outputs.operation != 'update')
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
+    timeout-minutes: 180
+    environment: ${{ vars.ENGINEBOX_DEPLOY_ENVIRONMENT || 'production' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - if: needs.plan.outputs.operation == 'update'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: enginebox-controller-${{ github.run_id }}
+          path: .state/deploy-artifact
+      - name: Create owned temporary credential directory
+        run: node packages/enginebox-deploy/src/temporary.mjs create
+      - name: Stage, switch and verify without replacing server secrets
+        env:
+          ENGINEBOX_DEPLOY_WORKFLOW_TEMP: '1'
+          VERSION: ${{ needs.plan.outputs.version }}
+          OPERATION: ${{ needs.plan.outputs.operation }}
+          DEPLOY_CONFIG: ${{ vars.ENGINEBOX_DEPLOY_CONFIG || 'packages/enginebox-deploy/environments/production.json' }}
+          ENGINEBOX_DEPLOY_PORT: ${{ vars.ENGINEBOX_DEPLOY_PORT || '22' }}
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact
+      - name: Remove temporary deployment credentials
+        if: always()
+        run: node packages/enginebox-deploy/src/temporary.mjs cleanup

@@ -23,7 +23,7 @@ The fleet slice adds explicit host selection, clean-template cloning, bounded as
 
 ## Current agent-readiness work
 
-The reference Linux fleet now runs Rust 0.3.0 with its original account state preserved. Two private workspaces received native helper/browser migration, and native-dev revision 4 plus two fresh reserves are synchronized. The migration now supports an external private state root. Real supervisor update/rollback checks preserve that root, browser sessions and stdio MCP access; a separate [metadata qualification](RUST-STATE-QUALIFICATION.md) loaded the deployed Python controller's completed jobs, runs and templates in an isolated copy.
+The reference Linux fleet now runs Rust 0.3.1-live.0 with its original account state preserved. Two private workspaces received native helper/browser migration, and native-dev revision 4 plus two fresh reserves are synchronized. The migration now supports an external private state root. Real supervisor update/rollback checks preserve that root, browser sessions and stdio MCP access; a separate [metadata qualification](RUST-STATE-QUALIFICATION.md) loaded the deployed Python controller's completed jobs, runs and templates in an isolated copy.
 
 The [native qualification](RUST-NATIVE-QUALIFICATION.md) passed actual file changes, exact conversation resume after service recreation, browser MCP interaction and independent screenshot verification for Codex and Claude. Cursor reached its provider but remains usage-limit blocked; its inference and resume are not qualified. Fresh Rust measurements retain a 0.505-second median frozen resume and 6.288-second median cold readiness across three samples each. These are host-local readiness measurements, not a controlled Python comparison or a model-response guarantee.
 
@@ -44,7 +44,7 @@ LayerFS now has compatibility-checked, durable allocation preparation and conser
 - `packages/dashboard`: Vinext owner dashboard, session authentication and server-side proxy.
 - `examples/`: host/fleet configuration and portable template manifests. Tests live with their owning package.
 
-The Rust port uses root pnpm with Cargo and JavaScript lockfiles. Native Linux, macOS and Windows checks passed for the merged port. Real controller upgrade/rollback through the stable supervisor has been tested with concurrent requests and the real dashboard; Windows service installation, fresh-host bootstrap and initial Python-to-Rust cutover remain distinct gates. See [migration](RUST-MIGRATION.md) and [updates](UPDATES.md).
+The Rust port uses root pnpm with Cargo and JavaScript lockfiles. Native Linux, macOS and Windows checks passed for the merged port. Real controller upgrade/rollback through the stable supervisor has been tested with concurrent requests and the real dashboard; Windows service installation and fresh-host bootstrap remain distinct gates; the reference deployment has completed its initial Python-to-Rust cutover. See [migration](RUST-MIGRATION.md) and [updates](UPDATES.md).
 
 Do not implement a generic plugin framework before a second backend exists. Keep config parsing and planning independent of live mutation so they can be tested without administrator access.
 

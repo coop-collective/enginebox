@@ -302,7 +302,7 @@ target/release/enginebox-fleet-mcp`) + `<p>The operator token stays on the opera
       {
         id: 'qualification',
         title: 'Build checks and deployment are separate',
-        html: `<p>The Rust port is merged. Native build/test checks cover Linux, macOS and Windows; isolated macOS/Linux archive staging and Rust-to-Rust update/rollback have been exercised. Existing hosts are not upgraded merely because a PR merged.</p><p>The reference fleet now runs Rust 0.3.0 with account state preserved, native helper/browser migration on two private workspaces, and native-dev revision 4 plus two fresh reserves synchronized. Fresh physical-host bootstrap, Windows service installation and independently reproduced installs remain release acceptance gates. Check <a href="/docs/platform-support/">current qualification</a> before choosing a deployment target.</p>`,
+        html: `<p>The Rust port is merged. Native build/test checks cover Linux, macOS and Windows; isolated macOS/Linux archive staging and Rust-to-Rust update/rollback have been exercised. Existing hosts are not upgraded merely because a PR merged.</p><p>The reference fleet now runs Rust 0.3.1-live.0 with account state preserved, native helper/browser migration on two private workspaces, and native-dev revision 4 plus two fresh reserves synchronized. Fresh physical-host bootstrap, Windows service installation and independently reproduced installs remain release acceptance gates. Check <a href="/docs/platform-support/">current qualification</a> before choosing a deployment target.</p>`,
       },
     ],
   },
