@@ -1,5 +1,84 @@
 # LayerFS storage and checkout validation
 
+Current direction: [LayerFS game workspaces](GAME-WORKSPACES.md) and
+[Store distribution](STORE-DISTRIBUTION.md) record the October 23 owner decision.
+The experiments below retain their original versions and qualification limits;
+the older optional-candidate wording is historical, not the current product scope.
+
+## Git-free Unreal follow-up, October 23, 2026
+
+An independent disposable probe of upstream **v1.0.0**, commit
+`2aaf2552ce21154928b9f9c83582e41a637f5910`, exercised real environment meshes,
+textures and a map, one deliberate duplicate mesh, and 1,001 small generated
+files. Total: **1,006 files / 802,045,960 bytes**, with no `.git` directory.
+Original assets were mounted read-only; only private copies were changed.
+This is a single local diagnostic on Linux ARM64 in Docker Desktop with
+uncontrolled OS caches, not a cold-node or engine-start benchmark.
+
+| Observed operation | Seconds |
+| --- | ---: |
+| Import into a new Store | 3.895 |
+| Create two branch references, separately | 0.0058 / 0.0005 |
+| Mount first workspace in its sandbox | 0.327 |
+| Fully read and hash the first two views | 7.306 / 9.210 |
+| Commit a 4 KiB overwrite in a 175.5 MB mesh, plus one text file | 1.233 |
+| Merge the two branches' disjoint changes | 0.034 |
+| SQLite online backup, integrity/foreign-key checks and local fsync | 1.144 |
+| Mount from a copied backup in a fresh volume and sandbox | 0.927 |
+| Fully read and hash all restored files | 6.359 |
+
+Restore preparation additionally took 1.863 seconds including its container,
+copy and checksum checks. It reused the local image/toolchain and project
+discovery manifest; no network download was involved. The database after import
+was 631,500,800 bytes; the deliberate duplicate affects this ratio. The binary
+commit reported 8,310 newly stored object bytes and 8,149 metadata bytes, while
+the WAL grew 127,840 bytes. These are different accounting boundaries. The edit
+used repeated replacement bytes and a copy/rename save, not an Unreal editor
+resave; the live overlay temporarily held a complete modified file.
+
+Full SHA-256 comparisons passed for both initial views, the untouched sibling,
+the merged/published view, and the backup restored into a separate Store volume.
+Same-file branch changes were refused as a conflict. The SQLite backup passed
+`integrity_check` and `foreign_key_check`; SDK history and content were readable.
+No engine imported or rendered the modified mesh: this was storage validation.
+
+The publication experiment directly distinguishes three behaviors:
+
+- Separate branches and mounted workspaces stay pinned, including untouched
+  files. A new fork from main sees a new publication; an existing fork does not.
+- Publishing B from an old baseline after A replaced A's changes in main,
+  including an unrelated file B never edited. LayerFS reported one overwritten
+  layer and retained A's history. Publication is not automatic integration.
+- Two workspaces on one branch do not see each other's edits immediately, but B's
+  later commit merged A's non-conflicting committed change and updated B's view.
+
+Merging B with the branch pinned to A's publication retained both changes. After
+the deliberate overwrite, merging A with the now-descendant main did not undo
+that overwrite; merging the original A and B branches recovered both. The first
+assertion assumed otherwise and failed; its evidence remains in the raw logs.
+A second harness attempt passed a raw layer ID to `branch.merge`, which accepts
+branch names/main, and was refused. The corrected test used the already-pinned
+branch. An initial Docker memory-limit update also failed before readback and
+was corrected. No failed attempt was deleted or counted as a passing stage.
+
+This corrects a possible overgeneralization from the older `.git` experiment:
+**LayerFS does have chunked history and can merge Git-free changes.** The conflict
+with independently changed `.git` internals does not establish that LayerFS
+cannot replace Git inside an ephemeral workspace. The tested JavaScript SDK still
+selects Disposable/WAL/synchronous=OFF, so this orderly restore is not a host
+power-loss guarantee. The prior custom durable-profile research used a different
+upstream revision and API and does not qualify this SDK path.
+
+Probe sources are `research/storage-benchmarks/layerfs-unreal*`; sanitized results
+are in `research/storage-benchmarks/layerfs-unreal-results.json`. Raw append-only
+receipts, hashes and backup/discovery records remain in ignored
+`.state/layerfs-unreal/`; temporary data/store/restore volumes and stopped
+experiment containers were removed after export. No private asset or
+credential is included in Git. These probes do not update Engine Box's existing
+pinned preview backend.
+
+## Original preview qualification
+
 On October 19, 2026, the pinned LayerFS preview **did share a complete checkout and installed dependencies across independent writable mounts**. This validates the basic storage idea. It does not yet qualify LayerFS as Engine Box's persistent filesystem or as a shared store across its existing Incus VMs.
 
 Upstream revision: `968a5d0be0ea3e9456b06f9148b65523138e9490`. The independent [research harness](../research/layerfs-validation/README.md) builds the actual upstream Rust daemon and Node addon. [Source-level integration boundaries](LAYERFS.md) cover durability, same-kernel storage access, restart recovery and retention. [Rust boot measurements](RUST-BOOT-BENCHMARKS.md) are a separate experiment; LayerFS forks are not VM boots.

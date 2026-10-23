@@ -12,6 +12,12 @@ The [product site and developer guide](packages/site/README.md) run locally with
 
 **Early development: native Rust services and tools, a capacity-aware fleet API, Vinext dashboard and headless browser MCP.** See [Rust migration and qualification](docs/RUST-MIGRATION.md) for the current release boundary.
 
+The target [fleet control plane uses Cloudflare Workers and Durable Objects](docs/DESIGN.md#required-cloudflare-fleet-control-plane),
+deployed in production or run with local Wrangler for development/tests.
+Production bare-metal servers are managed nodes; this migration is planned, not deployed.
+A dedicated storage node is optional. Single-node project storage can stay local;
+multi-node project execution requires shared storage, which R2 directly can provide.
+
 | Available in this repository | Planned |
 |---|---|
 | Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Additional qualified host/guest combinations |
@@ -92,6 +98,8 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Storage registration, controller API and MCP](docs/STORAGE-API.md)
 - [Local Cloudflare fleet, shared Store transport and debugging](docs/LOCAL-FLEET.md)
 - [Enginebox integration, batching and protected CI evidence](docs/INTEGRATION-CI.md)
+- [LayerFS game workspaces, container integration and large-project measurements](docs/GAME-WORKSPACES.md)
+- [Project Store distribution, worker NVMe caches and safe eviction](docs/STORE-DISTRIBUTION.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)
