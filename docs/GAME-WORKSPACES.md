@@ -1,18 +1,17 @@
 # LayerFS game workspaces
 
-Owner decision, October 23, 2026: use LayerFS for shared project state and private
+Owner decisions, October 23–24, 2026: use LayerFS for shared project state and private
 agent workspaces. Engine Box combines
 containers with LayerFS, manages compute and storage residency, and preserves
-recoverable Store generations. Gamejam owns task policy, candidate validation,
-playtests and promotion. The target controller uses Cloudflare Workers/Durable
+recoverable Store generations. Engine Box owns generic task/agent execution,
+integration and merging, batched validation, evidence and promotion. Gamejam is an
+application consuming these APIs and presenting game/community workflows. The target controller uses Cloudflare Workers/Durable
 Objects, deployed in production or run locally with Wrangler for development/tests.
 Every production bare-metal server is a managed compute and/or storage node. A dedicated storage
 server is optional. One agent node may keep project storage local; execution across
 multiple agent nodes requires shared storage, which R2 directly can supply.
 
-The existing container integration is implemented. Cloudflare control-plane
-migration, distributed Store hydration, disk-pressure eviction and the game
-acceptance queue below are planned. See the [control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
+The existing container integration is implemented. The independent [local fleet implementation draft #17](https://github.com/coop-collective/enginebox/pull/17) adds Wrangler/Compose, verified Store transport, cache eviction and protected candidate CI gates. Automatic merge/import, batch composition, engine validation and production controller migration remain Engine Box work. This design branch does not contain that implementation. See the [control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
 The [local development contract](DESIGN.md#local-development-and-test-fleets) keeps
 Wrangler control state separate from the Linux LayerFS node's Store and task branches.
 
@@ -60,7 +59,7 @@ that every upstream feature is already exposed by Engine Box.
 |---|---|
 | Short-lived compute | Headless tasks lease compute only when needed. Editor/play leases last across an interactive session. Existing sandboxes stay alive until explicitly closed; per-command scheduling is pending. |
 | Distributed agents | Each worker has its own local Store. Containers there share its kernel. Network distribution exchanges consistent generations; no shared live SQLite database over NFS. |
-| Parallel coordination | Private task branches; parallel work and candidate preparation; one authority updates the accepted head after checking its prior revision. Gamejam's integration queue is pending. |
+| Parallel coordination | Private task branches; parallel work and candidate preparation; one authority updates the accepted head after checking its prior revision. Engine Box's integration queue is pending. |
 | Forking earlier state | Reuse prepared checkpoints. `fork --from` already reuses a completed workspace checkpoint; arbitrary historical revision selection needs an explicit product API. |
 | Deduplicated storage | Share committed content within a project Store. Measure database, WAL, overlays, transfer cache and generated data separately; do not multiply upstream benchmark ratios into capacity estimates. |
 | Prepared startup | Preserve compatible dependencies and generated files. Existing pnpm reuse is qualified; engine cache identity and cold-to-play behavior still need qualification. |
@@ -101,7 +100,7 @@ Recordings remain separately retained artifacts referenced by task/build IDs.
    receipts and safe eviction. Connect to the required Cloudflare authority and
    qualify R2-direct operation without a dedicated storage node. Benchmark current
    and previous project generations.
-3. Connect Gamejam's batched candidate checks and bounded engine pool. Test
+3. Implement Engine Box's batched candidate checks and bounded engine pool. Test
    concurrent submissions, conflicts, stale promotion, native engine saves and
    compatible shader/import cache restoration. Cross-worker results require a
    logical change-import protocol; SQLite replica copying alone is insufficient.

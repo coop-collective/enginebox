@@ -10,11 +10,13 @@ storage is required before a project can execute across two or more agent nodes.
 R2 directly can provide that service. This decision changes the target design;
 the existing native controller has not yet been migrated.
 
+October 24 ownership clarification: Engine Box owns the generic agent/task and integration workflow; Gamejam consumes it as an application. [Implementation draft #17](https://github.com/coop-collective/enginebox/pull/17) contains the local fleet, Store transport and candidate CI gate; this branch retains the broader design and qualification plan.
+
 ## Outcome
 
 An owner connects a Linux server, prepares a workspace once, signs into the official Codex, Cursor Agent or Claude Code client, and works through the ordinary terminal. Files, compatible dependencies and caches remain available. Optional CI uses the same preparation contracts to return reliable build/test results sooner.
 
-Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Launching an official CLI and resuming its native conversation belong in the environment API. Agent planning, task delegation between workers, a model gateway and a replacement CI scheduler remain outside this product.
+Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Launching an official CLI and resuming its native conversation belong in the environment API. Engine Box owns reusable task dispatch, agent workspace coordination, merging, batched validation and promotion; apps consume its APIs. Native harness planning and inference remain in the official clients.
 
 ## Components
 
@@ -289,7 +291,7 @@ Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes
 
 The fleet controller clones only configured disk snapshots marked as clean bases. It copies into the configured storage pool and applies per-VM CPU/RAM/disk limits. Prepared tools and dependencies live on the copy-on-write disk; no provider installer runs during a fork. Headless browser preparation avoids a desktop by default. Completed cloud-init is disabled in the reusable image, while clone identity and ordinary networking remain enabled.
 
-Admission counts active instances across Incus projects, includes frozen RAM, preserves configured host/CI reserves and budgets full root/state disks even for stopped instances. The API bounds its work queue and shares a host lock with bootstrap. The current implementation provides manual multi-host fleet management; automatic workload placement belongs to the planned Cloudflare control plane. Agent planning and swarm task delegation remain separate concerns.
+Admission counts active instances across Incus projects, includes frozen RAM, preserves configured host/CI reserves and budgets full root/state disks even for stopped instances. The API bounds its work queue and shares a host lock with bootstrap. The current implementation provides manual multi-host fleet management; automatic workload placement belongs to the planned Cloudflare control plane. Task scheduling and integration belong to Engine Box; the native harness retains its planning loop.
 
 Registered templates are controller-owned desired state. Importing or revising one schedules installation on every registered node, subject to capacity and compatibility checks. Adding a host to the inventory and restarting the controller enrolls it in synchronization; live host registration is not yet implemented. Per-node readiness/errors remain visible, and existing workspaces keep their original image.
 
@@ -309,4 +311,4 @@ Existing private workflow patterns include a persistent pnpm store, mounted Carg
 
 The foundation, usable generic workspace recipe and reusable optional modules belong in this source-available repository under Sustainable Use License 1.0. Personal and internal business use are permitted; commercial hosting and redistribution require a separate agreement. Managed operations and original specialized workspace recipes may be maintained separately. Historical Apache-2.0 grants remain valid. User code remains the user's. Do not import proprietary recipes, provider binaries or engine source into this repository. See [licensing](LICENSING.md).
 
-Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate workload candidates. They do not block a useful native-agent environment or require expanding the core into orchestration.
+Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate workload candidates. They use the shared Engine Box workflow APIs, with separate engine-specific qualification.

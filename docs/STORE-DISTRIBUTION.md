@@ -14,6 +14,8 @@ the existing container backend is described in [game workspaces](GAME-WORKSPACES
 
 ## Proposed technology choice
 
+October 24 implementation update: [draft #17](https://github.com/coop-collective/enginebox/pull/17) implements SQLite Online Backup, bounded content-addressed 4 MiB chunks, a Worker/R2 gateway and reconstructible storage caches in the local Wrangler/Compose fleet. The desync work below remains a measured comparison and a possible adapter after qualification; it is not a dependency of that first implementation. Logical cross-worker integration and native engine startup remain separate gates.
+
 Qualify **SQLite's Online Backup API plus desync v1.1.5** first: obtain a consistent
 closed snapshot, publish its chunk index once, and let workers reconstruct it
 using local chunks or a previous verified snapshot as a seed. A private HTTP

@@ -2,7 +2,7 @@
 
 Prepared environments for native coding agents, on hardware you control.
 
-Engine Box manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Agent planning and swarm orchestration stay with other tools.
+Engine Box manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Native clients retain their planning loops; Engine Box owns reusable task, workspace, integration and validation workflows that apps consume.
 
 The goal is less repeated setup and faster, trustworthy feedback from builds and tests. Self-hosted CI optimization is an optional module on the same foundation.
 

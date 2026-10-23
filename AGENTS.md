@@ -13,3 +13,5 @@
 - Live integration tests must create disposable environments. Do not pause, restore or stop a developer's workspace as a test fixture.
 - Use exact provider documentation and record tested versions. Installation success is not proof of subscription eligibility or successful inference.
 - Keep changes small and identify what was verified versus what remains planned.
+
+- Engine Box owns generic agent/task execution, integration and merging, batching, CI evidence and promotion. Gamejam is an application consuming these APIs; do not put a second merge queue, fleet scheduler or CI authority in the app. Native harnesses keep their own planning loops.

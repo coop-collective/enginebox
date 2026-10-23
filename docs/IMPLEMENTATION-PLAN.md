@@ -20,7 +20,7 @@ Updated October 23, 2026. Scope: portable environments for native Codex, Cursor 
 
 Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and wider deployment qualification remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
-The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. It does not add agent orchestration or automatic placement.
+The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. Automatic placement and generic task/integration orchestration are Engine Box follow-up work; native harnesses keep their own planning loops.
 
 ## Cloudflare control-plane delivery
 
@@ -151,7 +151,7 @@ CPU/RAM limits are the first resource contract. GPU contribution is a separate o
 
 Public multi-tenancy requires real tenant authorization and private account/state storage. The current single-owner controller and per-workspace native homes do not establish that guarantee. Shared writable `.claude`, `.codex` or Cursor state across unrelated users is prohibited. Moving a tenant's state between workspaces needs stable paths, exclusive writer leases and recovery tests; see [native state](TENANT-AGENT-STATE.md).
 
-Automatic placement, swarm orchestration, GPU memory restoration, a new CI scheduler and premium engine recipes remain separate work. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
+Automatic placement, task/integration orchestration and engine-pool recipes belong in Engine Box and remain separate implementation gates. GPU memory restoration remains unqualified. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
 
 ## Checkout storage and large game assets
 
@@ -183,7 +183,7 @@ shared service, which R2 directly can supply. Work proceeds through these bounda
    Add resumable storage-node warmup, generation-specific readiness and gradual
    read preference with bounded R2 fallback under concurrent publication/GC.
 3. Add logical cross-worker result import into the canonical LayerFS history and
-   Gamejam's batched candidate checks. Database copying must never stand in for
+   Engine Box's batched candidate checks, consumed by Gamejam through APIs. Database copying must never stand in for
    merging independently written Stores or accepting a tested artifact.
 
 Automatic eviction, the distributed provider and cross-worker integration remain
