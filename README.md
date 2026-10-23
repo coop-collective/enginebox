@@ -12,6 +12,11 @@ The [product site and developer guide](packages/site/README.md) run locally with
 
 **Early development: native Rust services and tools, a capacity-aware fleet API, Vinext dashboard and headless browser MCP.** See [Rust migration and qualification](docs/RUST-MIGRATION.md) for the current release boundary.
 
+The target [fleet control plane runs on Cloudflare](docs/DESIGN.md#required-cloudflare-fleet-control-plane).
+Bare-metal servers are managed nodes; this migration is planned, not deployed.
+A dedicated storage node is optional. Single-node project storage can stay local;
+multi-node project execution requires shared storage, which R2 directly can provide.
+
 | Available in this repository | Planned |
 |---|---|
 | Configurable server bootstrap: `init`, `doctor`, `plan`, `apply` | Additional qualified host/guest combinations |

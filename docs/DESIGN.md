@@ -1,6 +1,13 @@
-# Portable self-hosted environment design
+# Portable node runtime and Cloudflare fleet design
 
 Status: implementation design updated October 23, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
+
+Owner decision, October 23: the target fleet requires a Cloudflare control plane.
+Bare-metal servers are managed compute and/or storage nodes, never the fleet's
+authoritative controller. A dedicated storage node is optional; shared project
+storage is required before a project can execute across two or more agent nodes.
+R2 directly can provide that service. This decision changes the target design;
+the existing native controller has not yet been migrated.
 
 ## Outcome
 
@@ -9,6 +16,9 @@ An owner connects a Linux server, prepares a workspace once, signs into the offi
 Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Launching an official CLI and resuming its native conversation belong in the environment API. Agent planning, task delegation between workers, a model gateway and a replacement CI scheduler remain outside this product.
 
 ## Components
+
+The following diagram describes the implemented native controller. The required
+Cloudflare target and migration boundary follow it.
 
 ```mermaid
 flowchart TD
@@ -32,6 +42,85 @@ flowchart TD
 The core owns environment lifecycle, preparation manifests, storage/mount interfaces and resource limits. The native-client recipe installs official binaries and configures supported local tools; it does not sit between the harness and provider. The CI module owns runner registration, job preparation, cache mappings and CI measurements. A workspace remains usable without GitHub or a runner.
 
 The first backend is Incus. Keep backend-specific operations behind a small internal interface, but implement only this backend until another real deployment requires more. Local and SSH transports should support the same operations.
+
+## Required Cloudflare fleet control plane
+
+Cloudflare owns node registration, authorization, desired state, workload placement,
+resource reservations, task/engine leases, accepted project revisions and recovery
+decisions. This applies even when one physical server combines compute and storage.
+Bare-metal machines run the native Engine Box node service and existing execution
+backends. Their local journals and inventories record execution evidence; they do
+not supersede the Cloudflare authority or become a fallback fleet controller.
+
+```mermaid
+flowchart TD
+    UI[Dashboard and operator MCP] --> API[Cloudflare Workers: authenticated fleet API]
+    API --> Registry[Durable Objects: tenant membership and policy]
+    API --> Projects[Durable Objects: project tasks, leases and accepted revisions]
+    API --> Nodes[Durable Objects: node sessions and capacity reservations]
+    Projects --> Nodes
+    Nodes <-->|Node-initiated authenticated connection| Runtime[Bare-metal Engine Box node service]
+    Runtime --> Agent[Private agent containers and engine processes]
+    Agent --> Local[Node-local LayerFS Store and NVMe caches]
+    Runtime <-->|Authorized object transfer| R2[R2: optional single-node storage; shared generations and recovery]
+    Runtime <-->|Optional nearby origin| Storage[Managed storage node]
+    Storage <--> R2
+```
+
+Use Workers for authentication, API/MCP ingress and routing. Use SQLite-backed
+Durable Objects for authoritative coordination, partitioned by tenant membership,
+node and project rather than one object serializing the entire fleet. A node's
+object owns its reservations; a project's object owns its accepted-head transitions
+and task decisions. Keep global listings or search in a derived index such as D1
+only if needed; that index cannot issue leases or override authoritative records.
+Each Durable Object has transactional, strongly consistent storage; this is not a
+transaction spanning multiple objects, nodes and R2. Persist before acknowledging
+state changes. [Durable Object storage](https://developers.cloudflare.com/durable-objects/best-practices/access-durable-objects-storage/).
+
+Placement uses a durable attempt ID: reserve capacity through the node authority,
+bind the reservation to the project attempt, and dispatch only after both records
+agree. Expire/reconcile partial reservations. Retries must return the recorded
+outcome or continue the same attempt, never allocate another engine implicitly.
+The node still checks actual local capacity under its existing host lock and may
+reject a reservation that no longer fits. Build and merge execution stays on nodes;
+only the Cloudflare project authority may accept the resulting revision.
+
+Nodes enroll through an owner-authorized, expiring registration and get revocable
+identities scoped to their tenant/node. Prefer node-initiated authenticated HTTPS
+or WebSocket control connections, with bounded messages, reconnect cursors and
+boot/session identity. Agent containers never receive these credentials. Durable
+Object WebSocket hibernation is available for idle connections; the session and
+assignment state must survive object restarts. [WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
+
+Every dispatched operation binds its project, node, attempt, desired revision,
+lease expiry and fencing epoch. Nodes journal operations before execution and
+report receipts idempotently. Reconnection reconciles receipts against Cloudflare
+state instead of replaying every command. Queues can provide retryable notification
+delivery when needed, with a durable outbox and deduplication; queue messages are
+not assignment authority. Delivery can occur more than once. Long native tasks do
+not occupy a Worker request while they run. [Queues delivery](https://developers.cloudflare.com/queues/reference/delivery-guarantees/).
+
+Cloudflare unavailability blocks new placement, lease renewal and promotion. A
+node can retain isolated local edits and finish work within an existing valid
+lease; exclusive shared effects must stop at lease expiry or revocation. Missing
+heartbeats do not prove an old process stopped. Cloudflare must fence/reconcile
+uncertain attempts before assigning conflicting work, and reject stale results.
+There is no bare-metal leader election during an outage.
+
+Control state and large project bytes remain separate. R2 or an authorized storage
+origin serves immutable generations directly to nodes; Workers/Durable Objects
+authorize access and record receipts rather than buffer multi-GB Stores. Optional
+storage nodes register like compute nodes and receive replication/repair work from
+Cloudflare. They cannot publish accepted revisions. See [storage modes and recovery](STORE-DISTRIBUTION.md).
+
+Migration must preserve the existing native execution, private provider homes and
+host admission contracts. Establish Cloudflare identities and durable state, import
+versioned desired state, drain the old controller, reconcile uncertain jobs, then
+fence its fleet mutation authority before cutover. Never run both controllers as
+independent writers. Native authentication helpers remain native; moving refresh
+ownership and secret access requires its own qualified migration. The current
+Rust REST service, direct SSH operator path and controller-owned credential store
+remain implementation facts, not evidence that this Cloudflare design is deployed.
 
 ## Initial support contract
 
@@ -97,10 +186,12 @@ VM never receives the backing SQLite file. See [core-idea mapping and current
 boundaries](GAME-WORKSPACES.md).
 
 The proposed [distributed storage model](STORE-DISTRIBUTION.md) puts recoverable,
-immutable project generations on a storage server and active Stores on worker
-NVMe. CPU/GPU scheduling favors compatible cached projects. Engine Box owns
-residency leases, capacity reservations and eviction after remote recoverability
-is proved. The storage and worker roles may initially run on the same server.
+immutable project generations in R2 and/or an optional storage origin, with active
+Stores on worker NVMe. Single-node project storage can remain local; cross-node
+execution requires shared storage. Cloudflare placement favors compatible cached
+projects. Engine Box owns residency leases, capacity reservations and eviction
+after remote recoverability is proved. The storage and worker roles may initially
+run on the same managed node.
 Cross-worker edits need logical revision integration; live database files are
 not shared across kernels and independently changed SQLite copies are not merged.
 
@@ -147,7 +238,7 @@ Operator MCP uses the operator's existing SSH/Incus authority. Guest MCP exposes
 
 The fleet controller clones only configured disk snapshots marked as clean bases. It copies into the configured storage pool and applies per-VM CPU/RAM/disk limits. Prepared tools and dependencies live on the copy-on-write disk; no provider installer runs during a fork. Headless browser preparation avoids a desktop by default. Completed cloud-init is disabled in the reusable image, while clone identity and ordinary networking remain enabled.
 
-Admission counts active instances across Incus projects, includes frozen RAM, preserves configured host/CI reserves and budgets full root/state disks even for stopped instances. The API bounds its work queue and shares a host lock with bootstrap. This is manual multi-host fleet management; automatic workload placement and swarm scheduling remain outside scope.
+Admission counts active instances across Incus projects, includes frozen RAM, preserves configured host/CI reserves and budgets full root/state disks even for stopped instances. The API bounds its work queue and shares a host lock with bootstrap. The current implementation provides manual multi-host fleet management; automatic workload placement belongs to the planned Cloudflare control plane. Agent planning and swarm task delegation remain separate concerns.
 
 Registered templates are controller-owned desired state. Importing or revising one schedules installation on every registered node, subject to capacity and compatibility checks. Adding a host to the inventory and restarting the controller enrolls it in synchronization; live host registration is not yet implemented. Per-node readiness/errors remain visible, and existing workspaces keep their original image.
 

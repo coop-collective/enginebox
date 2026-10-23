@@ -1,10 +1,13 @@
 # Project Store distribution and worker disk management
 
 Decision, October 23, 2026: keep LayerFS as the project workspace/history system.
-Use a storage server for recoverable generations and workers with local NVMe for
-active projects, agent containers and engine caches. The same existing server
-may perform both roles during development. Distribution, cache eviction and
-cross-worker change integration below are proposed Engine Box capabilities;
+Cloudflare is the required fleet controller; every bare-metal server is a managed
+node. Workers use local NVMe for active projects, agent containers and engine caches.
+A dedicated storage server is optional. Shared project storage, supplied by R2
+directly or a managed origin, is required for execution across two or more agent
+nodes. One node may use local-only project storage; a node may combine compute
+and storage roles. Distribution, cache eviction and cross-worker integration are
+proposed capabilities;
 the existing container backend is described in [game workspaces](GAME-WORKSPACES.md).
 
 ## Proposed technology choice
@@ -12,8 +15,9 @@ the existing container backend is described in [game workspaces](GAME-WORKSPACES
 Qualify **SQLite's Online Backup API plus desync v1.1.5** first: obtain a consistent
 closed snapshot, publish its chunk index once, and let workers reconstruct it
 using local chunks or a previous verified snapshot as a seed. A private HTTP
-origin on the storage server is sufficient initially. No new database service
-or second source-control system is needed for this transfer path.
+origin is sufficient for transfer qualification; it is an optional deployment role.
+Qualify an R2-direct adapter so multi-node execution needs no dedicated storage
+machine. No second source-control system is needed for this transfer path.
 
 | Technology | Useful role | Decision and boundary |
 |---|---|---|
@@ -25,24 +29,47 @@ or second source-control system is needed for this transfer path.
 | Litestream | Continuous SQLite WAL replication for recovery | Later option for reducing the loss window. Its checkpoint interaction with LayerFS's pinned profile needs qualification. Async backup is not accepted-head synchronization. [Mechanism](https://litestream.io/how-it-works/) |
 | LiteFS | Primary/replica SQLite service | Poor fit for independent writable worker Stores: replicas do not accept writes, and LayerFS currently restricts backing filesystems to local ext4/XFS/Btrfs. [Write model](https://www.fly.io/docs/litefs/primary/), [LayerFS contract](https://layerfs.ai/docs/platform/) |
 
-The initial implementation should need only a snapshot publisher, a private
-chunk origin and an Engine Box worker cache manager. Backup software is a
+The transfer implementation needs a snapshot publisher, a shared chunk destination
+and an Engine Box worker cache manager, controlled by the required Cloudflare
+fleet service. Backup software is a
 separate retention/recovery choice. Neither desync nor SQLite replication replaces
 LayerFS history or supplies the task acceptance queue.
 
 ## Storage and compute topology
 
+Cloudflare Workers and Durable Objects own fleet authority as specified in the
+[control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
+Storage optionality concerns project bytes and node roles, not control state.
+
+| Deployment | Project storage requirement | Dedicated storage node |
+|---|---|---|
+| One agent node, including multiple agent containers | Local LayerFS Store is sufficient for editing; remote storage is optional until recovery/promotion guarantees are requested | Optional |
+| Two or more agent nodes executing the same project | Shared service retaining authenticated generations and required chunks; R2 alone qualifies once the adapter passes qualification | Optional |
+| Larger fleet with nearby origins | Shared service plus managed replicas/site caches to improve throughput and recovery | Optional performance/capacity role |
+
+Here a node is a separate worker machine/kernel, not an agent process. Two machines
+can technically run unrelated projects without shared project storage; the
+requirement applies to our shared-project distribution and recovery contract.
+Allow node enrollment before storage setup, but block cross-node project placement
+until the shared backend is configured, authorized and ready. Loss of readiness
+blocks new transfers/promotion, not deletion of local work. Local-only mode must
+show that losing its node can lose project data; Cloudflare metadata cannot
+reconstruct absent project bytes. The off-host acceptance gate below still applies.
+
 ```mermaid
 flowchart LR
-    Catalog[Controller: accepted revisions and leases] --> Storage[Storage server: manifests and immutable chunks]
-    Storage --> Cache[Worker NVMe: chunk and generation cache]
+    Catalog[Cloudflare: accepted revisions, node state and leases] --> Shared[Shared project storage: R2 or managed origin]
+    Catalog --> Worker[Managed compute node]
+    Shared --> Cache[Worker NVMe: chunk and generation cache]
+    Origin[Optional managed storage node] --> Cache
+    Worker --> Cache
     Cache --> Local[Worker-local writable LayerFS Store]
     Local --> Agents[Private agent containers]
     Local --> Engine[Bounded CPU or GPU engine leases]
     Agents --> Results[Task result bundle and exact base revision]
-    Results --> Integrator[Canonical integration authority]
+    Results --> Integrator[Leased integration executor]
     Integrator --> Catalog
-    Storage -. separate recovery copy .-> Backup[Backup failure domain]
+    Origin -. retained recovery copy .-> R2[R2 when not already the primary origin]
 ```
 
 Use separate Store volumes per project/trust boundary, as the existing backend
@@ -57,7 +84,8 @@ I/O and their workload's compute. Put catalog/index metadata and frequently
 requested chunks on fast storage where available, but measure before adding a
 second cache service. Initially keep role directories and quotas distinct on the
 existing machine. A second directory on that machine is not an independent
-backup; its loss can remove both roles.
+backup; its loss can remove both roles. Neither role hosts authoritative fleet
+state: Cloudflare remains the controller even for this combined-node deployment.
 
 ## Resilience and rebuilding a lost server
 
@@ -75,8 +103,10 @@ Use three distinct protections:
 | Replicated immutable generations on another storage host | Serve projects promptly after a host outage | Hosts must be separate failure domains; two directories or VMs on one machine do not qualify |
 | Retained generations in R2 | Rebuild after losing the storage fleet, or recover an earlier retained revision | Requires complete manifests, referenced chunks and recovery metadata; availability and recovery time still depend on the remote service/network |
 
-Start with the existing combined compute/storage server plus R2 Standard as the
-off-host recovery destination. Later add a second storage origin with a complete
+For recoverable/shared operation, start with the existing combined compute/storage
+node plus R2 Standard, or use R2 directly without running a separate origin service.
+Local-only single-node editing is the explicitly less durable option above.
+Later add a second storage origin with a complete
 copy of the retained project generations it serves, preferably outside the first
 host's site. Workers may fetch verified chunks from either origin or authorized
 peers. Worker residency is opportunistic and never counts as the sole durable copy.
@@ -89,7 +119,8 @@ unreadable. If capacity later requires sharding, use an established object backe
 with replication or erasure coding across host failure domains, a repair process
 and measured degraded reads. Do not implement a custom distributed RAID protocol
 inside the LayerFS adapter. Keep transport and origin selection independent of the
-local workspace API so a single-host installation does not require a cluster.
+local workspace API so a single-node installation does not require storage peers.
+Its fleet control plane still requires Cloudflare.
 
 The R2 path should transfer only missing content-addressed chunks while retaining
 a complete index for each generation. A restore follows that index directly; it
@@ -135,11 +166,12 @@ upload can still be lost; the target is not a guarantee for every editor action.
 
 Rebuild in this order:
 
-1. Provision a compatible clean host from pinned recipes. Recover the project
-   catalog, trust configuration and acceptance records from the independent copy.
-2. Fence the previous controller/integrator before issuing new writer leases.
-   Reconcile uncertain jobs; a missing heartbeat never proves the old writer is
-   stopped. Two storage replicas are not a controller consensus system.
+1. Provision a compatible clean node from pinned recipes and enroll it with the
+   existing Cloudflare controller. Losing a bare-metal node does not lose the fleet
+   catalog or acceptance records. The node receives authorized desired state.
+2. Cloudflare fences the previous node/integration attempt before issuing
+   conflicting leases. Reconcile uncertain jobs; a missing heartbeat never proves
+   the old writer is stopped. Storage replicas never elect a fleet controller.
 3. Restore the exact required generation from the surviving origin or R2 onto
    local supported storage. Verify digests, SQLite integrity, LayerFS reopening
    and project file manifests before activation.
@@ -151,6 +183,12 @@ Measure recovery separately for worker loss, origin loss and complete host/site
 loss. Time to provision, recover authority, transfer, verify, mount and reach the
 first playable frame all contribute to recovery time. A warm-cache offline restore
 does not establish recovery from an empty machine.
+
+Cloudflare control-state restoration is a separate disaster-recovery procedure.
+Retain versioned configuration and decision exports, and reconcile restored state
+against node receipts and remote generations before enabling scheduling. Rollback
+must not resurrect expired leases or reuse fencing epochs. A node's local database
+can supply execution evidence, never replace missing Cloudflare authority.
 
 ## Generation identity and publication
 
@@ -242,14 +280,16 @@ written SQLite copies cannot be combined by rsync, WAL replay or chunk transfer.
 Those mechanisms replace or reproduce a database state; they do not integrate
 two histories.
 
-Start with project affinity and one canonical integration authority. Allow remote
+Start with project affinity and one Cloudflare project authority. Assign native
+merge/import work to a node under an exclusive integration lease. Allow remote
 workers to produce isolated task branches/results, preserving their recoverable
 Store generations. Before accepting cross-worker edits, implement a result bundle
 containing task ID, exact base revision, result tree, file changes, deletions,
 modes, required content digests and test evidence. The integrator reconstructs a
 branch from that base in its own Store, imports changes through supported LayerFS
 operations, merges into a frozen candidate, validates it, and advances the accepted
-head conditionally. It records imported provenance; it must not claim the remote
+head through Cloudflare conditionally after required durable receipts. It records
+imported provenance; it must not claim the remote
 commit's identity or full history was preserved unless that is actually supported.
 
 This logical import protocol is product work, not a shipped upstream replication

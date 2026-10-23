@@ -4,11 +4,14 @@ Owner decision, October 23, 2026: use LayerFS for shared project state and priva
 agent workspaces. Lore is removed from the architecture. Engine Box combines
 containers with LayerFS, manages compute and storage residency, and preserves
 recoverable Store generations. Gamejam owns task policy, candidate validation,
-playtests and promotion. Storage and execution initially use the existing server;
-a separate storage server and CPU/GPU workers are the planned deployment shape.
+playtests and promotion. Cloudflare is the required target fleet controller; every
+bare-metal server is a managed compute and/or storage node. A dedicated storage
+server is optional. One agent node may keep project storage local; execution across
+multiple agent nodes requires shared storage, which R2 directly can supply.
 
-The existing container integration is implemented. Distributed Store hydration,
-disk-pressure eviction and the game acceptance queue below are planned.
+The existing container integration is implemented. Cloudflare control-plane
+migration, distributed Store hydration, disk-pressure eviction and the game
+acceptance queue below are planned. See the [control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
 
 ## Existing container integration
 
@@ -21,7 +24,7 @@ See [the backend contract](LAYERFS-BACKEND.md).
 
 ```mermaid
 flowchart TD
-    Controller[Engine Box controller and native harness lifecycle] --> Runtime[Trusted node storage runtime]
+    Controller[Existing native controller and harness lifecycle] --> Runtime[Trusted node storage runtime]
     subgraph Worker[One worker Linux kernel]
         Runtime --> Store[Local project LayerFS Store]
         Store --> A[Container A: private branch at /project]
@@ -29,7 +32,7 @@ flowchart TD
         B --> Export[Optional host checkout export]
         Export --> VM[Incus VM: private home and /project view]
     end
-    Archive[Storage server: verified immutable generations] -. planned transfer .-> Store
+    Archive[R2 or optional storage node: verified generations] -. planned transfer .-> Store
 ```
 
 The [Incus adapter](LAYERFS-INCUS.md) exports the filesystem view through virtiofs;
@@ -92,7 +95,9 @@ Recordings remain separately retained artifacts referenced by task/build IDs.
    identity, capacity or guest readiness checks.
 2. Add [Store distribution and cache residency](STORE-DISTRIBUTION.md): consistent
    snapshots, an authenticated manifest catalog, local hydration, recovery
-   receipts and safe eviction. Benchmark current and previous project generations.
+   receipts and safe eviction. Connect to the required Cloudflare authority and
+   qualify R2-direct operation without a dedicated storage node. Benchmark current
+   and previous project generations.
 3. Connect Gamejam's batched candidate checks and bounded engine pool. Test
    concurrent submissions, conflicts, stale promotion, native engine saves and
    compatible shader/import cache restoration. Cross-worker results require a
@@ -103,10 +108,10 @@ measurements are retained as [historical research](../research/storage-benchmark
 
 ## Integration queue and startup evidence
 
-The owner's proposed dedicated storage server, warm node caches and lightweight
-agent workspaces fit this split. The [Git-free Unreal probe](LAYERFS-VALIDATION.md)
+The optional dedicated storage nodes, warm node caches and lightweight agent
+workspaces fit this split. The [Git-free Unreal probe](LAYERFS-VALIDATION.md)
 also establishes that LayerFS has usable local history and merging. Keep the
-accepted revision authority singular. LayerFS is the selected workspace/history foundation;
+accepted revision authority in Cloudflare. LayerFS is the selected workspace/history foundation;
 Engine Box will distribute immutable Store generations and coordinate the accepted
 head. The distributed adapter is specified in [Store distribution](STORE-DISTRIBUTION.md)
 and is not implemented.

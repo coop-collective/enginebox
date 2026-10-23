@@ -1,6 +1,6 @@
 # Implementation plan
 
-Updated October 20, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
+Updated October 23, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. The target fleet requires Cloudflare as controller and treats every bare-metal server as a managed node. This plan distinguishes implemented capabilities from platform and release acceptance still required.
 
 ## Milestones
 
@@ -16,10 +16,37 @@ Updated October 20, 2026. Scope: portable environments for native Codex, Cursor 
 | P7 | Native session API and private state | P3 | MCP launches all three native harnesses; exact conversation resume; bounded execution/output; state persists in the private workspace; overlapping writers and conflicting lifecycle actions rejected. Protocol fixtures and live provider inference are reported separately. |
 | P8 | Optional personal-resource node | P1, P7 | Explicit opt-in enrollment; enforce chosen aggregate CPU/RAM budget locally and at admission; one disposable Docker workspace validated on Mac and Windows separately; disconnect/sleep/reconnect cannot duplicate a run; no daemon socket in agent containers. |
 | P9 | Movable tenant state and native engine hosts | P7, P8 | Authenticated tenant authorization, account separation and private volume attach/lease tests before public multi-tenancy; independent Windows/macOS worker and GPU/image qualification. |
+| P10 | Required Cloudflare fleet control plane | P1, P7 | Workers API and durable per-tenant/node/project authority; authenticated node enrollment; fenced, idempotent dispatch and reconciliation; shared-storage admission for multi-node projects; qualified cutover from the native controller. |
 
 Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and wider deployment qualification remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
 The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. It does not add agent orchestration or automatic placement.
+
+## Cloudflare control-plane delivery
+
+P10 is planned, not deployed. Follow the [required control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane):
+
+1. Establish Workers API authorization and SQLite-backed Durable Objects for
+   membership, node capacity/reservations and project decisions. Persist each
+   authority's state; use derived indexes only for discovery/reporting.
+2. Enroll a disposable bare-metal/VM node through its outbound authenticated
+   connection. Add durable command IDs, boot/session identity, fencing epochs,
+   bounded leases, local operation receipts and reconciliation after reconnect.
+3. Exercise duplicate delivery, lost acknowledgments, partial reservations,
+   Cloudflare/object restarts, node restart, clock/lease expiry and partitions.
+   Prove no duplicate exclusive engine allocation or stale accepted-head update.
+4. Qualify one-node local storage and multi-node shared storage. R2 directly must
+   permit two compute nodes without a dedicated storage node. Block cross-node
+   placement when the shared backend is absent or unready; retain local work.
+5. Migrate versioned desired state and native credential ownership with explicit
+   compatibility checks. Drain/reconcile/fence the native controller before
+   enabling Cloudflare mutations. Validate node replacement with the Cloudflare
+   catalog intact and control-state recovery without reviving old leases.
+
+The native runtime remains the execution backend. Bare-metal storage nodes receive
+replication/repair assignments from Cloudflare; they never become fleet controllers.
+Current production services remain on their existing controller until this cutover
+is qualified. No implied deployment or credential migration accompanies this plan.
 
 ## Current agent-readiness work
 
@@ -132,9 +159,11 @@ forks. Preserve native provider homes and the separately qualified Incus export.
 The design maps all ten upstream core ideas to implemented behavior or explicit
 remaining work; a LayerFS version upgrade is not implicit in this decision.
 
-[Store distribution](STORE-DISTRIBUTION.md) separates the storage server from
-workers' local NVMe Stores. The same existing server may hold both roles during
-qualification. Work proceeds through these dependent boundaries:
+[Store distribution](STORE-DISTRIBUTION.md) separates shared generation storage
+from workers' local NVMe Stores under Cloudflare authority. A dedicated storage
+node is optional, and one node may combine compute and storage. Single-node editing
+can use local-only project storage; multi-node project execution requires a ready
+shared service, which R2 directly can supply. Work proceeds through these boundaries:
 
 1. Qualify the pinned container backend for game ingestion, exact task checkpoints
    and native engine cache reuse; complete allocation/attachment readiness.
@@ -144,6 +173,8 @@ qualification. Work proceeds through these dependent boundaries:
    Qualify incremental R2 recovery, retained manifests and acceptance records,
    fenced authority recovery and an empty-cache rebuild with the original host
    unavailable. RAID10 and worker caches do not satisfy off-host durability.
+   Connect publication and placement to P10; qualify both R2-direct delivery and
+   the optional managed-origin path without making a storage server mandatory.
 3. Add logical cross-worker result import into the canonical LayerFS history and
    Gamejam's batched candidate checks. Database copying must never stand in for
    merging independently written Stores or accepting a tested artifact.
