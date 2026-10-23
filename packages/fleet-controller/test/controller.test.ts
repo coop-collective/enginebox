@@ -172,6 +172,18 @@ it("retains assistant reservations across node restart until owner reconciliatio
   expect(
     (await ok("/v1/node/poll", {}, restarted)).reconciliationRequired,
   ).toBe(true);
+  await ok(
+    "/v1/node/heartbeat",
+    { stats: { uncertainNativeJobs: 1 } },
+    restarted,
+  );
+  expect(
+    (await ok("/v1/projects/demo/assistant/turn", undefined, restarted))
+      .blocked,
+  ).toBe(true);
+  expect(
+    (await ok("/v1/projects/demo/assistant", undefined, restarted)).available,
+  ).toBe(false);
   await ok("/v1/nodes/native-node/reconcile", { assignment, stopped: true });
   expect(
     (await ok("/v1/projects/demo/assistant/turn", undefined, restarted)).status,

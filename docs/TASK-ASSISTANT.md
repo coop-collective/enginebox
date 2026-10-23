@@ -45,6 +45,8 @@ Authenticated owner or project-scoped agent credentials can call these routes; s
 
 Reusing an ID with another prompt fails. Submission without a live capable node fails visibly. Existing accepted requests can be retried while a node is offline without creating another job. Nodes without this project's assistant capability never receive its assistant work.
 
+An uncertain native executor reports `status: "assigned", blocked: true` with an owner-reconciliation explanation. The app must not resubmit that operation under a fresh ID or claim it failed without side effects. Blocked nodes stop advertising assistant availability; owner reconciliation plus node restart is explicit.
+
 ## Recovery and qualification
 
 The node writes an intent before native submission and saves the returned native run ID before polling. The existing native launch API does not provide a caller idempotency key: a lost submission response is therefore uncertain, not safe to retry. The node retains the fleet reservation and blocks further execution until an owner checks/stops that native executor, reconciles the assignment, and restarts the node. Process restart never silently resubmits an uncertain native request.

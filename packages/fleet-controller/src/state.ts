@@ -62,8 +62,8 @@ export class Registry extends State {
   async registerNode(spec: NodeSpec) {
     this.put(`node:${spec.id}`, spec.id);
     if (spec.role === "agent")
-      for (const project of spec.projects)
-        this.put(`agent:${project}:${spec.id}`, spec.id);
+      for (const project of spec.assistantProjects ?? [])
+        this.put(`assistant:${project}:${spec.id}`, spec.id);
     if (spec.role === "storage")
       for (const project of spec.projects)
         this.put(`storage:${project}:${spec.id}`, spec.id);
@@ -71,8 +71,8 @@ export class Registry extends State {
   async storage(project: string) {
     return this.rows<string>(`storage:${project}:`);
   }
-  async agents(project: string) {
-    return this.rows<string>(`agent:${project}:`);
+  async assistants(project: string) {
+    return this.rows<string>(`assistant:${project}:`);
   }
 }
 

@@ -22,17 +22,25 @@ export async function assistantRoute(
 ) {
   const authority = env.PROJECTS.getByName(project);
   async function available() {
-    for (const nodeId of await env.REGISTRY.getByName("owner").agents(
-      project,
-    )) {
-      const node = await env.NODES.getByName(nodeId).view();
+    const ids = await env.REGISTRY.getByName("owner").assistants(project);
+    for (let offset = 0; offset < ids.length; offset += 16) {
+      const nodes = await Promise.all(
+        ids.slice(offset, offset + 16).map((id) =>
+          env.NODES.getByName(id)
+            .view()
+            .catch(() => null),
+        ),
+      );
       if (
-        node &&
-        !node.revoked &&
-        node.role === "agent" &&
-        !(node.stats.uncertainNativeJobs > 0) &&
-        node.lastSeen > Date.now() - NODE_STALE_MS &&
-        node.assistantProjects?.includes(project)
+        nodes.some(
+          (node) =>
+            node &&
+            !node.revoked &&
+            node.role === "agent" &&
+            !(node.stats.uncertainNativeJobs > 0) &&
+            node.lastSeen > Date.now() - NODE_STALE_MS &&
+            node.assistantProjects?.includes(project),
+        )
       )
         return true;
     }
