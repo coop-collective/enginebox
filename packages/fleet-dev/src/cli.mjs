@@ -236,6 +236,15 @@ async function smoke() {
     ),
   );
   if (!tasks.ok) throw new Error("Task MCP proof failed");
+  const { assistantDispatchSmoke } = await import(
+    "../test/assistant-dispatch-smoke.mjs"
+  );
+  const assistant = await assistantDispatchSmoke({
+    controller: url,
+    state,
+    api,
+    until,
+  });
   const source = await fixture();
   const generation = await publish(source);
   const recipe = createHash("sha256")
@@ -365,9 +374,11 @@ async function smoke() {
         ok: true,
         generation: generation.id,
         snapshotBytes: generation.manifest.snapshotBytes,
+        assistant,
         checks: [
           "publish",
           "scoped task MCP create/edit/move",
+          "assistant dispatch to scoped task MCP mutations (fixture executor)",
           "accept",
           "full candidate validation",
           "independent restore",
