@@ -395,11 +395,18 @@ export async function runNode(config: Config) {
             reservations: Assignment[];
           }>("/v1/node/hello", { session: client.session });
           client.epoch = hello.epoch;
-          for (const reservation of hello.reservations)
-            if (readOnlyJob(reservation) && reservation.epoch !== client.epoch)
+          for (const reservation of hello.reservations) {
+            if (
+              !readOnlyJob(reservation) &&
+              (reservation.epoch !== client.epoch ||
+                reservation.expires <= Date.now())
+            )
+              blockedNative = true;
+            else if (readOnlyJob(reservation) && reservation.epoch !== client.epoch)
               await client.json("/v1/node/reconcile", {
                 attempt: reservation.attempt,
               });
+          }
           connected = true;
           log("node_connected", { node: config.id, epoch: client.epoch });
         }
