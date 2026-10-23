@@ -23,7 +23,7 @@ The [product site and developer guide](packages/site/README.md) run locally with
 | Native packages, terminal installer plans, version pinning and supervised update/rollback | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
 | Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
-| Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
+| Controller-managed LayerFS storage, GitHub import/export with conflict-agent handoff, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
 The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Rust qualification passed real Codex/Claude coding, exact conversation resume and browser MCP use. A later disposable Cursor 2026.10.22 qualification passed delegated inference and exact-session resume; rollout of the compatible release and fresh templates is still required. The reference fleet now runs Rust 0.3.1-live.0 with account state preserved; Codex/Claude coding and exact resume also passed through the deployed operator MCP. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
@@ -73,6 +73,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Interrupted-command and daemon recovery qualification](docs/LAYERFS-RECOVERY-VALIDATION.md)
 - [LayerFS checkout attachment to Incus](docs/LAYERFS-INCUS.md)
 - [Storage registration, controller API and MCP](docs/STORAGE-API.md)
+- [GitHub import, optional sync and specialized conflict environments](docs/GITHUB-SYNC.md)
 - [Lore, Cloudflare Artifacts and measured game-project storage](docs/LORE-STORAGE.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)

@@ -29,7 +29,7 @@ flowchart TD
   R --> B
 ```
 
-The core owns environment lifecycle, preparation manifests, storage/mount interfaces and resource limits. The native-client recipe installs official binaries and configures supported local tools; it does not sit between the harness and provider. The CI module owns runner registration, job preparation, cache mappings and CI measurements. A workspace remains usable without GitHub or a runner.
+The core owns environment lifecycle, preparation manifests, storage/mount interfaces and resource limits. The native-client recipe installs official binaries and configures supported local tools; it does not sit between the harness and provider. The CI module owns runner registration, job preparation, cache mappings and CI measurements. A workspace remains usable without GitHub or a runner. LayerFS owns project source and branch history; [GitHub connections](GITHUB-SYNC.md) import/export files without placing Git in normal workspaces. Only the dedicated reconciliation environment uses Git, with specialized-agent conflict resolution and conditional external commits after LayerFS main acceptance.
 
 The first backend is Incus. Keep backend-specific operations behind a small internal interface, but implement only this backend until another real deployment requires more. Local and SSH transports should support the same operations.
 

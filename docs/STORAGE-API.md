@@ -26,9 +26,9 @@ Place `storage/config.json` inside the private controller state directory, owned
 }
 ```
 
-`host_id` must already exist in the fleet configuration. The executable must be this release's `ebox`, and the node configuration must refer to qualified local SDK artifacts, image and storage budgets. Prepare or fetch the repository on that node beforehand. The controller never accepts arbitrary repository paths, executable paths, SSH targets or shell commands from an API/MCP request.
+`host_id` must already exist in the fleet configuration. The executable must be this release's `ebox`, and the node configuration must refer to qualified local SDK artifacts, image and storage budgets. For local aliases, prepare the repository on the node beforehand. The GitHub connector can fetch an `owner/repository` directly without registering a local repository path. The controller never accepts arbitrary repository paths, executable paths, SSH targets or shell commands from an API/MCP request.
 
-The registry is loaded under exclusive controller ownership during activation. Use the normal drain/activation upgrade process to apply changes. An absent registry produces an empty storage catalog; malformed registrations fail activation. Node additions and newer Git revisions are not automatically fetched or replicated in this release. Project IDs currently identify one approved imported base; updating an existing base needs a separate versioned publication workflow.
+The registry is loaded under exclusive controller ownership during activation. Use the normal drain/activation upgrade process to apply changes. An absent registry produces an empty storage catalog; malformed registrations fail activation. Node additions are not automatically replicated. Local alias imports identify one approved base. GitHub imports become LayerFS-owned projects: subsequent source integration uses LayerFS main promotion and the optional GitHub reconciliation workflow, rather than replacing the imported Store.
 
 The API catalog hides node paths and reports `registered`, which means enrollment, not verified health. Queue `inspect` to check current prerequisites and `list` to read workspace receipts. Receipts retain interrupted operations and are not a live daemon health observation.
 
@@ -66,7 +66,7 @@ There is no API for general `exec`, arbitrary cache preparation, forced discard,
 
 The dashboard's **Storage** sidebar uses the same API. It shows enrolled nodes and their receipts, lets an operator review the exact source commit before attesting and importing, and forks from the base or a completed prepared checkpoint. Checkout actions track independent jobs, so work on one checkout does not disable its siblings. Status polling stops after 15 minutes or an observation failure; the UI can check an existing job again without resubmitting its command. Leaving the page stops observation, not the node operation.
 
-The built-in `enginebox-fleet-mcp` server exposes six storage tools:
+The built-in `enginebox-fleet-mcp` server exposes six local storage tools:
 
 - `storage_catalog`
 - `storage_inspect` (`operation` is `list` or `inspect`)
@@ -92,3 +92,42 @@ See [LayerFS backend operation](LAYERFS-BACKEND.md) for source import, immutable
 Controller and MCP tests exercise strict registration/request validation, exact import approval, absence of shell/path escape hatches, failed node results, durable jobs and draining during a storage operation. The node executor is substituted in controller route tests; those tests do not claim a deployed remote controller or production host migration.
 
 Core Incus transport tests additionally refuse hibernation, VM snapshots, restores and copies when a LayerFS attachment marker is present. Bootstrap preparation and template publication also reject marked VMs or snapshots, including markers left by a partial attachment. Old snapshots and reusable templates containing such a marker are refused. An external checkout is not captured by a VM's disk/RAM snapshot, and its file checkpoint must remain a separate operation.
+
+## GitHub connections and LayerFS main
+
+See [GitHub architecture and operation](GITHUB-SYNC.md). These operations use the
+same authenticated node job boundary and do not accept filesystem paths, tokens,
+Git URLs outside github.com, shell commands or arbitrary push refspecs.
+
+| Operation | Body | Behavior |
+| --- | --- | --- |
+| `github-preview` | `{"project":"app","repository":"owner/repo","branch":"main"}` | Fetch and review the exact source. Branch is optional on initial import. |
+| `github-import` | `{"project":"app","revision":"EXACT_COMMIT","approval":"DIGEST","credential_free":true}` | Import Git-free files into LayerFS; idempotent for the reviewed initial commit. |
+| `github-fork` | `{"project":"app","name":"agent-a"}` | Fork LayerFS main; optional `from` selects a prepared checkpoint in that Store. |
+| `github-settings` | `{"project":"app"}` | Observe accepted main revision/sequence and delivery state. Add `enabled: true/false` to configure outbound sync. |
+| `github-promote` | `{"project":"app","name":"agent-a","expected_main":"REVISION","merge":true}` | Merge the closed checkpoint with main and conditionally publish it. `merge: false` explicitly promotes that branch's complete tree. Optional `message`. |
+| `github-delivery` | `{"project":"app","action":"export"}` | Queue the current accepted main if enabled; ordinary task checkpoints are not export events. |
+| `github-delivery` | `{"project":"app","action":"deliver","attempt":"sync-ID"}` | Continue a durable attempt; lost push replies reuse its exact commit. |
+| `github-delivery` | `{"project":"app","action":"agent-task","attempt":"sync-ID"}` | Provision/inspect an isolated Git reconciliation container and return its specialized-agent task. |
+| `github-delivery` | `{"project":"app","action":"resolve","attempt":"sync-ID"}` | Accept a stopped agent environment's clean resolution into LayerFS, then conditionally deliver to GitHub. |
+| `github-delivery` | `{"project":"app","action":"retry","attempt":"sync-ID"}` | Retain a stale/failed-preparation attempt and reconcile again from accepted files. |
+
+The corresponding MCP tools are `storage_github_preview`, `storage_github_import`,
+`storage_github_fork`, `storage_github_settings`, `storage_github_promote` and
+`storage_github_delivery`. Poll `fleet_job` as for other storage operations.
+
+An administrator can add `github_token_file` to a registered node. It names a
+node-local service-owned mode-0600 JSON file containing `{"token":"..."}`.
+Parent storage state stays private. Use repository-scoped read access for imports
+or contents read/write for enabled delivery. Credentials are passed through an
+isolated Git process environment, never argv, a remote URL, a project, a sync
+container or a job response. Public imports need no token. Auth/rate/network
+errors remain visible and do not roll back accepted LayerFS main.
+
+Main promotion must use a closed workspace with a completed LayerFS checkpoint.
+The current adapter's publication lock and durable outbox are local-owner
+coordination, not distributed fencing. The in-progress distributed controller
+must invoke this workflow only after accepting an immutable generation under its
+lease/durability policy. Native agent scheduling/provider assignment remains the
+executor's responsibility; the connector supplies the bounded environment and
+exact-input task, and refuses active or unresolved agent results.

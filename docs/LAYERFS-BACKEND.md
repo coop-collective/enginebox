@@ -27,7 +27,7 @@ ebox --host local storage layerfs preview --repo /srv/source/my-project --revisi
 
 ## Publish a clean project and run work
 
-Review the preview's file list, exact commit, byte count and `approval` digest. Import takes **only that Git commit and its tree objects**, preserving the original commit ID in a clean shallow repository. It excludes the source checkout's local Git configuration, hooks, credentials, remotes, untracked files, ignored dependencies and earlier history objects. Export attributes cannot omit or rewrite tracked files. Known credential paths, escaping symlink chains and submodules are refused. This path policy is not a general secret scanner: the administrator must review the tracked content and explicitly declare it suitable for reuse. Git LFS hydration, submodules and automatic history fetching are not supported by this first import path.
+Review the preview's file list, exact commit, byte count and `approval` digest. Import materializes **only the reviewed committed files** into LayerFS. Git objects exist only in temporary connector staging; `.git` is removed before the Store is initialized. The original commit ID remains in the provenance receipt. It excludes the source checkout's local Git configuration, hooks, credentials, remotes, untracked files, ignored dependencies and earlier history objects. Export attributes cannot omit or rewrite tracked files. Known credential paths, escaping symlink chains and submodules are refused. This path policy is not a general secret scanner: the administrator must review the tracked content and explicitly declare it suitable for reuse. Git LFS hydration, submodules and automatic history fetching are not supported by this first import path.
 
 ```sh
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
@@ -37,7 +37,7 @@ sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json fork demo worker-a
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json fork demo worker-b
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
-  exec worker-a --timeout 120 -- git status --short
+  exec worker-a --timeout 120 -- ls -la /project
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
   checkpoint worker-a --message 'Saved file changes'
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json remount worker-a
@@ -49,9 +49,9 @@ After preparing and checkpointing dependencies, `fork demo worker-c --from worke
 
 Every sandbox gets a separate bind mount at `/project`, pointing to its current LayerFS mount. Remount changes the underlying `/workspaces/N` location but restores the `/project` bind before accepting another command. Workspaces have independent leases: commands in different workspaces may overlap; concurrent operations on the same workspace are refused. Do not launch detached background workloads through this first command interface.
 
-The source checkout's local Git author settings and remotes are deliberately not imported. Configure the desired author identity in your image or workspace before committing. Agent commits retain the imported commit as their normal Git ancestor.
+New workspaces use LayerFS checkpoints and branches, without a native Git checkout. Existing legacy imports containing `.git` are retained as-is and require explicit migration. GitHub import and optional outbound commits are handled by the separate [GitHub connector](GITHUB-SYNC.md).
 
-`close` and `remount` refuse uncheckpointed changes. There is no implicit discard or filesystem branch-merge command. Use Git's own integration semantics for future agent changes; whole-tree LayerFS merging of `.git` metadata is not Git merging. File checkpoints retain the upstream preview's durability and mtime limitations; they are not a backup or power-loss guarantee.
+`close` and `remount` refuse uncheckpointed changes. There is no implicit discard. The `main` and `promote` commands inspect and conditionally advance LayerFS main from a checkpointed, closed workspace; `promote --merge` first merges with current main. GitHub-linked projects use `github-promote` so enabled export is queued. Git reconciliation occurs only in a dedicated sync environment. File checkpoints retain the upstream preview's durability and mtime limitations; they are not a backup or power-loss guarantee.
 
 ## Immutable dependency reuse
 

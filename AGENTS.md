@@ -2,6 +2,7 @@
 
 - Keep provider harnesses native. The owner explicitly requested controller-managed provider connections and credential delegation to their authorized private workspaces. Keep refresh credentials in private controller storage and use provider-supported or explicitly version-qualified native authentication formats. Do not proxy inference, replace agent loops or pool accounts across unrelated users.
 - Keep the core runtime independent of GitHub and of the optional CI module.
+- LayerFS owns project files, branches and accepted main revisions. Normal project workspaces contain no native Git checkout. GitHub is an optional import/export connection; enabled exports follow accepted main promotion. Conflicts belong in a dedicated agent environment with Git and materialized LayerFS files, and resolved source must return through LayerFS acceptance before a conditional remote update.
 - Treat `docs/DESIGN.md` and `docs/IMPLEMENTATION-PLAN.md` as the current scope. Explicitly label proposed commands and unimplemented capabilities.
 - Never put host inventories, account state, provider tokens, GitHub registration tokens, SSH keys, real customer projects or VM snapshots in Git.
 - Bootstrap must inspect before changing a host. Never repartition disks, overwrite unrelated profiles or change global NFS/firewall services implicitly.

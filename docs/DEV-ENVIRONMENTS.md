@@ -38,7 +38,7 @@ These are design steps, not currently callable Engine Box operations. Publicatio
 
 Two environments must not point independent SQLite/Miniflare runtimes at the same writable persistence directory. Fork isolation comes from independent writable state, not from distinct ports or branch names. Sharing a service is a different choice: agents call its API with the intended permissions and accept that writes affect shared state.
 
-Later changes in the core do not silently appear in an existing fork. Refresh creates a new fork or performs a deliberate application-specific import. Code returns through reviewed Git changes. Data returns only through an explicit migration, export/import or application operation; there is no automatic database merge. Task completion can discard the fork without deleting the core or its published baseline.
+Later changes in the core do not silently appear in an existing fork. Refresh creates a new fork or performs a deliberate application-specific import. Code returns through reviewed LayerFS branch integration. An optional GitHub connection exports accepted main revisions and uses a specialized Git environment for external conflicts; see [GitHub sync](GITHUB-SYNC.md). Data returns only through an explicit migration, export/import or application operation; there is no automatic database merge. Task completion can discard the fork without deleting the core or its published baseline.
 
 ## Cloudflare as the first recipe
 

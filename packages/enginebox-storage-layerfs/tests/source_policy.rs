@@ -284,3 +284,61 @@ fn private_configuration_requires_pins_and_budgets_without_feature_opt_in() {
         assert!(identifier(name).is_err());
     }
 }
+
+#[test]
+fn layerfs_materialization_contains_files_and_modes_but_no_git_database() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempfile::tempdir().unwrap();
+    fixture(repo.path());
+    fs::write(repo.path().join("binary.bin"), [0, 1, 255]).unwrap();
+    fs::write(repo.path().join("script"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(
+        repo.path().join("script"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("hello.txt", repo.path().join("link")).unwrap();
+    source::git(repo.path(), &["add", "."]).unwrap();
+    source::git(repo.path(), &["commit", "-m", "files"]).unwrap();
+    let preview = source::preview(repo.path(), "HEAD").unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    source::stage_files(repo.path(), &preview, staging.path()).unwrap();
+    let imported = staging.path().join("source");
+    assert!(!imported.join(".git").exists());
+    assert_eq!(fs::read(imported.join("binary.bin")).unwrap(), [0, 1, 255]);
+    assert!(
+        fs::metadata(imported.join("script"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    );
+    assert!(
+        fs::symlink_metadata(imported.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+#[test]
+fn lfs_pointer_is_not_imported_as_if_it_were_the_asset() {
+    let repo = tempfile::tempdir().unwrap();
+    fixture(repo.path());
+    fs::write(
+        repo.path().join("asset.bin"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12345\n",
+            "a".repeat(64)
+        ),
+    )
+    .unwrap();
+    source::git(repo.path(), &["add", "."]).unwrap();
+    source::git(repo.path(), &["commit", "-m", "pointer"]).unwrap();
+    assert!(
+        source::preview(repo.path(), "HEAD")
+            .unwrap_err()
+            .to_string()
+            .contains("Git LFS")
+    );
+}
