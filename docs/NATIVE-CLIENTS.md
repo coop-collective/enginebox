@@ -13,11 +13,11 @@ The Rust bootstrap stages Linux-native `enginebox-host`, `enginebox-guest` and `
 
 The host guest mapping selects the ordinary user, UID/GID, private home and workspace. The template selects native clients and optional browser/desktop/computer MCP. Existing mismatched identities fail. Existing native clients and unrelated MCP entries are preserved. Native clients install as the ordinary user, and their resolved versions are recorded without account data in `/opt/enginebox-runtime/installed-versions.json`; this historical data path is retained for compatibility.
 
-New installations target Codex 0.163.0 and Claude Code 2.1.302. The Cursor official installer is checked against 2026.10.16-e3cb207; upstream update behavior is separate from Engine Box versioning. Browser setup uses the pinned official Playwright MCP package. Guest computer MCP exposes only guest desktop tools and receives no host SSH identity or Incus socket. Native approval settings remain in force.
+New installations target Codex 0.163.0 and Claude Code 2.1.302. The Cursor official installer is checked against 2026.10.22-27dcf5f; upstream update behavior is separate from Engine Box versioning. Browser setup uses the pinned official Playwright MCP package. Guest computer MCP exposes only guest desktop tools and receives no host SSH identity or Incus socket. Native approval settings remain in force.
 
 For controller clients, run `enginebox-agent-clients --state-dir /private/controller-root --plan`, then the same command with `--apply`. It prepares the providers' original binaries under controller-owned persistent storage. The managed native-client installer currently supports Linux/macOS; Windows operator packaging does not qualify Windows native sign-in.
 
-Existing v0.2 guests can receive the three native helpers using the guarded [migration procedure](RUST-MIGRATION.md). Helper installation preserves homes, credentials, native CLI binaries and existing identity services. New recipe changes use template revision 4; old prepared images are not silently reprovisioned.
+Existing v0.2 guests can receive the three native helpers using the guarded [migration procedure](RUST-MIGRATION.md). Helper installation preserves homes, credentials, native CLI binaries and existing identity services. New recipe changes use template revision 5; old prepared images are not silently reprovisioned. Version constraints are shared by controller installation, guest preparation and access delegation. Guest preparation rejects an unqualified existing or newly installed client before publishing a ready base. Repeated credential delivery also verifies the version when its credential generation has not changed.
 
 ## Owner sign-in and Agent Access
 
@@ -64,6 +64,8 @@ may retain its old credential even after a controller updates files.
 [Claude token authentication](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token),
 [Cursor automation authentication](https://cursor.com/docs/cli/reference/authentication),
 [Codex external-token authentication](https://learn.chatgpt.com/docs/app-server#3c-log-in-with-externally-managed-chatgpt-tokens-chatgptauthtokens).
+
+On October 23, Cursor `2026.10.22-27dcf5f` passed access-only credential delivery, three fresh read tasks and exact-session resume in a disposable Ubuntu workspace with its native sandbox enabled. See the [timing follow-up](REMOTE-AGENT-TIMING-2026-10-23.md#cursor-follow-up-qualification). That qualification does not upgrade existing fleet templates or qualify the Cursor Cloud service.
 
 Subscription entitlement, available models and concurrency remain provider/account
 decisions. Signing in successfully does not establish successful inference. API

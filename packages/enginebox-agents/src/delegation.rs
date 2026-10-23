@@ -202,9 +202,6 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
             );
         }
     }
-    if marker["generation"] == generation {
-        return Ok(json!({"ok":true,"unchanged":true,"instance_id":instance_id}));
-    }
     if let Some(expected) = request["expected_version"].as_str() {
         let env = native::environment(home)?;
         let exe = native::find_binary(native::binary(p), &env)
@@ -214,6 +211,9 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
             actual.split_whitespace().any(|part| part == expected),
             "Native access format is not qualified for this client version."
         );
+    }
+    if marker["generation"] == generation {
+        return Ok(json!({"ok":true,"unchanged":true,"instance_id":instance_id}));
     }
     let content = &request["content"];
     ensure!(content.is_object(), "Invalid delegated content.");

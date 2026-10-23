@@ -101,10 +101,47 @@ Do not sum cumulative rows, infer missing values as zero, or present list-price
 cost estimates as subscription balances. The separate ACP/fleet task change uses
 this evidence to distinguish invocation counts from session totals.
 
+## Cursor follow-up qualification
+
+Cursor Agent **2026.10.22-27dcf5f** subsequently passed three fresh conversations
+and one exact-session resume in a separate disposable 4-vCPU / 4-GiB workspace.
+The official installer and native sandbox preflight passed first. The controller's
+existing connected account supplied access-only material; its refresh credential
+was retained on the controller. The expired browser login request was not treated
+as a completed new login.
+
+| Operation | Samples | Median | Range |
+| --- | ---: | ---: | --- |
+| Cursor fresh conversation + tiny read task | 3 | 23.073 s | 20.690–54.122 s |
+| Cursor follow-up in exact conversation | 1 | 18.478 s | — |
+
+Fresh times were **54.122, 20.690 and 23.073 seconds**. Each fresh run emitted a
+completed native read-tool event and returned `enginebox ENGINEBOX_STARTUP_OK`.
+All four invocations exited successfully without timeout, and the follow-up
+returned the exact original native session ID. The native default was **Auto
+Balance**, whose response reported routing to **Grok 4.7**. These settings differ
+from the Codex and Claude samples above.
+
+This timer covers the controller host invoking `incus exec`, the Rust guest
+helper, native CLI initialization, the task and the complete result. It excludes
+workspace allocation, CLI installation and the fleet HTTP admission path. The
+native result reported approximately 12.7–13.6 seconds for the fresh turns; that
+field is not a measurement of overall process startup. No first-token, first-tool
+or VM-only latency is inferred from these completion times. The first sample also
+includes costs that may be amortized by subsequent CLI launches; this experiment
+did not isolate them.
+
+The qualification deliberately used the candidate's exact version constraint on
+credential delivery. It does not mean the deployed controller or existing
+revision-4 templates have been upgraded. The compatible controller/guest release
+and a newly prepared revision-5 template must be rolled out together before
+claiming the normal fleet API is repaired. Signed-in developer workspaces are not
+silently reinstalled.
+
 ## Next comparable run
 
-1. Align the installed Cursor version with a qualified delegation format, then
-   verify inference and exact-session follow-up on a fresh disposable workspace.
+1. Roll out the qualified Cursor version and new template, then repeat through
+   the normal controller HTTP path. Native guest inference and resume now pass.
 2. Configure a valid Cursor Cloud user API key locally and select a prepared
    Build for the same benchmark repository.
 3. Select a suitable Codex Cloud environment and an accessible cloud task channel.

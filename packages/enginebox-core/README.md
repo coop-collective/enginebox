@@ -32,7 +32,7 @@ Replace the example with the real lowercase workspace name. The command authoriz
 
 Create/resume and warm assignment check helper versions before readiness. A legacy warm reserve is durably claimed, resumed, then upgraded before it becomes ready for agent access; failed startup never returns that VM to the pool. All three helper versions are checked so an interrupted rollout can resume. The `Fleet::sync_guest_tools` method provides the same controlled migration for running assigned VMs.
 
-Clean templates for the Rust provisioning recipe use manifest revision 4. Existing revision 3 digests are not silently rewritten. Helper-only migration preserves an old guest's original identity service; installing a new revision 4 clean template is what replaces Python-based guest preparation and identity units. Never run full bootstrap preparation against an assigned workspace with account state.
+Clean templates for the current native-client recipe use manifest revision 5. Revision 4 introduced Rust guest preparation; revision 5 requires qualified client versions, including Cursor 2026.10.22. Existing revision 3 digests are not silently rewritten. Helper-only migration preserves an old guest's original identity service; installing a new revision 4 clean template is what replaces Python-based guest preparation and identity units. Never run full bootstrap preparation against an assigned workspace with account state.
 
 ## Validation
 
