@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   canonical,
   requireThat,
@@ -18,8 +19,26 @@ type Store = {
 export type AcceptedTaskEvidence = {
   id: string;
   generation: string;
-  validation?: { candidate: CandidateSpec };
+  validation?: {
+    candidate: CandidateSpec;
+    taskRequirements?: Record<string, string>;
+  };
 };
+type TaskCandidate = {
+  spec: CandidateSpec;
+  taskRequirements?: Record<string, string>;
+};
+function requirements(task: Task) {
+  return createHash("sha256")
+    .update(
+      canonical({
+        title: task.title,
+        description: task.description,
+        type: task.type,
+      }),
+    )
+    .digest("hex");
+}
 
 // Project-local records share the Project DO's synchronous transaction boundary.
 // No I/O or await occurs between task, operation receipt and event writes.
@@ -30,6 +49,24 @@ export class Tasks {
   ) {}
   get(id: string) {
     return this.store.get<Task>(`task:${id}`) ?? null;
+  }
+  snapshotRequirements(spec: CandidateSpec) {
+    return Object.fromEntries(
+      spec.changes.flatMap((change) => {
+        const task = this.get(change.id);
+        return task ? [[task.id, requirements(task)]] : [];
+      }),
+    );
+  }
+  validateRequirements(snapshot: Record<string, string> = {}) {
+    for (const [id, expected] of Object.entries(snapshot)) {
+      const task = this.get(id);
+      requireThat(
+        task && requirements(task) === expected,
+        "Task requirements changed after this candidate was staged",
+        409,
+      );
+    }
   }
   list(cursor: string, limit: number, status?: TaskStatus) {
     const rows = this.sql
@@ -191,6 +228,13 @@ export class Tasks {
       (input.patch.description !== undefined &&
         input.patch.description !== task.description) ||
       (input.patch.type !== undefined && input.patch.type !== task.type);
+    if (contentChanged)
+      requireThat(
+        !this.store.get<AcceptedTaskEvidence>("pendingDecision")?.validation
+          ?.taskRequirements?.[task.id],
+        "Acceptance must settle before changing task requirements",
+        409,
+      );
     Object.assign(task, input.patch);
     if (contentChanged) {
       task.resultGeneration = null;
@@ -217,7 +261,7 @@ export class Tasks {
       task.resultGeneration = input.generation;
     }
     if (input.candidate) {
-      const candidate = this.store.get<{ spec: CandidateSpec }>(
+      const candidate = this.store.get<TaskCandidate>(
         `candidate:${input.candidate}`,
       );
       requireThat(
@@ -227,6 +271,11 @@ export class Tasks {
             change.generation === task.resultGeneration,
         ),
         "Candidate does not include this task result",
+        409,
+      );
+      requireThat(
+        candidate?.taskRequirements?.[task.id] === requirements(task),
+        "Candidate does not match current task requirements",
         409,
       );
       task.candidate = input.candidate;
@@ -261,7 +310,7 @@ export class Tasks {
       "Accepted candidate evidence is required to ship",
       409,
     );
-    const candidate = this.store.get<{ spec: CandidateSpec }>(
+    const candidate = this.store.get<TaskCandidate>(
       `candidate:${task.candidate}`,
     );
     requireThat(candidate, "Unknown task candidate", 409);
@@ -270,6 +319,8 @@ export class Tasks {
     );
     requireThat(
       evidence?.validation?.candidate.id === task.candidate &&
+        evidence.validation.taskRequirements?.[task.id] ===
+          requirements(task) &&
         evidence.validation.candidate.changes.some(
           (change) =>
             change.id === task.id &&
@@ -290,6 +341,8 @@ export class Tasks {
         !task ||
         task.status !== "testing" ||
         task.review !== "automatic" ||
+        evidence.validation.taskRequirements?.[task.id] !==
+          requirements(task) ||
         task.resultGeneration !== change.generation ||
         (task.candidate && task.candidate !== candidate.id)
       )

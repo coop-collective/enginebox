@@ -37,6 +37,8 @@ Codex supports [stdio MCP registration](https://learn.chatgpt.com/docs/developer
 
 Authenticated owner or project-scoped agent credentials can call these routes; storage nodes cannot. The app backend authenticates its user before proxying, keeps the node credential server-side, and binds polling to the requesting account.
 
+Storage inventories and node catalogs omit assistant jobs, and raw job-detail reads require an agent or owner credential. Storage nodes retain access to their project's generation metadata without receiving assistant prompts or responses.
+
 | Route | Behavior |
 |---|---|
 | `GET /v1/projects/:project/assistant` | Reports configured/live executor availability and provider; no native endpoint or credentials |

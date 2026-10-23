@@ -3,6 +3,7 @@ import {
   canonical,
   LEASE_MS,
   requireThat,
+  readOnlyJob,
   type Assignment,
   type Generation,
   type JobSpec,
@@ -120,6 +121,11 @@ export class FleetNode extends State {
       node.ready = {};
     }
     node.lastSeen = Date.now();
+    if (this.hasUncertainNative(node.epoch))
+      node.stats.uncertainNativeJobs = Math.max(
+        node.stats.uncertainNativeJobs ?? 0,
+        1,
+      );
     this.put("node", node);
     return {
       epoch: node.epoch,
@@ -138,6 +144,14 @@ export class FleetNode extends State {
     );
     return node;
   }
+  private hasUncertainNative(epoch: number) {
+    return this.rows<Reservation>("lease:").some(
+      (lease) =>
+        lease.state !== "finished" &&
+        !readOnlyJob(lease) &&
+        (lease.epoch !== epoch || lease.expires <= Date.now()),
+    );
+  }
   async heartbeat(
     epoch: number,
     session: string,
@@ -145,7 +159,12 @@ export class FleetNode extends State {
   ) {
     const node = this.current(epoch, session);
     node.lastSeen = Date.now();
-    node.stats = stats;
+    node.stats = {
+      ...stats,
+      ...(this.hasUncertainNative(epoch)
+        ? { uncertainNativeJobs: Math.max(stats.uncertainNativeJobs ?? 0, 1) }
+        : {}),
+    };
     this.put("node", node);
     return { epoch, now: Date.now() };
   }
@@ -328,12 +347,14 @@ type Decision = {
     candidate: CandidateSpec;
     checks: CheckRequirement[];
     jobs: Record<string, string>;
+    taskRequirements?: Record<string, string>;
   };
 };
 type CandidateRecord = {
   spec: CandidateSpec;
   checks: CheckRequirement[];
   fullJobs: Record<string, string>;
+  taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
   private tasks() {
@@ -449,7 +470,12 @@ export class Project extends State {
       );
       return prior;
     }
-    const value: CandidateRecord = { spec, checks, fullJobs: {} };
+    const value: CandidateRecord = {
+      spec,
+      checks,
+      fullJobs: {},
+      taskRequirements: this.tasks().snapshotRequirements(spec),
+    };
     this.put(`candidate:${spec.id}`, value);
     return value;
   }
@@ -500,6 +526,7 @@ export class Project extends State {
         "Candidate or validation policy changed",
         409,
       );
+      this.tasks().validateRequirements(candidate.taskRequirements);
       for (const check of checks) {
         const job = this.get<JobRecord>(
           `job:${candidate.fullJobs[check.name]}`,
@@ -518,6 +545,10 @@ export class Project extends State {
         candidate: candidate.spec,
         checks,
         jobs: candidate.fullJobs,
+        ...(candidate.taskRequirements &&
+        Object.keys(candidate.taskRequirements).length
+          ? { taskRequirements: candidate.taskRequirements }
+          : {}),
       };
     }
     requireThat(head === expected, "Accepted head changed", 409);

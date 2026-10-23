@@ -39,6 +39,16 @@ const json = (value: unknown, status = 200) =>
     },
   });
 type Principal = { admin: true } | { admin: false; node: NodeView };
+function visibleInventory<T extends { jobs: { spec: { kind: string } }[] }>(
+  p: Principal,
+  inventory: T,
+) {
+  if (p.admin || p.node.role === "agent") return inventory;
+  return {
+    ...inventory,
+    jobs: inventory.jobs.filter((job) => job.spec.kind !== "assistant"),
+  };
+}
 function bearer(request: Request) {
   return (
     request.headers.get("authorization")?.match(/^Bearer ([^\s]+)$/)?.[1] ?? ""
@@ -178,6 +188,22 @@ export default {
       const p = await principal(request, env);
       const registry = env.REGISTRY.getByName("owner");
       requireThat(parts[0] === "v1", "Unknown API", 404);
+      if (!p.admin && p.node.taskOnly === true)
+        requireThat(
+          (parts.length === 3 &&
+            parts[1] === "node" &&
+            parts[2] === "identity" &&
+            request.method === "GET") ||
+            (parts[1] === "projects" &&
+              (parts[3] === "tasks" ||
+                (parts[3] === "activity" &&
+                  parts.length === 4 &&
+                  request.method === "GET") ||
+                (parts[3] === "assistant" &&
+                  (parts.length === 4 || parts.length === 5)))),
+          "Task-only credentials cannot operate fleet executors or storage",
+          403,
+        );
       if (parts.length === 2 && parts[1] === "projects") {
         admin(p);
         if (request.method === "GET")
@@ -272,7 +298,12 @@ export default {
           return json(await stub.hello(body.session));
         }
         if (parts[2] === "identity" && request.method === "GET") {
-          return json({ id: n.id, role: n.role, projects: n.projects });
+          return json({
+            id: n.id,
+            role: n.role,
+            projects: n.projects,
+            taskOnly: n.taskOnly === true,
+          });
         }
         if (parts[2] === "heartbeat" && request.method === "POST") {
           const s = session(request);
@@ -317,8 +348,11 @@ export default {
           await stub.reservations(s.epoch, s.session);
           return json(
             await Promise.all(
-              n.projects.map((project) =>
-                env.PROJECTS.getByName(project).inventory(),
+              n.projects.map(async (project) =>
+                visibleInventory(
+                  p,
+                  await env.PROJECTS.getByName(project).inventory(),
+                ),
               ),
             ),
           );
@@ -350,6 +384,18 @@ export default {
         if (parts[2] === "poll" && request.method === "POST") {
           const s = session(request);
           const reservations = await stub.reservations(s.epoch, s.session);
+          if (
+            reservations.some(
+              (r) =>
+                !readOnlyJob(r) &&
+                (r.epoch !== s.epoch || r.expires <= Date.now()),
+            )
+          )
+            return json({
+              assignment: null,
+              reconciliationRequired: true,
+              reservations,
+            });
           const own = reservations.filter(
             (r) =>
               r.epoch === s.epoch &&
@@ -523,7 +569,13 @@ export default {
                 : {}),
             })),
             nodes: views
-              .filter((v) => v && !v.revoked && v.projects.includes(project))
+              .filter(
+                (v) =>
+                  v &&
+                  !v.revoked &&
+                  !v.taskOnly &&
+                  v.projects.includes(project),
+              )
               .map((v) => ({
                 id: v!.id,
                 role: v!.role,
@@ -535,7 +587,7 @@ export default {
           });
         }
         if (parts.length === 3 && request.method === "GET")
-          return json(await authority.inventory());
+          return json(visibleInventory(p, await authority.inventory()));
         if (
           parts.length === 4 &&
           parts[3] === "checks" &&
@@ -583,6 +635,11 @@ export default {
           parts[3] === "jobs" &&
           request.method === "GET"
         ) {
+          requireThat(
+            p.admin || p.node.role === "agent",
+            "Job access requires an agent or owner",
+            403,
+          );
           identifier(parts[4]);
           const job = await authority.job(parts[4]);
           requireThat(job, "Unknown job", 404);
