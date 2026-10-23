@@ -180,6 +180,8 @@ shared service, which R2 directly can supply. Work proceeds through these bounda
    unavailable. RAID10 and worker caches do not satisfy off-host durability.
    Connect publication and placement to P10; qualify both R2-direct delivery and
    the optional managed-origin path without making a storage server mandatory.
+   Add resumable storage-node warmup, generation-specific readiness and gradual
+   read preference with bounded R2 fallback under concurrent publication/GC.
 3. Add logical cross-worker result import into the canonical LayerFS history and
    Gamejam's batched candidate checks. Database copying must never stand in for
    merging independently written Stores or accepting a tested artifact.

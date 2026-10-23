@@ -6,7 +6,7 @@ in production or run locally with Wrangler for development/tests. Every producti
 bare-metal server is a managed node. Workers use local NVMe for active projects,
 agent containers and engine caches.
 A dedicated storage server is optional. Shared project storage, supplied by R2
-directly or a managed origin, is required for execution across two or more agent
+directly or an R2-backed managed origin in production, is required across two or more agent
 nodes. One node may use local-only project storage; a node may combine compute
 and storage roles. Distribution, cache eviction and cross-worker integration are
 proposed capabilities;
@@ -163,14 +163,78 @@ local workspace API so a single-node installation does not require storage peers
 Its fleet controller still uses the Cloudflare architecture, with local Wrangler
 permitted for development/tests as specified in [the design](DESIGN.md#local-development-and-test-fleets).
 
+### Warming a storage node and making it the preferred origin
+
+In the production R2-backed mode, a storage node becomes the preferred **read
+origin** for verified project generations. Cloudflare keeps fleet/revision
+authority, and R2 keeps the retained durable content needed to rebuild the node.
+Read preference never authorizes accepting a revision whose required R2 objects
+and acceptance record are absent. A node can begin serving active projects while
+older retained generations are still downloading.
+
+1. **Enroll and inventory.** Register the node's identity, supported format,
+   capacity and endpoint with Cloudflare. Reconcile any surviving local inventory;
+   only verified content is reusable. Begin in `warming`, without advertising
+   complete project replicas. R2 continues serving the existing read path.
+2. **Capture the assigned scope.** Cloudflare supplies authenticated manifests for
+   the node's assigned projects, retention pins and a durable catalog cursor.
+   Subscribe to later publication changes and periodically reconcile the catalog;
+   notifications are hints, not the sole record of what needs copying. The cursor
+   and assignments are scoped rather than one global fleet synchronization lock.
+3. **Fetch useful data first.** Prioritize active accepted/candidate generations,
+   upcoming tasks and compatible expensive caches, then pinned rollback/history.
+   Fetch missing chunks from R2 or an authorized healthy replica. Coalesce repeated
+   demand for the same chunk; journal verified progress so a restart resumes.
+   Bound bandwidth, concurrency and disk reservations so backfill yields to agent
+   reads and current-generation replication. A node without enough capacity stays
+   partial or receives a smaller assignment; it never claims complete residency.
+4. **Verify and advertise each generation.** Download into owned staging files,
+   verify digests against the authenticated manifest and atomically install complete
+   chunks. Retain the generation's pins. Report readiness only after its manifest,
+   index and every required chunk are present and local persistence is acknowledged.
+   Cloudflare binds the receipt to the exact generation, node session and format;
+   a percentage-complete download or heartbeat is not a readiness receipt.
+5. **Shift reads gradually.** Cloudflare issues versioned endpoint preferences per
+   project/generation. Try a bounded share of requests, check latency, corruption,
+   misses and errors, then prefer the node for that generation. Other generations
+   keep using R2 until ready. Clients cache authorized routing information, retain
+   bounded timeouts and verify content; they do not need a control-plane call for
+   every chunk. This changes future transfers, not running engines or local Stores.
+6. **Keep following new work.** Publish durable new content to R2 first, then enqueue
+   replication to assigned storage nodes. Until a node verifies the new generation,
+   that generation uses R2; the prior verified generation remains valid for its
+   exact revision. A caught-up catalog cursor describes a point in time, not a
+   permanent promise that all future revisions are already local.
+
+The normal read order is worker-local verified cache, a ready preferred storage
+node, another authorized replica, then R2. A timeout, missing chunk or digest
+failure triggers bounded fallback for that request and a repair report; Cloudflare
+can reduce or remove the node's routing preference. A stale route cannot silently
+substitute an older generation. During initial warmup, bypass known-incomplete
+generations instead of adding a storage-node miss to every R2 request.
+
+Replication uses retained manifest roots, not a blind copy of every object in the
+bucket. Coordinate hydration pins and remote GC so required chunks cannot expire
+mid-copy. Track verified bytes, missing bytes, ready generation IDs, catalog lag,
+hit rate and foreground latency. Separate `warming`, `serving selected generations`,
+`caught up to cursor` and `degraded`; there is no fleet-wide primary switch or
+requirement to copy the entire archive before serving the first project.
+
+R2's read-after-write consistency supports fetching successfully published objects,
+but the chunk/manifest/catalog publication protocol still needs its own receipts
+and retry handling. [R2 consistency](https://developers.cloudflare.com/r2/reference/consistency/).
+This warmup, routing and repair behavior is proposed Engine Box functionality,
+not a shipped LayerFS or Cloudflare fleet feature.
+
 The R2 path should transfer only missing content-addressed chunks while retaining
 a complete index for each generation. A restore follows that index directly; it
 does not replay every earlier snapshot. Upload referenced objects before exposing
 the manifest. Deduplication belongs within an authorized project/trust domain.
 This is a proposed publication protocol, not a qualified desync-to-R2 integration.
-Compare direct S3-compatible transport with a restic-managed backup of consistent
-generation bundles before selecting the recovery adapter; avoid maintaining two
-independent backup catalogs without a demonstrated need.
+Qualify direct R2 object transport for this shared-origin and fallback path. A
+restic-managed backup may be an additional recovery option; it must not be the
+only copy if the node adapter cannot directly reconstruct the advertised generations
+from it. Avoid maintaining two backup catalogs without a demonstrated need.
 
 R2 Standard currently charges $0.015/GB-month plus operations, with no Internet
 egress or retrieval fee. One TB (1,000 GB) is about $15/month for storage before
@@ -417,6 +481,13 @@ prove the last acknowledged accepted revision survives, stale writers cannot
 publish, and retained historical generations remain readable after GC. Also test
 interruption between object upload, manifest publication and acceptance-record
 publication. No developer workspace or production host is a failure fixture.
+
+Qualify progressive origin adoption: start with R2 serving all requests, add an
+empty storage node, publish new generations during its backfill, and shift reads
+only for exact verified generations. Interrupt and resume backfill, exhaust its
+disk budget, remove a supposedly present chunk, race retention GC, and fail the
+node after routing changes. Assert bounded fallback, no stale-generation reads,
+no accepted data existing only on the node, and continued foreground throughput.
 
 Record network payload bytes, source reads, actual disk growth, CPU/RAM, publication
 delay, cache-hit rate, hydration/verification/mount time, shader work and first
