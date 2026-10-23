@@ -2,11 +2,15 @@
 
 Status: implementation design updated October 19, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
 
+October 24 fleet direction: **Cloudflare Workers and Durable Objects own the target fleet authority**. Every production bare-metal machine is a managed compute and/or storage node. The same Worker runs under local Wrangler for development; nodes never elect a replacement controller. The [local fleet implementation](LOCAL-FLEET.md) adds scoped enrollment, leases, durable generation acceptance, R2-backed Store transfer, optional storage-node read-through caches and local eviction. One node may keep its project local; two or more nodes sharing generations need a shared object service, which R2 alone can provide. Compute and storage can share a server.
+
+LayerFS and containers remain the project-workspace foundation. Immutable SQLite generations are distribution/recovery units; independently written Stores require logical integration, not database-file merging. The existing Rust/Incus architecture below describes the deployed runtime, whose provider state and execution adapters still need an explicit migration before Cloudflare replaces its authority.
+
 ## Outcome
 
 An owner connects a Linux server, prepares a workspace once, signs into the official Codex, Cursor Agent or Claude Code client, and works through the ordinary terminal. Files, compatible dependencies and caches remain available. Optional CI uses the same preparation contracts to return reliable build/test results sooner.
 
-Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Launching an official CLI and resuming its native conversation belong in the environment API. Agent planning, task delegation between workers, a model gateway and a replacement CI scheduler remain outside this product.
+Start with one trusted owner and one server. Support different server providers and existing compatible Incus installations through configuration, rather than hardcoding one machine. Launching an official CLI and resuming its native conversation belong in the environment API. Enginebox owns reusable task dispatch, agent workspace coordination, merging, batched validation and promotion; apps consume its APIs. Native harness planning and inference remain in the official clients. See [the integration/CI contract](INTEGRATION-CI.md).
 
 ## Components
 
@@ -152,4 +156,4 @@ Existing private workflow patterns include a persistent pnpm store, mounted Carg
 
 The foundation, usable generic workspace recipe and reusable optional modules belong in this source-available repository under Sustainable Use License 1.0. Personal and internal business use are permitted; commercial hosting and redistribution require a separate agreement. Managed operations and original specialized workspace recipes may be maintained separately. Historical Apache-2.0 grants remain valid. User code remains the user's. Do not import proprietary recipes, provider binaries or engine source into this repository. See [licensing](LICENSING.md).
 
-Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate workload candidates. They do not block a useful native-agent environment or require expanding the core into orchestration.
+Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate workload candidates. They use the same Enginebox task, integration, validation and resource APIs; engine-specific recipes require separate qualification.

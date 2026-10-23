@@ -22,3 +22,8 @@ enginebox.local.toml
 target/
 node_modules/
 .pnpm/
+
+# Local Cloudflare state and secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
