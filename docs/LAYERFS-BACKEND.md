@@ -7,7 +7,7 @@ LayerFS is Engine Box's first-class checkout storage backend. The controller own
 File storage and VM memory remain distinct. Provider homes and credential delegation keep their existing private lifecycle. Native authenticated sessions on LayerFS mounts and production durability still need separate qualification. Incus attachment and recovery have explicit capability checks; first-class access does not mean every platform or failure mode is supported.
 
 The [game workspace decision](GAME-WORKSPACES.md) keeps this container/LayerFS
-combination as the foundation, with no Lore dependency. It maps checkpointing,
+combination as the foundation. It maps checkpointing,
 fork reuse, conflicts and compute leases to the upstream core ideas.
 [Distributed Store generations and local cache eviction](STORE-DISTRIBUTION.md)
 extend this backend; they are not supplied by the current commands.

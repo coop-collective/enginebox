@@ -229,8 +229,8 @@ Prefer an existing compatible storage pool. Offer bounded loop-backed storage as
 | Git and browser account state | Private workspace identity, with separate explicit authorization. |
 | External data | Its own backup and versioning policy; not implicitly captured by a VM snapshot. |
 
-The October 23 game-workspace decision uses LayerFS with containers and removes
-Lore from the architecture. The backend already creates and limits private Docker
+The October 23 game-workspace decision uses LayerFS with containers.
+The backend already creates and limits private Docker
 workspaces over node-local project Stores. The qualified Incus adapter exports a
 checkout view while keeping every Store opener in the host kernel; an attached
 VM never receives the backing SQLite file. See [core-idea mapping and current

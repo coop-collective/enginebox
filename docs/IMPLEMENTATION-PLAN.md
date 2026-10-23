@@ -158,7 +158,7 @@ Automatic placement, swarm orchestration, GPU memory restoration, a new CI sched
 [LayerFS](LAYERFS.md) is a first-class checkout provider exposed through controller registration, durable API jobs, MCP and the Storage dashboard. The pinned preview remains explicitly provisioned on qualified Linux nodes; it is not downloaded by a general installer. Keep file checkpoints separate from Incus RAM checkpoints, and retain uncertain state for operator inspection. See [the backend contract](LAYERFS-BACKEND.md) and [Incus attachment](LAYERFS-INCUS.md) for the tested boundaries and remaining release gates.
 
 The October 23 owner decision selects [LayerFS game workspaces](GAME-WORKSPACES.md)
-and removes Lore as a planned dependency. The existing backend already combines
+as the foundation. The existing backend already combines
 private container branches with stable `/project` mounts and prepared checkpoint
 forks. Preserve native provider homes and the separately qualified Incus export.
 The design maps all ten upstream core ideas to implemented behavior or explicit
@@ -188,8 +188,7 @@ shared service, which R2 directly can supply. Work proceeds through these bounda
 
 Automatic eviction, the distributed provider and cross-worker integration remain
 unimplemented. Large-project archive and checksum measurements do not qualify
-those paths or first playable frame. The retired Lore comparison remains
-[historical research](../research/storage-benchmarks/lore-assessment.md).
+those paths or first playable frame.
 
 ## Persistent project environments and disposable agent forks
 

@@ -1,7 +1,7 @@
 # LayerFS game workspaces
 
 Owner decision, October 23, 2026: use LayerFS for shared project state and private
-agent workspaces. Lore is removed from the architecture. Engine Box combines
+agent workspaces. Engine Box combines
 containers with LayerFS, manages compute and storage residency, and preserves
 recoverable Store generations. Gamejam owns task policy, candidate validation,
 playtests and promotion. The target controller uses Cloudflare Workers/Durable
@@ -105,9 +105,6 @@ Recordings remain separately retained artifacts referenced by task/build IDs.
    concurrent submissions, conflicts, stale promotion, native engine saves and
    compatible shader/import cache restoration. Cross-worker results require a
    logical change-import protocol; SQLite replica copying alone is insufficient.
-
-No Lore installation or adapter is required by any of these stages. Its earlier
-measurements are retained as [historical research](../research/storage-benchmarks/lore-assessment.md).
 
 ## Integration queue and startup evidence
 

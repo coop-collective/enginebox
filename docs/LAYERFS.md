@@ -2,8 +2,8 @@
 
 Decision recorded 2026-10-19: make [LayerFS checkout storage](LAYERFS-BACKEND.md) a first-class Engine Box capability, available through controller registration, durable jobs and MCP. Keep Incus responsible for compute and VM lifecycle. Storage nodes must satisfy the pinned runtime and capability checks before allocation; the normal feature does not require an experimental opt-in switch. Provider homes remain private.
 
-Owner decision, October 23: LayerFS is the game workspace/history foundation;
-Lore is removed from the plan. [Game workspaces](GAME-WORKSPACES.md) maps the
+Owner decision, October 23: LayerFS is the game workspace/history foundation.
+[Game workspaces](GAME-WORKSPACES.md) maps the
 upstream core ideas to the existing container backend and its remaining gates.
 [Store distribution](STORE-DISTRIBUTION.md) specifies a storage origin, local NVMe
 worker Stores, immutable generation transfer and safe disk-pressure eviction.
