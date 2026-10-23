@@ -107,6 +107,7 @@ function errorStatus(error: unknown) {
 
 export async function runNode(config: Config) {
   identifier(config.id);
+  requireThat(!config.taskOnly, "Task-only credentials cannot run a fleet node", 403);
   requireThat(
     config.role === "agent" || config.role === "storage",
     "Invalid role",
@@ -395,11 +396,18 @@ export async function runNode(config: Config) {
             reservations: Assignment[];
           }>("/v1/node/hello", { session: client.session });
           client.epoch = hello.epoch;
-          for (const reservation of hello.reservations)
-            if (readOnlyJob(reservation) && reservation.epoch !== client.epoch)
+          for (const reservation of hello.reservations) {
+            if (
+              !readOnlyJob(reservation) &&
+              (reservation.epoch !== client.epoch ||
+                reservation.expires <= Date.now())
+            )
+              blockedNative = true;
+            else if (readOnlyJob(reservation) && reservation.epoch !== client.epoch)
               await client.json("/v1/node/reconcile", {
                 attempt: reservation.attempt,
               });
+          }
           connected = true;
           log("node_connected", { node: config.id, epoch: client.epoch });
         }

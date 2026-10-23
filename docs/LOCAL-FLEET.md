@@ -17,7 +17,7 @@ pnpm fleet:logs
 pnpm fleet:down
 ```
 
-`fleet:dev` creates a private owner token and independently scoped node credentials, starts Wrangler, enrolls `agent-a`, `agent-b` and `storage`, and starts the selected services. Omit `--storage` for two nodes sharing only the R2 emulator. Omitting the flag does not stop an already running storage node. The controller health URL is **http://127.0.0.1:8799/health**; authenticated inventory is available through `fleet:status`. This is an API development stack, not the existing dashboard.
+`fleet:dev` creates a private owner token and independently scoped node credentials, starts Wrangler, enrolls `agent-a`, `agent-b` and `storage`, and starts the selected services. It also enrolls a non-executing `task-client` credential with `taskOnly: true` for app/MCP access; `.state/fleet-dev/task-client.json` uses the host's loopback controller URL. Omit `--storage` for two nodes sharing only the R2 emulator. Omitting the flag does not stop an already running storage node. The controller health URL is **http://127.0.0.1:8799/health**; authenticated inventory is available through `fleet:status`. This is an API development stack, not the existing dashboard.
 
 `fleet:fixture` creates, publishes and queues verification of a synthetic SQLite snapshot. Publication retains a candidate generation; acceptance is a separate compare-and-swap operation. It does not silently update the accepted project head. To publish an existing **closed, consistent** Store backup:
 

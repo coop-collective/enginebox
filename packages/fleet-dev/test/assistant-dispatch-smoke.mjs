@@ -154,8 +154,13 @@ export async function assistantDispatchSmoke({
       cacheBytes: 16 * 1024 * 1024,
     };
     const { token } = await api("/v1/nodes", spec);
+    const taskIdentity = "assistant-task-tools";
+    const {token: taskToken} = await api("/v1/nodes", {
+      id: taskIdentity, role: "agent", projects: [project], taskOnly: true,
+      origin: null, slots: 1, cacheBytes: 16 * 1024 * 1024,
+    });
     const config = join(directory, "task-mcp.json");
-    await writeFile(config, JSON.stringify({ controller, token, project }), {
+    await writeFile(config, JSON.stringify({ controller, token: taskToken, project }), {
       mode: 0o600,
       flag: "wx",
     });
@@ -212,11 +217,12 @@ export async function assistantDispatchSmoke({
     const task = await api(`${base}/tasks/${proof.task}`, undefined, token);
     assert.equal(task.status, "in_progress");
     assert.equal(task.revision, 3);
-    assert.equal(task.createdBy, `node:${spec.id}`);
-    assert.equal(task.updatedBy, `node:${spec.id}`);
+    assert.equal(task.createdBy, `node:${taskIdentity}`);
+    assert.equal(task.updatedBy, `node:${taskIdentity}`);
     assert.equal(task.description, "Changed through the official MCP client");
     assert.match(answer.text, new RegExp(proof.task));
     assert.ok(!answer.text.includes(token));
+    assert.ok(!answer.text.includes(taskToken));
     assert.ok(!answer.text.includes(fixture.token));
     assert.deepEqual(
       (await api(`${base}/tasks/activity`, undefined, token)).events.map(

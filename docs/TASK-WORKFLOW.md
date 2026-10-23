@@ -55,7 +55,7 @@ Install the pinned workspace dependencies and Node 24+ in the authorized private
 }
 ```
 
-Use an existing enrolled **agent** credential with only the intended project in its scope. The MCP server rejects owner credentials and verifies the server's node identity before its first task request. Its configuration and the agent's native provider credentials remain private; keep owner promotion credentials out of the agent's environment, task files and MCP configuration. Use HTTPS outside an isolated local development network.
+Enroll a separate **agent** credential with `taskOnly: true`, exactly one project, `origin: null`, and no `assistantProjects`. The owner enrolls it through `POST /v1/nodes`; the required `slots: 1` and `cacheBytes: 16777216` fields do not allocate a worker. Local `fleet:dev` creates `task-client.json` for this purpose. Never give the model a worker's executor credential. The controller restricts task-only credentials to identity, tasks, activity and assistant requests: they cannot join a worker session, submit validation outcomes, publish data or read raw job inventories. The MCP server verifies this immutable scope before its first request and rejects owner or ordinary worker credentials. Keep owner promotion and worker credentials out of the agent's environment, task files and MCP configuration. Use HTTPS outside an isolated local development network.
 
 Register the stdio server in that workspace's Codex configuration:
 
@@ -64,7 +64,7 @@ codex mcp add enginebox_tasks -- node /absolute/enginebox/packages/fleet-node/sr
 codex mcp list
 ```
 
-This uses the installed CLI's `mcp add` contract and the [official MCP configuration guidance](https://learn.chatgpt.com/docs/extend/mcp?surface=cli). Existing node configuration files containing `controller`, `token` and `projects` can be reused by supplying the project as the final argument. The controller URL must be an origin without credentials, a path, query or fragment. Project authority is always checked on the server.
+This uses the installed CLI's `mcp add` contract and the [official MCP configuration guidance](https://learn.chatgpt.com/docs/extend/mcp?surface=cli). A task-only enrollment file containing `controller`, `token` and `projects` can be used by supplying the project as the final argument. The controller URL must be an origin without credentials, a path, query or fragment. Project authority is always checked on the server.
 
 For an authorized unattended native task runner using `approval_policy="never"`, explicitly permit only this scoped tool set in its private Codex configuration; otherwise a tool requiring interactive approval cannot run. The MCP configuration supports `enabled_tools`, `required` and `default_tools_approval_mode`:
 
