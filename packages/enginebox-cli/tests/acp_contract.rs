@@ -152,12 +152,27 @@ struct Client {
     messages: mpsc::Receiver<Value>,
     pending: Vec<Value>,
 }
+
+fn ebox_command(fleet: &Fleet) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ebox"));
+    command.env_clear();
+    // Winsock expands its provider DLL paths through the Windows directory.
+    // Preserve OS paths, but not user config, proxy settings or credentials.
+    #[cfg(windows)]
+    for name in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("ENGINEBOX_API_URL", &fleet.url)
+        .env("ENGINEBOX_API_TOKEN", "t".repeat(32));
+    command
+}
+
 impl Client {
     fn new(fleet: &Fleet) -> Self {
-        let mut process = Command::new(env!("CARGO_BIN_EXE_ebox"))
-            .env_clear()
-            .env("ENGINEBOX_API_URL", &fleet.url)
-            .env("ENGINEBOX_API_TOKEN", "t".repeat(32))
+        let mut process = ebox_command(fleet)
             .args([
                 "--fleet-host",
                 "node",
@@ -343,10 +358,7 @@ fn disconnect_requests_remote_cancellation_and_task_cli_uses_the_same_authentica
     fleet.wait_launches(1);
     drop(client);
     assert_eq!(fleet.state.lock().unwrap().cancelled.len(), 1);
-    let output = Command::new(env!("CARGO_BIN_EXE_ebox"))
-        .env_clear()
-        .env("ENGINEBOX_API_URL", &fleet.url)
-        .env("ENGINEBOX_API_TOKEN", "t".repeat(32))
+    let output = ebox_command(&fleet)
         .args(["tasks", "--json"])
         .output()
         .unwrap();
@@ -388,10 +400,7 @@ fn malformed_frames_receive_protocol_errors_and_watch_json_stays_machine_readabl
     assert_eq!(parse_error["error"]["code"], -32700);
     assert!(parse_error["id"].is_null());
     client.initialize();
-    let mut watch = Command::new(env!("CARGO_BIN_EXE_ebox"))
-        .env_clear()
-        .env("ENGINEBOX_API_URL", &fleet.url)
-        .env("ENGINEBOX_API_TOKEN", "t".repeat(32))
+    let mut watch = ebox_command(&fleet)
         .args(["tasks", "--watch", "--json", "--interval", "1"])
         .stdout(Stdio::piped())
         .spawn()
