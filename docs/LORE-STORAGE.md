@@ -78,3 +78,177 @@ Before making Lore a default game storage provider, qualify:
 5. A pinned upgrade/rollback policy and a separately tested R2-backed architecture if remote object storage is needed.
 
 The practical first step is a pinned self-hosted Lore service and per-trust-boundary host cache feeding LayerFS. Cloudflare Artifacts remains an option for code repositories that fit its limits.
+
+## Engine workflow follow-up, October 23, 2026
+
+The owner's proposed dedicated storage server, warm node caches and lightweight
+agent workspaces fit this split. The [Git-free Unreal probe](LAYERFS-VALIDATION.md)
+also establishes that LayerFS has usable local history and merging; its role is
+not limited by an absence of history. The remaining choice is which system owns
+recoverable cross-node project history, retention and distribution. Keep that
+authority singular. The proposed default is Lore for accepted project revisions,
+with LayerFS branches as temporary local workspaces. This is not implemented.
+
+Inspecting Gitstalk main `785b66da` confirmed an existing integration pattern worth
+adapting: parallel speculative preparation/checks, short serialized sprout updates,
+asynchronous validation of immutable heads, and promotion of a validated prefix.
+`v2-validator.ts` supports debouncing nearby landings into a shared validation;
+`v2-check-reuse.ts` reuses a full passing check on the identical commit. The
+debounce and evidence-promotion options are disabled by default in run config;
+exact-commit full-check reuse defaults on. These are source findings, not a claim
+that every option is deployed or enabled on a hosted repository.
+
+The proposed Engine Box workflow is:
+
+1. Agents edit private workspaces concurrently, usually without an engine process.
+   A task submission records its base revision, exact changed content and intent.
+2. The integration service combines compatible submissions into a sprout candidate.
+   It preserves task dependencies and limits how much unvalidated work accumulates.
+   Changes continue arriving while a verifier works on a frozen candidate.
+3. A bounded engine pool performs the required compile/import, asset validation
+   and playable smoke checks. One candidate build can cover several tasks, whose
+   preview links record that same candidate revision. Isolated previews are a
+   separate on-demand request and consume the same bounded capacity.
+4. Promote only the checked candidate and its artifact to the validated/live
+   channel, with a single publication authority and an expected previous revision.
+   A newer sprout head is not covered by an older passing check. Failures keep the
+   current live channel and return conflicting work for repair.
+5. Refresh idle or checkpointed agent workspaces explicitly from an accepted
+   revision. Updating files beneath an engine that is saving a project is not the
+   default. LayerFS `branch.publish` alone cannot implement this workflow.
+
+This preserves the integration policy without requiring Git to own every local
+workspace. The Gitstalk implementation itself currently uses Git operations and
+SHAs; a Lore/LayerFS adapter needs explicit revision, merge and publication
+contracts. It is not a configuration-only substitution.
+
+Gitstalk's optional test skipper was merged in PR #32. It selects Node test files
+using restricted JS/TS import dependencies; the analyzer caps inputs at 16 MiB and
+10,000 files/directories. It therefore does not cover Unreal or Unity assets.
+Selected results cannot stand in for full validation or seed full-check reuse.
+Its recorded paired benchmark showed a 1.11× median paired speedup in one CPU-heavy
+scenario but lost to exact-commit reuse in every pair of that scenario: 9.21 s off versus 13.50 s on
+for the separate medians. Reuse and skipping must be measured together.
+
+For engines, begin with exact-input reuse and candidate batching. An engine test
+selection adapter would need code/module dependencies, asset dependencies, importer
+and build settings, engine/plugin versions, platform and check definitions. Unreal
+[Asset Registry dependencies](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/AssetRegistry/IAssetRegistry/GetDependencies)
+and Unity's
+[asset dependency API](https://docs.unity3d.com/6000.0/Documentation/ScriptReference/AssetDatabase.GetDependencies.html)
+can supply part of that graph; neither alone proves complete runtime dependency
+coverage. Unknown/dynamic dependencies require broader checks. A shared material
+can affect maps that no agent edited directly. The current Gitstalk flake heuristic
+can treat different failing reruns as green; do not carry that heuristic into the
+engine's final playable acceptance gate without a separate explicit policy.
+
+For storage, a warm node forks an already prepared revision; a cold node fetches
+missing Lore fragments, materializes the required view, prepares/imports its local
+workspace, then starts the engine. Each stage needs its own timing. Lore's
+[shared store](https://epicgames.github.io/lore/how-to/run-parallel-instances-over-a-shared-store/)
+shares downloaded content across local instances, but its
+[lazy-checkout VFS remains in progress](https://github.com/EpicGames/lore/blob/main/docs/roadmap.md).
+Do not promise that a cold node can skip all materialization today. Lore and
+LayerFS do not share a compatible chunk store automatically; retain that import
+cost in cold-start and capacity measurements.
+
+Keep live SQLite stores local to their supported Linux kernel/filesystem. The
+mesh should exchange verified immutable content and revision manifests, with
+optional peer cache sources scoped to authorized projects. Peers are cache
+providers, not independent authorities for the accepted head. Back up canonical
+metadata together with reachable content to a separate failure domain; a storage
+server and its backup directory on the same machine are not independent recovery.
+Keep generated shader/import/build caches separate and disposable, with explicit
+compatibility keys. None of this cross-node flow has been deployed or benchmarked
+by the local storage probe.
+
+## Initial deployment and generated caches
+
+The owner approved using the existing Engine Box host for both execution and
+storage during qualification. Separate OVH storage and GPU machines are a later
+deployment choice, not a prerequisite for the prototype. Keep the service and
+cache interfaces separable now, and label same-host measurements accordingly.
+The current test host exposes only a management display adapter, so rendered
+Unreal startup is measured separately on the local Mac, not claimed on that host.
+
+A prepared workspace should reference an accepted source revision and a separate
+cache manifest keyed by engine build, compiler/SDK, target OS/architecture/RHI, plugins,
+import/build settings and relevant inputs. Preserve Unity's imported Library
+and Unreal's reusable derived/build data in their correct storage scopes. The
+Gamejam Unreal prototype currently reuses artifact-local binaries by build hash,
+but its source hash excludes Saved/Intermediate/DerivedDataCache and the runtime
+uses a host-level Zen DDC. Copying just the project does not back up that Zen cache.
+
+Prepared VM disks or explicit cache bundles can avoid redoing compatible imports
+without running a shared cache service. A local filesystem DDC is one testable
+option; a Zen database needs its supported export/quiescence procedure, not a
+copy of live database files. Keep installed engine DDC packs in the base image.
+Treat project-local caches, host-level caches, driver/pipeline caches and process
+RAM as distinct. macOS Metal cache/binary reuse does not establish Linux Vulkan
+compatibility. Cache misses must rebuild correctly; source history remains the
+authoritative recoverable content.
+
+Measure source download, materialization, cache hydration, import/shader work,
+engine readiness and first playable frame separately. Engine-ready alone is not
+first playable frame. Cold tests must state whether installed engine DDC packs
+are available, and whether only the project cache or every DDC tier starts empty.
+Shared cache services remain an optimization to evaluate once multiple hosts
+need incremental reuse; they are not required merely to preserve a prepared
+single-host workspace. Do not advertise instantaneous cold restore from a local
+copy-on-write clone result.
+
+## Same-host Unreal storage baseline, October 23
+
+The [machine-readable report](../research/storage-benchmarks/unreal-cold-load-results.json)
+records a real 11,168,790,731-byte Unreal environment with 379 files, including
+files up to 228,269,877 bytes. Both restored copies passed full SHA-256 manifests.
+This is an archive/materialization baseline inside an admitted disposable Engine
+Box VM, not a Lore or LayerFS transport implementation.
+
+| Stage | Single observation |
+|---|---:|
+| Cold base VM readiness reported by Engine Box | 15.03 s |
+| Fresh restore from already-seeded storage host, including guest fsync | 27.40 s |
+| Verify every restored file | 10.25 s |
+| Repeat extraction into another fresh directory, including fsync | 26.46 s |
+| Verify every file in the second copy | 10.76 s |
+
+Only the owned archive was advised out of the host's file cache before the first
+restore; OS/device caches were otherwise uncontrolled. The repeat still writes
+all content and is not a warm workspace fork or editor resume. Local archive
+hydration was much faster than WAN seeding: the initial sequential transfer was
+changed after 1,314 seconds, retaining a checksum-verified 5.97 GB prefix. Four
+connections then transferred the remaining 5.16 GB in 643 seconds. This changed
+treatment is not a controlled throughput comparison. The full archive checksum
+matched after assembly. Zstd level 1 reduced 11.17 GB to only 11.12 GB; these
+already-compressed assets need reuse/deltas, not an assumption of large archive
+compression savings.
+
+The guest had 4 vCPU and 8 GiB RAM. Its Incus root device was configured as 80 GiB,
+but the mounted guest filesystem was only 31,043,616,768 bytes. The two copies
+fit with the required free-space reserve; this exposes a capacity-readiness gap
+to fix before allocating larger game projects. Verify usable guest filesystem
+capacity, not just the declared volume size.
+
+Private source, manifests and logs remain outside Git. The disposable VM and
+duplicate upload fragments were removed. The verified 11.12 GB archive remains
+privately on the existing storage host to avoid another WAN seed for follow-up
+tests; it is a reusable fixture cache, not an independent backup. Rendered
+startup, complete shader-cache preparation, and restored-cache reuse remain
+unqualified and must not be inferred from these file-copy timings.
+
+The native probe copied and hashed the full 20.66 GB Content tree, while targeting
+the environment's asset-zoo map for cache preparation. Render-capable DDC runs
+hit a 900-second deadline during initial shader work. A separate headless run
+exposed an incorrect `/Game/...` map argument in the harness: this commandlet
+expects a relative Content filename. The corrected headless run selected the
+map but still hit its 300-second limit before processing it. UE 5.8's commandlet
+explicitly compiles target-platform global shaders before loading packages,
+including under NullRHI. Headless does not eliminate that preparation cost.
+
+All attempts, including the map-argument failure and deliberate diagnostic stop,
+remain in the report. The harness now requires the map's processing log as well
+as successful exit; an empty successful commandlet cannot count as qualification.
+No cold-fill success, warm-fill speedup, generated-cache restore benefit or
+first-playable-frame timing was established. Complete those measurements on the
+intended engine/toolchain/platform before promising fast editor startup.

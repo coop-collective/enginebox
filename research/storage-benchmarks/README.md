@@ -20,3 +20,105 @@ The fixture must be below 20 GiB. Allow six times its content size plus 4 GiB fr
 Private logs, server data and working copies remain under the output for review; they may contain project paths and contents and must not be committed. `LORE_GLOBAL_PATH` isolates the registry and configuration under that output as well. The shared store is explicitly selected, with `--make-default false`. After inspection, remove only the run's owned output if desired. No global cleanup is performed.
 
 This is a manually invoked qualification tool, not a CI performance assertion. One observation cannot establish latency percentiles, remote throughput, production durability, engine build correctness or results for a much larger Unreal project.
+
+## Git-free LayerFS Unreal probe
+
+`layerfs-unreal-results.json` and [the validation notes](../../docs/LAYERFS-VALIDATION.md)
+record a separate v1.0.0 experiment. This does not exercise the product backend or
+run an Unreal editor. The 4 KiB mutation is deliberately a storage-only binary edit.
+
+The bounded runner uses an explicit disposable namespace ending in `20261023`.
+Before a new campaign, require its data/store volumes and source/output directory
+to be absent; do not reuse somebody else's volumes. Build the supplied Dockerfile
+as `enginebox-layerfs-unreal:20261023`. Place upstream commit
+`2aaf2552ce21154928b9f9c83582e41a637f5910` at
+`.state/layerfs-unreal/source`. Create these local Docker volumes with label
+`enginebox.experiment=layerfs-unreal-20261023`:
+
+- `ebox-lfu-data-20261023`
+- `ebox-lfu-store-20261023`
+- `ebox-lfu-target-20261023`
+- `ebox-lfu-cargo-20261023`
+
+In the supplied build image, mount that source read-only at `/src`, the target
+volume at `/artifacts` and the Cargo cache at `/usr/local/cargo/registry`. From
+`/src/core`, run `CARGO_TARGET_DIR=/artifacts cargo build --locked --release -p
+layerfs-daemon -p layerfs-node`, then copy `release/liblayerfs_node.so` to
+`release/layerfs.node` within the target volume. Keep the matching SDK, daemon
+and addon together. The runner requires Docker API 1.54, local Linux volumes,
+the Docker socket for its trusted SDK client, and Docker Desktop's
+`host.docker.internal` connectivity. It is not an untrusted-agent launch recipe.
+
+Set `UNREAL_PROBE_SOURCE` to a private environment asset directory containing
+`Geometry/`, `Textures/` and a map. The original is mounted read-only. Invoke
+`python3 research/storage-benchmarks/layerfs-unreal-run.py STAGE`, in this order,
+inspecting each result before continuing:
+
+```text
+prepare
+init
+forks
+read
+edit
+merge
+backup
+stale-publication
+publication-recovery
+shared-branch
+restore-prepare
+restore-read
+```
+
+Each stage has a deadline and preserves append-only invocation receipts and
+failures in ignored `.state/layerfs-unreal/`. Do not blindly rerun a mutation:
+inspect its recorded state first. `restore-prepare` creates its own fresh labeled
+destination volume, and restore uses a separate discovery home and sandbox.
+Export the private report, fixture hashes, database backup and `project.record`
+before removing only the experiment-owned stopped containers and scratch volumes.
+The original campaign did so; its backup remains locally ignored and its temporary
+data/store/restore volumes were removed. Toolchain caches were retained.
+
+## Full Unreal content and native cache follow-up
+
+`unreal-cold-load.py` prepares a private APFS clone of an existing UE 5.8 project,
+verifies every Content file with SHA-256, and runs a bounded native DDC-fill
+commandlet against an empty private filesystem cache. Supply the source and a
+fresh ignored output directory; real project names and manifests stay private.
+
+```sh
+python3 research/storage-benchmarks/unreal-cold-load.py prepare PRIVATE_PROJECT PRIVATE_CASE
+python3 research/storage-benchmarks/unreal-cold-load.py fill PRIVATE_CASE cold
+python3 research/storage-benchmarks/unreal-cold-load.py fill PRIVATE_CASE warm
+python3 research/storage-benchmarks/unreal-cold-load.py fill PRIVATE_CASE restored
+```
+
+Only run warm/restored after a successful cold cache fill. The fixture map is the
+European Hornbeam asset zoo; select an applicable map deliberately for a different
+fixture. Installed native binaries are retained; this does not measure a clean
+C++ compilation. The default is a 900-second deadline and 80 GiB free-disk floor.
+No host cache is purged. `restored` uses a new local path and APFS clones, never
+a network transfer. `UNREAL_PROBE_ENGINE_PAK=1` adds the installed engine's
+read-only DDC pack, and `UNREAL_PROBE_DISABLE_APP_NAP=1` passes a per-process
+macOS diagnostic option without modifying defaults or the installed engine.
+The first invocation persists those settings for subsequent warm/restored runs.
+Use a fresh case for a changed treatment. Keep stopped/failed receipts and do not
+call an incomplete cache fill a successful warm-cache qualification.
+`UNREAL_PROBE_NULL_RHI=1` is a separate headless treatment: it omits rendering and
+cannot establish GPU shader readiness or first playable frame, even if it fills
+other target-platform derived data successfully.
+
+`unreal-server-restore.py` is a separate **archive baseline**, run on an existing
+storage host against a newly admitted disposable Engine Box VM. It does not
+implement Lore, LayerFS, server provisioning or fleet admission. Provide private
+`--vm`, `--project`, `--uuid`, `--owner` and `--store` arguments. The store must be
+an experiment-owned directory under `/srv/enginebox/assets`, with `owner`,
+`manifest.json` and a complete `content.tar.zst`. The archive contains only the
+verified `EuropeanHornbeam/` content tree, not agent homes or credentials.
+
+The harness validates the VM UUID/owner, asks Linux to evict only its own archive
+from file cache, then times extraction into two fresh guest directories and
+guest fsync separately from full-file hash verification. Cache eviction is
+advisory and device caches remain uncontrolled. Repeated extraction is not a warm
+engine or an in-memory workspace resume. Guest extraction has its own timeout;
+all operations preserve a 2 GiB free-disk reserve. Export receipts before deleting
+only the exact experiment-owned VM and archive directory under the host lease.
