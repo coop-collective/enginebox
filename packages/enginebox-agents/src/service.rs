@@ -1,4 +1,4 @@
-use crate::{auth, delegation, native, process, security, usage};
+use crate::{auth, delegation, native, process, run_details, security, usage};
 use anyhow::{Result, bail, ensure};
 use enginebox_core::{Fleet, Host};
 use serde_json::{Value, json};
@@ -19,6 +19,8 @@ pub struct AgentService {
 struct Inner {
     root: PathBuf,
     runs_root: PathBuf,
+    details_root: PathBuf,
+    details: Mutex<BTreeMap<String, Value>>,
     fleet: Fleet,
     binaries: BTreeMap<String, Option<String>>,
     sessions: Mutex<BTreeMap<String, Session>>,
@@ -61,6 +63,8 @@ impl AgentService {
         security::private_dir(&controller_root)?;
         let runs_root = controller_root.join("agent-runs");
         security::private_dir(&runs_root)?;
+        let details_root = controller_root.join("agent-run-details");
+        security::private_dir(&details_root)?;
         let root = controller_root.join("agents");
         security::private_dir(&root)?;
         for dir in ["homes", "attachments"] {
@@ -91,7 +95,7 @@ impl AgentService {
             }
             binaries.insert(p.into(), path);
         }
-        let mut records = BTreeMap::new();
+        let mut records: BTreeMap<String, Value> = BTreeMap::new();
         let record_pattern = regex::Regex::new(r"^[a-f0-9]{32}\.json$")?;
         for item in std::fs::read_dir(&runs_root)? {
             let item = item?;
@@ -123,10 +127,22 @@ impl AgentService {
             }
             records.insert(id.into(), v);
         }
+        let mut details = BTreeMap::new();
+        for id in records.keys() {
+            if let Some(raw) =
+                security::read_bytes(&details_root, &format!("{id}.json"), security::LIMIT, true)?
+            {
+                let detail: Value = serde_json::from_slice(&raw)?;
+                run_details::validate(&detail)?;
+                details.insert(id.clone(), detail);
+            }
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 root,
                 runs_root,
+                details_root,
+                details: Mutex::new(details),
                 fleet,
                 binaries,
                 sessions: Mutex::new(BTreeMap::new()),
@@ -906,11 +922,84 @@ impl AgentService {
             "Invalid native run ID."
         );
         let records = self.inner.records.lock().unwrap();
-        records
+        let record = records
             .get(id)
             .filter(|v| v["host_id"] == host_id && v["name"] == name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Unknown native run for this workspace."))
+            .ok_or_else(|| anyhow::anyhow!("Unknown native run for this workspace."))?;
+        Ok(run_details::enrich(
+            record,
+            self.inner.details.lock().unwrap().get(id),
+            chrono::Utc::now(),
+        ))
+    }
+    pub fn list_runs(&self) -> Value {
+        let records = self.inner.records.lock().unwrap();
+        let details = self.inner.details.lock().unwrap();
+        let mut summaries: Vec<_> = records
+            .iter()
+            .map(|(id, record)| run_details::summary(record, details.get(id)))
+            .collect();
+        summaries.sort_by(|a, b| {
+            let active =
+                |v: &Value| ["queued", "running"].contains(&v["status"].as_str().unwrap_or(""));
+            active(b)
+                .cmp(&active(a))
+                .then_with(|| b["created_at"].as_str().cmp(&a["created_at"].as_str()))
+        });
+        let total = summaries.len();
+        summaries.truncate(256);
+        json!({"runs":summaries,"total":total,"truncated":total>256})
+    }
+    fn save_detail(&self, id: &str, detail: &Value) -> Result<()> {
+        security::write_json(&self.inner.details_root, &format!("{id}.json"), detail)
+    }
+    pub fn cancel_run(&self, host_id: &str, name: &str, id: &str) -> Result<Value> {
+        native::validate_run_id(id)?;
+        let _pending = self.pending_guard()?;
+        let (provider, running) = {
+            let records = self.inner.records.lock().unwrap();
+            let record = records
+                .get(id)
+                .filter(|v| v["host_id"] == host_id && v["name"] == name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown native run for this workspace."))?;
+            if !["queued", "running"].contains(&record["status"].as_str().unwrap_or("")) {
+                return Ok(run_details::enrich(
+                    record,
+                    self.inner.details.lock().unwrap().get(id),
+                    chrono::Utc::now(),
+                ));
+            }
+            let mut details = self.inner.details.lock().unwrap();
+            let detail = details.get_mut(id).ok_or_else(|| {
+                anyhow::anyhow!("This legacy run does not support targeted cancellation.")
+            })?;
+            detail["cancel_requested"] = json!(true);
+            self.save_detail(id, detail)?;
+            (
+                record["provider"].as_str().unwrap().to_owned(),
+                record["status"] == "running",
+            )
+        };
+        {
+            // Pair notification with the queue mutex so a cancellation between
+            // the worker's predicate check and wait cannot be lost.
+            let _workers = self.inner.workers.0.lock().unwrap();
+            self.inner.workers.1.notify_all();
+        }
+        // The same records mutex guards queued->running. A queued cancellation
+        // is observed before launch; a running cancellation may arrive before
+        // the remote helper and remains recorded until that exact run observes it.
+        if running {
+            let host = self.inner.fleet.account_workspace(host_id, name)?;
+            let command = guest_command(&host, name, &["cancel".into(), provider, id.into()])?;
+            let output = process::checked(&command, None, None, b"", 20, 4096)?;
+            let value: Value = serde_json::from_str(&output)?;
+            ensure!(
+                value["ok"] == true && value["cancel_requested"] == true,
+                "Guest did not accept cancellation; update its helper."
+            );
+        }
+        self.get_run(host_id, name, id)
     }
     pub fn launch(&self, host_id: &str, name: &str, value: Value) -> Result<Value> {
         let request = native::RunRequest::parse(value)?;
@@ -951,7 +1040,14 @@ impl AgentService {
         ensure!(leases.len() < 16, "Native run queue is full.");
         let id = uuid::Uuid::new_v4().simple().to_string();
         let value = json!({"id":id,"host_id":host_id,"name":name,"provider":request.provider,"scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":request.workdir,"resume_id":request.resume_id,"created_at":crate::now()});
+        let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false});
+        self.save_detail(&id, &detail)?;
         self.save_record(&value)?;
+        self.inner
+            .details
+            .lock()
+            .unwrap()
+            .insert(id.clone(), detail);
         leases.insert(key.clone());
         self.inner
             .records
@@ -963,18 +1059,35 @@ impl AgentService {
         thread::spawn(move || {
             let _pending = pending;
             let mut workers = this.inner.workers.0.lock().unwrap();
-            while *workers >= 4 {
+            while *workers >= 4 && !this.cancel_requested(&id) {
                 workers = this.inner.workers.1.wait(workers).unwrap();
             }
-            *workers += 1;
+            let admitted = !this.cancel_requested(&id);
+            if admitted {
+                *workers += 1;
+            }
             drop(workers);
             this.run_worker(host, &name, request, &id);
             this.inner.leases.lock().unwrap().remove(&key);
-            let mut workers = this.inner.workers.0.lock().unwrap();
-            *workers -= 1;
+            if admitted {
+                let mut workers = this.inner.workers.0.lock().unwrap();
+                *workers -= 1;
+            }
             this.inner.workers.1.notify_one();
         });
-        Ok(value)
+        self.get_run(
+            host_id,
+            value["name"].as_str().unwrap_or(""),
+            value["id"].as_str().unwrap_or(""),
+        )
+    }
+    fn cancel_requested(&self, id: &str) -> bool {
+        self.inner
+            .details
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|detail| detail["cancel_requested"] == true)
     }
     fn save_record(&self, value: &Value) -> Result<()> {
         security::write_bytes(
@@ -987,11 +1100,25 @@ impl AgentService {
     fn run_worker(&self, host: Host, name: &str, request: native::RunRequest, id: &str) {
         let outcome = (|| -> Result<Value> {
             if let Some(v) = self.inner.records.lock().unwrap().get_mut(id) {
+                let mut details = self.inner.details.lock().unwrap();
+                let detail = details
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow::anyhow!("Missing run metadata."))?;
+                if detail["cancel_requested"] == true {
+                    return Ok(
+                        json!({"exit_code":process::CANCELLED_EXIT_CODE,"output":"","timed_out":false,"output_truncated":false}),
+                    );
+                }
+                detail["started_at"] = json!(crate::now());
+                self.save_detail(id, detail)?;
                 v["status"] = json!("running");
                 self.save_record(v)?;
             }
-            let command =
-                guest_command(&host, name, &["run".into(), host.guest.workspace.clone()])?;
+            let command = guest_command(
+                &host,
+                name,
+                &["run".into(), host.guest.workspace.clone(), id.into()],
+            )?;
             let output = process::checked(
                 &command,
                 None,
@@ -1023,6 +1150,12 @@ impl AgentService {
                     {
                         v["native_session_id"] = json!(session);
                     }
+                    if result["exit_code"] == process::CANCELLED_EXIT_CODE
+                        && let Some(detail) = self.inner.details.lock().unwrap().get_mut(id)
+                    {
+                        detail["cancelled"] = json!(detail["cancel_requested"] == true);
+                        let _ = self.save_detail(id, detail);
+                    }
                     v["result"] = result;
                 }
                 Err(_) => {
@@ -1046,6 +1179,8 @@ impl AgentService {
                 .map(|(k, _)| k.clone());
             let Some(key) = oldest else { break };
             records.remove(&key);
+            self.inner.details.lock().unwrap().remove(&key);
+            let _ = std::fs::remove_file(self.inner.details_root.join(format!("{key}.json")));
             let _ = std::fs::remove_file(self.inner.runs_root.join(format!("{key}.json")));
         }
     }
@@ -1151,4 +1286,78 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
         ensure!(uncertain.is_boolean(), "Invalid native recovery state.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod run_control_tests {
+    use super::*;
+
+    #[test]
+    fn queued_cancellation_is_scoped_persistent_and_never_starts_guest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let host = Host {
+            id: "test-node".into(),
+            target: "offline.invalid".into(),
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host.clone()], &root).unwrap();
+        let service = AgentService::new(&root, fleet.clone()).unwrap();
+        let id = "11111111111111111111111111111111";
+        let record = json!({"id":id,"host_id":"test-node","name":"ebox-private","provider":"codex","scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":".","resume_id":null,"created_at":crate::now()});
+        let detail = json!({"schema":1,"task":"fixture task","started_at":null,"cancel_requested":false,"cancelled":false});
+        service
+            .inner
+            .records
+            .lock()
+            .unwrap()
+            .insert(id.into(), record);
+        service
+            .inner
+            .details
+            .lock()
+            .unwrap()
+            .insert(id.into(), detail);
+        assert!(
+            service
+                .cancel_run("other-node", "ebox-private", id)
+                .is_err()
+        );
+        assert!(service.cancel_run("test-node", "ebox-other", id).is_err());
+        assert_eq!(
+            service.get_run("test-node", "ebox-private", id).unwrap()["cancel_requested"],
+            false
+        );
+        let requested = service.cancel_run("test-node", "ebox-private", id).unwrap();
+        assert_eq!(requested["status"], "queued");
+        assert_eq!(requested["cancel_requested"], true);
+        let request =
+            native::RunRequest::parse(json!({"provider":"codex","prompt":"never sent"})).unwrap();
+        service.run_worker(host, "ebox-private", request, id);
+        let completed = service.get_run("test-node", "ebox-private", id).unwrap();
+        assert_eq!(completed["status"], "cancelled");
+        assert!(completed["started_at"].is_null());
+        assert!(completed["elapsed_seconds"].is_null());
+        assert_eq!(
+            completed["result"]["exit_code"],
+            process::CANCELLED_EXIT_CODE
+        );
+        let raw = security::read_json(&service.inner.runs_root, &format!("{id}.json"))
+            .unwrap()
+            .unwrap();
+        // A retained controller release can still read and safely classify the record.
+        validate_record(&raw, id).unwrap();
+        assert_eq!(raw["status"], "failed");
+        let restarted = AgentService::new(&root, fleet).unwrap();
+        assert_eq!(
+            restarted.get_run("test-node", "ebox-private", id).unwrap()["status"],
+            "cancelled"
+        );
+        assert_eq!(restarted.list_runs()["runs"][0]["task"], "fixture task");
+    }
 }
