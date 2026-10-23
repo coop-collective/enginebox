@@ -125,7 +125,30 @@ Automatic placement, swarm orchestration, GPU memory restoration, a new CI sched
 
 [LayerFS](LAYERFS.md) is a first-class checkout provider exposed through controller registration, durable API jobs, MCP and the Storage dashboard. The pinned preview remains explicitly provisioned on qualified Linux nodes; it is not downloaded by a general installer. Keep file checkpoints separate from Incus RAM checkpoints, and retain uncertain state for operator inspection. See [the backend contract](LAYERFS-BACKEND.md) and [Incus attachment](LAYERFS-INCUS.md) for the tested boundaries and remaining release gates.
 
-[Lore and Artifacts assessment](LORE-STORAGE.md) records a 3.96 GB Unity fixture and the current Artifacts size limits. Lore is a proposed first-class source/asset provider feeding prepared LayerFS bases. The local Lore benchmark is complete; fleet ingestion, native engine builds, cross-host distribution and an R2-backed service remain separate implementation and qualification work.
+The October 23 owner decision selects [LayerFS game workspaces](GAME-WORKSPACES.md)
+and removes Lore as a planned dependency. The existing backend already combines
+private container branches with stable `/project` mounts and prepared checkpoint
+forks. Preserve native provider homes and the separately qualified Incus export.
+The design maps all ten upstream core ideas to implemented behavior or explicit
+remaining work; a LayerFS version upgrade is not implicit in this decision.
+
+[Store distribution](STORE-DISTRIBUTION.md) separates the storage server from
+workers' local NVMe Stores. The same existing server may hold both roles during
+qualification. Work proceeds through these dependent boundaries:
+
+1. Qualify the pinned container backend for game ingestion, exact task checkpoints
+   and native engine cache reuse; complete allocation/attachment readiness.
+2. Publish consistent, verified Store generations; qualify desync chunk delivery
+   against SQLite's remote-copy baseline; add manifest authorization, single-flight
+   hydration, residency leases, space reservations and recoverability-gated eviction.
+3. Add logical cross-worker result import into the canonical LayerFS history and
+   Gamejam's batched candidate checks. Database copying must never stand in for
+   merging independently written Stores or accepting a tested artifact.
+
+Automatic eviction, the distributed provider and cross-worker integration remain
+unimplemented. Large-project archive and checksum measurements do not qualify
+those paths or first playable frame. The retired Lore comparison remains
+[historical research](../research/storage-benchmarks/lore-assessment.md).
 
 ## Persistent project environments and disposable agent forks
 

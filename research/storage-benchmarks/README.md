@@ -1,6 +1,12 @@
 # Storage qualification
 
-`lore.mjs` measures a private Unity content copy against an owned loopback Lore server. It does **not** measure Cloudflare Artifacts, R2 or GitHub. See [results and storage recommendation](../../docs/LORE-STORAGE.md).
+The active design uses [LayerFS game workspaces](../../docs/GAME-WORKSPACES.md)
+and [Store distribution](../../docs/STORE-DISTRIBUTION.md). Lore is excluded from
+the architecture. `lore.mjs` and its [historical assessment](lore-assessment.md)
+remain comparison research: a private Unity content copy against an owned
+loopback Lore server, not Cloudflare Artifacts, R2 or GitHub.
+
+## Historical Lore comparison
 
 Use Node 22.12+ and the verified native Lore **v0.10.1** CLI and server release for your platform. Extract both binaries into one directory, check their release SHA-256 digests, and make them executable. No server or CLI is installed by this script.
 
@@ -109,7 +115,7 @@ other target-platform derived data successfully.
 
 `unreal-server-restore.py` is a separate **archive baseline**, run on an existing
 storage host against a newly admitted disposable Engine Box VM. It does not
-implement Lore, LayerFS, server provisioning or fleet admission. Provide private
+implement LayerFS transfer, server provisioning or fleet admission. Provide private
 `--vm`, `--project`, `--uuid`, `--owner` and `--store` arguments. The store must be
 an experiment-owned directory under `/srv/enginebox/assets`, with `owner`,
 `manifest.json` and a complete `content.tar.zst`. The archive contains only the
@@ -175,3 +181,50 @@ These cover corrupt input/stored bytes, incomplete or unexpected content,
 truncation, existing-workspace protection, path/link rejection, and publication
 only after the whole input is consumed. They do not qualify crash consistency,
 malicious concurrent writers, cross-platform behavior or engine startup overlap.
+
+## Immutable LayerFS snapshot distribution
+
+`layerfs-distribution.py` exercises desync v1.1.5 against an existing consistent
+SQLite snapshot. It reads the original, publishes chunks to a fresh private local
+directory and restores through a loopback HTTP server into temporary output files.
+The worker cache and origin are distinct directories. Successful restores pass
+whole-file SHA-256, SQLite integrity and foreign-key checks; only then does the
+harness remove its own restored file. It leaves the original and private evidence
+intact. No live Store, production server or active workspace is changed.
+
+Provision the pinned release separately and verify its release digest. The tested
+`desync_1.1.5_darwin_arm64.tar.gz` SHA-256 was
+`dcbbaa2c6b6960ccc1b9f6c8095dd724f6e74bc7e6f9a6372219d6754f2b6717`.
+Python 3.11+ is required. Use a fresh ignored output directory with at least six
+times the input size plus 1 GiB free; input must be a closed consistent snapshot
+without WAL/SHM/journal sidecars, never an active Store file.
+
+```sh
+python3 research/storage-benchmarks/layerfs-distribution.py \
+  --snapshot PRIVATE_CONSISTENT_SNAPSHOT \
+  --desync VERIFIED_DESYNC_BINARY \
+  --output .state/FRESH_PRIVATE_RUN
+```
+
+The [recorded observation](layerfs-distribution-results.json) used a 631,517,184-byte
+LayerFS v1.0.0 snapshot from the earlier asset probe. Chunk publication took 6.35 s.
+First restore took 11.77 s and fetched 630,104,188 payload bytes; a fresh restore
+with a populated cache took 3.42 s with zero HTTP requests. After corrupting one
+test-cache chunk, explicit repair-disabled extraction failed. Repair fetched one
+19,059-byte chunk and restored the exact database. With the origin stopped, the
+full cached restore also passed, in 2.84 s. Independent verification took another
+0.81–1.38 s per successful restore. Payload counters exclude HTTP/TCP overhead.
+
+The initial HTTP/1.0 fixture hit a connect timeout. Its failed logs remain private;
+the fresh successful fixture uses HTTP/1.1, a larger accept queue and TCP_NODELAY.
+This is not an isolated diagnosis of which change fixed the timeout. The binary's
+`--cache-repair` flag is explicit in both corrupt-cache cases; do not infer its
+behavior from an unpinned documentation page.
+
+This proves snapshot-byte distribution and cache behavior on loopback. It does
+not prove WAN throughput, changed-generation deduplication, Linux cross-host
+LayerFS reopening, game startup, active-project eviction or the 11 GB fixture.
+The server binds only loopback and stops in the finalizer. Commands have a
+180-second deadline and use four workers. Private output can be removed only
+after exporting receipts and confirming its exact owner marker; this is not a
+general cache-deletion command.

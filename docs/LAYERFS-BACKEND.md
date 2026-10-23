@@ -6,6 +6,12 @@ LayerFS is Engine Box's first-class checkout storage backend. The controller own
 
 File storage and VM memory remain distinct. Provider homes and credential delegation keep their existing private lifecycle. Native authenticated sessions on LayerFS mounts and production durability still need separate qualification. Incus attachment and recovery have explicit capability checks; first-class access does not mean every platform or failure mode is supported.
 
+The [game workspace decision](GAME-WORKSPACES.md) keeps this container/LayerFS
+combination as the foundation, with no Lore dependency. It maps checkpointing,
+fork reuse, conflicts and compute leases to the upstream core ideas.
+[Distributed Store generations and local cache eviction](STORE-DISTRIBUTION.md)
+extend this backend; they are not supplied by the current commands.
+
 ## Runtime and installation boundary
 
 The Rust package is `packages/enginebox-storage-layerfs`. Rust owns configuration, import policy, local receipts, leases, admission, Docker resource limits and CLI behavior. An embedded JavaScript bridge calls the same upstream SDK used in qualification; it supplies no inference proxy, agent loop or orchestration. Each SDK operation runs in a short-lived trusted Docker helper. Agent commands run as the upstream sandbox's unprivileged UID 501/GID 20, without the Docker socket or readable backing Store.
@@ -51,7 +57,7 @@ Every sandbox gets a separate bind mount at `/project`, pointing to its current 
 
 The source checkout's local Git author settings and remotes are deliberately not imported. Configure the desired author identity in your image or workspace before committing. Agent commits retain the imported commit as their normal Git ancestor.
 
-`close` and `remount` refuse uncheckpointed changes. There is no implicit discard or filesystem branch-merge command. Use Git's own integration semantics for future agent changes; whole-tree LayerFS merging of `.git` metadata is not Git merging. File checkpoints retain the upstream preview's durability and mtime limitations; they are not a backup or power-loss guarantee.
+`close` and `remount` refuse uncheckpointed changes. There is no implicit discard or filesystem branch-merge command in this adapter. For its current Git imports, use Git's integration semantics; whole-tree LayerFS merging of `.git` metadata is not Git merging. The Git-free LayerFS game merge path is separately planned. `exec` does not automatically checkpoint; an orchestrator must explicitly commit at a safe task/command boundary before releasing compute. File checkpoints retain the upstream preview's durability and mtime limitations; they are not a backup or power-loss guarantee.
 
 ## Immutable dependency reuse
 

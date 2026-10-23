@@ -1,6 +1,6 @@
 # Portable self-hosted environment design
 
-Status: implementation design updated October 19, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
+Status: implementation design updated October 23, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
 
 ## Outcome
 
@@ -82,12 +82,27 @@ Prefer an existing compatible storage pool. Offer bounded loop-backed storage as
 
 | Data | Handling |
 |---|---|
-| Writable project and installed dependency tree | Private VM disk; snapshot/fork uses the backend's copy-on-write facilities where supported. |
+| Writable project and installed dependency tree | Private VM disk, or an explicitly selected private LayerFS container branch at `/project`; prepared checkpoints retain compatible dependencies. |
 | Large repository and asset references | Versioned read-only mounts near compute; each workspace gets independent writable state. |
 | Download/build caches | Tool-supported reuse, separated by trust domain, OS/architecture and relevant toolchain/input keys. |
 | Provider account state | Private controller refresh credentials; access-only credentials delivered to the same owner’s assigned workspaces. Never stored in caches or clean bases. |
 | Git and browser account state | Private workspace identity, with separate explicit authorization. |
 | External data | Its own backup and versioning policy; not implicitly captured by a VM snapshot. |
+
+The October 23 game-workspace decision uses LayerFS with containers and removes
+Lore from the architecture. The backend already creates and limits private Docker
+workspaces over node-local project Stores. The qualified Incus adapter exports a
+checkout view while keeping every Store opener in the host kernel; an attached
+VM never receives the backing SQLite file. See [core-idea mapping and current
+boundaries](GAME-WORKSPACES.md).
+
+The proposed [distributed storage model](STORE-DISTRIBUTION.md) puts recoverable,
+immutable project generations on a storage server and active Stores on worker
+NVMe. CPU/GPU scheduling favors compatible cached projects. Engine Box owns
+residency leases, capacity reservations and eviction after remote recoverability
+is proved. The storage and worker roles may initially run on the same server.
+Cross-worker edits need logical revision integration; live database files are
+not shared across kernels and independently changed SQLite copies are not merged.
 
 The prototype used guest NFS because its Incus version rejected direct shared devices with stateful migration enabled. Generalize this as an optional mount backend. Initially use an existing suitable NFS endpoint or an isolated, explicitly provisioned service. Do not disable unrelated rpcbind/statd services, replace global NFS bindings or claim arbitrary shared mounts support memory restoration.
 

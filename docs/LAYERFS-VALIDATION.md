@@ -1,5 +1,10 @@
 # LayerFS storage and checkout validation
 
+Current direction: [LayerFS game workspaces](GAME-WORKSPACES.md) and
+[Store distribution](STORE-DISTRIBUTION.md) record the October 23 owner decision.
+The experiments below retain their original versions and qualification limits;
+the older optional-candidate wording is historical, not the current product scope.
+
 ## Git-free Unreal follow-up, October 23, 2026
 
 An independent disposable probe of upstream **v1.0.0**, commit
