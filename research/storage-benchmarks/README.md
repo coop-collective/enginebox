@@ -122,3 +122,56 @@ advisory and device caches remain uncontrolled. Repeated extraction is not a war
 engine or an in-memory workspace resume. Guest extraction has its own timeout;
 all operations preserve a 2 GiB free-disk reserve. Export receipts before deleting
 only the exact experiment-owned VM and archive directory under the host lease.
+
+## Checksum concurrency and streaming comparison
+
+`unreal-verified-restore.py` compares full-file SHA-256 read-back with one and
+four workers, and verification during extraction. It uses the same private
+archive/manifest contract as the baseline, a fresh admitted VM and a fresh
+`--output` directory beneath `/srv/enginebox/assets`. Pass `--vm`, `--project`,
+`--uuid`, `--owner`, `--store` and `--output`; place `verified-restore.py` beside
+the runner. Python 3.11+, zstd and Incus are required. Preflight reserves two
+complete copies plus 2 GiB of usable guest space. Preserve the append-only
+receipts before removing only the exact owned VM under the host operation lease.
+
+The [results](unreal-verified-restore-results.json) favor bounded parallel
+read-back: 2.59–2.84 s versus 9.21–10.86 s serially for 11.17 GB. All eight audits
+passed. Extraction plus guest sync took 28.05 s. The first streaming extractor
+took 64.62 s, including per-file fsync; it is **not a speedup**. Serial Python
+hashing, extraction and a different durability strategy are confounded here;
+there is no attribution of the slowdown to a single cause. Do not enable this
+streaming implementation as an optimization based on these results.
+
+Audits alternate worker counts on each of two restored trees, with the second
+tree starting with four workers. Page/device caches are uncontrolled; archive
+eviction is advisory. These are small-sample, same-host asset measurements, not
+cold physical-disk verification, a remote cache service, editor startup or a
+production latency percentile. Read-back goes through the filesystem and can
+hit page cache; it is not an independent hardware/media integrity scrub.
+
+The streaming helper requires a **trusted** manifest, fresh private destination
+and private ancestor directories. It rejects unexpected/missing/duplicate files,
+wrong sizes/hashes, traversal and links; preserves no executable modes or owners;
+and exposes the complete read-only tree only after validation and fsync. This is
+an asset-only format, not a general repository restore or an authentication API.
+The controller must also require successful producer/decompressor exit before
+granting a consumer access. A failed producer can leave a verified tree that is
+still ineligible for use; no engine is launched by this harness.
+
+`content_verified` means incoming bytes matched the manifest. `readback_verified`
+means a separate pass read stored files and matched them. They are different
+receipts. Read-only modes assume a trusted owner; they do not isolate hostile
+same-user/root writers. Audits require an immutable base. Engine edits belong in
+a private writable fork. Promotion and startup policies must not be inferred
+from file creation or an incomplete pipeline.
+
+Run the integrity/publication regressions locally:
+
+```sh
+python3 -m unittest discover -s research/storage-benchmarks -p test_verified_restore.py -v
+```
+
+These cover corrupt input/stored bytes, incomplete or unexpected content,
+truncation, existing-workspace protection, path/link rejection, and publication
+only after the whole input is consumed. They do not qualify crash consistency,
+malicious concurrent writers, cross-platform behavior or engine startup overlap.

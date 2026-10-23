@@ -252,3 +252,46 @@ as successful exit; an empty successful commandlet cannot count as qualification
 No cold-fill success, warm-fill speedup, generated-cache restore benefit or
 first-playable-frame timing was established. Complete those measurements on the
 intended engine/toolchain/platform before promising fast editor startup.
+
+## Checksum follow-up and startup overlap
+
+The [October 23 comparison](../research/storage-benchmarks/unreal-verified-restore-results.json)
+reused the already-seeded 11.17 GB environment in a fresh 4-vCPU, 8-GiB disposable
+VM. One-worker read-back took 9.21–10.86 s; four workers took 2.59–2.84 s. All eight
+full-file SHA-256 audits passed. Across these observations, median verification
+time fell from 10.46 s to 2.72 s (about 3.8×). This supports a **bounded parallel
+verifier**, not removing integrity checks. Cache state is uncontrolled and this
+small sample does not establish production percentiles or physical-media checks.
+
+Extraction plus guest sync took 28.05 s. Adding the first serial verification
+gave 37.26 s; adding the first four-worker audit would give about 30.64 s. The
+latter is a component-time estimate, not a separately measured end-to-end run.
+Thus the checksum gain removes roughly seven seconds here, not three quarters
+of total restore time. The initial inline SHA-256 extractor took 64.62 s and
+passed integrity checks, but was slower; serial extraction/hashing and per-file
+fsync need separate investigation before recommending that implementation.
+
+For the product integration, overlap independent preparation first:
+
+1. Boot/admit the VM and prepare trusted engine binaries or reusable cache layers
+   while source content is fetched and verified. Project scripts/plugins stay
+   behind the project integrity gate. Reusing a prewarmed process is engine-
+   specific and still needs qualification.
+2. Verify a complete immutable base once for its revision and storage generation,
+   then let authorized agents fork it. Do not run 100 identical full scans merely
+   because 100 agents start. Invalidation, corruption or untrusted cache sources
+   require revalidation; cache receipts must not outlive their content identity.
+3. After every required file and the producer exit pass, allow project startup.
+   A later independent audit may overlap startup only under an explicit policy
+   that accepts ingress verification first. Audit the immutable base while the
+   engine writes its own fork. A failed audit invalidates dependent work and
+   prevents acceptance/promotion.
+4. To load a project before *all* files arrive, build a filesystem gate that checks
+   each chunk/file before the engine can read it. Ordinary extraction plus a
+   background checksum task does not provide that guarantee. Neither this
+   research helper nor the deployed provider implements that gate.
+
+The measured recommendation is four-worker read-back before project access,
+with host-wide limits to avoid competing scans. No actual engine-start overlap,
+first-frame improvement or product provider change was demonstrated by this
+checksum experiment. Startup/cache qualification remains an independent gate.
