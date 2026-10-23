@@ -12,6 +12,7 @@ import {
   readBounded,
   record,
   requireThat,
+  readOnlyJob,
   sha256,
   validateChunks,
   validateGeneration,
@@ -22,6 +23,7 @@ import {
   type Assignment,
   type NodeView,
 } from "@enginebox/fleet-protocol";
+import { assistantRoute } from "./assistant.ts";
 export { Registry, FleetNode, Project } from "./state.ts";
 
 const json = (value: unknown, status = 200) =>
@@ -142,7 +144,12 @@ async function assignmentBody(request: Request, p: Principal) {
   const a = body.assignment as unknown as Assignment;
   identifier(a.id);
   identifier(a.project);
-  digest(a.generation);
+  if (a.kind === "assistant")
+    requireThat(
+      a.generation === null,
+      "Assistant jobs have no Store generation",
+    );
+  else digest(a.generation);
   requireThat(
     a.node === n.id &&
       a.epoch === active.epoch &&
@@ -290,8 +297,7 @@ export default {
           );
           requireThat(a, "Unknown attempt", 404);
           requireThat(
-            a.kind !== "layerfs-exec" &&
-              (a.epoch !== s.epoch || a.expires <= Date.now()),
+            readOnlyJob(a) && (a.epoch !== s.epoch || a.expires <= Date.now()),
             "Native or active work requires owner reconciliation",
             409,
           );
@@ -357,7 +363,9 @@ export default {
             });
           for (const project of n.projects) {
             const authority = env.PROJECTS.getByName(project);
-            const next = await authority.next();
+            const next = await authority.next(
+              n.assistantProjects?.includes(project) ?? false,
+            );
             if (!next) continue;
             const reserved = await stub.reserve(next, s.epoch, s.session);
             try {
@@ -399,6 +407,19 @@ export default {
         projectAccess(p, project);
         await requireProject(env, project);
         const authority = env.PROJECTS.getByName(project);
+        if (
+          parts[3] === "assistant" &&
+          (parts.length === 4 || parts.length === 5)
+        ) {
+          requireThat(
+            p.admin || p.node.role === "agent",
+            "Assistant access requires an agent or owner",
+            403,
+          );
+          return await assistantRoute(request, env, project, parts[4], () =>
+            jsonBody(request),
+          );
+        }
         if (parts.length === 3 && request.method === "GET")
           return json(await authority.inventory());
         if (

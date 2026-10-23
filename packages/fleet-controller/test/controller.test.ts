@@ -44,7 +44,11 @@ async function ok(
   expect(response.ok, JSON.stringify(data)).toBe(true);
   return data;
 }
-async function setup(id = "agent-a", role = "agent"): Promise<Session> {
+async function setup(
+  id = "agent-a",
+  role = "agent",
+  assistantProjects?: string[],
+): Promise<Session> {
   await ok("/v1/projects", { id: "demo" });
   const { token: secret } = await ok("/v1/nodes", {
     id,
@@ -53,6 +57,7 @@ async function setup(id = "agent-a", role = "agent"): Promise<Session> {
     origin: role === "storage" ? "http://storage:8790" : null,
     slots: 1,
     cacheBytes: 16777216,
+    ...(assistantProjects ? { assistantProjects } : {}),
   });
   const session = crypto.randomUUID();
   const hello = await ok("/v1/node/hello", { session }, secret);
@@ -85,6 +90,92 @@ async function publish(text = "snapshot", parent: string | null = null) {
 }
 afterEach(async () => {
   await reset();
+});
+
+it("dispatches assistant metadata jobs only to capable nodes and preserves request identity", async () => {
+  const app = await setup();
+  expect(
+    (await ok("/v1/projects/demo/assistant", undefined, app)).available,
+  ).toBe(false);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/assistant",
+        { id: "turn", prompt: "Create an issue" },
+        app,
+      )
+    ).status,
+  ).toBe(503);
+  const native = await setup("native-node", "agent", ["demo"]);
+  expect(
+    (await ok("/v1/projects/demo/assistant", undefined, app)).available,
+  ).toBe(true);
+  const spec = { id: "turn", prompt: "Create an issue" };
+  await ok("/v1/projects/demo/assistant", spec, app);
+  await ok("/v1/projects/demo/assistant", spec, app);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/assistant",
+        { ...spec, prompt: "Different instruction" },
+        app,
+      )
+    ).status,
+  ).toBe(409);
+  expect((await ok("/v1/node/poll", {}, app)).assignment).toBeNull();
+  const { assignment } = await ok("/v1/node/poll", {}, native);
+  expect(assignment.kind).toBe("assistant");
+  expect(assignment.generation).toBeNull();
+  await ok(
+    "/v1/node/finish",
+    {
+      assignment,
+      ok: true,
+      result: { text: "Created issue task-one", nativeRunId: "a".repeat(32) },
+    },
+    native,
+  );
+  expect(await ok("/v1/projects/demo/assistant/turn", undefined, app)).toEqual({
+    id: "turn",
+    status: "completed",
+    text: "Created issue task-one",
+  });
+  const storage = await setup("storage", "storage");
+  expect(
+    (await request("/v1/projects/demo/assistant", undefined, storage)).status,
+  ).toBe(403);
+  expect(
+    (await request("/v1/projects/another/assistant", undefined, app)).status,
+  ).toBe(403);
+});
+
+it("retains assistant reservations across node restart until owner reconciliation", async () => {
+  const native = await setup("native-node", "agent", ["demo"]);
+  await ok(
+    "/v1/projects/demo/assistant",
+    { id: "turn", prompt: "Review the backlog" },
+    native,
+  );
+  const { assignment } = await ok("/v1/node/poll", {}, native);
+  const session = crypto.randomUUID();
+  const hello = await ok("/v1/node/hello", { session }, native.token);
+  const restarted = { ...native, session, epoch: hello.epoch };
+  expect(
+    (
+      await request(
+        "/v1/node/reconcile",
+        { attempt: assignment.attempt },
+        restarted,
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    (await ok("/v1/node/poll", {}, restarted)).reconciliationRequired,
+  ).toBe(true);
+  await ok("/v1/nodes/native-node/reconcile", { assignment, stopped: true });
+  expect(
+    (await ok("/v1/projects/demo/assistant/turn", undefined, restarted)).status,
+  ).toBe("failed");
 });
 
 it("scopes node credentials and revokes access", async () => {

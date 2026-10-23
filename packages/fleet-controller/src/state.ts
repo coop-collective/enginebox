@@ -55,12 +55,18 @@ export class Registry extends State {
   }
   async registerNode(spec: NodeSpec) {
     this.put(`node:${spec.id}`, spec.id);
+    if (spec.role === "agent")
+      for (const project of spec.projects)
+        this.put(`agent:${project}:${spec.id}`, spec.id);
     if (spec.role === "storage")
       for (const project of spec.projects)
         this.put(`storage:${project}:${spec.id}`, spec.id);
   }
   async storage(project: string) {
     return this.rows<string>(`storage:${project}:`);
+  }
+  async agents(project: string) {
+    return this.rows<string>(`agent:${project}:`);
   }
 }
 
@@ -139,6 +145,11 @@ export class FleetNode extends State {
   }
   async reserve(job: JobSpec, epoch: number, session: string) {
     const node = this.current(epoch, session);
+    requireThat(
+      job.kind !== "assistant" || node.assistantProjects?.includes(job.project),
+      "Node has no assistant binding for this project",
+      403,
+    );
     requireThat(
       node.role === "agent" && node.projects.includes(job.project),
       "Node cannot execute this project",
@@ -532,7 +543,7 @@ export class Project extends State {
   }
   async enqueue(spec: JobSpec) {
     requireThat(
-      this.get(`generation:${spec.generation}`),
+      spec.kind === "assistant" || this.get(`generation:${spec.generation}`),
       "Generation is not published",
       409,
     );
@@ -575,12 +586,13 @@ export class Project extends State {
     this.put(`job:${spec.id}`, job);
     return job;
   }
-  async next() {
+  async next(allowAssistant = false) {
     const row = this.ctx.storage.sql
       .exec<{
         value: string;
       }>(
-        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' ORDER BY rowid LIMIT 1",
+        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') ORDER BY rowid LIMIT 1",
+        allowAssistant ? 1 : 0,
       )
       .toArray()[0];
     return row ? (JSON.parse(row.value) as JobRecord).spec : null;
@@ -596,6 +608,12 @@ export class Project extends State {
             project: assignment.project,
             generation: assignment.generation,
             kind: assignment.kind,
+            ...(assignment.kind === "assistant"
+              ? {
+                  prompt: assignment.prompt,
+                  timeoutSeconds: assignment.timeoutSeconds,
+                }
+              : {}),
             ...(assignment.check ? { check: assignment.check } : {}),
             ...(assignment.argv
               ? {
