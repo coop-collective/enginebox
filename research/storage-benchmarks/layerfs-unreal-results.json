@@ -1,0 +1,269 @@
+{
+  "schema": 1,
+  "date": "2026-10-23",
+  "scope": "Single local diagnostic, not a throughput/cold-node/engine benchmark",
+  "upstream": {
+    "tag": "v1.0.0",
+    "commit": "2aaf2552ce21154928b9f9c83582e41a637f5910"
+  },
+  "runtime": {
+    "os": "Linux ARM64 inside Docker Desktop",
+    "node": "24.22.0",
+    "rust_build": "1.85.1",
+    "sdk_clients_and_sandboxes_cpu_limit": 2,
+    "sdk_clients_and_sandboxes_memory_gib": 3,
+    "cache_state": "Uncontrolled OS caches; fixture preparation reads every input",
+    "resource_limit_boundary": "Client container limits applied at launch; each SDK sandbox was bounded after its first mount, so that first mount is outside the sandbox resource limit."
+  },
+  "fixture": {
+    "files": 1006,
+    "bytes": 802045960,
+    "git": false,
+    "real_unreal_assets": true,
+    "duplicate_mesh": true,
+    "synthetic_small_files": 1001,
+    "binary_edit": "4096 repeated bytes inside a 175543363-byte mesh, copied and renamed; storage-only, not an editor resave"
+  },
+  "observations": [
+    {
+      "stage": "init",
+      "name": "initialize",
+      "seconds": 3.894720502,
+      "ok": true
+    },
+    {
+      "stage": "forks",
+      "name": "fork-a",
+      "seconds": 0.005795458999999994,
+      "ok": true
+    },
+    {
+      "stage": "forks",
+      "name": "fork-b",
+      "seconds": 0.0004870829999999984,
+      "ok": true
+    },
+    {
+      "stage": "forks",
+      "name": "mount-a",
+      "seconds": 0.32724733399999995,
+      "ok": true
+    },
+    {
+      "stage": "read",
+      "name": "read-and-hash-a",
+      "seconds": 7.305776336000001,
+      "ok": true
+    },
+    {
+      "stage": "read",
+      "name": "read-and-hash-b",
+      "seconds": 9.209931754000001,
+      "ok": true
+    },
+    {
+      "stage": "edit",
+      "name": "commit-a",
+      "seconds": 1.232906792,
+      "ok": true
+    },
+    {
+      "stage": "edit",
+      "name": "sibling-isolation",
+      "seconds": 1.610322959,
+      "ok": true
+    },
+    {
+      "stage": "merge",
+      "name": "merge-disjoint-files",
+      "seconds": 0.03363816700000001,
+      "ok": true
+    },
+    {
+      "stage": "merge",
+      "name": "verify-published-bytes",
+      "seconds": 6.966939920000001,
+      "ok": true
+    },
+    {
+      "stage": "merge",
+      "name": "same-file-conflict-refused",
+      "seconds": 0.0028223339999995005,
+      "ok": true
+    },
+    {
+      "stage": "backup",
+      "name": "sqlite-online-backup",
+      "seconds": 1.143889751,
+      "ok": true
+    },
+    {
+      "stage": "backup",
+      "name": "backup-sdk-history-read",
+      "seconds": 0.007453833000000031,
+      "ok": true
+    },
+    {
+      "stage": "stale-publication",
+      "name": "unchanged-branch-and-workspace-stay-pinned",
+      "seconds": 0.068809,
+      "ok": true
+    },
+    {
+      "stage": "stale-publication",
+      "name": "publish-b-from-same-old-baseline",
+      "seconds": 0.0027838749999999947,
+      "ok": true
+    },
+    {
+      "stage": "publication-recovery",
+      "name": "merge-b-with-main-as-it-was-before-b-published",
+      "seconds": 0.021331917000000006,
+      "ok": true
+    },
+    {
+      "stage": "publication-recovery",
+      "name": "recover-from-original-source-branches",
+      "seconds": 0.009777541000000013,
+      "ok": true
+    },
+    {
+      "stage": "shared-branch",
+      "name": "same-branch-b-before-commit",
+      "seconds": 0.04699695799999998,
+      "ok": true
+    },
+    {
+      "stage": "shared-branch",
+      "name": "same-branch-commit-b-merges-a",
+      "seconds": 0.140824166,
+      "ok": true
+    },
+    {
+      "stage": "restore-read",
+      "name": "mount-from-restored-volume",
+      "seconds": 0.9267112089999999,
+      "ok": true
+    },
+    {
+      "stage": "restore-read",
+      "name": "full-hash-check-from-backup",
+      "seconds": 6.359228878,
+      "ok": true
+    }
+  ],
+  "behavior": {
+    "separate_branches_follow_main": false,
+    "unchanged_workspace_follows_main": false,
+    "new_fork_sees_latest_main": true,
+    "stale_publish_overwrote_layers": 1,
+    "stale_publish_preserved_unrelated_main_addition": false,
+    "disjoint_branch_merge_passed": true,
+    "same_file_branch_conflict_refused": true,
+    "same_branch_commit_combines_disjoint_changes": true,
+    "sqlite_integrity_check": "ok",
+    "sqlite_foreign_key_check": "ok",
+    "restored_fuse_view_full_sha256_verified": true
+  },
+  "storage": {
+    "imported_database_bytes": 631500800,
+    "committed_small_delta_new_stored_object_bytes": 8310,
+    "committed_small_delta_new_metadata_bytes": 8149,
+    "committed_small_delta_wal_growth_bytes": 127840,
+    "backup_database_bytes": 631517184
+  },
+  "attempts": [
+    {
+      "stage": "prepare",
+      "status": 0,
+      "seconds": 6.411966625018977
+    },
+    {
+      "stage": "init",
+      "status": 0,
+      "seconds": 5.3824282909045
+    },
+    {
+      "stage": "forks",
+      "status": 1,
+      "seconds": 0.7440812499262393
+    },
+    {
+      "stage": "read",
+      "status": 0,
+      "seconds": 17.074370999936946
+    },
+    {
+      "stage": "edit",
+      "status": 0,
+      "seconds": 5.1457452500471845
+    },
+    {
+      "stage": "merge",
+      "status": 0,
+      "seconds": 7.972629083087668
+    },
+    {
+      "stage": "backup",
+      "status": 0,
+      "seconds": 1.55881491699256
+    },
+    {
+      "stage": "stale-publication",
+      "status": 1,
+      "seconds": 0.5974021659931168
+    },
+    {
+      "stage": "publication-recovery",
+      "status": 1,
+      "seconds": 0.5481932919938117
+    },
+    {
+      "stage": "publication-recovery",
+      "status": 0,
+      "seconds": 0.8685169579694048
+    },
+    {
+      "stage": "shared-branch",
+      "status": 0,
+      "seconds": 0.7652083330322057
+    },
+    {
+      "stage": "restore-prepare",
+      "status": 0,
+      "seconds": 1.863176167011261
+    },
+    {
+      "stage": "restore-read",
+      "status": 0,
+      "seconds": 8.02199133404065
+    }
+  ],
+  "limitations": [
+    "Original project read-only; assets and raw identities excluded from Git",
+    "Local image/binaries already present for restored sandbox",
+    "Backup taken without concurrent active edits; uncommitted overlays not included",
+    "No engine import, compile, rendering, native save or valid-binary semantic merge tested",
+    "No cross-node/network transfer, cold-disk control, host crash, power loss, retention or sustained load test",
+    "Failed assertions and harness attempts retained in raw append-only evidence",
+    "Prepare source path made configurable after execution; final configuration change syntax-checked only"
+  ],
+  "evidence": "Ignored .state/layerfs-unreal/ logs and evidence, with private manifests and backup",
+  "gitstalk_review": {
+    "main_commit": "785b66da",
+    "skipper_merge_commit": "354cbdec",
+    "findings": [
+      "Parallel pre-land preparation/checks and short serialized sprout update",
+      "Asynchronous validation of exact sprout heads can promote multiple accumulated changes",
+      "Validation debounce available but default off; exact-commit full-check reuse default on",
+      "Restricted JS/TS skipper default off; selected passes not full promotion evidence",
+      "No engine test-selection or Lore/LayerFS adapter implemented"
+    ]
+  },
+  "cleanup": {
+    "private_backup_exported": true,
+    "stopped_experiment_containers_removed": true,
+    "scratch_data_store_and_restore_volumes_removed": true,
+    "toolchain_caches_retained": true
+  }
+}

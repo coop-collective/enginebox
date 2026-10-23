@@ -1,0 +1,8 @@
+**/node_modules
+**/.state
+**/.wrangler
+**/.dev.vars*
+**/.env*
+.git
+target
+**/dist
