@@ -279,6 +279,109 @@ it("scopes node credentials and revokes access", async () => {
   expect((await request("/v1/node/catalog", undefined, node)).status).toBe(401);
   expect((await request("/v1/projects", undefined, "short")).status).toBe(401);
 });
+it("limits task-only credentials to metadata tools and rejects executor impersonation", async () => {
+  const native = await setup("native-node", "agent", ["demo"]);
+  const spec = {
+    id: "task-client",
+    role: "agent",
+    projects: ["demo"],
+    taskOnly: true,
+    origin: null,
+    slots: 1,
+    cacheBytes: 16777216,
+  };
+  const { token: service } = await ok("/v1/nodes", spec);
+  expect(await ok("/v1/node/identity", undefined, service)).toEqual({
+    id: spec.id,
+    role: "agent",
+    projects: ["demo"],
+    taskOnly: true,
+  });
+  const task = await ok(
+    "/v1/projects/demo/tasks",
+    {
+      id: "scoped-task",
+      title: "Scoped task",
+      type: "idea",
+    },
+    service,
+  );
+  expect(task.createdBy).toBe("node:task-client");
+  await ok(
+    "/v1/projects/demo/tasks/scoped-task/update",
+    {
+      operationId: "edit",
+      expectedRevision: 1,
+      patch: { description: "Created through scoped service" },
+    },
+    service,
+  );
+  await ok(
+    "/v1/projects/demo/tasks/scoped-task/move",
+    {
+      operationId: "start",
+      expectedRevision: 2,
+      status: "in_progress",
+    },
+    service,
+  );
+  expect(
+    (await ok("/v1/projects/demo/tasks", undefined, service)).tasks,
+  ).toHaveLength(1);
+  expect(
+    (await ok("/v1/projects/demo/tasks/activity", undefined, service)).events,
+  ).toHaveLength(3);
+  expect(
+    (await ok("/v1/projects/demo/activity", undefined, service)).nodes.map(
+      (n: any) => n.id,
+    ),
+  ).toEqual(["native-node"]);
+  await ok(
+    "/v1/projects/demo/assistant",
+    { id: "service-turn", prompt: "List tasks" },
+    service,
+  );
+  const { assignment } = await ok("/v1/node/poll", {}, native);
+  expect(assignment.id).toBe("service-turn");
+  const denied: [string, unknown?, string?][] = [
+    ["/v1/node/hello", { session: "stolen-executor" }],
+    ["/v1/node/poll", {}],
+    ["/v1/node/finish", { assignment, ok: true, result: { check: "forged" } }],
+    ["/v1/node/catalog"],
+    ["/v1/projects/demo"],
+    ["/v1/projects/demo/jobs/service-turn"],
+    ["/v1/projects/demo/jobs", { id: "forged-check" }],
+    ["/v1/projects/demo/generations", {}],
+    ["/v1/projects/demo/checks", {}],
+    ["/v1/projects/demo/candidates", {}],
+    ["/v1/projects/demo/accept", {}],
+    [`/v1/data/demo/chunks/${"a".repeat(64)}`, "untrusted", "PUT"],
+    [
+      "/v1/projects/demo/tasks/scoped-task/move",
+      { operationId: "ship", expectedRevision: 3, status: "shipped" },
+    ],
+    ["/v1/projects/other/tasks"],
+  ];
+  for (const [path, body, method] of denied)
+    expect((await request(path, body, service, method)).status, path).toBe(403);
+  expect((await ok("/v1/projects/demo/jobs/service-turn")).status).toBe(
+    "assigned",
+  );
+  await ok("/v1/projects", { id: "other" });
+  expect(
+    (
+      await request("/v1/nodes", {
+        ...spec,
+        id: "wide-service",
+        projects: ["demo", "other"],
+      })
+    ).status,
+  ).toBe(400);
+  await ok("/v1/nodes/task-client/revoke", {});
+  expect(
+    (await request("/v1/projects/demo/tasks", undefined, service)).status,
+  ).toBe(401);
+});
 it("requires verified chunks before pages and verified pages before publication", async () => {
   await ok("/v1/projects", { id: "demo" });
   const missing = "a".repeat(64);

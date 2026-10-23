@@ -188,7 +188,7 @@ export default {
       const p = await principal(request, env);
       const registry = env.REGISTRY.getByName("owner");
       requireThat(parts[0] === "v1", "Unknown API", 404);
-      if (!p.admin && "taskOnly" in p.node && p.node.taskOnly === true)
+      if (!p.admin && p.node.taskOnly === true)
         requireThat(
           (parts.length === 3 &&
             parts[1] === "node" &&
@@ -302,7 +302,7 @@ export default {
             id: n.id,
             role: n.role,
             projects: n.projects,
-            taskOnly: "taskOnly" in n && n.taskOnly === true,
+            taskOnly: n.taskOnly === true,
           });
         }
         if (parts[2] === "heartbeat" && request.method === "POST") {
@@ -569,7 +569,13 @@ export default {
                 : {}),
             })),
             nodes: views
-              .filter((v) => v && !v.revoked && v.projects.includes(project))
+              .filter(
+                (v) =>
+                  v &&
+                  !v.revoked &&
+                  !v.taskOnly &&
+                  v.projects.includes(project),
+              )
               .map((v) => ({
                 id: v!.id,
                 role: v!.role,
