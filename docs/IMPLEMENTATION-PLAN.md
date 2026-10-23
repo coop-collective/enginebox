@@ -141,6 +141,9 @@ qualification. Work proceeds through these dependent boundaries:
 2. Publish consistent, verified Store generations; qualify desync chunk delivery
    against SQLite's remote-copy baseline; add manifest authorization, single-flight
    hydration, residency leases, space reservations and recoverability-gated eviction.
+   Qualify incremental R2 recovery, retained manifests and acceptance records,
+   fenced authority recovery and an empty-cache rebuild with the original host
+   unavailable. RAID10 and worker caches do not satisfy off-host durability.
 3. Add logical cross-worker result import into the canonical LayerFS history and
    Gamejam's batched candidate checks. Database copying must never stand in for
    merging independently written Stores or accepting a tested artifact.

@@ -59,6 +59,99 @@ second cache service. Initially keep role directories and quotas distinct on the
 existing machine. A second directory on that machine is not an independent
 backup; its loss can remove both roles.
 
+## Resilience and rebuilding a lost server
+
+This is an optional Engine Box distribution/recovery layer around local LayerFS,
+not an upstream distributed SQLite mode. LayerFS's current contract requires
+every Store opener to share one Linux kernel and supported local storage. Its
+decentralized-agent concept does not currently provide cross-server replication,
+consensus or automatic failover. [Current contract](https://layerfs.ai/docs/core-ideas/).
+
+Use three distinct protections:
+
+| Protection | Purpose | Boundary |
+|---|---|---|
+| RAID10 on the storage host | Continue through tolerated disk failures and replace failed drives | Does not survive losing the host/site or preserve an earlier version after deletion; does not fix LayerFS's current power-loss durability limitation |
+| Replicated immutable generations on another storage host | Serve projects promptly after a host outage | Hosts must be separate failure domains; two directories or VMs on one machine do not qualify |
+| Retained generations in R2 | Rebuild after losing the storage fleet, or recover an earlier retained revision | Requires complete manifests, referenced chunks and recovery metadata; availability and recovery time still depend on the remote service/network |
+
+Start with the existing combined compute/storage server plus R2 Standard as the
+off-host recovery destination. Later add a second storage origin with a complete
+copy of the retained project generations it serves, preferably outside the first
+host's site. Workers may fetch verified chunks from either origin or authorized
+peers. Worker residency is opportunistic and never counts as the sole durable copy.
+R2 stores redundant data across several data centers within a geographic region;
+this does not promise cross-region availability. [R2 durability](https://developers.cloudflare.com/r2/reference/durability/).
+
+Initially replicate each required chunk instead of spreading unique chunks across
+servers: losing one server must not make every snapshot that referenced its chunks
+unreadable. If capacity later requires sharding, use an established object backend
+with replication or erasure coding across host failure domains, a repair process
+and measured degraded reads. Do not implement a custom distributed RAID protocol
+inside the LayerFS adapter. Keep transport and origin selection independent of the
+local workspace API so a single-host installation does not require a cluster.
+
+The R2 path should transfer only missing content-addressed chunks while retaining
+a complete index for each generation. A restore follows that index directly; it
+does not replay every earlier snapshot. Upload referenced objects before exposing
+the manifest. Deduplication belongs within an authorized project/trust domain.
+This is a proposed publication protocol, not a qualified desync-to-R2 integration.
+Compare direct S3-compatible transport with a restic-managed backup of consistent
+generation bundles before selecting the recovery adapter; avoid maintaining two
+independent backup catalogs without a demonstrated need.
+
+R2 Standard currently charges $0.015/GB-month plus operations, with no Internet
+egress or retrieval fee. One TB (1,000 GB) is about $15/month for storage before
+free allowances and operations. Small objects increase request counts; our 632 MB
+loopback fixture needed 9,544 chunk GETs. Measure remote latency and request cost
+before choosing larger transfer chunks or immutable packs. Neither packing nor
+efficient incremental transfer across real engine saves has been qualified.
+[R2 pricing](https://developers.cloudflare.com/r2/pricing/).
+
+Retain authored assets, source/history, exact candidate/test references, manifests
+and accepted-head decision records. Back up controller desired state and pinned
+installation recipes separately; keep necessary recovery keys accessible outside
+the lost host in private operator custody. Never put native provider credentials
+in a shared project generation. Keep selected compatible engine/shader cache
+bundles to shorten recovery, with separate bounded retention; their loss may make
+a rebuild slow but must not make the project unrecoverable.
+
+Use unique immutable generation names and bucket lock rules for the retained
+recovery objects. Separate uploader access from retention/deletion administration.
+R2 lock rules can be removed by authorized administrators, so they are not an
+absolute defense against account compromise. Do not expire shared chunks based
+only on object age: an old chunk can still be required by a new retained manifest.
+GC must check all retained roots and lock requirements. [Bucket locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/).
+
+The proposed acceptance contract requires an off-host durable copy of all required
+objects **and the accepted-head decision record** before acknowledging acceptance
+or shipping. Recovering accepted work after one host loss should then have a zero
+loss window for acknowledged revisions; this remains an implementation and drill
+requirement, not a current guarantee. If off-host publication is unavailable, keep
+working locally where authorized, but leave promotion pending. For in-progress
+work, target upload within one minute of a safe committed file checkpoint and
+report actual lag. Uncommitted overlays, engine RAM and changes made during an
+upload can still be lost; the target is not a guarantee for every editor action.
+
+Rebuild in this order:
+
+1. Provision a compatible clean host from pinned recipes. Recover the project
+   catalog, trust configuration and acceptance records from the independent copy.
+2. Fence the previous controller/integrator before issuing new writer leases.
+   Reconcile uncertain jobs; a missing heartbeat never proves the old writer is
+   stopped. Two storage replicas are not a controller consensus system.
+3. Restore the exact required generation from the surviving origin or R2 onto
+   local supported storage. Verify digests, SQLite integrity, LayerFS reopening
+   and project file manifests before activation.
+4. Restore compatible optional caches and start a bounded engine lease. Prioritize
+   active projects; rebuild remaining origin data in the background. Full Store
+   hydration remains required before opening that Store.
+
+Measure recovery separately for worker loss, origin loss and complete host/site
+loss. Time to provision, recover authority, transfer, verify, mount and reach the
+first playable frame all contribute to recovery time. A warm-cache offline restore
+does not establish recovery from an empty machine.
+
 ## Generation identity and publication
 
 Treat a distributable generation as immutable. Its authenticated manifest binds:
@@ -235,6 +328,14 @@ engine saves; interrupted transfer; corrupt/missing chunks; manifest substitutio
 remote outage; upload/eviction races; crash recovery; tenant isolation; and a worker
 with disk too small for peak hydration. Restore must open through the pinned
 LayerFS SDK and pass full file manifests, not only SQLite `integrity_check`.
+
+Add a disposable disaster-recovery drill with the original worker and storage
+origin unavailable and the replacement machine's cache empty. Recover from the
+independent destination using only its catalog, manifests, keys and pinned recipes;
+prove the last acknowledged accepted revision survives, stale writers cannot
+publish, and retained historical generations remain readable after GC. Also test
+interruption between object upload, manifest publication and acceptance-record
+publication. No developer workspace or production host is a failure fixture.
 
 Record network payload bytes, source reads, actual disk growth, CPU/RAM, publication
 delay, cache-hit rate, hydration/verification/mount time, shader work and first
