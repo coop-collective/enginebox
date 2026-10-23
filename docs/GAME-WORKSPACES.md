@@ -4,14 +4,17 @@ Owner decision, October 23, 2026: use LayerFS for shared project state and priva
 agent workspaces. Lore is removed from the architecture. Engine Box combines
 containers with LayerFS, manages compute and storage residency, and preserves
 recoverable Store generations. Gamejam owns task policy, candidate validation,
-playtests and promotion. Cloudflare is the required target fleet controller; every
-bare-metal server is a managed compute and/or storage node. A dedicated storage
+playtests and promotion. The target controller uses Cloudflare Workers/Durable
+Objects, deployed in production or run locally with Wrangler for development/tests.
+Every production bare-metal server is a managed compute and/or storage node. A dedicated storage
 server is optional. One agent node may keep project storage local; execution across
 multiple agent nodes requires shared storage, which R2 directly can supply.
 
 The existing container integration is implemented. Cloudflare control-plane
 migration, distributed Store hydration, disk-pressure eviction and the game
 acceptance queue below are planned. See the [control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
+The [local development contract](DESIGN.md#local-development-and-test-fleets) keeps
+Wrangler control state separate from the Linux LayerFS node's Store and task branches.
 
 ## Existing container integration
 

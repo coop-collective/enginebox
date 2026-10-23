@@ -1,8 +1,10 @@
 # Project Store distribution and worker disk management
 
 Decision, October 23, 2026: keep LayerFS as the project workspace/history system.
-Cloudflare is the required fleet controller; every bare-metal server is a managed
-node. Workers use local NVMe for active projects, agent containers and engine caches.
+The required fleet controller uses Cloudflare Workers/Durable Objects, deployed
+in production or run locally with Wrangler for development/tests. Every production
+bare-metal server is a managed node. Workers use local NVMe for active projects,
+agent containers and engine caches.
 A dedicated storage server is optional. Shared project storage, supplied by R2
 directly or a managed origin, is required for execution across two or more agent
 nodes. One node may use local-only project storage; a node may combine compute
@@ -46,6 +48,7 @@ Storage optionality concerns project bytes and node roles, not control state.
 | One agent node, including multiple agent containers | Local LayerFS Store is sufficient for editing; remote storage is optional until recovery/promotion guarantees are requested | Optional |
 | Two or more agent nodes executing the same project | Shared service retaining authenticated generations and required chunks; R2 alone qualifies once the adapter passes qualification | Optional |
 | Larger fleet with nearby origins | Shared service plus managed replicas/site caches to improve throughput and recovery | Optional performance/capacity role |
+| Two-node local integration test | One reachable development object service with a local R2 simulation, or an isolated real R2 bucket | None required; simulated storage is not an independent backup |
 
 Here a node is a separate worker machine/kernel, not an agent process. Two machines
 can technically run unrelated projects without shared project storage; the
@@ -55,6 +58,43 @@ until the shared backend is configured, authorized and ready. Loss of readiness
 blocks new transfers/promotion, not deletion of local work. Local-only mode must
 show that losing its node can lose project data; Cloudflare metadata cannot
 reconstruct absent project bytes. The off-host acceptance gate below still applies.
+
+### What a configured shared service means
+
+A shared service is an object-transfer endpoint plus an authorization, generation
+and retention contract. It is not a shared mount of the live LayerFS database, and
+it does not imply a dedicated physical server. The minimum R2-direct deployment is
+the Cloudflare controller, an R2 bucket and two compute nodes with local Stores.
+
+Configuration/readiness requires:
+
+1. A selected environment/bucket and project/trust namespaces, with every intended
+   node able to reach the object-transfer endpoint. Test resources must be explicit.
+2. A controller R2 binding or narrowly scoped service credential, plus authorized
+   node transfer access. A Worker binding alone does not give an external node S3
+   access. Use short-lived operation URLs or scoped temporary credentials through
+   the controller; never send bucket-admin credentials to agent containers.
+   [Presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/),
+   [temporary credentials](https://developers.cloudflare.com/r2/api/s3/temporary-credentials/).
+3. Authenticated generation manifests, chunk identities and upload-completion
+   receipts, with retention/pins and recoverability checks before eviction or
+   promotion. Cloudflare retains the accepted-head authority.
+4. A working node adapter that publishes from node A and reconstructs/verifies the
+   exact generation on node B from empty local storage. Merely creating a bucket
+   or writing a binding in a config does not establish readiness.
+
+For local tests, a Worker development route can expose authorized chunk/manifest
+HTTP operations through one simulated R2 binding. This is a proposed development
+adapter; do not assume Wrangler exposes a production-compatible S3 endpoint to
+external clients. Nodes use that service API, never its local persistence files.
+Two independent R2 simulations on different nodes do not form one shared store.
+Alternatively use an isolated real R2 bucket with the local controller to qualify
+the actual transfer path. Local versus remote bindings must be explicit.
+[Development binding support](https://developers.cloudflare.com/workers/local-development/bindings-per-env/).
+
+The simulated service tests sharing, not independent durability: a local-only
+fixture cannot satisfy production's off-host acceptance requirement. Keep simulated
+test results visibly separate from production-ready acceptance receipts.
 
 ```mermaid
 flowchart LR
@@ -120,7 +160,8 @@ with replication or erasure coding across host failure domains, a repair process
 and measured degraded reads. Do not implement a custom distributed RAID protocol
 inside the LayerFS adapter. Keep transport and origin selection independent of the
 local workspace API so a single-node installation does not require storage peers.
-Its fleet control plane still requires Cloudflare.
+Its fleet controller still uses the Cloudflare architecture, with local Wrangler
+permitted for development/tests as specified in [the design](DESIGN.md#local-development-and-test-fleets).
 
 The R2 path should transfer only missing content-addressed chunks while retaining
 a complete index for each generation. A restore follows that index directly; it

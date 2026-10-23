@@ -2,9 +2,10 @@
 
 Status: implementation design updated October 23, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
 
-Owner decision, October 23: the target fleet requires a Cloudflare control plane.
-Bare-metal servers are managed compute and/or storage nodes, never the fleet's
-authoritative controller. A dedicated storage node is optional; shared project
+Owner decision, October 23: the target fleet uses a Cloudflare control plane,
+deployed on Cloudflare in production and runnable under local Wrangler for
+development/tests. Production bare-metal servers are managed compute and/or
+storage nodes, never the fleet's authoritative controller. A dedicated storage node is optional; shared project
 storage is required before a project can execute across two or more agent nodes.
 R2 directly can provide that service. This decision changes the target design;
 the existing native controller has not yet been migrated.
@@ -121,6 +122,56 @@ independent writers. Native authentication helpers remain native; moving refresh
 ownership and secret access requires its own qualified migration. The current
 Rust REST service, direct SSH operator path and controller-owned credential store
 remain implementation facts, not evidence that this Cloudflare design is deployed.
+
+### Local development and test fleets
+
+Run the same Worker/Durable Object controller code under `wrangler dev` for local
+development and disposable integration tests. This satisfies the Cloudflare-based
+controller design without requiring a deployed account for fully simulated
+resources. Wrangler uses Miniflare/workerd locally, and Durable Objects and R2
+have local simulations. Production still uses the deployed Cloudflare authority;
+the local dev server is not a production outage fallback. [Local development](https://developers.cloudflare.com/workers/local-development/),
+[binding support](https://developers.cloudflare.com/workers/local-development/bindings-per-env/).
+
+| Mode | Controller | Project storage | Dedicated storage machine |
+|---|---|---|---|
+| One local agent node | Local Wrangler, persistent local Durable Objects | Local LayerFS Store; optional local R2 simulation | None |
+| Two-node local integration test | One reachable local Wrangler controller | Shared development object API backed by one local R2 simulation, or an isolated real R2 test bucket | None |
+| Distributed staging/production | Deployed Worker and Durable Objects | R2 directly; optional nearby managed storage replicas | Optional |
+
+Wrangler can run on the developer host or inside the Linux development environment.
+The node connects through its configured controller URL; container/VM `localhost`
+does not generally identify a host-side Wrangler process. Qualify the actual
+private network address, authentication and reconnect behavior. For one test fleet,
+both nodes connect to the same controller instance/namespace. Separate Wrangler
+controllers with separate persistence directories simulate separate fleets.
+Do not make independent runtimes share a live `.wrangler/state` directory.
+
+Persist controller development state in a private ignored directory, outside task
+branches and LayerFS checkout mounts; Wrangler's `--persist-to` selects that path.
+Use the same path for local data commands. Application previews inside agent
+workspaces may run their own Wrangler processes with independent data, but those
+processes are not additional fleet controllers. Agent test code must not gain the
+fleet's state directory or credentials. [Local persistence](https://developers.cloudflare.com/workers/local-development/local-data/).
+
+LayerFS requires Linux and local ext4, XFS or Btrfs for the Store, with every opener
+sharing that Linux kernel. A Linux developer machine needs no extra VM for this
+requirement; the existing Engine Box backend still uses Docker workspaces. On
+macOS/Windows, put the node's Store/helper/daemon in a qualified Linux VM, commonly
+provided by a Linux-container platform, with a volume actually backed by a supported
+Linux filesystem. A macOS/Windows directory bind-mounted into a container is not
+equivalent. Validate filesystem type, FUSE/mount permissions, architecture and pinned
+artifacts; a container alone does not establish compatibility. Laptop node enrollment
+and this complete local stack remain unqualified. [LayerFS contract](https://layerfs.ai/docs/core-ideas/),
+[platform scope](PORTABLE-HOSTS.md).
+
+Pin Wrangler/Miniflare with the future controller package. Engine Box currently has
+no controller Worker or Wrangler fleet launcher; these are acceptance requirements,
+not working commands supplied by this PR. Require local restart/reconnect tests,
+two nodes with separate Store volumes, then two separate Linux kernels against an
+isolated real bucket. Two containers sharing one VM only qualify the same-kernel
+case. Local simulations do not establish remote latency, host-loss recovery or
+Cloudflare production availability.
 
 ## Initial support contract
 

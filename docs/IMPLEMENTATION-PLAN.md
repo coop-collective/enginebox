@@ -29,6 +29,8 @@ P10 is planned, not deployed. Follow the [required control-plane design](DESIGN.
 1. Establish Workers API authorization and SQLite-backed Durable Objects for
    membership, node capacity/reservations and project decisions. Persist each
    authority's state; use derived indexes only for discovery/reporting.
+   Add a pinned local Wrangler launcher for the same controller code, isolated
+   persistent state and explicit local/test/production resource selection.
 2. Enroll a disposable bare-metal/VM node through its outbound authenticated
    connection. Add durable command IDs, boot/session identity, fencing epochs,
    bounded leases, local operation receipts and reconciliation after reconnect.
@@ -38,6 +40,9 @@ P10 is planned, not deployed. Follow the [required control-plane design](DESIGN.
 4. Qualify one-node local storage and multi-node shared storage. R2 directly must
    permit two compute nodes without a dedicated storage node. Block cross-node
    placement when the shared backend is absent or unready; retain local work.
+   Cover one local Wrangler controller with one Linux node, then two nodes using
+   one simulated object API, then separate kernels and an isolated real R2 bucket.
+   Qualify laptop Linux volumes/FUSE separately from native-host Wrangler support.
 5. Migrate versioned desired state and native credential ownership with explicit
    compatibility checks. Drain/reconcile/fence the native controller before
    enabling Cloudflare mutations. Validate node replacement with the Cloudflare
