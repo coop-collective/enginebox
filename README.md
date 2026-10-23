@@ -55,6 +55,9 @@ The [fleet service](docs/FLEET.md) clones configured clean snapshots, checks CPU
 
 The [Vinext dashboard](docs/DASHBOARD.md) provides inventory, creation, lifecycle controls and template installation. [Portable template manifests](docs/TEMPLATES.md) define Minimum/Recommended resources and install independently on each host. Optional [warm pools](docs/WARM-POOLS.md) preboot fresh workspaces so allocation can resume a ready VM instead of waiting for a cold boot. Its server holds the API token; the browser authenticates with a separate owner password. The [operator MCP](docs/FLEET.md) exposes the same fleet operations to local tools. Both use the same backend and admission checks.
 
+The [ACP adapter and fleet task CLI](docs/ACP.md) connect ACP clients to native remote conversations. `ebox tasks --watch` shows parallel jobs across agent types, their tasks, elapsed time and reported usage. `ebox acp` supports prompts, exact-session continuation and targeted cancellation through the same controller.
+
+
 [Browser MCP](docs/BROWSER.md) gives each native CLI its own persistent headless Chromium profile. Agents can navigate, inspect pages, type, click and take screenshots. It controls the workspace browser; personal laptop browser sessions are not imported.
 
 The runtime targets an Incus project named `enginebox` by default, with `ebox-` prefixed VMs and an `agent` user (UID/GID 1001), `/home/agent`, `/workspace` and optional display `:99`. See [runtime configuration](docs/RUNTIME.md) for overrides and capability boundaries. The operator needs administrative Incus access through noninteractive `sudo`; this is a trusted-owner tool.
