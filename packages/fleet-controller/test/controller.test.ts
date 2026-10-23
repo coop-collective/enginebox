@@ -48,6 +48,7 @@ async function setup(
   id = "agent-a",
   role = "agent",
   assistantProjects?: string[],
+  slots = 1,
 ): Promise<Session> {
   await ok("/v1/projects", { id: "demo" });
   const { token: secret } = await ok("/v1/nodes", {
@@ -55,7 +56,7 @@ async function setup(
     role,
     projects: ["demo"],
     origin: role === "storage" ? "http://storage:8790" : null,
-    slots: 1,
+    slots,
     cacheBytes: 16777216,
     ...(assistantProjects ? { assistantProjects } : {}),
   });
@@ -90,6 +91,69 @@ async function publish(text = "snapshot", parent: string | null = null) {
 }
 afterEach(async () => {
   await reset();
+});
+
+it("keeps assistant prompts and results out of storage inventory, catalog and raw job reads", async () => {
+  const native = await setup("native-node", "agent", ["demo"]);
+  const storage = await setup("storage-node", "storage");
+  const generation = await publish();
+  const prompt = "Private community request to create a task";
+  const answer = "Private assistant response about task content";
+  await ok(
+    "/v1/projects/demo/assistant",
+    { id: "private-turn", prompt },
+    native,
+  );
+  const { assignment } = await ok("/v1/node/poll", {}, native);
+  await ok(
+    "/v1/node/finish",
+    { assignment, ok: true, result: { text: answer } },
+    native,
+  );
+  await ok("/v1/projects/demo/jobs", {
+    id: "store-check",
+    project: "demo",
+    generation: generation.id,
+    kind: "verify",
+  });
+  const inventory = await ok("/v1/projects/demo", undefined, storage);
+  const catalog = await ok("/v1/node/catalog", undefined, storage);
+  for (const value of [inventory, catalog[0]]) {
+    expect(value.jobs.map((job: any) => job.spec.id)).toEqual(["store-check"]);
+    expect(value.generations.map((g: any) => g.id)).toContain(generation.id);
+    expect(JSON.stringify(value)).not.toContain(prompt);
+    expect(JSON.stringify(value)).not.toContain(answer);
+  }
+  expect(
+    (
+      await ok(
+        `/v1/projects/demo/generations/${generation.id}`,
+        undefined,
+        storage,
+      )
+    ).id,
+  ).toBe(generation.id);
+  for (const path of [
+    "/v1/projects/demo/assistant/private-turn",
+    "/v1/projects/demo/jobs/private-turn",
+    "/v1/projects/demo/jobs/store-check",
+  ])
+    expect((await request(path, undefined, storage)).status).toBe(403);
+  for (const actor of [token, native]) {
+    const job = await ok(
+      "/v1/projects/demo/jobs/private-turn",
+      undefined,
+      actor,
+    );
+    expect(job.spec.prompt).toBe(prompt);
+    expect(JSON.parse(job.result).text).toBe(answer);
+    expect(
+      JSON.stringify(await ok("/v1/projects/demo", undefined, actor)),
+    ).toContain(prompt);
+  }
+  await ok("/v1/nodes/storage-node/revoke", {});
+  for (const path of ["/v1/projects/demo", "/v1/node/catalog"])
+    expect((await request(path, undefined, storage)).status).toBe(401);
 });
 
 it("dispatches assistant metadata jobs only to capable nodes and preserves request identity", async () => {
@@ -149,8 +213,8 @@ it("dispatches assistant metadata jobs only to capable nodes and preserves reque
   ).toBe(403);
 });
 
-it("retains assistant reservations across node restart until owner reconciliation", async () => {
-  const native = await setup("native-node", "agent", ["demo"]);
+it("fences restarted native reservations despite spare slots and an optimistic heartbeat", async () => {
+  const native = await setup("native-node", "agent", ["demo"], 2);
   await ok(
     "/v1/projects/demo/assistant",
     { id: "turn", prompt: "Review the backlog" },
@@ -160,6 +224,17 @@ it("retains assistant reservations across node restart until owner reconciliatio
   const session = crypto.randomUUID();
   const hello = await ok("/v1/node/hello", { session }, native.token);
   const restarted = { ...native, session, epoch: hello.epoch };
+  expect(
+    (await ok("/v1/projects/demo/assistant", undefined, restarted)).available,
+  ).toBe(false);
+  await ok("/v1/projects/demo/jobs", {
+    id: "another-turn",
+    project: "demo",
+    generation: null,
+    kind: "assistant",
+    prompt: "Another queued request",
+    timeoutSeconds: 30,
+  });
   expect(
     (
       await request(
@@ -174,7 +249,7 @@ it("retains assistant reservations across node restart until owner reconciliatio
   ).toBe(true);
   await ok(
     "/v1/node/heartbeat",
-    { stats: { uncertainNativeJobs: 1 } },
+    { stats: { uncertainNativeJobs: 0 } },
     restarted,
   );
   expect(
@@ -184,6 +259,10 @@ it("retains assistant reservations across node restart until owner reconciliatio
   expect(
     (await ok("/v1/projects/demo/assistant", undefined, restarted)).available,
   ).toBe(false);
+  expect((await ok("/v1/node/poll", {}, restarted)).assignment).toBeNull();
+  expect((await ok("/v1/projects/demo/jobs/another-turn")).status).toBe(
+    "queued",
+  );
   await ok("/v1/nodes/native-node/reconcile", { assignment, stopped: true });
   expect(
     (await ok("/v1/projects/demo/assistant/turn", undefined, restarted)).status,
@@ -794,6 +873,11 @@ it("denies task policy escalation, storage-node access, cross-project access and
 async function acceptedTask(
   review: "required" | "automatic",
   editWhileTesting = false,
+  beforeAccept?: (context: {
+    node: Session;
+    source: any;
+    integrated: any;
+  }) => Promise<void>,
 ) {
   const node = await setup();
   await ok("/v1/projects/demo/tasks", {
@@ -855,13 +939,133 @@ async function acceptedTask(
       },
       node,
     );
-  const acceptance = await ok("/v1/projects/demo/accept", {
+  if (beforeAccept) await beforeAccept({ node, source, integrated });
+  const promotion = {
     generation: integrated.id,
     expected: null,
     candidate: "batch",
-  });
+  };
+  let acceptance;
+  if (editWhileTesting)
+    expect((await request("/v1/projects/demo/accept", promotion)).status).toBe(
+      409,
+    );
+  else acceptance = await ok("/v1/projects/demo/accept", promotion);
   return { node, source, integrated, acceptance };
 }
+
+it("cannot reattach a stale candidate or auto-ship changed task requirements", async () => {
+  const { node, source, integrated } = await acceptedTask("automatic", true);
+  const candidate = await ok("/v1/projects/demo/candidates/batch");
+  expect(
+    (await ok("/v1/projects/demo/candidates", candidate.spec)).taskRequirements,
+  ).toEqual(candidate.taskRequirements);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks/feature/move",
+        {
+          operationId: "reattach-old",
+          expectedRevision: 3,
+          status: "testing",
+          generation: source.id,
+          candidate: "batch",
+        },
+        node,
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    (await ok("/v1/projects/demo/tasks/feature", undefined, node)).status,
+  ).toBe("in_progress");
+  // Omitting the candidate must not let acceptance infer stale evidence.
+  await ok(
+    "/v1/projects/demo/tasks/feature/move",
+    {
+      operationId: "generation-only",
+      expectedRevision: 3,
+      status: "testing",
+      generation: source.id,
+    },
+    node,
+  );
+  expect(
+    (
+      await request("/v1/projects/demo/accept", {
+        generation: integrated.id,
+        expected: null,
+        candidate: "batch",
+      })
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await request("/v1/projects/demo/tasks/feature/move", {
+        operationId: "approve-stale",
+        expectedRevision: 4,
+        status: "shipped",
+        candidate: "batch",
+      })
+    ).status,
+  ).toBe(409);
+  expect(await ok("/v1/projects/demo/tasks/feature")).toMatchObject({
+    status: "testing",
+    shippedGeneration: null,
+  });
+});
+
+it("freezes task requirements through a pending acceptance without freezing status or assignment", async () => {
+  const { integrated } = await acceptedTask(
+    "automatic",
+    false,
+    async ({ node, integrated }) => {
+      const candidate = await ok("/v1/projects/demo/candidates/batch");
+      await runInDurableObject(env.PROJECTS.getByName("demo"), (instance) => {
+        instance.put("pendingDecision", {
+          id: crypto.randomUUID(),
+          project: "demo",
+          previous: null,
+          generation: integrated.id,
+          created: Date.now(),
+          validation: {
+            candidate: candidate.spec,
+            checks: candidate.checks,
+            jobs: candidate.fullJobs,
+            taskRequirements: candidate.taskRequirements,
+          },
+        });
+      });
+      expect(
+        (
+          await request(
+            "/v1/projects/demo/tasks/feature/update",
+            {
+              operationId: "change-during-accept",
+              expectedRevision: 2,
+              patch: { title: "Different requirements" },
+            },
+            node,
+          )
+        ).status,
+      ).toBe(409);
+      await ok(
+        "/v1/projects/demo/tasks/feature/update",
+        {
+          operationId: "assign-during-accept",
+          expectedRevision: 2,
+          patch: { assignee: "agent-a" },
+        },
+        node,
+      );
+    },
+  );
+  expect(await ok("/v1/projects/demo/tasks/feature")).toMatchObject({
+    status: "shipped",
+    revision: 4,
+    assignee: "agent-a",
+    shippedGeneration: integrated.id,
+  });
+});
 
 it("ships only accepted candidate membership after explicit owner review and records the decision", async () => {
   const { node, integrated, source, acceptance } =
