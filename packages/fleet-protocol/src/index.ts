@@ -43,6 +43,7 @@ export type NodeSpec = {
   slots: number;
   cacheBytes: number;
   assistantProjects?: string[];
+  taskOnly?: true;
 };
 export type NodeView = NodeSpec & {
   epoch: number;
@@ -242,6 +243,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "slots",
     "cacheBytes",
     "assistantProjects",
+    "taskOnly",
   ]);
   identifier(value.id);
   requireThat(
@@ -255,6 +257,13 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "Projects required",
   );
   for (const project of value.projects) identifier(project);
+  if (value.taskOnly !== undefined)
+    requireThat(
+      value.taskOnly === true && value.role === "agent" &&
+        value.projects.length === 1 && value.origin === null &&
+        value.assistantProjects === undefined,
+      "Task-only credentials require one project, agent role and no executor capability",
+    );
   if (value.assistantProjects !== undefined) {
     requireThat(
       value.role === "agent" &&
@@ -303,6 +312,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     origin,
     slots: value.slots,
     cacheBytes: value.cacheBytes,
+    ...(value.taskOnly === true ? { taskOnly: true as const } : {}),
     ...(value.assistantProjects === undefined
       ? {}
       : {

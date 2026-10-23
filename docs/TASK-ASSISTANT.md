@@ -7,7 +7,7 @@ Assistant requests manage project tasks through scoped MCP tools. They are metad
 ## Configure a native executor
 
 1. Prepare an authorized private native Enginebox workspace with the owner's existing Codex connection. Use an isolated workspace for this project, never a live editor's writable checkout or another user's provider home.
-2. Install Node 24+ and the Enginebox task MCP package in that workspace. Configure the task MCP server with an agent credential scoped to this project, and verify its tools against the actual fleet API. Keep the credential file private. It must never contain the fleet owner's credential. The task server exposes reversible task operations and cannot approve or ship.
+2. Install Node 24+ and the Enginebox task MCP package in that workspace. Configure the task MCP server with a separate `taskOnly: true` agent credential scoped to this project, and verify its tools against the actual fleet API. Keep the credential file private. It must never contain the fleet owner or trusted worker's credential. The task server exposes reversible task operations and cannot approve, ship or submit validation evidence.
 3. Register a new agent node with `assistantProjects: ["demo"]` in addition to its normal project membership. Existing node enrollment is immutable; use a new node ID when changing its declared capability.
 4. In the node's private JSON configuration add the native execution binding below. The native controller credential stays in this trusted node service; it is not copied into the provider workspace. `taskToolsConfigured` explicitly records completion of step 2, rather than assuming that any signed-in client already has the tools.
 

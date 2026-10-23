@@ -67,11 +67,12 @@ export class TaskTools {
   }
   private async request(path: string, body?: unknown) {
     this.scope ??= this.client
-      .json<{ role: string; projects: string[] }>("/v1/node/identity")
+      .json<{ role: string; projects: string[]; taskOnly?: boolean }>("/v1/node/identity")
       .then((identity) => {
         requireThat(
-          identity.role === "agent" && identity.projects.includes(this.project),
-          "Task MCP requires an agent credential scoped to this project",
+          identity.role === "agent" && identity.taskOnly === true &&
+            identity.projects.length === 1 && identity.projects[0] === this.project,
+          "Task MCP requires a task-only agent credential scoped to this project",
           403,
         );
       })

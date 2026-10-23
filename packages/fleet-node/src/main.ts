@@ -107,6 +107,7 @@ function errorStatus(error: unknown) {
 
 export async function runNode(config: Config) {
   identifier(config.id);
+  requireThat(!config.taskOnly, "Task-only credentials cannot run a fleet node", 403);
   requireThat(
     config.role === "agent" || config.role === "storage",
     "Invalid role",
