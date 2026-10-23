@@ -4,10 +4,9 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+pub use enginebox_core::native_versions::{CODEX_VERSION, CURSOR_VERSION};
 use serde_json::{Value, json};
 use std::{fs, path::Path};
-pub const CODEX_VERSION: &str = "0.163.0";
-pub const CURSOR_VERSION: &str = "2026.10.16-e3cb207";
 pub const TOKEN_FILE: &str = ".config/enginebox/controller-token.json";
 pub fn native_file(provider: &str) -> &str {
     match provider {
