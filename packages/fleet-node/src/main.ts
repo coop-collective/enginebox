@@ -12,12 +12,18 @@ import {
   integer,
   ProtocolError,
   requireThat,
+  readOnlyJob,
   type Assignment,
   type NodeSpec,
 } from "@enginebox/fleet-protocol";
 import { Cache } from "./cache.ts";
 import { Client } from "./client.ts";
 import { Generations, publishSnapshot, type Published } from "./generations.ts";
+import {
+  NativeAssistant,
+  UncertainNativeRun,
+  type NativeAssistantConfig,
+} from "./native-assistant.ts";
 
 export type Config = NodeSpec & {
   controller: string;
@@ -26,6 +32,7 @@ export type Config = NodeSpec & {
   port: number;
   snapshotBytes?: number;
   warmDelayMs?: number;
+  nativeAssistant?: NativeAssistantConfig;
   layerfs?: {
     ebox: string;
     config: string;
@@ -100,6 +107,7 @@ function errorStatus(error: unknown) {
 
 export async function runNode(config: Config) {
   identifier(config.id);
+  requireThat(!config.taskOnly, "Task-only credentials cannot run a fleet node", 403);
   requireThat(
     config.role === "agent" || config.role === "storage",
     "Invalid role",
@@ -134,6 +142,15 @@ export async function runNode(config: Config) {
   journal.exec(
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(attempt TEXT PRIMARY KEY, state TEXT NOT NULL, assignment TEXT NOT NULL, result TEXT)",
   );
+  const nativeAssistant = config.nativeAssistant
+    ? new NativeAssistant(config.nativeAssistant, journal)
+    : null;
+  requireThat(
+    canonical([...(config.assistantProjects ?? [])].sort()) ===
+      canonical(Object.keys(config.nativeAssistant?.bindings ?? {}).sort()),
+    "Enrolled assistant projects must match configured native bindings",
+  );
+  let blockedNative = false;
   let stopping = false;
   let connected = false;
   let warming = false;
@@ -241,37 +258,61 @@ export async function runNode(config: Config) {
         ok = saved.ok;
         result = saved.result;
       } else {
-        requireThat(
-          !prior || assignment.kind !== "layerfs-exec",
-          "Interrupted native command requires explicit reconciliation",
-          409,
-        );
+        if (prior && !readOnlyJob(assignment))
+          throw new UncertainNativeRun(
+            "Interrupted native command requires explicit reconciliation",
+          );
         journal
           .prepare("INSERT OR REPLACE INTO operations VALUES(?,?,?,NULL)")
           .run(assignment.attempt, "running", canonical(assignment));
-        const path = await generations.hydrate(
-          assignment.project,
-          assignment.generation,
-        );
+        if (assignment.kind === "assistant") {
+          requireThat(
+            nativeAssistant,
+            "Native assistant is not configured",
+            409,
+          );
+          result = await nativeAssistant.execute(assignment, signal);
+        } else {
+          await generations.hydrate(assignment.project, assignment.generation);
+          requireThat(
+            !signal.aborted && assignment.expires > Date.now(),
+            "Job lease expired",
+            409,
+          );
+          if (assignment.kind === "layerfs-exec")
+            result = await nativeCommand(config, assignment, signal);
+          else
+            result = {
+              generation: assignment.generation,
+              verified: true,
+              snapshotBytes: (
+                await generations.index(
+                  assignment.project,
+                  assignment.generation,
+                )
+              ).published.manifest.snapshotBytes,
+            };
+        }
         requireThat(
           !signal.aborted && assignment.expires > Date.now(),
           "Job lease expired",
           409,
         );
-        if (assignment.kind === "layerfs-exec")
-          result = await nativeCommand(config, assignment, signal);
-        else
-          result = {
-            generation: assignment.generation,
-            verified: true,
-            snapshotBytes: (
-              await generations.index(assignment.project, assignment.generation)
-            ).published.manifest.snapshotBytes,
-          };
         ok = true;
         if (assignment.check) result.check = assignment.check;
       }
     } catch (error) {
+      if (error instanceof UncertainNativeRun) {
+        blockedNative = true;
+        log("native_reconciliation_required", {
+          job: assignment.id,
+          attempt: assignment.attempt,
+          error: error.message,
+        });
+        active = null;
+        abortJob = null;
+        return;
+      }
       result = { error: (error as Error).message };
     }
     journal
@@ -355,14 +396,18 @@ export async function runNode(config: Config) {
             reservations: Assignment[];
           }>("/v1/node/hello", { session: client.session });
           client.epoch = hello.epoch;
-          for (const reservation of hello.reservations)
+          for (const reservation of hello.reservations) {
             if (
-              reservation.kind !== "layerfs-exec" &&
-              reservation.epoch !== client.epoch
+              !readOnlyJob(reservation) &&
+              (reservation.epoch !== client.epoch ||
+                reservation.expires <= Date.now())
             )
+              blockedNative = true;
+            else if (readOnlyJob(reservation) && reservation.epoch !== client.epoch)
               await client.json("/v1/node/reconcile", {
                 attempt: reservation.attempt,
               });
+          }
           connected = true;
           log("node_connected", { node: config.id, epoch: client.epoch });
         }
@@ -372,6 +417,7 @@ export async function runNode(config: Config) {
             ...generations.stats,
             cacheBytes: cache.bytes(),
             activeJobs: active ? 1 : 0,
+            uncertainNativeJobs: blockedNative ? 1 : 0,
           },
         });
         if (active) {
@@ -392,16 +438,22 @@ export async function runNode(config: Config) {
           lastCatalog = await client.json<Catalog>("/v1/node/catalog");
           void warm();
         }
-        if (config.role === "agent" && !active) {
+        if (config.role === "agent" && !active && !blockedNative) {
           const { assignment, reservations } = await client.json<{
             assignment: Assignment | null;
             reservations?: Assignment[];
           }>("/v1/node/poll", {});
-          for (const reserved of reservations ?? [])
-            if (
-              reserved.kind !== "layerfs-exec" &&
-              reserved.expires <= Date.now()
+          if (
+            reservations?.some(
+              (reserved) =>
+                !readOnlyJob(reserved) &&
+                (reserved.epoch !== client.epoch ||
+                  reserved.expires <= Date.now()),
             )
+          )
+            blockedNative = true;
+          for (const reserved of reservations ?? [])
+            if (readOnlyJob(reserved) && reserved.expires <= Date.now())
               await client.json("/v1/node/reconcile", {
                 attempt: reserved.attempt,
               });

@@ -106,7 +106,7 @@ async function up(storage) {
   await docker(["up", "--build", "--detach", "--wait", "controller"]);
   await api("/v1/projects", { id: "demo" });
   const registered = await api("/v1/nodes");
-  for (const id of ["agent-a", "agent-b", "storage"]) {
+  for (const id of ["agent-a", "agent-b", "storage", "task-client"]) {
     const path = join(state, `${id}.json`);
     if (await exists(path)) {
       if (!registered.some((n) => n.id === id))
@@ -126,6 +126,7 @@ async function up(storage) {
       origin: id === "storage" ? "http://storage:8790" : null,
       slots: 1,
       cacheBytes: 256 * 1024 * 1024,
+      ...(id === "task-client" ? {taskOnly: true} : {}),
     };
     const enrollment = await api("/v1/nodes", spec);
     await secretFile(
@@ -134,7 +135,7 @@ async function up(storage) {
         {
           ...spec,
           token: enrollment.token,
-          controller: "http://controller:8787",
+          controller: id === "task-client" ? url : "http://controller:8787",
           state: "/state",
           port: 8790,
         },
@@ -221,6 +222,34 @@ async function verify(generation) {
 }
 async function smoke() {
   await up(true);
+  const taskConfig = JSON.parse(await readFile(join(state, "task-client.json"), "utf8"));
+  const taskPath = join(state, "task-mcp-container.json");
+  await secretFile(taskPath, JSON.stringify({...taskConfig, controller: "http://controller:8787"}));
+  await docker(["cp", taskPath, "agent-a:/state/task-mcp.json"]);
+  const tasks = JSON.parse(
+    await docker(
+      [
+        "exec",
+        "-T",
+        "agent-a",
+        "node",
+        "packages/fleet-node/test/task-mcp-proof.ts",
+        "/state/task-mcp.json",
+        "demo",
+      ],
+      true,
+    ),
+  );
+  if (!tasks.ok) throw new Error("Task MCP proof failed");
+  const { assistantDispatchSmoke } = await import(
+    "../test/assistant-dispatch-smoke.mjs"
+  );
+  const assistant = await assistantDispatchSmoke({
+    controller: url,
+    state,
+    api,
+    until,
+  });
   const source = await fixture();
   const generation = await publish(source);
   const recipe = createHash("sha256")
@@ -350,8 +379,11 @@ async function smoke() {
         ok: true,
         generation: generation.id,
         snapshotBytes: generation.manifest.snapshotBytes,
+        assistant,
         checks: [
           "publish",
+          "scoped task MCP create/edit/move",
+          "assistant dispatch to scoped task MCP mutations (fixture executor)",
           "accept",
           "full candidate validation",
           "independent restore",

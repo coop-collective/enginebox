@@ -42,6 +42,8 @@ export type NodeSpec = {
   origin: string | null;
   slots: number;
   cacheBytes: number;
+  assistantProjects?: string[];
+  taskOnly?: true;
 };
 export type NodeView = NodeSpec & {
   epoch: number;
@@ -51,7 +53,7 @@ export type NodeView = NodeSpec & {
   ready: Record<string, string[]>;
   stats: Record<string, number>;
 };
-export type JobSpec = {
+export type StoreJob = {
   id: string;
   project: string;
   generation: string;
@@ -65,6 +67,20 @@ export type JobSpec = {
     scope: "full" | "selected";
   };
 };
+export type AssistantJob = {
+  id: string;
+  project: string;
+  kind: "assistant";
+  generation: null;
+  prompt: string;
+  timeoutSeconds: number;
+  argv?: never;
+  check?: never;
+};
+export type JobSpec = StoreJob | AssistantJob;
+export function readOnlyJob(job: { kind: string }) {
+  return job.kind === "hydrate" || job.kind === "verify";
+}
 export type CheckRequirement = {
   name: string;
   recipe: string;
@@ -219,7 +235,16 @@ export function validateGeneration(value: unknown): Generation {
 }
 export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
   record(value);
-  exactKeys(value, ["id", "role", "projects", "origin", "slots", "cacheBytes"]);
+  exactKeys(value, [
+    "id",
+    "role",
+    "projects",
+    "origin",
+    "slots",
+    "cacheBytes",
+    "assistantProjects",
+    "taskOnly",
+  ]);
   identifier(value.id);
   requireThat(
     value.role === "agent" || value.role === "storage",
@@ -232,6 +257,28 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "Projects required",
   );
   for (const project of value.projects) identifier(project);
+  if (value.taskOnly !== undefined)
+    requireThat(
+      value.taskOnly === true && value.role === "agent" &&
+        value.projects.length === 1 && value.origin === null &&
+        value.assistantProjects === undefined,
+      "Task-only credentials require one project, agent role and no executor capability",
+    );
+  if (value.assistantProjects !== undefined) {
+    requireThat(
+      value.role === "agent" &&
+        Array.isArray(value.assistantProjects) &&
+        value.assistantProjects.length <= 128,
+      "Invalid assistant projects",
+    );
+    for (const project of value.assistantProjects) {
+      identifier(project);
+      requireThat(
+        value.projects.includes(project),
+        "Assistant project must be enrolled",
+      );
+    }
+  }
   integer(value.slots, 1, 64);
   integer(value.cacheBytes, MAX_CHUNK_BYTES * 2, Number.MAX_SAFE_INTEGER);
   let origin: string | null = null;
@@ -265,6 +312,12 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     origin,
     slots: value.slots,
     cacheBytes: value.cacheBytes,
+    ...(value.taskOnly === true ? { taskOnly: true as const } : {}),
+    ...(value.assistantProjects === undefined
+      ? {}
+      : {
+          assistantProjects: [...new Set(value.assistantProjects as string[])],
+        }),
   };
 }
 export function validateJob(value: unknown): JobSpec {
@@ -277,19 +330,45 @@ export function validateJob(value: unknown): JobSpec {
     "argv",
     "timeoutSeconds",
     "check",
+    "prompt",
   ]);
   identifier(value.id);
   identifier(value.project);
+  if (value.kind === "assistant") {
+    requireThat(
+      value.generation === null &&
+        value.argv === undefined &&
+        value.check === undefined,
+      "Assistant jobs cannot claim Store or CI evidence",
+    );
+    requireThat(
+      typeof value.prompt === "string" &&
+        value.prompt.trim().length > 0 &&
+        new TextEncoder().encode(value.prompt).byteLength <= 8000 &&
+        !value.prompt.includes("\0"),
+      "Prompt must contain 1–8000 UTF-8 bytes without NUL",
+    );
+    integer(value.timeoutSeconds, 1, 300);
+    return {
+      id: value.id,
+      project: value.project,
+      kind: "assistant",
+      generation: null,
+      prompt: value.prompt,
+      timeoutSeconds: value.timeoutSeconds,
+    };
+  }
+  requireThat(value.prompt === undefined, "Only assistant jobs accept prompts");
   digest(value.generation);
   requireThat(
     ["hydrate", "verify", "layerfs-exec"].includes(String(value.kind)),
     "Unknown job kind",
   );
-  const job: JobSpec = {
+  const job: StoreJob = {
     id: value.id,
     project: value.project,
     generation: value.generation,
-    kind: value.kind as JobSpec["kind"],
+    kind: value.kind as StoreJob["kind"],
   };
   if (value.check !== undefined) {
     record(value.check);
@@ -459,3 +538,5 @@ export async function jsonBody(request: Request): Promise<unknown> {
     throw new ProtocolError(400, "Invalid JSON");
   }
 }
+
+export * from "./tasks.ts";

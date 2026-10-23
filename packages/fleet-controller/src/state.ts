@@ -3,6 +3,7 @@ import {
   canonical,
   LEASE_MS,
   requireThat,
+  readOnlyJob,
   type Assignment,
   type Generation,
   type JobSpec,
@@ -10,7 +11,13 @@ import {
   type NodeView,
   type CandidateSpec,
   type CheckRequirement,
+  type TaskActor,
+  type TaskCreate,
+  type TaskMove,
+  type TaskStatus,
+  type TaskUpdate,
 } from "@enginebox/fleet-protocol";
+import { Tasks } from "./tasks.ts";
 
 export class State extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -55,12 +62,18 @@ export class Registry extends State {
   }
   async registerNode(spec: NodeSpec) {
     this.put(`node:${spec.id}`, spec.id);
+    if (spec.role === "agent")
+      for (const project of spec.assistantProjects ?? [])
+        this.put(`assistant:${project}:${spec.id}`, spec.id);
     if (spec.role === "storage")
       for (const project of spec.projects)
         this.put(`storage:${project}:${spec.id}`, spec.id);
   }
   async storage(project: string) {
     return this.rows<string>(`storage:${project}:`);
+  }
+  async assistants(project: string) {
+    return this.rows<string>(`assistant:${project}:`);
   }
 }
 
@@ -108,6 +121,11 @@ export class FleetNode extends State {
       node.ready = {};
     }
     node.lastSeen = Date.now();
+    if (this.hasUncertainNative(node.epoch))
+      node.stats.uncertainNativeJobs = Math.max(
+        node.stats.uncertainNativeJobs ?? 0,
+        1,
+      );
     this.put("node", node);
     return {
       epoch: node.epoch,
@@ -126,6 +144,14 @@ export class FleetNode extends State {
     );
     return node;
   }
+  private hasUncertainNative(epoch: number) {
+    return this.rows<Reservation>("lease:").some(
+      (lease) =>
+        lease.state !== "finished" &&
+        !readOnlyJob(lease) &&
+        (lease.epoch !== epoch || lease.expires <= Date.now()),
+    );
+  }
   async heartbeat(
     epoch: number,
     session: string,
@@ -133,12 +159,22 @@ export class FleetNode extends State {
   ) {
     const node = this.current(epoch, session);
     node.lastSeen = Date.now();
-    node.stats = stats;
+    node.stats = {
+      ...stats,
+      ...(this.hasUncertainNative(epoch)
+        ? { uncertainNativeJobs: Math.max(stats.uncertainNativeJobs ?? 0, 1) }
+        : {}),
+    };
     this.put("node", node);
     return { epoch, now: Date.now() };
   }
   async reserve(job: JobSpec, epoch: number, session: string) {
     const node = this.current(epoch, session);
+    requireThat(
+      job.kind !== "assistant" || node.assistantProjects?.includes(job.project),
+      "Node has no assistant binding for this project",
+      403,
+    );
     requireThat(
       node.role === "agent" && node.projects.includes(job.project),
       "Node cannot execute this project",
@@ -311,14 +347,37 @@ type Decision = {
     candidate: CandidateSpec;
     checks: CheckRequirement[];
     jobs: Record<string, string>;
+    taskRequirements?: Record<string, string>;
   };
 };
 type CandidateRecord = {
   spec: CandidateSpec;
   checks: CheckRequirement[];
   fullJobs: Record<string, string>;
+  taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
+  private tasks() {
+    return new Tasks(this, this.ctx.storage.sql);
+  }
+  async task(id: string) {
+    return this.tasks().get(id);
+  }
+  async listTasks(cursor: string, limit: number, status?: TaskStatus) {
+    return this.tasks().list(cursor, limit, status);
+  }
+  async taskActivity(cursor: number, limit: number) {
+    return this.tasks().activity(cursor, limit);
+  }
+  async createTask(spec: TaskCreate, actor: TaskActor) {
+    return this.tasks().create(spec, actor);
+  }
+  async updateTask(id: string, input: TaskUpdate, actor: TaskActor) {
+    return this.tasks().update(id, input, actor);
+  }
+  async moveTask(id: string, input: TaskMove, actor: TaskActor) {
+    return this.tasks().move(id, input, actor);
+  }
   async create(id: string) {
     if (!this.get("id")) {
       this.put("id", id);
@@ -411,7 +470,12 @@ export class Project extends State {
       );
       return prior;
     }
-    const value: CandidateRecord = { spec, checks, fullJobs: {} };
+    const value: CandidateRecord = {
+      spec,
+      checks,
+      fullJobs: {},
+      taskRequirements: this.tasks().snapshotRequirements(spec),
+    };
     this.put(`candidate:${spec.id}`, value);
     return value;
   }
@@ -462,6 +526,7 @@ export class Project extends State {
         "Candidate or validation policy changed",
         409,
       );
+      this.tasks().validateRequirements(candidate.taskRequirements);
       for (const check of checks) {
         const job = this.get<JobRecord>(
           `job:${candidate.fullJobs[check.name]}`,
@@ -480,6 +545,10 @@ export class Project extends State {
         candidate: candidate.spec,
         checks,
         jobs: candidate.fullJobs,
+        ...(candidate.taskRequirements &&
+        Object.keys(candidate.taskRequirements).length
+          ? { taskRequirements: candidate.taskRequirements }
+          : {}),
       };
     }
     requireThat(head === expected, "Accepted head changed", 409);
@@ -527,12 +596,13 @@ export class Project extends State {
     );
     this.put("head", generation);
     this.put("lastDecision", pending.id);
+    this.tasks().accepted(pending);
     this.remove("pendingDecision");
     return { head: generation, decision: pending.id };
   }
   async enqueue(spec: JobSpec) {
     requireThat(
-      this.get(`generation:${spec.generation}`),
+      spec.kind === "assistant" || this.get(`generation:${spec.generation}`),
       "Generation is not published",
       409,
     );
@@ -575,12 +645,13 @@ export class Project extends State {
     this.put(`job:${spec.id}`, job);
     return job;
   }
-  async next() {
+  async next(allowAssistant = false) {
     const row = this.ctx.storage.sql
       .exec<{
         value: string;
       }>(
-        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' ORDER BY rowid LIMIT 1",
+        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') ORDER BY rowid LIMIT 1",
+        allowAssistant ? 1 : 0,
       )
       .toArray()[0];
     return row ? (JSON.parse(row.value) as JobRecord).spec : null;
@@ -596,6 +667,12 @@ export class Project extends State {
             project: assignment.project,
             generation: assignment.generation,
             kind: assignment.kind,
+            ...(assignment.kind === "assistant"
+              ? {
+                  prompt: assignment.prompt,
+                  timeoutSeconds: assignment.timeoutSeconds,
+                }
+              : {}),
             ...(assignment.check ? { check: assignment.check } : {}),
             ...(assignment.argv
               ? {
