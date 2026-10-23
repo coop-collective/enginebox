@@ -51,8 +51,14 @@ Use Node 22+ and a valid user Cloud Agents API key in `CURSOR_API_KEY`:
 ```sh
 node research/agent-startup/probe-cursor.mjs \
   --run-live --repo https://github.com/your-org/benchmark-repo \
-  --ref YOUR_EXACT_COMMIT_SHA --output .state/startup-cursor.json
+  --ref YOUR_EXACT_COMMIT_SHA --model grok-4.7 \
+  --output .state/startup-cursor.json
 ```
+
+Use an exact model ID returned by `GET /v1/models`; `--model composer-2.5` was
+also tested in this campaign. Omit `--model` to use Cursor's configured default.
+The receipt records the requested model, not a claim about which model ran.
+Known rejection codes are retained without provider messages or account details.
 
 The repository must contain a root `package.json`. The probe performs an auth
 preflight, creates one read-only agent with automatic PR creation disabled, and
@@ -61,8 +67,10 @@ the agent it creates after a terminal result. On stream failure it requests
 cancellation of its own run and records whether that request was accepted.
 Inspect an ambiguous creation failure before retrying. The first-action numbers
 include stream transport/replay delays; they are not server-side timestamps.
-The configured account currently fails preflight, so the stream/cleanup path is
-provided for a future qualified run and is **not live-validated** in this report.
+A later valid-key probe passed authentication and repository access, but explicit
+Grok 4.7 and Composer 2.5 launches both returned `400 usage_limit_exceeded` before
+creating an agent. The stream/cleanup path remains **not live-validated** in this
+report; an authenticated key alone does not establish launch eligibility.
 
 ## Claude Cloud
 
