@@ -1,6 +1,7 @@
 //! Official native client installation into an owned controller HOME.
 use crate::{native, process, security};
 use anyhow::{Result, bail, ensure};
+use enginebox_core::native_versions::{CLAUDE_VERSION, CODEX_VERSION, CURSOR_VERSION};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -13,21 +14,16 @@ fn recipe(provider: &str) -> (&'static str, &'static str, Vec<&'static str>, &'s
         "codex" => (
             "https://chatgpt.com/codex/install.sh",
             "sh",
-            vec!["--release", "0.163.0"],
-            "0.163.0",
+            vec!["--release", CODEX_VERSION],
+            CODEX_VERSION,
         ),
         "claude" => (
             "https://claude.ai/install.sh",
             "bash",
-            vec!["2.1.302"],
-            "2.1.302",
+            vec![CLAUDE_VERSION],
+            CLAUDE_VERSION,
         ),
-        _ => (
-            "https://cursor.com/install",
-            "bash",
-            vec![],
-            "2026.10.16-e3cb207",
-        ),
+        _ => ("https://cursor.com/install", "bash", vec![], CURSOR_VERSION),
     }
 }
 pub fn plan(state_root: &Path, providers: &[String]) -> Result<Value> {

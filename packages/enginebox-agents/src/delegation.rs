@@ -4,10 +4,9 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+pub use enginebox_core::native_versions::{CODEX_VERSION, CURSOR_VERSION};
 use serde_json::{Value, json};
 use std::{fs, path::Path};
-pub const CODEX_VERSION: &str = "0.163.0";
-pub const CURSOR_VERSION: &str = "2026.10.16-e3cb207";
 pub const TOKEN_FILE: &str = ".config/enginebox/controller-token.json";
 pub fn native_file(provider: &str) -> &str {
     match provider {
@@ -203,9 +202,6 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
             );
         }
     }
-    if marker["generation"] == generation {
-        return Ok(json!({"ok":true,"unchanged":true,"instance_id":instance_id}));
-    }
     if let Some(expected) = request["expected_version"].as_str() {
         let env = native::environment(home)?;
         let exe = native::find_binary(native::binary(p), &env)
@@ -215,6 +211,9 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
             actual.split_whitespace().any(|part| part == expected),
             "Native access format is not qualified for this client version."
         );
+    }
+    if marker["generation"] == generation {
+        return Ok(json!({"ok":true,"unchanged":true,"instance_id":instance_id}));
     }
     let content = &request["content"];
     ensure!(content.is_object(), "Invalid delegated content.");

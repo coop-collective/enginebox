@@ -432,6 +432,57 @@ fn adoption_requires_matching_instance_and_explicit_ownership() {
     delegation::transfer(&root, &req, "12345678901234567890123456789012").unwrap();
     assert!(!root.join(".claude/.credentials.json").exists());
 }
+#[cfg(unix)]
+#[test]
+fn unchanged_cursor_credentials_still_reject_client_version_drift() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, root) = temp();
+    let exe = root.join(".local/bin/agent");
+    security::write_bytes(
+        &root,
+        ".local/bin/agent",
+        b"#!/bin/sh\ncat \"$HOME/.config/enginebox/test-version\"\n",
+        65536,
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    security::write_bytes(
+        &root,
+        ".config/enginebox/test-version",
+        delegation::CURSOR_VERSION.as_bytes(),
+        65536,
+    )
+    .unwrap();
+    let material = delegation::material("cursor", &json!({"accessToken":"access-token"})).unwrap();
+    let request = delegation::attachment("cursor", &material, false);
+    let id = "12345678901234567890123456789012";
+    assert_eq!(
+        delegation::transfer(&root, &request, id).unwrap()["ok"],
+        true
+    );
+    assert_eq!(
+        delegation::transfer(&root, &request, id).unwrap()["unchanged"],
+        true
+    );
+    let before = std::fs::read(root.join(delegation::native_file("cursor"))).unwrap();
+    security::write_bytes(
+        &root,
+        ".config/enginebox/test-version",
+        b"2026.10.18-ea085cb",
+        65536,
+    )
+    .unwrap();
+    let error = delegation::transfer(&root, &request, id).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not qualified for this client version")
+    );
+    assert_eq!(
+        std::fs::read(root.join(delegation::native_file("cursor"))).unwrap(),
+        before
+    );
+}
 #[test]
 fn cursor_policy_is_narrow_to_helper_attachment() {
     assert!(

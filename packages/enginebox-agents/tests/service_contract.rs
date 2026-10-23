@@ -233,7 +233,7 @@ fn native_client_install_plan_is_read_only_and_names_exact_qualified_versions() 
     assert_eq!(plan["actions"][1]["qualified_version"], "2.1.302");
     assert_eq!(
         plan["actions"][2]["qualified_version"],
-        "2026.10.16-e3cb207"
+        "2026.10.22-27dcf5f"
     );
     assert!(!state.exists());
     assert!(enginebox_agents::clients::plan(&state, &["invalid".into()]).is_err());

@@ -1,6 +1,7 @@
 use crate::{
     bootstrap, capacity,
     model::{GuestConfig, Host},
+    native_versions::{CLAUDE_VERSION, CODEX_VERSION, verify_qualified_version},
     transport::{run_process, shell_quote},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -632,14 +633,14 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
             "codex",
             "https://chatgpt.com/codex/install.sh",
             "sh",
-            vec!["--release", "0.163.0"],
+            vec!["--release", CODEX_VERSION],
         ),
         (
             "claude",
             "claude",
             "https://claude.ai/install.sh",
             "bash",
-            vec!["2.1.302"],
+            vec![CLAUDE_VERSION],
         ),
         (
             "cursor",
@@ -652,7 +653,8 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
         if !enabled(provider) {
             continue;
         }
-        if guest_run(&g, &[command, "--version"], None, 30).is_ok() {
+        if let Ok(version) = guest_run(&g, &[command, "--version"], None, 30) {
+            verify_qualified_version(provider, &String::from_utf8(version)?)?;
             continue;
         }
         let file = temp.path().join(format!("{command}-install"));
@@ -665,7 +667,8 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
         ];
         args.extend(extras);
         guest_run(&g, &args, None, 600)?;
-        guest_run(&g, &[command, "--version"], None, 30)?;
+        let version = guest_run(&g, &[command, "--version"], None, 30)?;
+        verify_qualified_version(provider, &String::from_utf8(version)?)?;
     }
     if enabled("cursor") {
         run(

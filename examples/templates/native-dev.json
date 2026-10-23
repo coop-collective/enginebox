@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "native-dev",
-  "revision": 4,
+  "revision": 5,
   "label": "Native development",
   "description": "Ubuntu 24.04 with official Codex, Claude Code and Cursor Agent, plus a browser MCP. Connect agents once on the controller; assigned workspaces receive native access automatically.",
   "recipe": "native-clients-v1",

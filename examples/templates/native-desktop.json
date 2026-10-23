@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "native-desktop",
-  "revision": 4,
+  "revision": 5,
   "label": "Native development with desktop",
   "description": "Official native clients, Chromium and an isolated desktop with computer MCP. Desktop services remain on guest loopback; use an authenticated tunnel.",
   "recipe": "native-clients-v1",
