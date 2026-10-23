@@ -126,6 +126,10 @@ enum Commands {
     },
     /// List native controller agent connections.
     Agents,
+    /// Watch native tasks across all registered hosts and agent types.
+    Tasks(enginebox_cli::tasks::Options),
+    /// Serve ACP v1 over stdio using native agents in assigned remote workspaces.
+    Acp(enginebox_cli::acp::Options),
     /// Run a named fleet MCP tool with JSON arguments from stdin.
     Tool {
         name: String,
@@ -246,6 +250,15 @@ fn main() -> Result<()> {
         }
         Commands::Agents => {
             return output(enginebox_cli::FleetClient::from_env()?.request("/v1/agents", None)?);
+        }
+        Commands::Tasks(options) => {
+            return enginebox_cli::tasks::run(enginebox_cli::FleetClient::from_env()?, options);
+        }
+        Commands::Acp(options) => {
+            let host = args
+                .fleet_host
+                .context("Set --fleet-host or ENGINEBOX_FLEET_HOST for ACP")?;
+            return enginebox_cli::acp::run(enginebox_cli::FleetClient::from_env()?, host, options);
         }
         Commands::Tool { name } => {
             let (path, body) = enginebox_cli::tool_request(&name, &input()?)?;

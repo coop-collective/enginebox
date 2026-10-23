@@ -1,3 +1,5 @@
+pub mod acp;
+pub mod tasks;
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -160,6 +162,18 @@ pub fn tools() -> Vec<Value> {
             &["host_id", "name", "provider", "prompt"],
         ),
         tool(
+            "agent_runs",
+            "List bounded task summaries across the owner fleet, including agent type, state, elapsed time and reported token usage.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "agent_cancel",
+            "Request cancellation of one native run. Poll agent_run until cancelled; acceptance is not proof of termination.",
+            json!({"host_id":{"type":"string"},"name":{"type":"string"},"run_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}),
+            &["host_id", "name", "run_id"],
+        ),
+        tool(
             "agent_run",
             "Read a private run's bounded output and native_session_id for exact resume.",
             json!({"host_id":{"type":"string"},"name":{"type":"string"},"run_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}),
@@ -281,6 +295,7 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         "fleet_inventory" => ("/v1/fleet".into(), None),
         "template_catalog" => ("/v1/templates".into(), None),
         "agent_connections" => ("/v1/agents".into(), None),
+        "agent_runs" => ("/v1/agent-runs".into(), None),
         "storage_catalog" => ("/v1/storage".into(), None),
         "storage_inspect" | "storage_preview" | "storage_import" | "storage_fork"
         | "storage_action" | "storage_prepare" | "storage_allocation" => {
@@ -462,6 +477,15 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
                 Some(json!({"action":action})),
             )
         }
+        "agent_cancel" => (
+            format!(
+                "/v1/hosts/{}/instances/{}/agent-runs/{}/cancel",
+                id(args, "host_id", false)?,
+                id(args, "name", true)?,
+                record_id(args, "run_id")?
+            ),
+            Some(json!({})),
+        ),
         "agent_run" => (
             format!(
                 "/v1/hosts/{}/instances/{}/agent-runs/{}",
@@ -592,7 +616,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            20
+            22
         );
     }
     #[test]

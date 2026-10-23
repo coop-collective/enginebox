@@ -302,7 +302,20 @@ pub fn verify_client(
     Ok(version.into())
 }
 pub fn execute(r: &RunRequest, home: &Path, workspace: &Path) -> Result<process::Output> {
+    execute_scoped(r, home, workspace, None)
+}
+
+/// The controller supplies a unique run ID separately from the public native request.
+pub fn execute_scoped(
+    r: &RunRequest,
+    home: &Path,
+    workspace: &Path,
+    run_id: Option<&str>,
+) -> Result<process::Output> {
     r.validate()?;
+    if let Some(id) = run_id {
+        validate_run_id(id)?;
+    }
     let home = security::absolute_existing(home)?;
     let workspace = security::absolute_existing(workspace)?;
     let cwd = workspace.join(&r.workdir).canonicalize()?;
@@ -320,7 +333,11 @@ pub fn execute(r: &RunRequest, home: &Path, workspace: &Path) -> Result<process:
     let exe = find_binary(binary(&r.provider), &env)
         .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
     verify_client(&exe, &r.provider, &env, &cwd)?;
-    process::bounded(
+    let cancelled = || match run_id {
+        Some(id) => cancellation_requested(&home, &r.provider, id),
+        None => Ok(false),
+    };
+    let result = process::bounded_controlled(
         &native_command_with_config(r, &exe, &home, &cwd),
         Some(&env),
         Some(&cwd),
@@ -331,9 +348,63 @@ pub fn execute(r: &RunRequest, home: &Path, workspace: &Path) -> Result<process:
         },
         Duration::from_secs(r.timeout_seconds),
         MAX_OUTPUT,
-        Some(&lease),
+        process::Control {
+            lease: Some(&lease),
+            cancelled: &cancelled,
+        },
+    );
+    if let Some(id) = run_id {
+        // The writer lease still protects the native home while the helper cleans up.
+        let _ = security::remove(&home, &cancel_path(id));
+    }
+    drop(lease);
+    if result
+        .as_ref()
+        .is_ok_and(|output| output.exit_code == process::CANCELLED_EXIT_CODE)
+    {
+        // Concurrent fork/exec transitions may briefly inherit a CLOEXEC copy.
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while lease_active(&home, &r.provider)? && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ensure!(
+            !lease_active(&home, &r.provider)?,
+            "Native cancellation left a descendant holding its writer lease."
+        );
+    }
+    result
+}
+
+pub fn validate_run_id(id: &str) -> Result<()> {
+    ensure!(
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "Invalid native run ID."
+    );
+    Ok(())
+}
+fn cancel_path(id: &str) -> String {
+    format!(".local/state/enginebox/agent-runs/cancellations/{id}.json")
+}
+pub fn request_cancel(home: &Path, provider: &str, id: &str) -> Result<()> {
+    crate::provider(provider)?;
+    validate_run_id(id)?;
+    security::absolute_existing(home)?;
+    security::write_json(
+        home,
+        &cancel_path(id),
+        &serde_json::json!({"run_id":id,"provider":provider}),
     )
 }
+pub fn cancellation_requested(home: &Path, provider: &str, id: &str) -> Result<bool> {
+    crate::provider(provider)?;
+    validate_run_id(id)?;
+    Ok(security::read_json(home, &cancel_path(id))?
+        .is_some_and(|v| v["run_id"] == id && v["provider"] == provider))
+}
+
 pub fn lease_active(home: &Path, provider: &str) -> Result<bool> {
     crate::provider(provider)?;
     security::absolute_existing(home)?;

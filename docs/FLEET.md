@@ -150,7 +150,7 @@ export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
 enginebox-fleet-mcp
 ```
 
-Register that command through your client's ordinary MCP configuration. The current stdio implementation supports handshake revisions through `2025-11-25`; it does not advertise the separate `2026-07-28` discovery/per-request versioning protocol. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch` and `agent_run`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate bounded run queue and private result endpoint; see [native runs and state](TENANT-AGENT-STATE.md).
+Register that command through your client's ordinary MCP configuration. The current stdio implementation supports handshake revisions through `2025-11-25`; it does not advertise the separate `2026-07-28` discovery/per-request versioning protocol. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch`, `agent_runs`, `agent_run` and `agent_cancel`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate bounded run queue and private result endpoint; see [native runs and state](TENANT-AGENT-STATE.md).
 
 The MCP client only permits HTTP for loopback origins, requires HTTPS for remote origins, rejects URL credentials and disables redirects and ambient forward proxies. A redirect must not forward the bearer token to another service. Use a direct API connection or SSH tunnel. Do not install fleet API tokens or operator SSH authority inside agent guests; guest computer/browser MCP is a separate interface.
 
@@ -163,3 +163,7 @@ pnpm exec cargo test -p enginebox-core -p enginebox-controller -p enginebox-cli
 The tests cover reserve accounting, cross-project/frozen allocations, template trust and pool selection, disk-shrink rejection, exact guest mapping, readiness-contract handling, serialized jobs, restart records, queue-slot recovery and bearer authentication/redirect protection. They do not create live VMs. Real clone, networking, identity and RAM continuity checks are reported separately in [validation](VALIDATION.md).
 
 The service assumes trusted operators and prepared Linux VM templates. It does not provide tenant-level authorization, automatic credential rotation, agent orchestration, CI scheduling, arbitrary environment upgrades, fleet-wide storage replication or GPU state restoration.
+
+## ACP and terminal tasks
+
+`ebox tasks --watch` displays native runs across all hosts and providers. `ebox acp` exposes the stable Agent Client Protocol v1 session lifecycle over stdio. Both use the existing authenticated controller and native workspace state. See [ACP and fleet tasks](ACP.md) for client configuration, cancellation, usage semantics and current limitations.

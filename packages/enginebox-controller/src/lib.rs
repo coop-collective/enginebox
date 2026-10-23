@@ -450,6 +450,7 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
         ["v1", "agents"] => c.runtime()?.agents.status(),
+        ["v1", "agent-runs"] => Ok(c.runtime()?.agents.list_runs()),
         ["v1", "agents", provider, "usage"] => {
             Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
         }
@@ -520,6 +521,21 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
                 _ => anyhow::bail!("Unknown session operation"),
             };
             json!({"session":result})
+        }
+        [
+            "v1",
+            "hosts",
+            host,
+            "instances",
+            name,
+            "agent-runs",
+            id,
+            "cancel",
+        ] => {
+            empty(&body)?;
+            let (host, name, id) = (host.to_string(), name.to_string(), id.to_string());
+            code = StatusCode::ACCEPTED;
+            json!({"run":blocking(move||runtime.agents.cancel_run(&host,&name,&id)).await?})
         }
         ["v1", "hosts", host, "instances", name, "agent-runs"] => {
             let host = host.to_string();
@@ -678,6 +694,44 @@ mod tests {
             StatusCode::FORBIDDEN
         );
     }
+    #[tokio::test]
+    async fn agent_run_listing_and_cancellation_require_operator_auth() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        let cancel = "/v1/hosts/worker/instances/ebox-private/agent-runs/11111111111111111111111111111111/cancel";
+        for (method, path, body) in [
+            (Method::GET, "/v1/agent-runs", ""),
+            (Method::POST, cancel, "{}"),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(method, path, body, false))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        c.activate().unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/v1/agent-runs", "", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(payload, json!({"runs":[],"total":0,"truncated":false}));
+        // Unknown runs are rejected before attempting to contact a registered host.
+        assert_eq!(
+            app.oneshot(request(Method::POST, cancel, "{}", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn storage_routes_use_registered_targets_and_durable_admitted_jobs() {
         let (_temp, c) = setup();

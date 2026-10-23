@@ -169,6 +169,14 @@ pub fn inherit_lease(cmd: &mut Command, lease: Option<&crate::security::Lease>) 
     #[cfg(not(unix))]
     let _ = (cmd, lease);
 }
+/// A supervisor-confirmed cancellation, distinct from native exits and timeouts.
+pub const CANCELLED_EXIT_CODE: i32 = -125;
+
+pub struct Control<'a> {
+    pub lease: Option<&'a crate::security::Lease>,
+    pub cancelled: &'a dyn Fn() -> Result<bool>,
+}
+
 pub fn bounded(
     argv: &[String],
     environment: Option<&BTreeMap<String, String>>,
@@ -178,6 +186,37 @@ pub fn bounded(
     max: usize,
     lease: Option<&crate::security::Lease>,
 ) -> Result<Output> {
+    bounded_controlled(
+        argv,
+        environment,
+        cwd,
+        input,
+        timeout,
+        max,
+        Control {
+            lease,
+            cancelled: &|| Ok(false),
+        },
+    )
+}
+
+pub fn bounded_controlled(
+    argv: &[String],
+    environment: Option<&BTreeMap<String, String>>,
+    cwd: Option<&Path>,
+    input: &[u8],
+    timeout: Duration,
+    max: usize,
+    control: Control<'_>,
+) -> Result<Output> {
+    if (control.cancelled)()? {
+        return Ok(Output {
+            exit_code: CANCELLED_EXIT_CODE,
+            output: String::new(),
+            timed_out: false,
+            output_truncated: false,
+        });
+    }
     let mut file = tempfile::tempfile()?;
     file.write_all(input)?;
     use std::io::{Seek, SeekFrom};
@@ -186,7 +225,7 @@ pub fn bounded(
     cmd.stdin(file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    inherit_lease(&mut cmd, lease);
+    inherit_lease(&mut cmd, control.lease);
     let mut child = cmd.spawn()?;
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
     let cancel_read = Arc::new(AtomicBool::new(false));
@@ -214,10 +253,15 @@ pub fn bounded(
     let deadline = Instant::now() + timeout;
     let mut output = Vec::new();
     let mut timed_out = false;
+    let mut cancelled = false;
     let mut truncated = false;
     let result = (|| -> Result<()> {
         readers?;
         loop {
+            if (control.cancelled)()? {
+                cancelled = true;
+                break;
+            }
             if Instant::now() >= deadline {
                 timed_out = true;
                 break;
@@ -257,7 +301,7 @@ pub fn bounded(
     #[cfg(not(unix))]
     let code = status.code().unwrap_or(-1);
     Ok(Output {
-        exit_code: code,
+        exit_code: if cancelled { CANCELLED_EXIT_CODE } else { code },
         output: String::from_utf8_lossy(&output).into_owned(),
         timed_out,
         output_truncated: truncated,
