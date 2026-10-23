@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { reset, runInDurableObject } from "cloudflare:test";
+import { reset, runInDurableObject, evictDurableObject } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
 import worker from "../src/index.ts";
 import { canonical, sha256 } from "@enginebox/fleet-protocol";
@@ -623,4 +623,379 @@ it("preserves frozen validation while recovering an interrupted acceptance", asy
       `projects/demo/decisions/${pending.id}.json`,
     ))!.json(),
   ).toEqual(pending);
+});
+
+it("persists scoped task creation, chat provenance, idempotency and optimistic edits", async () => {
+  const node = await setup();
+  const input = {
+    id: "chat-task",
+    title: "A useful idea",
+    type: "idea",
+    source: {
+      kind: "chat",
+      conversation: "room:one",
+      messageIds: ["message-2", "message-1"],
+    },
+  };
+  let task = await ok("/v1/projects/demo/tasks", input, node);
+  expect(task.createdBy).toBe("node:agent-a");
+  expect(task.source.messageIds).toEqual(["message-1", "message-2"]);
+  expect((await ok("/v1/projects/demo/tasks", input, node)).revision).toBe(1);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks",
+        { ...input, title: "Different request" },
+        node,
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks",
+        { ...input, id: "duplicate-source" },
+        node,
+      )
+    ).status,
+  ).toBe(409);
+  const update = {
+    operationId: "edit",
+    expectedRevision: 1,
+    patch: { title: "Revised idea" },
+  };
+  task = await ok("/v1/projects/demo/tasks/chat-task/update", update, node);
+  expect(task.revision).toBe(2);
+  expect(
+    await ok("/v1/projects/demo/tasks/chat-task/update", update, node),
+  ).toEqual(task);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks/chat-task/update",
+        { ...update, operationId: "stale" },
+        node,
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks/chat-task/update",
+        { ...update, patch: { title: "Reuse operation" } },
+        node,
+      )
+    ).status,
+  ).toBe(409);
+  await evictDurableObject(env.PROJECTS.getByName("demo"));
+  expect(
+    await ok("/v1/projects/demo/tasks/chat-task", undefined, node),
+  ).toEqual(task);
+  expect((await ok("/v1/projects/demo/tasks", input, node)).revision).toBe(2);
+  const events = await ok(
+    "/v1/projects/demo/tasks/activity?limit=1",
+    undefined,
+    node,
+  );
+  expect(events.events).toHaveLength(1);
+  expect(events.nextCursor).toBe(1);
+  expect(
+    (await ok("/v1/projects/demo/tasks/activity?cursor=1", undefined, node))
+      .events[0].action,
+  ).toBe("updated");
+});
+
+it("denies task policy escalation, storage-node access, cross-project access and spoofed fields", async () => {
+  const agent = await setup();
+  const storage = await setup("storage", "storage");
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks",
+        { id: "auto", title: "Automatic", type: "idea", review: "automatic" },
+        agent,
+      )
+    ).status,
+  ).toBe(403);
+  expect(
+    (await request("/v1/projects/demo/tasks", undefined, storage)).status,
+  ).toBe(403);
+  await ok("/v1/projects", { id: "other" });
+  expect(
+    (await request("/v1/projects/other/tasks", undefined, agent)).status,
+  ).toBe(403);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks",
+        { id: "spoof", title: "Bad actor", type: "idea", createdBy: "owner" },
+        agent,
+      )
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks",
+        { id: "activity", title: "Reserved", type: "idea" },
+        agent,
+      )
+    ).status,
+  ).toBe(400);
+  await ok(
+    "/v1/projects/demo/tasks",
+    { id: "one", title: "Task one", type: "issue" },
+    agent,
+  );
+  await ok(
+    "/v1/projects/demo/tasks",
+    { id: "two", title: "Task two", type: "idea" },
+    agent,
+  );
+  const first = await ok("/v1/projects/demo/tasks?limit=1", undefined, agent);
+  expect(first.tasks[0].id).toBe("one");
+  expect(first.nextCursor).toBe("one");
+  expect(
+    (await ok("/v1/projects/demo/tasks?limit=1&cursor=one", undefined, agent))
+      .tasks[0].id,
+  ).toBe("two");
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks/one/move",
+        { operationId: "ship", expectedRevision: 1, status: "shipped" },
+        agent,
+      )
+    ).status,
+  ).toBe(403);
+  expect(
+    (
+      await request("/v1/projects/demo/tasks/one/move", {
+        operationId: "ship",
+        expectedRevision: 1,
+        status: "shipped",
+      })
+    ).status,
+  ).toBe(409);
+});
+
+async function acceptedTask(
+  review: "required" | "automatic",
+  editWhileTesting = false,
+) {
+  const node = await setup();
+  await ok("/v1/projects/demo/tasks", {
+    id: "feature",
+    title: "Feature",
+    type: "idea",
+    review,
+  });
+  const source = await publish("feature result");
+  const integrated = await publish("integrated result");
+  const recipe = await sha256("task-check");
+  await ok("/v1/projects/demo/checks", {
+    checks: [{ name: "integrity", recipe, kind: "verify" }],
+  });
+  await ok("/v1/projects/demo/candidates", {
+    id: "batch",
+    project: "demo",
+    base: null,
+    generation: integrated.id,
+    changes: [{ id: "feature", generation: source.id }],
+  });
+  await ok(
+    "/v1/projects/demo/tasks/feature/move",
+    {
+      operationId: "testing",
+      expectedRevision: 1,
+      status: "testing",
+      generation: source.id,
+      candidate: "batch",
+    },
+    node,
+  );
+  const check = {
+    candidate: "batch",
+    name: "integrity",
+    recipe,
+    scope: "full",
+  };
+  await ok("/v1/projects/demo/jobs", {
+    id: "task-check",
+    project: "demo",
+    generation: integrated.id,
+    kind: "verify",
+    check,
+  });
+  const { assignment } = await ok("/v1/node/poll", {}, node);
+  await ok(
+    "/v1/node/finish",
+    { assignment, ok: true, result: { check } },
+    node,
+  );
+  if (editWhileTesting)
+    await ok(
+      "/v1/projects/demo/tasks/feature/update",
+      {
+        operationId: "changed-request",
+        expectedRevision: 2,
+        patch: { description: "New acceptance requirement" },
+      },
+      node,
+    );
+  const acceptance = await ok("/v1/projects/demo/accept", {
+    generation: integrated.id,
+    expected: null,
+    candidate: "batch",
+  });
+  return { node, source, integrated, acceptance };
+}
+
+it("ships only accepted candidate membership after explicit owner review and records the decision", async () => {
+  const { node, integrated, source, acceptance } =
+    await acceptedTask("required");
+  expect(
+    (await ok("/v1/projects/demo/tasks/feature", undefined, node)).status,
+  ).toBe("testing");
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks/feature/move",
+        { operationId: "self-ship", expectedRevision: 2, status: "shipped" },
+        node,
+      )
+    ).status,
+  ).toBe(403);
+  await ok(
+    "/v1/projects/demo/tasks",
+    { id: "unrelated", title: "Unrelated task", type: "issue" },
+    node,
+  );
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/tasks/unrelated/move",
+        {
+          operationId: "wrong-membership",
+          expectedRevision: 1,
+          status: "testing",
+          generation: source.id,
+          candidate: "batch",
+        },
+        node,
+      )
+    ).status,
+  ).toBe(409);
+  await ok(
+    "/v1/projects/demo/tasks/unrelated/move",
+    {
+      operationId: "testing",
+      expectedRevision: 1,
+      status: "testing",
+      generation: integrated.id,
+    },
+    node,
+  );
+  expect(
+    (
+      await request("/v1/projects/demo/tasks/unrelated/move", {
+        operationId: "ship",
+        expectedRevision: 2,
+        status: "shipped",
+      })
+    ).status,
+  ).toBe(409);
+  const ship = {
+    operationId: "approve",
+    expectedRevision: 2,
+    status: "shipped",
+  };
+  const task = await ok("/v1/projects/demo/tasks/feature/move", ship);
+  expect(task.shippedGeneration).toBe(integrated.id);
+  expect(task.updatedBy).toBe("owner");
+  expect(await ok("/v1/projects/demo/tasks/feature/move", ship)).toEqual(task);
+  expect(
+    (
+      await request("/v1/projects/demo/tasks/feature/update", {
+        operationId: "rewrite",
+        expectedRevision: 3,
+        patch: { title: "Different task" },
+      })
+    ).status,
+  ).toBe(409);
+  const { events } = await ok("/v1/projects/demo/tasks/activity");
+  expect(events.find((event: any) => event.action === "shipped")).toMatchObject(
+    { actor: "owner", taskId: "feature", decision: acceptance.decision },
+  );
+});
+
+it("auto-ships only owner-configured tasks with accepted evidence and invalidates evidence on changed requests", async () => {
+  const { integrated } = await acceptedTask("automatic");
+  expect(await ok("/v1/projects/demo/tasks/feature")).toMatchObject({
+    status: "shipped",
+    shippedGeneration: integrated.id,
+    updatedBy: "policy:automatic",
+  });
+  await reset();
+  await acceptedTask("automatic", true);
+  expect(await ok("/v1/projects/demo/tasks/feature")).toMatchObject({
+    status: "in_progress",
+    resultGeneration: null,
+    candidate: null,
+    shippedGeneration: null,
+  });
+});
+
+it("reports actual project activity without exposing other project membership or node origins", async () => {
+  const node = await setup();
+  await ok("/v1/projects", { id: "other" });
+  await ok("/v1/nodes", {
+    id: "private-node",
+    role: "agent",
+    projects: ["other"],
+    origin: null,
+    slots: 1,
+    cacheBytes: 16777216,
+  });
+  const activity = await ok("/v1/projects/demo/activity", undefined, node);
+  expect(activity.jobs).toEqual([]);
+  expect(activity.nodes.map((node: any) => node.id)).toEqual(["agent-a"]);
+  expect(activity.nodes[0]).not.toHaveProperty("projects");
+  expect(activity.nodes[0]).not.toHaveProperty("origin");
+});
+
+it("serializes competing task edits and preserves one operation receipt", async () => {
+  const node = await setup();
+  await ok(
+    "/v1/projects/demo/tasks",
+    { id: "race", title: "Original", type: "idea" },
+    node,
+  );
+  const mutation = {
+    operationId: "one",
+    expectedRevision: 1,
+    patch: { title: "First" },
+  };
+  const responses = await Promise.all([
+    request("/v1/projects/demo/tasks/race/update", mutation, node),
+    request(
+      "/v1/projects/demo/tasks/race/update",
+      { ...mutation, operationId: "two", patch: { title: "Second" } },
+      node,
+    ),
+  ]);
+  expect(responses.map((response) => response.status).sort()).toEqual([
+    200, 409,
+  ]);
+  const current = await ok("/v1/projects/demo/tasks/race", undefined, node);
+  expect(current.revision).toBe(2);
+  expect(
+    (await ok("/v1/projects/demo/tasks/activity", undefined, node)).events,
+  ).toHaveLength(2);
+  expect((await request("/v1/node/identity")).status).toBe(403);
+  expect(await ok("/v1/node/identity", undefined, node)).toMatchObject({
+    id: "agent-a",
+    role: "agent",
+    projects: ["demo"],
+  });
 });

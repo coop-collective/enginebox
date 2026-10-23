@@ -221,6 +221,21 @@ async function verify(generation) {
 }
 async function smoke() {
   await up(true);
+  const tasks = JSON.parse(
+    await docker(
+      [
+        "exec",
+        "-T",
+        "agent-a",
+        "node",
+        "packages/fleet-node/test/task-mcp-proof.ts",
+        "/config/node.json",
+        "demo",
+      ],
+      true,
+    ),
+  );
+  if (!tasks.ok) throw new Error("Task MCP proof failed");
   const source = await fixture();
   const generation = await publish(source);
   const recipe = createHash("sha256")
@@ -352,6 +367,7 @@ async function smoke() {
         snapshotBytes: generation.manifest.snapshotBytes,
         checks: [
           "publish",
+          "scoped task MCP create/edit/move",
           "accept",
           "full candidate validation",
           "independent restore",

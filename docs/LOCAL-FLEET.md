@@ -82,6 +82,8 @@ R2 objects are retained indefinitely in this first implementation. Do not add bu
 
 Enginebox owns the generic agent/task, integration and CI workflow. Gamejam consumes it as an application. See [integration and CI](INTEGRATION-CI.md) for the Beanstalk mapping and implemented candidate gate: protected recipes, immutable batch membership, full-check evidence, and stale-promotion rejection. Configure project checks to require a validated candidate at acceptance; the plain storage service remains usable without a CI provider.
 
+[Project tasks and native MCP tools](TASK-WORKFLOW.md) add durable idea/issue records, chat-to-task references, revision-guarded edits/moves, audit history and evidence-gated shipping. The same API serves the app adapter and native Codex. The smoke test exercises real scoped MCP calls against this local controller.
+
 The owner queues `hydrate`, `verify`, or explicitly configured `layerfs-exec` jobs against immutable generations. Nodes pull work; the controller reserves node capacity and records an attempt before dispatch. Leases last 30 seconds and renew while work runs. Node restarts change the session epoch. A local watchdog cancels an expired native invocation independently of a slow controller HTTP request.
 
 Node-local journal records survive process restarts. A completed attempt resends its recorded result; it does not replay the command. Interrupted read/verify attempts can be reconciled as failed and submitted again under a new job ID. Interrupted native commands retain their reservation and require owner reconciliation after inspecting/stopping the executor. Killing the CLI process alone is not proof that its container command stopped; the existing Rust backend's bounded command/recovery receipts remain relevant.

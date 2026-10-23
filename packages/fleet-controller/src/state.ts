@@ -10,7 +10,13 @@ import {
   type NodeView,
   type CandidateSpec,
   type CheckRequirement,
+  type TaskActor,
+  type TaskCreate,
+  type TaskMove,
+  type TaskStatus,
+  type TaskUpdate,
 } from "@enginebox/fleet-protocol";
+import { Tasks } from "./tasks.ts";
 
 export class State extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -330,6 +336,27 @@ type CandidateRecord = {
   fullJobs: Record<string, string>;
 };
 export class Project extends State {
+  private tasks() {
+    return new Tasks(this, this.ctx.storage.sql);
+  }
+  async task(id: string) {
+    return this.tasks().get(id);
+  }
+  async listTasks(cursor: string, limit: number, status?: TaskStatus) {
+    return this.tasks().list(cursor, limit, status);
+  }
+  async taskActivity(cursor: number, limit: number) {
+    return this.tasks().activity(cursor, limit);
+  }
+  async createTask(spec: TaskCreate, actor: TaskActor) {
+    return this.tasks().create(spec, actor);
+  }
+  async updateTask(id: string, input: TaskUpdate, actor: TaskActor) {
+    return this.tasks().update(id, input, actor);
+  }
+  async moveTask(id: string, input: TaskMove, actor: TaskActor) {
+    return this.tasks().move(id, input, actor);
+  }
   async create(id: string) {
     if (!this.get("id")) {
       this.put("id", id);
@@ -538,6 +565,7 @@ export class Project extends State {
     );
     this.put("head", generation);
     this.put("lastDecision", pending.id);
+    this.tasks().accepted(pending);
     this.remove("pendingDecision");
     return { head: generation, decision: pending.id };
   }
