@@ -46,6 +46,9 @@ impl Fleet {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                // macOS may inherit the listener's nonblocking flag. The fixture
+                // polls accept, but each accepted HTTP request uses bounded reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
