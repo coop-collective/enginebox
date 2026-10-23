@@ -54,7 +54,7 @@ try {
   let buffer = '';
   const decoder = new TextDecoder();
   for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, '\n');
+    buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, '\n');
     if (buffer.length > 2 * 1024 * 1024) throw new Error('SSE event exceeds limit');
     let boundary;
     while ((boundary = buffer.indexOf('\n\n')) >= 0) {
