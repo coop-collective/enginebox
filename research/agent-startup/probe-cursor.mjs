@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 
 const { values: options } = parseArgs({ options: {
   output: { type: 'string' }, repo: { type: 'string' }, ref: { type: 'string', default: 'main' },
+  model: { type: 'string' },
   'run-live': { type: 'boolean', default: false },
 } });
 if (!options.output || !options.repo || !options['run-live']) {
@@ -16,7 +17,7 @@ await access(options.output).then(() => { throw new Error('Receipt already exist
 });
 await mkdir(dirname(options.output), { recursive: true, mode: 0o700 });
 const authorization = `Basic ${Buffer.from(`${process.env.CURSOR_API_KEY}:`).toString('base64')}`;
-const receipt = { schema: 1, recorded_at: new Date().toISOString(), provider: 'cursor-cloud', events: [] };
+const receipt = { schema: 1, recorded_at: new Date().toISOString(), provider: 'cursor-cloud', requested_model: options.model ?? null, events: [] };
 const save = () => writeFile(options.output, JSON.stringify(receipt, null, 2), { mode: 0o600 });
 async function request(path, body, timeout = 30_000) {
   const response = await fetch(`https://api.cursor.com${path}`, {
@@ -27,6 +28,11 @@ async function request(path, body, timeout = 30_000) {
     // Persist only status/code, never a response that could echo credentials.
     const error = new Error(`Cursor API ${response.status}`);
     error.status = response.status;
+    const details = await response.json().catch(() => null);
+    // Keep only reviewed codes, never arbitrary provider messages or account data.
+    if (['usage_limit_exceeded', 'validation_error'].includes(details?.error?.code)) {
+      error.code = details.error.code;
+    }
     throw error;
   }
   return response;
@@ -40,6 +46,7 @@ try {
   const start = performance.now();
   const body = {
     name: 'Engine Box read-only startup benchmark', autoCreatePR: false,
+    ...(options.model ? { model: { id: options.model } } : {}),
     repos: [{ url: options.repo, startingRef: options.ref }],
     prompt: { text: 'Startup benchmark only. Read package.json in the repository root and reply with its package name followed by ENGINEBOX_STARTUP_OK. Do not edit files, install dependencies, create commits, push branches, open pull requests, or call external tools. Stop after answering.' },
   };
@@ -85,6 +92,7 @@ try {
 } catch (error) {
   receipt.error = error.status ? `HTTP ${error.status}` : 'Probe interrupted; inspect the owned run before retrying';
   receipt.http_status = error.status;
+  receipt.error_code = error.code;
   process.exitCode = 1;
 } finally {
   if (ownedRun) {
@@ -102,7 +110,7 @@ try {
     }
   }
   await save();
-  console.log(JSON.stringify({ stage: receipt.stage, status: receipt.status, error: receipt.error,
+  console.log(JSON.stringify({ requested_model: receipt.requested_model, stage: receipt.stage, status: receipt.status, error: receipt.error, error_code: receipt.error_code,
     admission_seconds: receipt.admission_seconds, first_tool_seconds: receipt.first_tool_observed_seconds,
     completion_seconds: receipt.completion_observed_seconds }));
 }
