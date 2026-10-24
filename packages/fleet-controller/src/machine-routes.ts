@@ -251,7 +251,7 @@ export async function machineRoute(
     if (prior) return json(prior);
     const ice =
         (await authority.machineGrantIce(input, node.epoch)) ??
-        (await machineIce(env)),
+        (await machineIce(env, input.mode)),
       token = `${input.id}.stream.${random()}`;
     return json(
       await authority.machineGrant(

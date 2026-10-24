@@ -105,7 +105,27 @@ can end a session but cannot inject or read signaling through these routes.
 ## Relay configuration and bounds
 
 Set the protected optional `MACHINE_TURN_CONFIG` secret to
-`{"keyId":"...","apiToken":"...","ttlSeconds":3600,"iceTransportPolicy":"relay"}`.
+`{"keyId":"...","apiToken":"...","ttlSeconds":3600}`.
+The controller derives each new session's routing from its immutable authorized
+mode: `control` receives `iceTransportPolicy:"all"`, permitting direct ICE
+candidates with TURN fallback, and `watch` always receives `"relay"`. Input still
+requires the separate live control lease; a relayed controller keeps its input
+permission, and choosing a transport cannot give a watcher control. Browsers
+cannot submit a routing preference in grants, opens, or renewals.
+
+An administrator can set `"iceTransportPolicy":"relay"` in this secret to force
+relay for both modes, including existing qualification configurations. Omit that
+override, or set `"all"`, to permit direct candidates only for new control
+sessions. Existing grants, active sessions, retries and renewals retain their
+original ICE credentials and routing policy. End and reopen a session to apply a
+changed policy; do not silently reconfigure an established peer connection.
+
+The `"all"` policy permits direct connectivity; it does not guarantee the selected
+route. ICE connectivity checks choose a working candidate pair, so clients must
+report the actual selected pair separately from the policy. See the
+[WebRTC transport policy definition](https://www.w3.org/TR/webrtc/#rtcicetransportpolicy-enum)
+and [ICE candidate prioritization](https://www.rfc-editor.org/rfc/rfc8445.html#section-5.1.2).
+
 The server calls Cloudflare's TURN credential API only after grant authorization.
 Only returned short-lived ICE credentials reach the client/native host; the
 provider API token never leaves the controller. Missing configuration returns 503
@@ -118,6 +138,8 @@ TURN allocation. Configured TTL may be 120–3600 seconds.
 An explicitly local fixture may use
 `{"local":true,"iceServers":[...],"iceTransportPolicy":"all"|"relay"}` only when
 `ALLOW_HTTP_NODES=true`. This is test configuration, not production relay proof.
+The same mode rule applies locally: `"all"` permits direct candidates for control
+and still forces watch through TURN; `"relay"` forces both through TURN.
 Wrangler 4.152.0 filters local `.dev.vars` through `secrets.required` when that
 configuration is present. A separate machine-development configuration must
 list both `ADMIN_TOKEN` and `MACHINE_TURN_CONFIG`, or omit that local allowlist.
@@ -139,7 +161,10 @@ no claim suggests unlimited registration or distributed media scheduling.
 `pnpm --filter @enginebox/fleet-controller test` runs actual workerd/SQLite tests.
 `test/machines.test.ts` covers concurrent invitation claims and control admission,
 retry/eviction, cross-project and role denials, private signaling, mailbox bounds,
-process fencing, revocation, grant collection, relay reuse and expiry. Broker
+process fencing, revocation, grant collection, relay reuse and expiry. Routing
+tests inspect saved grants/sessions and native polling, reject caller routing
+fields and cross-mode renewals, and preserve admitted policies across changes to
+the administrator override. Broker
 tests cover protected upstream requests and failure behavior. These tests prove
 controller authority, not video capture, NAT traversal, GPU support, or production
 Account login; Gamejam’s stream-host/browser qualification covers the media path.
