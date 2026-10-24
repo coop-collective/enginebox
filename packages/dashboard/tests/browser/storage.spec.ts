@@ -93,3 +93,60 @@ test("empty and unavailable storage are explicit and proxy rejects arbitrary com
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("Storage catalog unavailable");
 });
+
+test("GitHub import, LayerFS promotion and conflict-agent handoff use exact reviewed inputs", async ({ page, request }) => {
+  test.setTimeout(90_000);
+  await openStorage(page);
+  await page.getByText("Import a GitHub repository", { exact: true }).click();
+  await page.getByLabel("GitHub project ID", { exact: true }).fill("web-app");
+  await page.getByLabel("GitHub repository", { exact: true }).fill("owner/web-app");
+  await page.getByRole("button", { name: "Fetch and review", exact: true }).click();
+  await expect(page.getByLabel("GitHub tracked files")).toContainText("src/main.ts");
+  const importButton=page.getByRole("button", { name: "Import into LayerFS" });
+  await expect(importButton).toBeDisabled();
+  await page.getByRole("checkbox", { name: "I reviewed this source", exact: false }).check();
+  await importButton.click();
+  await expect(page.getByLabel("Connected project")).toHaveValue("web-app");
+  // This setting changes only after its durable controller job succeeds.
+  await page.getByRole("checkbox", { name: "Sync accepted main revisions to GitHub" }).click();
+  await expect(page.getByRole("checkbox", { name: "Sync accepted main revisions to GitHub" })).toBeChecked();
+  await page.getByLabel("GitHub checkout name").fill("github-agent");
+  await page.getByRole("button", { name: "Create LayerFS checkout" }).click();
+  const row=page.getByRole("region", { name: "Checkout github-agent", exact: true });
+  await expect(row).toBeVisible();
+  await row.getByRole("button", { name: "Checkpoint", exact: true }).click();
+  await expect(row.getByText("Checkpoint completed.")).toBeVisible();
+  await row.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(row.getByText("Closed", { exact: true })).toBeVisible();
+  await page.getByLabel("Branch to publish").selectOption("github-agent");
+  await page.getByRole("button", { name: "Merge to main", exact: true }).click();
+  await expect(page.getByLabel("GitHub sync status")).toContainText("needs agent");
+  await expect(page.getByLabel("GitHub sync status")).toContainText("src/main.ts");
+  await page.getByRole("button", { name: "Prepare sync agent task" }).click();
+  await page.getByText("Sync agent task prepared", { exact: true }).click();
+  await expect(page.getByLabel("Sync agent task", { exact: true })).toContainText("ebox-sync-fixture");
+  await expect(page.getByRole("button", { name: "Accept agent resolution" })).toBeEnabled();
+  await page.getByRole("button", { name: "Accept agent resolution" }).click();
+  await expect(page.getByLabel("GitHub sync status")).toContainText("delivered");
+  const requests=await (await request.get("http://127.0.0.1:18765/__test/storage-requests")).json();
+  expect(requests.find((r:{operation:string})=>r.operation==="github-import").body).toEqual({ project:"web-app",revision:"c".repeat(40),approval:"d".repeat(64),credential_free:true });
+  expect(requests.find((r:{operation:string})=>r.operation==="github-promote").body).toEqual({ project:"web-app",name:"github-agent",expected_main:"e".repeat(64),merge:true });
+  expect(requests.find((r:{operation:string,body:{action?:string}})=>r.operation==="github-delivery"&&r.body.action==="resolve").body).toEqual({ project:"web-app",action:"resolve",attempt:"sync-fixture" });
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+});
+
+test("GitHub source edits invalidate review and fetch failures never enable import", async ({page,request})=>{
+  await openStorage(page);
+  await page.getByText("Import a GitHub repository",{exact:true}).click();
+  await page.getByLabel("GitHub project ID",{exact:true}).fill("app");
+  await page.getByLabel("GitHub repository",{exact:true}).fill("owner/app");
+  await page.getByRole("button",{name:"Fetch and review",exact:true}).click();
+  await expect(page.getByLabel("GitHub tracked files")).toBeVisible();
+  await page.getByLabel("GitHub branch",{exact:true}).fill("different");
+  await expect(page.getByRole("button",{name:"Import into LayerFS"})).not.toBeVisible();
+  await request.post("http://127.0.0.1:18765/__test/mode",{data:{mode:"github-fetch-failed"}});
+  await page.getByRole("button",{name:"Fetch and review",exact:true}).click();
+  await expect(page.getByRole("alert")).toContainText("GitHub transfer failed");
+  await expect(page.getByRole("button",{name:"Import into LayerFS"})).not.toBeVisible();
+});

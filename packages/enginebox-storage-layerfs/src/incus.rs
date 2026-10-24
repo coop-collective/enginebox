@@ -646,7 +646,7 @@ pub fn verify(root: &Path, name: &str, docker_socket: &Path) -> Result<Value> {
             "-eu",
             "-c",
             &format!(
-                "test -r /project/.git/HEAD; test -w /project; test ! -e /layerfs-store; test ! -S /var/run/docker.sock; umask 077; probe=/project/.enginebox-storage-probe-{}; mkdir \"$probe\"; trap 'rm -f -- \"$probe/run\"; rmdir -- \"$probe\"' EXIT HUP INT TERM; printf '#!/bin/sh\\nexit 0\\n' > \"$probe/run\"; chmod 700 \"$probe/run\"; \"$probe/run\"; rm -- \"$probe/run\"; rmdir -- \"$probe\"; trap - EXIT HUP INT TERM",
+                "test -d /project; test -w /project; test ! -e /layerfs-store; test ! -S /var/run/docker.sock; umask 077; probe=/project/.enginebox-storage-probe-{}; mkdir \"$probe\"; trap 'rm -f -- \"$probe/run\"; rmdir -- \"$probe\"' EXIT HUP INT TERM; printf '#!/bin/sh\\nexit 0\\n' > \"$probe/run\"; chmod 700 \"$probe/run\"; \"$probe/run\"; rm -- \"$probe/run\"; rmdir -- \"$probe\"; trap - EXIT HUP INT TERM",
                 uuid::Uuid::new_v4()
             ),
         ],
