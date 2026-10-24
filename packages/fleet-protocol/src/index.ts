@@ -1,4 +1,5 @@
 export const SCHEMA = 1;
+export * from "./artifacts.ts";
 export const CHUNK_BYTES = 4 * 1024 * 1024;
 export const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 export const PAGE_CHUNKS = 256;

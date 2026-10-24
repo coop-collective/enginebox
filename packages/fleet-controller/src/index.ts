@@ -28,6 +28,7 @@ import {
   type NodeView,
 } from "@enginebox/fleet-protocol";
 import { assistantRoute } from "./assistant.ts";
+import { artifactRoute } from "./artifacts.ts";
 export { Registry, FleetNode, Project } from "./state.ts";
 
 const json = (value: unknown, status = 200) =>
@@ -196,6 +197,7 @@ export default {
             request.method === "GET") ||
             (parts[1] === "projects" &&
               (parts[3] === "tasks" ||
+                (parts[3] === "artifacts" && ["GET", "HEAD"].includes(request.method)) ||
                 (parts[3] === "activity" &&
                   parts.length === 4 &&
                   request.method === "GET") ||
@@ -460,6 +462,11 @@ export default {
         projectAccess(p, project);
         await requireProject(env, project);
         const authority = env.PROJECTS.getByName(project);
+        if (["artifacts", "artifact-files", "artifact-file-pages"].includes(parts[3])) {
+          requireThat(p.admin || p.node.role === "agent", "Artifact access requires an agent or owner", 403);
+          return await artifactRoute(request, env, project, parts.slice(3), p.admin || !p.node.taskOnly,
+            p.admin ? "owner" : `node:${p.node.id}`);
+        }
         if (
           parts[3] === "assistant" &&
           (parts.length === 4 || parts.length === 5)

@@ -18,6 +18,8 @@ import {
   type TaskUpdate,
 } from "@enginebox/fleet-protocol";
 import { Tasks } from "./tasks.ts";
+import { Artifacts } from "./artifacts.ts";
+import type { BuildManifest } from "@enginebox/fleet-protocol";
 
 export class State extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -357,6 +359,9 @@ type CandidateRecord = {
   taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
+  async registerArtifact(id: string, manifest: BuildManifest, candidate: string, actor: string) { return new Artifacts(this).register(id,manifest,candidate,actor); }
+  async artifact(id: string) { return new Artifacts(this).get(id); }
+  async listArtifacts(candidate?: string) { return new Artifacts(this).list(candidate); }
   private tasks() {
     return new Tasks(this, this.ctx.storage.sql);
   }
