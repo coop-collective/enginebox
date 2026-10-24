@@ -16,6 +16,7 @@ import {
   type Assignment,
   type NodeSpec,
 } from "@enginebox/fleet-protocol";
+import { executeMedia, type MediaConfig } from "./media.ts";
 import { Cache } from "./cache.ts";
 import { Client } from "./client.ts";
 import { Generations, publishSnapshot, type Published } from "./generations.ts";
@@ -33,6 +34,7 @@ export type Config = NodeSpec & {
   snapshotBytes?: number;
   warmDelayMs?: number;
   nativeAssistant?: NativeAssistantConfig;
+  media?: MediaConfig;
   layerfs?: {
     ebox: string;
     config: string;
@@ -272,6 +274,9 @@ export async function runNode(config: Config) {
             409,
           );
           result = await nativeAssistant.execute(assignment, signal);
+        } else if(assignment.kind === "media-finalize") {
+          requireThat(config.media,"Media validation is not configured",409);
+          result=await executeMedia(config.media,assignment,client,config.state,signal);
         } else {
           await generations.hydrate(assignment.project, assignment.generation);
           requireThat(

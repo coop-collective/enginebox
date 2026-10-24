@@ -12,11 +12,14 @@ import {
   type CandidateSpec,
   type CheckRequirement,
   type TaskActor,
+  type TaskApproval,
   type TaskCreate,
   type TaskMove,
   type TaskStatus,
   type TaskUpdate,
 } from "@enginebox/fleet-protocol";
+import { Recordings } from "./recordings.ts";
+import type { PlaytestPolicy, RecordingChunk } from "@enginebox/fleet-protocol";
 import { Tasks } from "./tasks.ts";
 import { Artifacts } from "./artifacts.ts";
 import type { BuildManifest } from "@enginebox/fleet-protocol";
@@ -172,6 +175,7 @@ export class FleetNode extends State {
   }
   async reserve(job: JobSpec, epoch: number, session: string) {
     const node = this.current(epoch, session);
+    requireThat(job.kind!=="media-finalize" || node.mediaProjects?.includes(job.project),"Node has no media binding for this project",403);
     requireThat(
       job.kind !== "assistant" || node.assistantProjects?.includes(job.project),
       "Node has no assistant binding for this project",
@@ -349,6 +353,7 @@ type Decision = {
     candidate: CandidateSpec;
     checks: CheckRequirement[];
     jobs: Record<string, string>;
+    playtests?:ReturnType<Recordings["requireCandidate"]>;
     taskRequirements?: Record<string, string>;
   };
 };
@@ -359,9 +364,61 @@ type CandidateRecord = {
   taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
-  async registerArtifact(id: string, manifest: BuildManifest, candidate: string, actor: string) { return new Artifacts(this).register(id,manifest,candidate,actor); }
-  async artifact(id: string) { return new Artifacts(this).get(id); }
-  async listArtifacts(candidate?: string) { return new Artifacts(this).list(candidate); }
+  private recordingState() { return new Recordings(this,this.ctx.storage.sql); }
+  async playtestPolicy() { return this.recordingState().policy(); }
+  async configurePlaytests(policy:PlaytestPolicy) { return this.recordingState().configure(policy); }
+  async testContexts() { return this.recordingState().contexts(); }
+  async testSession(id:string) { return this.recordingState().session(id); }
+  async createTestSession(input:unknown,actor:string) { return this.recordingState().createSession(input,actor); }
+  async recordings(taskId?:string) { return this.recordingState().list(taskId); }
+  async recording(id:string) { return this.recordingState().get(id); }
+  async createRecording(input:unknown,actor:string) {
+    const result=this.recordingState().create(input,actor);
+    await this.ctx.storage.setAlarm(Date.now()+60_000);return result;
+  }
+  async reserveRecordingChunk(id:string,chunk:Omit<RecordingChunk,"uploaded">,actor:string,output:boolean) { return this.recordingState().reserve(id,chunk,actor,output); }
+  async acknowledgeRecordingChunk(id:string,sequence:number,hash:string,output:boolean) { return this.recordingState().acknowledge(id,sequence,hash,output); }
+  async recordingEvents(id:string,input:unknown,actor:string) { return this.recordingState().events(id,input,actor); }
+  async finishRecording(id:string,input:unknown,actor:string) {
+    // Both mutations happen synchronously before the first await; retry repairs
+    // a lost response using the identical operation and server-derived job ID.
+    const result=this.recordingState().finish(id,input,actor);
+    if(result.job)await this.enqueue(result.job);
+    return result.recording;
+  }
+  async mediaWorker(id:string,node:string,attempt:string) {
+    const rows=this.ctx.storage.sql.exec<{value:string}>("SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.spec.kind')='media-finalize' AND json_extract(value,'$.spec.recording')=? AND json_extract(value,'$.status')='assigned' LIMIT 1",id).toArray();
+    const job=rows[0]?JSON.parse(rows[0].value) as JobRecord:null;
+    requireThat(job?.assignment?.node===node&&job.assignment.attempt===attempt&&job.assignment.expires>Date.now(),"Media output requires the active assigned worker",403);
+  }
+  async alarm() {
+    const completed=this.ctx.storage.sql.exec<{key:string;value:string}>("SELECT key,value FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.state') IN ('ready','partial') AND json_extract(value,'$.media') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-input-cleaned:' || substr(records.key,11)) LIMIT 8").toArray();
+    for(const row of completed) {
+      const value=JSON.parse(row.value) as import("@enginebox/fleet-protocol").Recording;
+      for(let index=0;index<value.chunks.length;index+=1000)await this.env.STORE.delete(value.chunks.slice(index,index+1000).map(chunk=>`projects/${value.project}/recordings/${value.id}/input/${chunk.sequence}`));
+      this.put(`recording-input-cleaned:${value.id}`,Date.now());
+    }
+    const cursor=this.get<string>("recording-cleanup-cursor")??"";
+    const expired=this.recordingState().expiredBatch(cursor);
+    for(const row of expired) {
+      const id=row.key.slice("recording:".length), value=this.recordingState().expire(id)!;
+      const prefix=`projects/${value.project}/recordings/${id}/`;
+      for(;;) {
+        const batch=await this.env.STORE.list({prefix,limit:1000});
+        if(!batch.objects.length)break;
+        await this.env.STORE.delete(batch.objects.map(object=>object.key));
+      }
+      this.put(`recording-cleaned:${id}`,Date.now());this.put("recording-cleanup-cursor",row.key);
+    }
+    if(expired.length<20)this.put("recording-cleanup-cursor","");
+    const next=this.ctx.storage.sql.exec<{at:number|null}>("SELECT MIN(CASE WHEN json_extract(value,'$.state') IN ('recording','uploading') THEN MIN(json_extract(value,'$.expiresAt'),json_extract(value,'$.uploadExpiresAt')) ELSE json_extract(value,'$.expiresAt') END) AS at FROM records WHERE key LIKE 'recording:%' AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-cleaned:' || substr(records.key,11))").one().at;
+    if(expired.length===20||completed.length===8)await this.ctx.storage.setAlarm(Date.now()+1000);
+    else if(next!==null)await this.ctx.storage.setAlarm(Math.max(Date.now()+60_000,next));
+  }
+
+  async registerArtifact(id: string, manifest: BuildManifest, candidate: string, actor: string) { return new Artifacts(this,this.ctx.storage.sql).register(id,manifest,candidate,actor); }
+  async artifact(id: string) { return new Artifacts(this,this.ctx.storage.sql).get(id); }
+  async listArtifacts(candidate?: string) { return new Artifacts(this,this.ctx.storage.sql).list(candidate); }
   private tasks() {
     return new Tasks(this, this.ctx.storage.sql);
   }
@@ -379,6 +436,31 @@ export class Project extends State {
   }
   async updateTask(id: string, input: TaskUpdate, actor: TaskActor) {
     return this.tasks().update(id, input, actor);
+  }
+  async approveTask(id:string,input:TaskApproval,actor:TaskActor) {
+    const reviewed=this.tasks().approve(id,input,actor);
+    if(reviewed.candidate)await this.promoteReviewed(reviewed.candidate);
+    const current=this.tasks().get(id)!;
+    const candidate=current.candidate?this.get<CandidateRecord>(`candidate:${current.candidate}`):undefined;
+    if(current.status==="testing"&&candidate&&this.get(`acceptance:${candidate.spec.generation}`))
+      return this.tasks().move(id,{operationId:`ship-${input.operationId}`.slice(0,48),expectedRevision:current.revision,status:"shipped"},actor);
+    return current;
+  }
+  private async promoteReviewed(id:string) {
+    const candidate=this.get<CandidateRecord>(`candidate:${id}`);if(!candidate)return;
+    const tasks=candidate.spec.changes.map(change=>this.tasks().get(change.id));
+    // Legacy manually staged candidates retain explicit acceptance. Automatic
+    // promotion is for Enginebox integrations or a newly recorded owner review.
+    if(!this.get(`integration:${id}`)&&!tasks.some(task=>task?.reviewReceipt))return;
+    if(tasks.some((task,index)=>!task||task.resultGeneration!==candidate.spec.changes[index].generation||!this.tasks().reviewReady(task,candidate)||!this.recordingState().ready(task)))return;
+    const checks=this.get<CheckRequirement[]>("checks")??[];
+    if(!checks.length||canonical(checks)!==canonical(candidate.checks))return;
+    for(const check of checks) {
+      const job=this.get<JobRecord>(`job:${candidate.fullJobs[check.name]}`);
+      if(job?.status!=="completed"||job.spec.generation!==candidate.spec.generation||job.spec.check?.scope!=="full"||job.spec.check.recipe!==check.recipe)return;
+    }
+    const head=this.get<string|null>("head")??null;if(head!==candidate.spec.base&&head!==candidate.spec.generation)return;
+    await this.accept(candidate.spec.generation,candidate.spec.base,id);
   }
   async moveTask(id: string, input: TaskMove, actor: TaskActor) {
     return this.tasks().move(id, input, actor);
@@ -515,6 +597,7 @@ export class Project extends State {
     if (head === generation)
       return { head, decision: this.get<string>("lastDecision") };
     const checks = this.get<CheckRequirement[]>("checks") ?? [];
+    requireThat(!this.recordingState().policy().required || checks.length>0,"Required recording evidence also needs candidate validation policy",409);
     let validation: Decision["validation"];
     if (checks.length > 0) {
       requireThat(
@@ -532,6 +615,9 @@ export class Project extends State {
         409,
       );
       this.tasks().validateRequirements(candidate.taskRequirements);
+      const prepared=this.get<Decision>("pendingDecision");
+      const playtests=prepared?.validation?.candidate.id===candidateId && prepared.generation===generation && canonical(prepared.validation.playtests?.policy)===canonical(this.recordingState().policy())
+        ? prepared.validation.playtests! : this.recordingState().requireCandidate(candidate);
       for (const check of checks) {
         const job = this.get<JobRecord>(
           `job:${candidate.fullJobs[check.name]}`,
@@ -550,6 +636,7 @@ export class Project extends State {
         candidate: candidate.spec,
         checks,
         jobs: candidate.fullJobs,
+        ...(playtests.policy.required ? {playtests} : {}),
         ...(candidate.taskRequirements &&
         Object.keys(candidate.taskRequirements).length
           ? { taskRequirements: candidate.taskRequirements }
@@ -650,13 +737,14 @@ export class Project extends State {
     this.put(`job:${spec.id}`, job);
     return job;
   }
-  async next(allowAssistant = false) {
+  async next(allowAssistant = false, allowMedia = false) {
     const row = this.ctx.storage.sql
       .exec<{
         value: string;
       }>(
-        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') ORDER BY rowid LIMIT 1",
+        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') AND (?=1 OR json_extract(value,'$.spec.kind')!='media-finalize') ORDER BY rowid LIMIT 1",
         allowAssistant ? 1 : 0,
+        allowMedia ? 1 : 0,
       )
       .toArray()[0];
     return row ? (JSON.parse(row.value) as JobRecord).spec : null;
@@ -678,6 +766,7 @@ export class Project extends State {
                   timeoutSeconds: assignment.timeoutSeconds,
                 }
               : {}),
+            ...(assignment.kind === "media-finalize" ? {recording:assignment.recording,timeoutSeconds:assignment.timeoutSeconds}:{}),
             ...(assignment.check ? { check: assignment.check } : {}),
             ...(assignment.argv
               ? {
@@ -729,6 +818,8 @@ export class Project extends State {
         "Result differs from recorded outcome",
         409,
       );
+      if(ok&&job.spec.check)await this.promoteReviewed(job.spec.check.candidate);
+      if(ok&&job.spec.kind==="media-finalize") {const recording=this.recordingState().get(job.spec.recording);if(recording)await this.promoteReviewed(recording.candidate);}
       return job;
     }
     requireThat(
@@ -744,9 +835,12 @@ export class Project extends State {
         409,
       );
     }
+    if(job.spec.kind === "media-finalize") this.recordingState().complete(job.spec.recording,JSON.parse(result),ok);
     job.status = ok ? "completed" : "failed";
     job.result = result;
     this.put(key, job);
+    if(ok&&job.spec.check)await this.promoteReviewed(job.spec.check.candidate);
+    if(ok&&job.spec.kind==="media-finalize") {await this.ctx.storage.setAlarm(Date.now()+60_000);const recording=this.recordingState().get(job.spec.recording);if(recording)await this.promoteReviewed(recording.candidate);}
     return job;
   }
   async interrupt(assignment: Assignment) {

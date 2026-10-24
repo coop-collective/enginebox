@@ -23,11 +23,13 @@ import {
   validateTaskCreate,
   validateTaskUpdate,
   validateTaskMove,
+  validateTaskApproval,
   taskStatus,
   type Assignment,
   type NodeView,
 } from "@enginebox/fleet-protocol";
 import { assistantRoute } from "./assistant.ts";
+import { recordingRoute } from "./recording-routes.ts";
 import { artifactRoute } from "./artifacts.ts";
 export { Registry, FleetNode, Project } from "./state.ts";
 
@@ -197,6 +199,7 @@ export default {
             request.method === "GET") ||
             (parts[1] === "projects" &&
               (parts[3] === "tasks" ||
+                ["test-contexts","test-sessions","recordings"].includes(parts[3]) ||
                 (parts[3] === "artifacts" && ["GET", "HEAD"].includes(request.method)) ||
                 (parts[3] === "activity" &&
                   parts.length === 4 &&
@@ -420,6 +423,7 @@ export default {
             const authority = env.PROJECTS.getByName(project);
             const next = await authority.next(
               n.assistantProjects?.includes(project) ?? false,
+              n.mediaProjects?.includes(project) ?? false,
             );
             if (!next) continue;
             const reserved = await stub.reserve(next, s.epoch, s.session);
@@ -462,6 +466,10 @@ export default {
         projectAccess(p, project);
         await requireProject(env, project);
         const authority = env.PROJECTS.getByName(project);
+        if (["test-contexts","test-sessions","recordings","playtest-policy"].includes(parts[3])) {
+          requireThat(p.admin||p.node.role==="agent","Recording access requires an agent or owner",403);
+          return await recordingRoute(request,env,project,parts.slice(3),p.admin?"owner":`node:${p.node.id}`,p.admin,!p.admin&&!p.node.taskOnly?p.node.id:null);
+        }
         if (["artifacts", "artifact-files", "artifact-file-pages"].includes(parts[3])) {
           requireThat(p.admin || p.node.role === "agent", "Artifact access requires an agent or owner", 403);
           return await artifactRoute(request, env, project, parts.slice(3), p.admin || !p.node.taskOnly,
@@ -526,6 +534,10 @@ export default {
             return json(task);
           }
           if (parts.length === 6 && request.method === "POST") {
+            if (parts[5] === "approve") {
+              admin(p);
+              return json(await authority.approveTask(parts[4],validateTaskApproval(await jsonBody(request)),actor));
+            }
             if (parts[5] === "update")
               return json(
                 await authority.updateTask(

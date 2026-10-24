@@ -90,7 +90,7 @@ async function until(fn, description, milliseconds = 120_000) {
   }
   throw new Error(`Timed out: ${description}`);
 }
-async function up(storage) {
+async function up(storage, media=false) {
   await mkdir(state, { recursive: true, mode: 0o700 });
   if (!(await exists(join(state, "owner.json"))))
     await secretFile(
@@ -113,6 +113,8 @@ async function up(storage) {
         throw new Error(
           `Controller state is missing ${id}. Restore its volume, or use a fresh EBOX_FLEET_STATE for an independent fleet.`,
         );
+      if(media && id === "agent-b" && !registered.find(n=>n.id===id)?.mediaProjects?.includes("demo"))
+        throw new Error("This enrollment predates media execution. Use a fresh EBOX_FLEET_STATE and port for the media preview; keep existing fleet data intact.");
       continue;
     }
     if (registered.some((n) => n.id === id))
@@ -127,6 +129,7 @@ async function up(storage) {
       slots: 1,
       cacheBytes: 256 * 1024 * 1024,
       ...(id === "task-client" ? {taskOnly: true} : {}),
+      ...(media && id === "agent-b" ? {mediaProjects:["demo"]} : {}),
     };
     const enrollment = await api("/v1/nodes", spec);
     await secretFile(
@@ -138,6 +141,7 @@ async function up(storage) {
           controller: id === "task-client" ? url : "http://controller:8787",
           state: "/state",
           port: 8790,
+          ...(media && id === "agent-b" ? {media:{ffmpeg:"/usr/bin/ffmpeg",ffprobe:"/usr/bin/ffprobe",projects:["demo"]}} : {}),
         },
         null,
         2,
@@ -401,7 +405,7 @@ async function smoke() {
 }
 
 try {
-  if (command === "up") await up(args.includes("--storage"));
+  if (command === "up") await up(args.includes("--storage"),args.includes("--media"));
   else if (command === "down") await docker(["--profile", "storage", "down"]);
   else if (command === "status") {
     await docker(["--profile", "storage", "ps"]);
@@ -494,7 +498,7 @@ try {
     }
   } else
     throw new Error(
-      "Commands: up [--storage], down, status, logs [service], smoke, fixture, publish SNAPSHOT, verify GENERATION, accept GENERATION",
+      "Commands: up [--storage] [--media], down, status, logs [service], smoke, fixture, publish SNAPSHOT, verify GENERATION, accept GENERATION",
     );
 } catch (error) {
   console.error(error.message);

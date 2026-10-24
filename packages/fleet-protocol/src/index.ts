@@ -1,5 +1,7 @@
 export const SCHEMA = 1;
 export * from "./artifacts.ts";
+export * from "./recordings.ts";
+import type { MediaFinalizeJob } from "./recordings.ts";
 export const CHUNK_BYTES = 4 * 1024 * 1024;
 export const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 export const PAGE_CHUNKS = 256;
@@ -45,6 +47,7 @@ export type NodeSpec = {
   cacheBytes: number;
   assistantProjects?: string[];
   taskOnly?: true;
+  mediaProjects?: string[];
 };
 export type NodeView = NodeSpec & {
   epoch: number;
@@ -78,7 +81,7 @@ export type AssistantJob = {
   argv?: never;
   check?: never;
 };
-export type JobSpec = StoreJob | AssistantJob;
+export type JobSpec = StoreJob | AssistantJob | MediaFinalizeJob;
 export function readOnlyJob(job: { kind: string }) {
   return job.kind === "hydrate" || job.kind === "verify";
 }
@@ -244,6 +247,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "slots",
     "cacheBytes",
     "assistantProjects",
+    "mediaProjects",
     "taskOnly",
   ]);
   identifier(value.id);
@@ -262,7 +266,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     requireThat(
       value.taskOnly === true && value.role === "agent" &&
         value.projects.length === 1 && value.origin === null &&
-        value.assistantProjects === undefined,
+        value.assistantProjects === undefined && value.mediaProjects === undefined,
       "Task-only credentials require one project, agent role and no executor capability",
     );
   if (value.assistantProjects !== undefined) {
@@ -278,6 +282,12 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
         value.projects.includes(project),
         "Assistant project must be enrolled",
       );
+    }
+  }
+  if (value.mediaProjects !== undefined) {
+    requireThat(value.role === "agent" && Array.isArray(value.mediaProjects) && value.mediaProjects.length <= 128, "Invalid media projects");
+    for (const project of value.mediaProjects) {
+      identifier(project); requireThat(value.projects.includes(project), "Media project must be enrolled");
     }
   }
   integer(value.slots, 1, 64);
@@ -313,6 +323,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     origin,
     slots: value.slots,
     cacheBytes: value.cacheBytes,
+    ...(value.mediaProjects === undefined ? {} : {mediaProjects: [...new Set(value.mediaProjects as string[])]}),
     ...(value.taskOnly === true ? { taskOnly: true as const } : {}),
     ...(value.assistantProjects === undefined
       ? {}
@@ -332,6 +343,7 @@ export function validateJob(value: unknown): JobSpec {
     "timeoutSeconds",
     "check",
     "prompt",
+    "recording",
   ]);
   identifier(value.id);
   identifier(value.project);
@@ -361,6 +373,12 @@ export function validateJob(value: unknown): JobSpec {
   }
   requireThat(value.prompt === undefined, "Only assistant jobs accept prompts");
   digest(value.generation);
+  if (value.kind === "media-finalize") {
+    identifier(value.recording); integer(value.timeoutSeconds, 1, 900);
+    requireThat(value.argv === undefined && value.check === undefined, "Media jobs cannot claim CI evidence");
+    return {id:value.id,project:value.project,generation:value.generation,kind:"media-finalize",recording:value.recording,timeoutSeconds:value.timeoutSeconds};
+  }
+  requireThat(value.recording === undefined, "Only media jobs accept a recording");
   requireThat(
     ["hydrate", "verify", "layerfs-exec"].includes(String(value.kind)),
     "Unknown job kind",
