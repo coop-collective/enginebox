@@ -50,7 +50,7 @@ Keep authoritative core data on storage with a qualified persistence and backup 
 
 ## Existing local proof
 
-An earlier executable experiment exists in the adjacent research checkout at `~/Workspace/engine-box/experiments/cloudflare-data-fork/`. Its [README](../../engine-box/experiments/cloudflare-data-fork/README.md), [probe](../../engine-box/experiments/cloudflare-data-fork/probe.py) and [recorded result](../../engine-box/docs/research/2026-10-18-cloudflare-fork/local-result.json) are local research references, not files shipped by this repository.
+An earlier executable experiment (not shipped in this repository) tested local Wrangler data forks.
 
 On October 18, 2026, all 15 checks passed on macOS ARM64 with Wrangler 4.151.1, Miniflare 5.20261012.1-beta and workerd 1.20261012.1. The probe started two connected Workers per environment, stopped the parent before an ordinary full-directory copy, then ran the parent and two forks concurrently. Local D1, KV, R2, SQLite Durable Object data and the auxiliary Worker's D1 inherited the seed, diverged independently and survived a Wrangler restart. The saved checkpoint remained byte-identical. A separate native DuckDB file was also tested historically; it is not part of this recipe.
 

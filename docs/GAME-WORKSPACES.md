@@ -108,7 +108,7 @@ Recordings remain separately retained artifacts referenced by task/build IDs.
 ## Integration queue and startup evidence
 
 The optional dedicated storage nodes, warm node caches and lightweight agent
-workspaces fit this split. The [Git-free Unreal probe](LAYERFS-VALIDATION.md)
+workspaces fit this split. The [Git-free Unreal probe](reports/LAYERFS-VALIDATION.md)
 also establishes that LayerFS has usable local history and merging. Keep the
 accepted revision authority in Cloudflare. LayerFS is the selected workspace/history foundation;
 Engine Box will distribute immutable Store generations and coordinate the accepted

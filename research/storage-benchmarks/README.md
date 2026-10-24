@@ -10,7 +10,7 @@ measure storage and recovery without changing the product runtime contract.
 
 ## Git-free LayerFS Unreal probe
 
-`layerfs-unreal-results.json` and [the validation notes](../../docs/LAYERFS-VALIDATION.md)
+`layerfs-unreal-results.json` and [the validation notes](../../docs/reports/LAYERFS-VALIDATION.md)
 record a separate v1.0.0 experiment. This does not exercise the product backend or
 run an Unreal editor. The 4 KiB mutation is deliberately a storage-only binary edit.
 

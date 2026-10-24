@@ -193,6 +193,6 @@ were kept out of the repository.
    record first tool action and terminal result for at least ten fresh runs per
    service. Measure parallel capacity separately.
 
-Reproduction scripts are under [research/agent-startup](../research/agent-startup/README.md).
+Reproduction scripts are under [research/agent-startup](../../research/agent-startup/README.md).
 Private receipts retain raw run records and native output; session IDs, host
 inventory, credentials and transcripts are excluded from this report and Git.

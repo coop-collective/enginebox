@@ -116,7 +116,7 @@ is configured. Neither browser CDP nor noVNC should be published unauthenticated
 
 Rust browser/profile tests live under `packages/enginebox-agents/tests/`. Run `pnpm exec cargo test -p enginebox-agents` for private-profile ownership, concurrent-writer locking, native child cleanup and protocol boundaries. A live browser acceptance run must use a disposable guest and profile, serve a local fixture, navigate/type/click through the official MCP, verify a screenshot and restart MCP to check cookie/storage persistence. Unit tests alone do not prove that browser installation works on a new platform.
 
-The v0.2 Python implementation passed that live Chromium fixture on October 19, 2026 in Ubuntu 24.04 x64 in 2.672 seconds. That is historical evidence; it is not automatically qualification of the Rust launcher. See [validation](VALIDATION.md) for release-specific evidence.
+The v0.2 Python implementation passed that live Chromium fixture on October 19, 2026 in Ubuntu 24.04 x64 in 2.672 seconds. That is historical evidence; it is not automatically qualification of the Rust launcher. See [validation](reports/VALIDATION.md) for release-specific evidence.
 
 An optional existing browser installation can be selected for a test with
 `ENGINEBOX_BROWSER_PACKAGE=/absolute/package/directory`; that directory must have

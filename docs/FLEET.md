@@ -160,7 +160,7 @@ The MCP client only permits HTTP for loopback origins, requires HTTPS for remote
 pnpm exec cargo test -p enginebox-core -p enginebox-controller -p enginebox-cli
 ```
 
-The tests cover reserve accounting, cross-project/frozen allocations, template trust and pool selection, disk-shrink rejection, exact guest mapping, readiness-contract handling, serialized jobs, restart records, queue-slot recovery and bearer authentication/redirect protection. They do not create live VMs. Real clone, networking, identity and RAM continuity checks are reported separately in [validation](VALIDATION.md).
+The tests cover reserve accounting, cross-project/frozen allocations, template trust and pool selection, disk-shrink rejection, exact guest mapping, readiness-contract handling, serialized jobs, restart records, queue-slot recovery and bearer authentication/redirect protection. They do not create live VMs. Real clone, networking, identity and RAM continuity checks are reported separately in [validation](reports/VALIDATION.md).
 
 The service assumes trusted operators and prepared Linux VM templates. It does not provide tenant-level authorization, automatic credential rotation, agent orchestration, CI scheduling, arbitrary environment upgrades, fleet-wide storage replication or GPU state restoration.
 

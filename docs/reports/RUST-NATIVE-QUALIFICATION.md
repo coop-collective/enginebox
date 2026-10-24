@@ -1,7 +1,7 @@
 # Rust native agent qualification
 
 The ignored integration test in
-[`live_native_runs.rs`](../packages/enginebox-agents/tests/live_native_runs.rs)
+[`live_native_runs.rs`](../../packages/enginebox-agents/tests/live_native_runs.rs)
 exercises the real Rust `AgentService`, guest credential delegation and original
 provider CLIs. It creates a separate, capacity-admitted Incus project and VM;
 existing workspaces and the running controller are not test fixtures.
