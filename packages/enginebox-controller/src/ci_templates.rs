@@ -19,6 +19,7 @@ pub struct Record {
     pub enabled: bool,
     pub epoch: String,
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Placement {
@@ -253,5 +254,49 @@ impl Registry {
             json!({"manifest":record.manifest,"enabled":record.enabled,"manifest_digest":record.manifest.digest(),"nodes":observations})
         }).collect();
         json!({"schema_version":1,"templates":templates})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn interrupted_installs_require_retry_and_changed_recipes_require_a_new_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest: Template = serde_json::from_str(include_str!(
+            "../../../examples/ci/templates/node24-linux-x64.json"
+        ))
+        .unwrap();
+        let node: Node = serde_json::from_value(json!({"schema_version":1,"id":"build","target":"builder@ci.example","os":"linux","architecture":"x64","image":"base","capabilities":[]})).unwrap();
+        let mut registry = Registry::open(tmp.path()).unwrap();
+        registry.register(manifest.clone()).unwrap();
+        registry.enable(&manifest.id, true).unwrap();
+        let record = registry.records[&manifest.id].clone();
+        let mut pending = registry.pending(&record, &node).unwrap();
+        let interrupted = pending.identity();
+        pending.status = "installing".into();
+        registry.save(pending).unwrap();
+        drop(registry);
+        let mut registry = Registry::open(tmp.path()).unwrap();
+        let failed = registry.pending(&record, &node).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.identity(),
+            interrupted,
+            "Observation must not silently create a retry"
+        );
+        assert!(registry.binding(&manifest.id, &node).is_err());
+        registry.retry(&manifest.id, &node).unwrap();
+        let retried = registry.pending(&record, &node).unwrap();
+        assert_eq!(retried.status, "pending");
+        assert!(retried.reinstall);
+        assert_ne!(retried.identity(), interrupted);
+        let mut changed = manifest.clone();
+        changed.label = "Changed".into();
+        assert!(registry.register(changed.clone()).is_err());
+        changed.revision += 1;
+        registry.register(changed).unwrap();
+        assert!(registry.records[&manifest.id].enabled);
+        assert_ne!(registry.records[&manifest.id].epoch, record.epoch);
     }
 }
