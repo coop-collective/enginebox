@@ -1,5 +1,8 @@
 name: Publish qualified WSL installer preview
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/publish-wsl-preview.yml'
   workflow_dispatch:
     inputs:
       qualification_run:
@@ -17,6 +20,7 @@ jobs:
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-installer.ps1
   publish:
+    if: github.event_name == 'workflow_dispatch'
     needs: installer
     runs-on: ubuntu-24.04
     timeout-minutes: 30
