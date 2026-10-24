@@ -1,0 +1,86 @@
+{
+  "scope": "loopback HTTP; immutable snapshot; no live LayerFS mount",
+  "snapshot_bytes": 631517184,
+  "runs": [
+    {
+      "stage": "publish",
+      "seconds": 6.353726959088817,
+      "exit_code": 0
+    },
+    {
+      "stage": "cold",
+      "seconds": 11.766343666939065,
+      "exit_code": 0,
+      "requests": 9544,
+      "bytes": 630104188,
+      "sha256_passed": true,
+      "sqlite_checks_passed": true,
+      "verification_seconds": 0.8532453749794513
+    },
+    {
+      "stage": "warm",
+      "seconds": 3.4197824579896405,
+      "exit_code": 0,
+      "requests": 0,
+      "bytes": 0,
+      "sha256_passed": true,
+      "sqlite_checks_passed": true,
+      "verification_seconds": 1.3799115410074592
+    },
+    {
+      "stage": "corrupt-cache-refused",
+      "seconds": 3.861053082975559,
+      "exit_code": 1,
+      "requests": 0,
+      "bytes": 0
+    },
+    {
+      "stage": "cache-repaired",
+      "seconds": 2.693834458012134,
+      "exit_code": 0,
+      "requests": 1,
+      "bytes": 19059,
+      "sha256_passed": true,
+      "sqlite_checks_passed": true,
+      "verification_seconds": 0.9985223329858854
+    },
+    {
+      "stage": "origin-offline",
+      "seconds": 2.842975707957521,
+      "exit_code": 0,
+      "requests": 0,
+      "bytes": 0,
+      "sha256_passed": true,
+      "sqlite_checks_passed": true,
+      "verification_seconds": 0.8075527499895543
+    }
+  ],
+  "tool": "desync version v1.1.5",
+  "chunk_files": 9544,
+  "stored_file_bytes": 630104188,
+  "original_unchanged": true,
+  "limitations": [
+    "No WAN, separate Linux kernel, engine launch, concurrent publisher or production service.",
+    "No changed-generation transfer or LayerFS runtime format migration measured.",
+    "Checks follow extraction; no consumer sees a partly restored tree in this probe.",
+    "Normal OS caches; four transfer workers; timings are individual observations.",
+    "Project-aware eviction, controller receipts and authenticated manifests are not implemented."
+  ],
+  "date": "2026-10-23",
+  "platform": "macOS arm64; loopback HTTP; four transfer workers; OS caches uncontrolled",
+  "release_archive_sha256": "dcbbaa2c6b6960ccc1b9f6c8095dd724f6e74bc7e6f9a6372219d6754f2b6717",
+  "fixture": "Existing consistent LayerFS v1.0.0 SQLite snapshot from the 802 MB asset probe; no assets committed",
+  "earlier_attempts": [
+    {
+      "fixture": "HTTP/1.0 with default accept queue",
+      "outcome": "Cold extraction failed with loopback connect timeout; private stderr retained.",
+      "change": "Fresh HTTP/1.1 fixture with a larger accept queue and TCP_NODELAY; no isolated attribution of timeout cause."
+    }
+  ],
+  "not_implemented": [
+    "Distributed Engine Box provider",
+    "Project-aware eviction",
+    "Logical import between independent worker Stores",
+    "Cross-host engine startup"
+  ]
+}

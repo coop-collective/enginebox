@@ -22,3 +22,16 @@ enginebox.local.toml
 target/
 node_modules/
 .pnpm/
+
+# Local Cloudflare state and secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Build, test and tool output
+.next/
+.vinext/
+*.tsbuildinfo
+test-results/
+playwright-report/
+coverage/

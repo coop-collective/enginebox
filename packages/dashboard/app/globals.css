@@ -25,6 +25,7 @@
 .storage-form { display: flex; gap: 14px; align-items: end; flex-wrap: wrap; margin: 18px 0; }
 .storage-form label { flex: 1; min-width: 180px; }
 .storage-review { padding-top: 12px; }
+.storage-review .mono { overflow-wrap: anywhere; }
 .storage-review dt { color: var(--muted); font-size: 12px; margin-top: 10px; }
 .storage-review dd { margin: 4px 0 12px; overflow-wrap: anywhere; }
 .storage-files { max-height: 260px; overflow: auto; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #f7f9fa; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1610,3 +1611,8 @@ input::placeholder {
 .github-fields label { display: grid; gap: 7px; }
 .github-fields select, .github-fields input { border: 1px solid #ccc; border-radius: 6px; padding: 10px; width: 100%; min-width: 0; background: white; }
 .github-repo { border-top: 1px solid var(--border, #ddd); padding-top: 15px; margin-top: 16px; overflow-wrap: anywhere; }
+.environment-panel { display: flex; flex-direction: column; gap: 20px; }
+.environment-panel .section-heading { flex-wrap: wrap; gap: 16px; }
+.environment-panel .host-card p { margin: 8px 0; line-height: 1.5; overflow-wrap: anywhere; }
+.environment-panel form.host-card { display: grid; gap: 16px; }
+.environment-panel .button { justify-self: start; }

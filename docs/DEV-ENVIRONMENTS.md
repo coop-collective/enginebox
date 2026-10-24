@@ -2,7 +2,7 @@
 
 Engine Box's next application-environment workflow has two lifetimes: a persistent **core environment** for the project, and disposable **agent environments** for individual tasks. The core follows the project's main branch and keeps its application data as code changes. An agent starts from a published revision of that environment, makes changes against its own data, and submits code for review.
 
-This is the intended product contract, not an implemented environment service. The current runtime supplies native agent workspaces, templates, lifecycle controls, checkout storage and file checkpoints. The project environment registry, branch-following reconciler, application startup service and consistent data publication adapters remain to be built. No new CLI command or template field is defined by this document.
+The broader fork/publication workflow below remains a product contract. The optional [environment service](ENVIRONMENT-SERVICES.md) now implements a protected registry, exact-source following, bounded application containers, persistent data, readiness, recovery and dashboard-managed HTTP/WebSocket/TCP/UDP routes. [Project config](PROJECT-CONFIG.md) defines repository-selected dev templates and bootstrap. Local LayerFS main and public vinext HMR have live qualification; the distributed accepted export adapter still needs live qualification with the separate integration executor. Consistent online data publication and disposable data forks remain unimplemented.
 
 ## One persistent core per project
 
@@ -38,7 +38,7 @@ These are design steps, not currently callable Engine Box operations. Publicatio
 
 Two environments must not point independent SQLite/Miniflare runtimes at the same writable persistence directory. Fork isolation comes from independent writable state, not from distinct ports or branch names. Sharing a service is a different choice: agents call its API with the intended permissions and accept that writes affect shared state.
 
-Later changes in the core do not silently appear in an existing fork. Refresh creates a new fork or performs a deliberate application-specific import. Code returns through reviewed Git changes. Data returns only through an explicit migration, export/import or application operation; there is no automatic database merge. Task completion can discard the fork without deleting the core or its published baseline.
+Later changes in the core do not silently appear in an existing fork. Refresh creates a new fork or performs a deliberate application-specific import. Code returns through reviewed LayerFS branch integration. An optional GitHub connection exports accepted main revisions and uses a specialized Git environment for external conflicts; see [GitHub sync](GITHUB-SYNC.md). Data returns only through an explicit migration, export/import or application operation; there is no automatic database merge. Task completion can discard the fork without deleting the core or its published baseline.
 
 ## Cloudflare as the first recipe
 
@@ -50,7 +50,7 @@ Keep authoritative core data on storage with a qualified persistence and backup 
 
 ## Existing local proof
 
-An earlier executable experiment exists in the adjacent research checkout at `~/Workspace/engine-box/experiments/cloudflare-data-fork/`. Its [README](../../engine-box/experiments/cloudflare-data-fork/README.md), [probe](../../engine-box/experiments/cloudflare-data-fork/probe.py) and [recorded result](../../engine-box/docs/research/2026-10-18-cloudflare-fork/local-result.json) are local research references, not files shipped by this repository.
+An earlier executable experiment (not shipped in this repository) tested local Wrangler data forks.
 
 On October 18, 2026, all 15 checks passed on macOS ARM64 with Wrangler 4.151.1, Miniflare 5.20261012.1-beta and workerd 1.20261012.1. The probe started two connected Workers per environment, stopped the parent before an ordinary full-directory copy, then ran the parent and two forks concurrently. Local D1, KV, R2, SQLite Durable Object data and the auxiliary Worker's D1 inherited the seed, diverged independently and survived a Wrangler restart. The saved checkpoint remained byte-identical. A separate native DuckDB file was also tested historically; it is not part of this recipe.
 

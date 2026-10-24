@@ -157,6 +157,12 @@ fn main() -> Result<()> {
         Path::new("LICENSE-APACHE-2.0"),
         false,
     )?;
+    add_file(
+        &mut builder,
+        &args.license.with_file_name("LICENSE-SUSTAINABLE-USE-1.0"),
+        Path::new("LICENSE-SUSTAINABLE-USE-1.0"),
+        false,
+    )?;
     if let Some(dashboard) = &args.dashboard {
         add_tree(
             &mut builder,

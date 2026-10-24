@@ -1,6 +1,7 @@
+import { fixtureOrigin } from "./urls";
 import { test, expect, type Page } from "@playwright/test";
 
-const fixture = `http://127.0.0.1:${process.env.ENGINEBOX_E2E_FIXTURE_PORT ?? "18765"}`;
+const fixture = `${fixtureOrigin}`;
 async function signIn(page: Page) {
   await page.goto("/");
   await page.getByLabel("Operator password").fill("fixture-dashboard-password");

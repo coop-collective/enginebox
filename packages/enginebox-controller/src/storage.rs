@@ -1,5 +1,6 @@
 //! Controller-owned registrations and bounded node-local checkout operations.
 //! Paths and executables come from the private administrator registry, never HTTP/MCP.
+use crate::environment::DevService;
 use anyhow::{Context, Result, ensure};
 use enginebox_core::{Fleet, Host, state, transport::host_run};
 use serde::Deserialize;
@@ -12,6 +13,12 @@ struct Registry {
     schema_version: u32,
     nodes: Vec<Node>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevServices {
+    schema_version: u32,
+    hosts: std::collections::BTreeMap<String, DevService>,
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Node {
@@ -19,6 +26,10 @@ struct Node {
     executable: String,
     config: String,
     projects: Vec<Project>,
+    #[serde(default)]
+    github_token_file: Option<String>,
+    #[serde(default)]
+    dev_service: Option<DevService>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,12 +38,14 @@ struct Project {
     repository: String,
 }
 
-type Runner = Arc<dyn Fn(&Host, &[String], Duration) -> Result<Value> + Send + Sync>;
+type Runner = Arc<dyn Fn(&Host, &[String], Option<&[u8]>, Duration) -> Result<Value> + Send + Sync>;
+type Credential = Arc<dyn Fn(&str, Option<&str>, bool) -> Result<Value> + Send + Sync>;
 #[derive(Clone)]
 pub struct Storage {
     registry: Registry,
     fleet: Fleet,
     runner: Runner,
+    credential: Option<Credential>,
 }
 pub struct Plan {
     host: Host,
@@ -41,10 +54,16 @@ pub struct Plan {
     argv: Vec<String>,
     timeout: Duration,
     runner: Runner,
+    credential: Option<Credential>,
     action: Action,
+    dev_service: Option<DevService>,
 }
 enum Action {
     Node,
+    Dev {
+        service: DevService,
+        start: bool,
+    },
     Compatibility,
     Prepare {
         fleet: Fleet,
@@ -57,10 +76,46 @@ enum Action {
 }
 impl Plan {
     pub fn execute(self) -> Result<Value> {
-        let result = if let Action::Allocation { fleet } = &self.action {
+        let result = if let Action::Dev { service, start } = &self.action {
+            service.request(&self.host.id, &self.name, *start, *start)?
+        } else if let Action::Allocation { fleet } = &self.action {
             enginebox_core::preparation::inspect(fleet, &self.host.id, &self.name)?
         } else {
-            (self.runner)(&self.host, &self.argv, self.timeout)?
+            let mut argv = self.argv.clone();
+            let credential = if let Some(provider) = &self.credential {
+                let (repository, branch, write) = if self.operation == "storage_github-preview" {
+                    let repo = argv
+                        .windows(2)
+                        .find(|p| p[0] == "--repository")
+                        .context("Missing repository")?[1]
+                        .clone();
+                    let branch = argv
+                        .windows(2)
+                        .find(|p| p[0] == "--branch")
+                        .map(|p| p[1].clone());
+                    (repo, branch, false)
+                } else {
+                    // The node's retained project binding selects credentials, never a browser-supplied repository on export.
+                    let mut inspect = argv[..10].to_vec();
+                    inspect.extend(["github-settings".into(), self.name.clone()]);
+                    let binding =
+                        (self.runner)(&self.host, &inspect, None, Duration::from_secs(60))?;
+                    (
+                        text(&binding, "repository")?.to_owned(),
+                        Some(text(&binding, "branch")?.to_owned()),
+                        true,
+                    )
+                };
+                let value = provider(&repository, branch.as_deref(), write)?;
+                if !write && branch.is_none() {
+                    argv.extend(["--branch".into(), text(&value, "branch")?.to_owned()]);
+                }
+                argv.push("--token-stdin".into());
+                Some(serde_json::to_vec(&value)?)
+            } else {
+                None
+            };
+            (self.runner)(&self.host, &argv, credential.as_deref(), self.timeout)?
         };
         ensure!(
             result.is_object(),
@@ -71,7 +126,7 @@ impl Plan {
             serde_json::to_vec(&result)?.len() <= 3 * 1024 * 1024,
             "Storage result exceeds the controller limit; inspect it directly on the node"
         );
-        let result = match self.action {
+        let mut result = match self.action {
             Action::Compatibility => {
                 require_storage_protocol(&result)?;
                 result
@@ -86,6 +141,18 @@ impl Plan {
             }
             _ => result,
         };
+        if matches!(
+            self.operation.as_str(),
+            "storage_github-import" | "storage_import"
+        ) {
+            // Import remains committed when optional dev preparation is unavailable.
+            // The same idempotent project endpoint is used by explicit MCP retries.
+            result["dev"] = match self.dev_service {
+                Some(service) => service.request(&self.host.id, &self.name, true, false)
+                    .unwrap_or_else(|_| json!({"status":"unavailable","error":"Development setup could not be queued; use dev-start to retry."})),
+                None => json!({"status":"not-configured"}),
+            };
+        }
         ensure!(
             serde_json::to_vec(&result)?.len() <= 3 * 1024 * 1024,
             "Storage result exceeds the controller limit; inspect it directly on the node"
@@ -171,7 +238,7 @@ impl Storage {
         let directory = root.join("storage");
         state::private_dir(&directory)?;
         let path = directory.join("config.json");
-        let registry: Registry = if path.try_exists()? {
+        let mut registry: Registry = if path.try_exists()? {
             serde_json::from_value(state::read_json(&path)?)?
         } else {
             Registry {
@@ -183,12 +250,40 @@ impl Storage {
             registry.schema_version == 1 && registry.nodes.len() <= 256,
             "Invalid storage registry schema or node count"
         );
+        // Keep optional wiring in a separate file so compatible prior controller
+        // releases can still read the original storage registry during rollback.
+        let dev_path = directory.join("dev-services.json");
+        if dev_path.try_exists()? {
+            let services: DevServices = serde_json::from_value(state::read_json(&dev_path)?)?;
+            ensure!(
+                services.schema_version == 1 && services.hosts.len() <= 256,
+                "Invalid development service registry"
+            );
+            for (host, service) in services.hosts {
+                let node = registry
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.host_id == host)
+                    .context("Development service names an unknown storage host")?;
+                ensure!(
+                    node.dev_service.is_none(),
+                    "Duplicate development service binding"
+                );
+                node.dev_service = Some(service);
+            }
+        }
         let mut nodes = BTreeSet::new();
         for node in &registry.nodes {
             fleet.host(&node.host_id)?;
             ensure!(nodes.insert(&node.host_id), "Duplicate storage node");
             node_path(&node.executable)?;
             node_path(&node.config)?;
+            if let Some(path) = &node.github_token_file {
+                node_path(path)?;
+            }
+            if let Some(service) = &node.dev_service {
+                service.validate()?;
+            }
             ensure!(
                 node.projects.len() <= 1024,
                 "Too many registered storage projects"
@@ -203,15 +298,24 @@ impl Storage {
         Ok(Self {
             registry,
             fleet,
-            runner: Arc::new(|host, argv, timeout| {
+            credential: None,
+            runner: Arc::new(|host, argv, input, timeout| {
                 Ok(serde_json::from_slice(&host_run(
-                    host, argv, None, timeout,
+                    host, argv, input, timeout,
                 )?)?)
             }),
         })
     }
+    pub fn with_github(mut self, github: enginebox_github::GitHub) -> Self {
+        if github.configured() {
+            self.credential = Some(Arc::new(move |repo, branch, write| {
+                github.transfer_credential(repo, branch, write)
+            }));
+        }
+        self
+    }
     pub fn catalog(&self) -> Value {
-        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
+        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","github":{"enabled":true,"private_auth_configured":node.github_token_file.is_some() || self.credential.is_some(),"oauth":self.credential.is_some()},"projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["dev-start","dev-status","github-settings","github-promote","github-delivery","github-preview","github-import","github-fork","compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
     }
     pub fn plan(&self, host_id: &str, operation: &str, body: &Value) -> Result<Plan> {
         let node = self
@@ -238,6 +342,146 @@ impl Storage {
         let name;
         let mut action = Action::Node;
         let timeout = match operation {
+            "dev-start" | "dev-status" => {
+                fields(body, &["project"], &["project"])?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                name = project.to_owned();
+                action = Action::Dev {
+                    service: node
+                        .dev_service
+                        .clone()
+                        .context("Development service is not configured on this storage host")?,
+                    start: operation == "dev-start",
+                };
+                15
+            }
+            "github-settings" | "github-promote" | "github-delivery" => {
+                let (allowed, required): (&[&str], &[&str]) = match operation {
+                    "github-settings" => (&["project", "enabled"], &["project"]),
+                    "github-promote" => (
+                        &["project", "name", "expected_main", "merge", "message"],
+                        &["project", "name", "expected_main"],
+                    ),
+                    _ => (&["project", "action", "attempt"], &["project", "action"]),
+                };
+                fields(body, allowed, required)?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                name = project.to_owned();
+                argv.extend([operation.into(), project.into()]);
+                if operation == "github-settings" {
+                    if let Some(enabled) = body.get("enabled") {
+                        argv.extend([
+                            "--enabled".into(),
+                            enabled
+                                .as_bool()
+                                .context("enabled must be boolean")?
+                                .to_string(),
+                        ]);
+                    }
+                } else if operation == "github-promote" {
+                    let workspace = text(body, "name")?;
+                    identifier(workspace)?;
+                    let expected = text(body, "expected_main")?;
+                    hex(expected, &[64])?;
+                    argv.extend([workspace.into(), "--expected-main".into(), expected.into()]);
+                    if let Some(merge) = body.get("merge")
+                        && merge.as_bool().context("merge must be boolean")?
+                    {
+                        argv.push("--merge".into());
+                    }
+                    if body.get("message").is_some() {
+                        let message = text(body, "message")?;
+                        ensure!(
+                            message.len() <= 4096 && !message.contains('\0'),
+                            "Invalid promotion message"
+                        );
+                        argv.extend(["--message".into(), message.into()]);
+                    }
+                } else {
+                    let action = text(body, "action")?;
+                    ensure!(
+                        ["export", "deliver", "resolve", "retry", "agent-task"].contains(&action),
+                        "Unsupported sync action"
+                    );
+                    argv.extend(["--action".into(), action.into()]);
+                    if action != "export" {
+                        let attempt = text(body, "attempt")?;
+                        identifier(attempt)?;
+                        argv.extend(["--attempt".into(), attempt.into()]);
+                    } else {
+                        ensure!(
+                            body.get("attempt").is_none(),
+                            "Export selects the accepted main revision"
+                        );
+                    }
+                }
+                if operation != "github-settings"
+                    && self.credential.is_none()
+                    && let Some(path) = &node.github_token_file
+                {
+                    argv.extend(["--token-file".into(), path.clone()]);
+                }
+                1800
+            }
+            "github-preview" => {
+                fields(
+                    body,
+                    &["project", "repository", "branch"],
+                    &["project", "repository"],
+                )?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                let repository =
+                    enginebox_storage_layerfs::github::repository(text(body, "repository")?)?;
+                name = project.to_owned();
+                argv.extend([
+                    operation.into(),
+                    project.into(),
+                    "--repository".into(),
+                    repository,
+                ]);
+                if body.get("branch").is_some() {
+                    let branch = text(body, "branch")?;
+                    enginebox_storage_layerfs::github::branch(branch)?;
+                    argv.extend(["--branch".into(), branch.into()]);
+                }
+                if self.credential.is_none()
+                    && let Some(path) = &node.github_token_file
+                {
+                    argv.extend(["--token-file".into(), path.clone()]);
+                }
+                780
+            }
+            "github-import" => {
+                fields(
+                    body,
+                    &["project", "revision", "approval", "credential_free"],
+                    &["project", "revision", "approval", "credential_free"],
+                )?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                let revision = text(body, "revision")?;
+                let approval = text(body, "approval")?;
+                hex(revision, &[40, 64])?;
+                hex(approval, &[64])?;
+                ensure!(
+                    body["credential_free"] == true,
+                    "Explicit credential-free source approval required"
+                );
+                name = project.to_owned();
+                argv.extend([
+                    operation.into(),
+                    project.into(),
+                    "--revision".into(),
+                    revision.into(),
+                    "--approval".into(),
+                    approval.into(),
+                    "--credential-free".into(),
+                ]);
+                900
+            }
             "compatibility" | "prepare" => {
                 argv.truncate(6);
                 argv.push("node-protocol".into());
@@ -343,16 +587,17 @@ impl Storage {
                 ]);
                 if operation == "import" { 900 } else { 300 }
             }
-            "fork" => {
+            "fork" | "github-fork" => {
                 fields(body, &["project", "name", "from"], &["project", "name"])?;
                 let project = text(body, "project")?;
                 ensure!(
-                    node.projects.iter().any(|p| p.id == project),
+                    operation == "github-fork" || node.projects.iter().any(|p| p.id == project),
                     "Unknown registered storage project"
                 );
+                identifier(project)?;
                 name = text(body, "name")?.to_owned();
                 identifier(&name)?;
-                argv.extend(["fork".into(), project.into(), name.clone()]);
+                argv.extend([operation.into(), project.into(), name.clone()]);
                 if body.get("from").is_some() {
                     let from = text(body, "from")?;
                     identifier(from)?;
@@ -392,7 +637,16 @@ impl Storage {
             argv,
             timeout: Duration::from_secs(timeout),
             runner: self.runner.clone(),
+            credential: if matches!(
+                operation,
+                "github-preview" | "github-promote" | "github-delivery"
+            ) {
+                self.credential.clone()
+            } else {
+                None
+            },
             action,
+            dev_service: node.dev_service.clone(),
         })
     }
     #[cfg(test)]
@@ -405,6 +659,62 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oauth_transfers_use_private_stdin_and_the_nodes_retained_binding() {
+        let (_root, mut storage) = configured();
+        storage.credential = Some(Arc::new(|repo, branch, write| {
+            assert_eq!(repo, "owner/private");
+            assert!(branch.is_none() || branch == Some("main"));
+            Ok(
+                json!({"schema":1,"repository":repo,"branch":"main","token":"fixture-private-token","write":write}),
+            )
+        }));
+        storage.runner = Arc::new(|_, argv, input, _| {
+            assert!(!argv.join(" ").contains("fixture-private-token"));
+            assert!(!argv.iter().any(|arg| arg == "--token-file"));
+            if argv.contains(&"github-settings".into()) {
+                assert!(input.is_none());
+                return Ok(json!({"repository":"owner/private","branch":"main"}));
+            }
+            assert!(argv.contains(&"--token-stdin".into()));
+            let credential: Value = serde_json::from_slice(input.unwrap()).unwrap();
+            assert_eq!(credential["token"], "fixture-private-token");
+            if argv.contains(&"github-preview".into()) {
+                assert!(argv.windows(2).any(|p| p == ["--branch", "main"]));
+                assert_eq!(credential["write"], false);
+            } else {
+                assert_eq!(credential["write"], true);
+            }
+            Ok(json!({"ok":true}))
+        });
+        for (op, body) in [
+            (
+                "github-preview",
+                json!({"project":"app","repository":"owner/private"}),
+            ),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"export"}),
+            ),
+        ] {
+            let result = storage.plan("node", op, &body).unwrap().execute().unwrap();
+            assert!(!result.to_string().contains("fixture-private-token"));
+        }
+        storage.credential = Some(Arc::new(|_, _, _| anyhow::bail!("Access revoked")));
+        storage.runner = Arc::new(|_, _, _, _| panic!("Revoked access must not reach a transfer"));
+        assert!(
+            storage
+                .plan(
+                    "node",
+                    "github-preview",
+                    &json!({"project":"app","repository":"owner/private"})
+                )
+                .unwrap()
+                .execute()
+                .is_err()
+        );
+    }
+
     fn configured() -> (tempfile::TempDir, Storage) {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
@@ -428,6 +738,159 @@ mod tests {
         state::write_json(&state_root.join("storage/config.json"),&json!({"schema_version":1,"nodes":[{"host_id":"node","executable":"/opt/enginebox/current/bin/ebox","config":"/etc/enginebox/layerfs.json","projects":[{"id":"game","repository":"/srv/repositories/game"}]}]})).unwrap();
         let storage = Storage::open(&state_root, fleet).unwrap();
         (root, storage)
+    }
+    #[test]
+    fn github_import_queues_the_same_dev_project_endpoint_used_by_mcp() {
+        use std::io::{BufRead, Read, Write};
+        let (root, mut storage) = configured();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let token_file = root.path().join("dev-token");
+        std::fs::write(&token_file, "t".repeat(32)).unwrap();
+        storage.registry.nodes[0].dev_service =
+            Some(serde_json::from_value(json!({"url":url,"token_file":token_file})).unwrap());
+        storage = storage.with_runner(Arc::new(|_, _, _, _| {
+            Ok(json!({"ok":true,"imported":true}))
+        }));
+        let server = std::thread::spawn(move || {
+            for retry in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                assert!(first.starts_with("POST /v1/environments/projects "));
+                let mut length = 0;
+                let mut authorized = false;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if lower.trim() == format!("authorization: bearer {}", "t".repeat(32)) {
+                        authorized = true;
+                    }
+                }
+                assert!(authorized);
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    json!({"host":"node","project":"app","retry":retry})
+                );
+                let body = json!({"host":"node","project":"app","status":"queued"}).to_string();
+                write!(stream, "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let result = storage.plan("node", "github-import", &json!({"project":"app","revision":"a".repeat(40),"approval":"b".repeat(64),"credential_free":true})).unwrap().execute().unwrap();
+        assert_eq!(result["result"]["dev"]["status"], "queued");
+        let result = storage
+            .plan("node", "dev-start", &json!({"project":"app"}))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(result["result"]["status"], "queued");
+        server.join().unwrap();
+        let result = storage.plan("node", "github-import", &json!({"project":"app","revision":"a".repeat(40),"approval":"b".repeat(64),"credential_free":true})).unwrap().execute().unwrap();
+        assert_eq!(result["result"]["imported"], true);
+        assert_eq!(result["result"]["dev"]["status"], "unavailable");
+        assert!(!result.to_string().contains(&"t".repeat(32)));
+        assert!(
+            storage
+                .plan(
+                    "node",
+                    "dev-start",
+                    &json!({"project":"app","command":"host shell"})
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn optional_dev_bindings_are_private_and_do_not_change_the_legacy_registry() {
+        let (root, storage) = configured();
+        assert!(
+            storage
+                .plan("node", "dev-status", &json!({"project":"app"}))
+                .is_err()
+        );
+        let directory = root.path().join("state/storage");
+        let original = std::fs::read(directory.join("config.json")).unwrap();
+        let service =
+            json!({"url":"http://127.0.0.1:18790/","token_file":root.path().join("private-token")});
+        state::write_json(
+            &directory.join("dev-services.json"),
+            &json!({"schema_version":1,"hosts":{"node":service}}),
+        )
+        .unwrap();
+        let configured = Storage::open(&root.path().join("state"), storage.fleet.clone()).unwrap();
+        assert!(
+            configured
+                .plan("node", "dev-status", &json!({"project":"app"}))
+                .is_ok()
+        );
+        assert_eq!(
+            std::fs::read(directory.join("config.json")).unwrap(),
+            original
+        );
+        assert!(!configured.catalog().to_string().contains("private-token"));
+        state::write_json(
+            &directory.join("dev-services.json"),
+            &json!({"schema_version":1,"hosts":{"unknown":service}}),
+        )
+        .unwrap();
+        assert!(Storage::open(&root.path().join("state"), storage.fleet).is_err());
+    }
+    #[test]
+    fn github_requests_are_bound_to_node_credentials_and_exact_main_revisions() {
+        let (_root, storage) = configured();
+        let plan=storage.plan("node","github-preview",&json!({"project":"app","repository":"https://github.com/Owner/Repo.git","branch":"feature/new"})).unwrap();
+        assert!(
+            plan.argv
+                .windows(2)
+                .any(|v| v == ["--repository", "owner/repo"])
+        );
+        assert!(!plan.argv.iter().any(|s| s == "--token-file"));
+        assert!(storage.plan("node","github-promote",&json!({"project":"app","name":"agent","expected_main":"a".repeat(64),"merge":true})).is_ok());
+        for (op, body) in [
+            (
+                "github-preview",
+                json!({"project":"app","repository":"https://token@github.com/a/b"}),
+            ),
+            (
+                "github-preview",
+                json!({"project":"app","repository":"a/b","token_file":"/private/token"}),
+            ),
+            (
+                "github-import",
+                json!({"project":"app","revision":"HEAD","approval":"a".repeat(64),"credential_free":true}),
+            ),
+            (
+                "github-promote",
+                json!({"project":"app","name":"agent","expected_main":"main"}),
+            ),
+            ("github-settings", json!({"project":"app","enabled":"true"})),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"resolve","attempt":"../other"}),
+            ),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"push","attempt":"sync-a"}),
+            ),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"export","attempt":"sync-a"}),
+            ),
+        ] {
+            assert!(storage.plan("node", op, &body).is_err(), "{op}: {body}");
+        }
     }
     #[test]
     fn registry_controls_paths_and_import_requires_exact_reviewed_commit() {
@@ -478,7 +941,7 @@ mod tests {
     #[test]
     fn node_failure_is_not_reported_as_success() {
         let (_root, storage) = configured();
-        let storage = storage.with_runner(Arc::new(|_, _, _| Ok(json!({"ok":false}))));
+        let storage = storage.with_runner(Arc::new(|_, _, _, _| Ok(json!({"ok":false}))));
         assert!(
             storage
                 .plan("node", "deps", &json!({"name":"worker"}))
@@ -490,7 +953,7 @@ mod tests {
     #[test]
     fn oversized_storage_results_cannot_poison_durable_job_records() {
         let (_root, storage) = configured();
-        let storage = storage.with_runner(Arc::new(|_, _, _| {
+        let storage = storage.with_runner(Arc::new(|_, _, _, _| {
             Ok(json!({"files":["a".repeat(3 * 1024 * 1024)]}))
         }));
         let error = storage
@@ -517,7 +980,7 @@ mod tests {
         }
         let plan = storage.plan("node", "prepare", &request).unwrap();
         assert_eq!(&plan.argv[4..], &["--host", "local", "node-protocol"]);
-        let incompatible = storage.with_runner(Arc::new(|_, _, _| {
+        let incompatible = storage.with_runner(Arc::new(|_, _, _, _| {
             Ok(json!({"version":"0.3.0","protocol":1}))
         }));
         assert!(
@@ -550,7 +1013,7 @@ mod tests {
             bad["layerfs"] = replacement;
             assert!(require_storage_protocol(&bad).is_err());
         }
-        let storage = storage.with_runner(Arc::new(move |_, _, _| Ok(valid.clone())));
+        let storage = storage.with_runner(Arc::new(move |_, _, _, _| Ok(valid.clone())));
         assert!(
             storage
                 .plan("node", "compatibility", &json!({}))

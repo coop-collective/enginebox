@@ -8,13 +8,17 @@ let mode,
   jobs,
   instances,
   templates,
+  ciTemplates,
   authSessions,
   connectedAccounts,
   syncProgress,
   retried,
   storageRows,
   storageRequests,
-  storageImported;
+  storageImported,
+  githubProjects,
+  githubConnections,
+  githubReviews;
 function manifest(id = "native", revision = 1) {
   return {
     schema_version: 1,
@@ -53,6 +57,9 @@ function reset() {
   syncProgress = new Map();
   retried = new Set();
   storageRequests = [];
+  githubProjects = [];
+  githubConnections = new Map();
+  githubReviews = new Map();
   storageImported = new Set(["game"]);
   storageRows = [
     { name: "prepared", project: "game", status: "ready", last_checkpoint: { status: "Committed", head: "fixture-head" } },
@@ -71,6 +78,7 @@ function reset() {
   });
   native.sync.nodes[0].status = "ready";
   templates = [native];
+  ciTemplates = [];
   instances = [
     {
       name: "ebox-editor",
@@ -109,6 +117,12 @@ function poolMode() {
 function hasMetadata() {
   return poolMode() || mode === "typed" || mode === "catalog";
 }
+let environmentRoutes = [];
+const environmentCatalog = () => ({
+  projects: [{ id: 'p-demo', host: 'metal-01', project: 'demo', status: 'ready', healthy: true, urls: ['https://demo.dev.example.com'] }, { id: 'p-failed', host: 'metal-01', project: 'failed-app', status: 'failed', healthy: false, error: 'setup-failed', urls: [] }],
+  baseDomains: ['dev.example.com'], transportEntrypoints: [{ name: 'game-udp', protocol: 'udp', port: 21000, public: false }], routes: environmentRoutes,
+  environments: [{ id: 'main', source: { kind: 'git', branch: 'main' }, services: [{ name: 'web', protocol: 'http' }, { name: 'game', protocol: 'udp' }], status: 'ready', healthy: true, revision: 'a'.repeat(40), desiredRevision: 'a'.repeat(40), cpu: 1, memoryMiB: 256 }],
+});
 reset();
 createServer(async (req, res) => {
   function send(status, body) {
@@ -121,6 +135,7 @@ createServer(async (req, res) => {
   if (req.url === "/healthz") return send(200, { ok: true });
   if (req.url === "/__test/reset") {
     reset();
+    environmentRoutes = [];
     return send(200, { ok: true });
   }
   if (req.url === "/__test/storage-requests") return send(200, storageRequests);
@@ -160,11 +175,43 @@ createServer(async (req, res) => {
   }
   if (req.headers.authorization !== `Bearer ${token}`)
     return send(401, { error: "Wrong backend token" });
+  if (req.url === "/v1/ci/templates") {
+    if (req.method === "POST") {
+      ciTemplates = ciTemplates.filter((item) => item.manifest.id !== data.manifest.id);
+      ciTemplates.push({ manifest: data.manifest, enabled: false, nodes: [{ node_id: "ci-linux", status: "disabled", verified_at: null, error: null }] });
+    }
+    for (const recipe of ciTemplates) for (const node of recipe.nodes) {
+      if (node.status === "installing" && Date.now() > node.finish) {
+        node.status = node.retried ? "ready" : "failed";
+        node.error = node.retried ? null : "verification-failed";
+        node.verified_at = node.retried ? Math.floor(Date.now() / 1000) : null;
+      }
+    }
+    return send(200, { schema_version: 1, templates: ciTemplates });
+  }
+  const ciAction = req.url.match(/^\/v1\/ci\/templates\/([^/]+)\/(enable|disable|retry)$/);
+  if (ciAction && req.method === "POST") {
+    const recipe = ciTemplates.find((item) => item.manifest.id === ciAction[1]);
+    if (!recipe) return send(400, { error: "Unknown CI template" });
+    if (ciAction[2] !== "retry") recipe.enabled = ciAction[2] === "enable";
+    for (const node of recipe.nodes) {
+      node.status = recipe.enabled ? "installing" : "disabled";
+      node.error = null; node.verified_at = null; node.finish = Date.now() + 250;
+      if (ciAction[2] === "retry") node.retried = true;
+    }
+    return send(200, { schema_version: 1, templates: ciTemplates });
+  }
+  if (req.url === '/v1/environments' && req.method === 'GET') return send(200, environmentCatalog());
+  if (req.url === '/v1/environments/routes' && req.method === 'POST') {
+    environmentRoutes = environmentRoutes.filter(r => r.id !== (data.remove ?? data.id));
+    if (!data.remove) environmentRoutes.push(data);
+    return send(200, environmentCatalog());
+  }
   if (req.url === "/v1/storage" && req.method === "GET") {
     if (mode === "storage-error") return send(503, { error: "Storage catalog unavailable." });
-    return send(200, { backend: "layerfs", configured: mode !== "storage-empty", nodes: mode === "storage-empty" ? [] : [{ host_id: "metal-01", status: "registered", projects: [{ id: "game" }, { id: "demo" }] }], incus_attachment: false, automatic_replay: false });
+    return send(200, { backend: "layerfs", configured: mode !== "storage-empty", nodes: mode === "storage-empty" ? [] : [{ host_id: "metal-01", status: "registered", github: { enabled: true, private_auth_configured: false }, projects: [{ id: "game" }, { id: "demo" }] }], incus_attachment: false, automatic_replay: false });
   }
-  const storage = req.url.match(/^\/v1\/storage\/hosts\/metal-01\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover)$/);
+  const storage = req.url.match(/^\/v1\/storage\/hosts\/metal-01\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover|github-preview|github-import|github-settings|github-fork|github-promote|github-delivery|dev-start|dev-status)$/);
   if (storage && req.method === "POST") {
     storageRequests.push({ operation: storage[1], body: data });
     const id = `storage-${jobs.size + 1}`;
@@ -183,7 +230,40 @@ createServer(async (req, res) => {
       const row = storageRows.find((row) => row.name === input.name);
       let result = { ok: true };
       job.status = "succeeded";
-      if (operation === "list") result = { workspaces: structuredClone(storageRows) };
+      if (operation === "list") result = { workspaces: structuredClone(storageRows), github_projects: structuredClone(githubProjects) };
+      else if (operation === "github-preview") {
+        if (mode === "github-fetch-failed") { job.status = "failed"; job.error = "GitHub transfer failed; check repository access."; }
+        else { githubReviews.set(input.project, input); result = { commit: "c".repeat(40), approval: "d".repeat(64), files: ["README.md", "src/main.ts"], bytes: 2000 }; }
+      } else if (operation === "github-import") {
+        if (input.revision !== "c".repeat(40) || input.approval !== "d".repeat(64) || input.credential_free !== true || !githubReviews.has(input.project)) { job.status = "failed"; job.error = "Exact source review required."; }
+        else {
+          result.dev = { status: "queued" };
+          const reviewed = githubReviews.get(input.project);
+          githubProjects.push({ id: input.project, repository: reviewed.repository, branch: reviewed.branch || "main", current: { project: "gh-fixture", commit: input.revision } });
+          githubConnections.set(input.project, { main: { revision: "e".repeat(64), sequence: 0 }, sync: { enabled: false, active: null } });
+        }
+      } else if (operation === "dev-start" || operation === "dev-status") {
+        result = { host: 'metal-01', project: input.project, status: operation === 'dev-start' ? 'queued' : 'ready', urls: operation === 'dev-status' ? ['https://demo.dev.example.com'] : [] };
+      } else if (operation === "github-settings") {
+        const connection = githubConnections.get(input.project);
+        if (!connection) { job.status = "failed"; job.error = "Unknown GitHub project."; }
+        else { if (typeof input.enabled === "boolean") connection.sync.enabled = input.enabled; result = structuredClone(connection); }
+      } else if (operation === "github-fork") {
+        storageRows.push({ name: input.name, project: "gh-fixture", github_project: input.project, status: "ready" });
+      } else if (operation === "github-promote") {
+        const connection = githubConnections.get(input.project);
+        if (!connection || input.expected_main !== connection.main.revision || row?.status !== "closed" || !row.last_checkpoint) { job.status = "failed"; job.error = "Main changed or the branch is not closed and checkpointed."; }
+        else {
+          connection.main = { revision: "f".repeat(64), sequence: 1 };
+          if (connection.sync.enabled) connection.sync.active = { id: "sync-fixture", status: "needs_agent", conflicts: ["src/main.ts"] };
+          result = { publication: structuredClone(connection.main), sync: structuredClone(connection.sync) };
+        }
+      } else if (operation === "github-delivery") {
+        const connection = githubConnections.get(input.project);
+        if (input.action === "agent-task") result = { kind: "github-reconciliation", attempt: input.attempt, environment: { kind: "docker", container: "ebox-sync-fixture", workdir: "/workspace", push_credentials: false } };
+        else if (input.action === "resolve") { connection.sync.active.status = "delivered"; connection.sync.active.conflicts = []; }
+        else if (input.action === "retry") connection.sync.active.status = "needs_agent";
+      }
       else if (operation === "preview") result = { commit: "a".repeat(40), approval: "b".repeat(64), files: ["package.json", "src/main.ts"], bytes: 5242 };
       else if (operation === "import") {
         if (input.revision !== "a".repeat(40) || input.approval !== "b".repeat(64) || input.credential_free !== true || storageImported.has(input.project)) {
@@ -632,6 +712,6 @@ createServer(async (req, res) => {
     });
   }
   send(404, { error: "Not found" });
-}).listen(Number(process.env.ENGINEBOX_E2E_FIXTURE_PORT ?? 18765), "127.0.0.1", () =>
+}).listen(Number(process.env.ENGINEBOX_TEST_FLEET_PORT ?? process.env.EBOX_TEST_FLEET_PORT ?? "18765"), "127.0.0.1", () =>
   process.stdout.write("Test fleet API listening on loopback.\n"),
 );

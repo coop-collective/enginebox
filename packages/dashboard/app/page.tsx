@@ -9,11 +9,14 @@ import type {
   Job,
   Resources,
 } from "@/lib/types";
-import { api, RequestError } from "@/lib/client";
+import { api, errorMessage, RequestError } from "@/lib/client";
+import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
 import { GitHubPanel } from "@/components/github-panel";
+import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
+import { EnvironmentsPanel } from "@/components/environments-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -28,6 +31,11 @@ const bytes = (value?: number) =>
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
   github: { title: "GitHub", description: "Connect repositories and run GitHub Actions on your infrastructure.", icon: "terminal" },
+  environments: {
+    title: "Environments",
+    description: "Run persistent development services and manage their endpoints.",
+    icon: "server",
+  },
   fleet: {
     title: "Fleet overview",
     description: "Manage your machines and give every workspace room to build.",
@@ -684,7 +692,8 @@ export default function Dashboard() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const loading = useRef(false);
   useEffect(() => {
-    if (new URLSearchParams(window.location.search).get("panel") === "github") setSection("github");
+    const panel = new URLSearchParams(window.location.search).get("panel");
+    if (panel === "github" || panel === "storage") setSection(panel);
     api<{ authenticated: boolean }>("/api/session")
       .then((data) => setSession(data.authenticated ? "ready" : "login"))
       .catch((err) => {
@@ -705,20 +714,20 @@ export default function Dashboard() {
         setSession("login");
         setFleet(null);
       }
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       loading.current = false;
       setRefreshing(false);
     }
   }, []);
+  const visible = usePageVisible();
   useEffect(() => {
     if (session !== "ready") return;
     void refresh();
-    const timer = setInterval(refresh, 10_000);
-    return () => clearInterval(timer);
   }, [session, refresh]);
+  useVisibleInterval(refresh, session === "ready" ? 10_000 : null);
   useEffect(() => {
-    if (session !== "ready" || !jobs.some(active)) return;
+    if (session !== "ready" || !visible || !jobs.some(active)) return;
     let cancelled = false;
     const timer = setTimeout(async () => {
       const updates = await Promise.all(
@@ -731,7 +740,7 @@ export default function Dashboard() {
           } catch (err) {
             return {
               ...job,
-              error: `Status unavailable: ${(err as Error).message}`,
+              error: `Status unavailable: ${errorMessage(err)}`,
             };
           }
         }),
@@ -748,7 +757,7 @@ export default function Dashboard() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [jobs, session, refresh]);
+  }, [jobs, session, visible, refresh]);
   async function signIn(event: FormEvent) {
     event.preventDefault();
     setSubmitting(true);
@@ -761,7 +770,7 @@ export default function Dashboard() {
       setPassword("");
       setSession("ready");
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -776,7 +785,7 @@ export default function Dashboard() {
       setSection("fleet");
       setError("");
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     }
   }
   async function queue(
@@ -800,7 +809,7 @@ export default function Dashboard() {
       );
       return true;
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
       return false;
     } finally {
       setPendingInstances((current) => current.filter((key) => key !== target));
@@ -885,7 +894,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates", "storage", "github"] as const)
+          {(["fleet", "agents", "templates", "storage", "environments", "github"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1039,15 +1048,19 @@ export default function Dashboard() {
                 <AgentsPanel close={() => navigate("fleet")} />
               )}
               {section === "templates" && (
+                <>
                 <TemplateCatalog
                   refreshToken={updated?.getTime() ?? 0}
                   registered={refresh}
                   close={() => navigate("fleet")}
                 />
+                <CiTemplates />
+                </>
               )}
               {section === "storage" && (
                 <StoragePanel refreshToken={updated?.getTime() ?? 0} />
               )}
+              {section === "environments" && <EnvironmentsPanel />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

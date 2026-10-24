@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "node24-linux-x64",
+  "label": "Node.js 24.22.1 (linux x64)",
+  "revision": 1,
+  "os": "linux",
+  "architecture": "x64",
+  "image": "node-24.22.1",
+  "capabilities": [
+    "node-24"
+  ],
+  "minimum": {
+    "cpu": 1,
+    "memory_mib": 256,
+    "disk_mib": 512
+  },
+  "shell": "bash",
+  "assets": [
+    {
+      "name": "node-archive",
+      "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.gz",
+      "sha256": "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c",
+      "max_bytes": 134217728
+    }
+  ],
+  "install": "mkdir toolchain\ntar -xzf \"$ENGINEBOX_ASSETS_DIR/node-archive\" -C toolchain --strip-components=1",
+  "verify": [
+    {
+      "capability": "node-24",
+      "run": "./toolchain/bin/node --version",
+      "expected_stdout": "v24.22.1"
+    }
+  ],
+  "paths": [
+    "toolchain/bin"
+  ],
+  "timeout_minutes": 10
+}

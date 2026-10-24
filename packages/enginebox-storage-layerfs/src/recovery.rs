@@ -479,6 +479,7 @@ mod tests {
             status: "ready".into(),
             commit: "e".repeat(40),
             approval: "f".repeat(64),
+            source_only: false,
         };
         let mut w = workspace("exec", Some("exec"));
         w.pending_call = Some("ebox-lfs-call-fixture".into());

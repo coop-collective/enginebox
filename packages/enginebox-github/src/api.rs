@@ -37,6 +37,8 @@ impl Api {
     fn client(&self) -> Result<Client> {
         Ok(Client::builder()
             .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("EngineBox-GitHub/0.3")
             .build()?)

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "linux-builder",
+  "target": "builder@linux-node.example.invalid",
+  "os": "linux",
+  "architecture": "x64",
+  "image": "ubuntu-24.04-cmake",
+  "capabilities": [
+    "cmake"
+  ]
+}

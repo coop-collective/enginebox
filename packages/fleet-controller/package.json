@@ -1,0 +1,23 @@
+{
+  "name": "@enginebox/fleet-controller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "types": "wrangler types",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "@enginebox/fleet-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "wrangler": "4.152.0",
+    "@cloudflare/vitest-plugin": "1.4.7",
+    "vitest": "5.0.5",
+    "typescript": "5.9.3",
+    "@types/node": "24.10.0"
+  }
+}

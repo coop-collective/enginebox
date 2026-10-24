@@ -31,11 +31,32 @@ pub fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 pub fn run_process(argv: &[String], input: Option<&[u8]>, timeout: Duration) -> Result<Vec<u8>> {
+    run_process_environment(argv, input, timeout, None)
+}
+/// Execute with only the supplied environment. Sensitive values stay out of argv
+/// and are never included in diagnostics by this runner.
+pub fn run_isolated_process(
+    argv: &[String],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    environment: &[(&str, &str)],
+) -> Result<Vec<u8>> {
+    run_process_environment(argv, input, timeout, Some(environment))
+}
+fn run_process_environment(
+    argv: &[String],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    environment: Option<&[(&str, &str)]>,
+) -> Result<Vec<u8>> {
     ensure!(
         !argv.is_empty() && argv.iter().all(|v| !v.contains('\0')),
         "Invalid command argv"
     );
     let mut cmd = Command::new(&argv[0]);
+    if let Some(environment) = environment {
+        cmd.env_clear().envs(environment.iter().copied());
+    }
     #[cfg(windows)]
     if std::path::Path::new(&argv[0])
         .file_name()
@@ -50,9 +71,26 @@ pub fn run_process(argv: &[String], input: Option<&[u8]>, timeout: Duration) -> 
     run_command(cmd, input, timeout)
 }
 
-/// Run an explicitly configured child environment with the same output,
-/// process-group and deadline bounds as ordinary transport commands.
-pub fn run_command(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Vec<u8>> {
+/// Run an explicitly configured command with the same bounded I/O and process-tree
+/// cleanup as the SSH transport. Callers may set a private cwd/environment.
+pub fn run_command(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Vec<u8>> {
+    run_command_bounded(cmd, input, timeout, 16 * 1024 * 1024, 64 * 1024)
+}
+
+/// Build tools can emit substantial stderr even on success. Callers still choose
+/// bounded streams; ordinary transport commands retain the stricter defaults.
+pub fn run_command_bounded(
+    mut cmd: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    max_stdout: usize,
+    max_stderr: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        (1..=64 * 1024 * 1024).contains(&max_stdout)
+            && (1..=64 * 1024 * 1024).contains(&max_stderr),
+        "Invalid process output bounds"
+    );
     let deadline = Instant::now() + timeout;
     // A child can stop reading stdin while its descendant retains that handle.
     // An anonymous private file removes the otherwise unbounded writer thread.
@@ -78,11 +116,10 @@ pub fn run_command(mut cmd: Command, input: Option<&[u8]>, timeout: Duration) ->
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_out = cancel.clone();
     let cancel_err = cancel.clone();
-    let out = thread::spawn(move || {
-        read_bounded(stdout, stdout_raw, 16 * 1024 * 1024, deadline, &cancel_out)
-    });
+    let out =
+        thread::spawn(move || read_bounded(stdout, stdout_raw, max_stdout, deadline, &cancel_out));
     let err =
-        thread::spawn(move || read_bounded(stderr, stderr_raw, 64 * 1024, deadline, &cancel_err));
+        thread::spawn(move || read_bounded(stderr, stderr_raw, max_stderr, deadline, &cancel_err));
     // Keep the parent unreaped until its streams finish. If a descendant keeps
     // a pipe open, the original process-group ID cannot be recycled before kill.
     let stdout = out
@@ -215,12 +252,42 @@ fn read_bounded(
     ensure!(!exceeded, "Command output exceeded its bound");
     Ok(result)
 }
-fn kill_tree(child: &mut Child) {
+/// Terminates a child that leads its own process group (`setsid`).
+///
+/// A zero `grace` kills immediately (SIGKILL) and returns without waiting. A
+/// non-zero `grace` sends SIGTERM first, polls for exit up to `grace`, then
+/// kills and reaps the child.
+pub fn kill_process_group(child: &mut Child, grace: Duration) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    let pid = child.id() as i32;
+    #[cfg(unix)]
+    let signal_group = |signal: i32| unsafe {
+        libc::kill(-pid, signal);
+    };
+    if grace.is_zero() {
+        #[cfg(unix)]
+        signal_group(libc::SIGKILL);
+        let _ = child.kill();
+        return;
     }
+    #[cfg(unix)]
+    signal_group(libc::SIGTERM);
+    #[cfg(not(unix))]
     let _ = child.kill();
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    #[cfg(unix)]
+    signal_group(libc::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+fn kill_tree(child: &mut Child) {
+    kill_process_group(child, Duration::ZERO);
 }
 pub fn host_command(host: &Host, argv: &[String]) -> Vec<String> {
     let mut result = vec!["sudo".into(), "-n".into()];

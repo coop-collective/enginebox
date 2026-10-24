@@ -6,6 +6,12 @@ LayerFS is Engine Box's first-class checkout storage backend. The controller own
 
 File storage and VM memory remain distinct. Provider homes and credential delegation keep their existing private lifecycle. Native authenticated sessions on LayerFS mounts and production durability still need separate qualification. Incus attachment and recovery have explicit capability checks; first-class access does not mean every platform or failure mode is supported.
 
+The [game workspace decision](GAME-WORKSPACES.md) keeps this container/LayerFS
+combination as the foundation. It maps checkpointing,
+fork reuse, conflicts and compute leases to the upstream core ideas.
+[Distributed Store generations and local cache eviction](STORE-DISTRIBUTION.md)
+extend this backend; they are not supplied by the current commands.
+
 ## Runtime and installation boundary
 
 The Rust package is `packages/enginebox-storage-layerfs`. Rust owns configuration, import policy, local receipts, leases, admission, Docker resource limits and CLI behavior. An embedded JavaScript bridge calls the same upstream SDK used in qualification; it supplies no inference proxy, agent loop or orchestration. Each SDK operation runs in a short-lived trusted Docker helper. Agent commands run as the upstream sandbox's unprivileged UID 501/GID 20, without the Docker socket or readable backing Store.
@@ -27,7 +33,7 @@ ebox --host local storage layerfs preview --repo /srv/source/my-project --revisi
 
 ## Publish a clean project and run work
 
-Review the preview's file list, exact commit, byte count and `approval` digest. Import takes **only that Git commit and its tree objects**, preserving the original commit ID in a clean shallow repository. It excludes the source checkout's local Git configuration, hooks, credentials, remotes, untracked files, ignored dependencies and earlier history objects. Export attributes cannot omit or rewrite tracked files. Known credential paths, escaping symlink chains and submodules are refused. This path policy is not a general secret scanner: the administrator must review the tracked content and explicitly declare it suitable for reuse. Git LFS hydration, submodules and automatic history fetching are not supported by this first import path.
+Review the preview's file list, exact commit, byte count and `approval` digest. Import materializes **only the reviewed committed files** into LayerFS. Git objects exist only in temporary connector staging; `.git` is removed before the Store is initialized. The original commit ID remains in the provenance receipt. It excludes the source checkout's local Git configuration, hooks, credentials, remotes, untracked files, ignored dependencies and earlier history objects. Export attributes cannot omit or rewrite tracked files. Known credential paths, escaping symlink chains and submodules are refused. This path policy is not a general secret scanner: the administrator must review the tracked content and explicitly declare it suitable for reuse. Git LFS hydration, submodules and automatic history fetching are not supported by this first import path.
 
 ```sh
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
@@ -37,7 +43,7 @@ sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json fork demo worker-a
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json fork demo worker-b
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
-  exec worker-a --timeout 120 -- git status --short
+  exec worker-a --timeout 120 -- ls -la /project
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json \
   checkpoint worker-a --message 'Saved file changes'
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json remount worker-a
@@ -49,13 +55,13 @@ After preparing and checkpointing dependencies, `fork demo worker-c --from worke
 
 Every sandbox gets a separate bind mount at `/project`, pointing to its current LayerFS mount. Remount changes the underlying `/workspaces/N` location but restores the `/project` bind before accepting another command. Workspaces have independent leases: commands in different workspaces may overlap; concurrent operations on the same workspace are refused. Do not launch detached background workloads through this first command interface.
 
-The source checkout's local Git author settings and remotes are deliberately not imported. Configure the desired author identity in your image or workspace before committing. Agent commits retain the imported commit as their normal Git ancestor.
+New workspaces use LayerFS checkpoints and branches, without a native Git checkout. Existing legacy imports containing `.git` are retained as-is and require explicit migration. GitHub import and optional outbound commits are handled by the separate [GitHub connector](GITHUB-SYNC.md).
 
-`close` and `remount` refuse uncheckpointed changes. There is no implicit discard or filesystem branch-merge command. Use Git's own integration semantics for future agent changes; whole-tree LayerFS merging of `.git` metadata is not Git merging. File checkpoints retain the upstream preview's durability and mtime limitations; they are not a backup or power-loss guarantee.
+`close` and `remount` refuse uncheckpointed changes. There is no implicit discard. The `main` and `promote` commands inspect and conditionally advance LayerFS main from a checkpointed, closed workspace; `promote --merge` first merges with current main. GitHub-linked projects use `github-promote` so enabled export is queued. Git reconciliation occurs only in a dedicated sync environment. `exec` does not automatically checkpoint; an orchestrator must explicitly commit at a safe task/command boundary before releasing compute. File checkpoints retain the upstream preview's durability and mtime limitations; they are not a backup or power-loss guarantee.
 
 ## Immutable dependency reuse
 
-Configure both `pnpm_store` and `pnpm_metadata` to existing local Docker volumes containing one published cache generation. Seed that generation separately using pnpm 12.14.0, then stop all writers before readers use it. The backend mounts both volumes read-only and copies metadata to each sandbox's private writable cache.
+Configure both `pnpm_store` and `pnpm_metadata` to existing local Docker volumes containing one published cache generation. Seed that generation separately using pnpm 12.15.0, then stop all writers before readers use it. The backend mounts both volumes read-only and copies metadata to each sandbox's private writable cache.
 
 ```sh
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json deps worker-a
@@ -96,8 +102,8 @@ Closing a workspace deletes its sandbox only after a clean unmount; committed hi
 
 ## Qualification
 
-The opt-in test is [live_backend.rs](../packages/enginebox-storage-layerfs/tests/live_backend.rs). Run it only in a disposable Linux fixture with prepared SDK/image/cache inputs, a fresh private state root and exactly two workspace slots. A disposable VM uses the marker `/etc/enginebox-layerfs-validation`. A separately isolated task-owned daemon can instead use an explicit `ENGINEBOX_LAYERFS_MARKER` path and exact `ENGINEBOX_LAYERFS_MARKER_CONTENT`, as in the [recovery qualification](LAYERFS-RECOVERY-VALIDATION.md); its resource isolation and cleanup must be provisioned beforehand. Existing developer workspaces and production daemon upgrades are not test setup.
+The opt-in test is [live_backend.rs](../packages/enginebox-storage-layerfs/tests/live_backend.rs). Run it only in a disposable Linux fixture with prepared SDK/image/cache inputs, a fresh private state root and exactly two workspace slots. A disposable VM uses the marker `/etc/enginebox-layerfs-validation`. A separately isolated task-owned daemon can instead use an explicit `ENGINEBOX_LAYERFS_MARKER` path and exact `ENGINEBOX_LAYERFS_MARKER_CONTENT`, as in the [recovery qualification](reports/LAYERFS-RECOVERY-VALIDATION.md); its resource isolation and cleanup must be provisioned beforehand. Existing developer workspaces and production daemon upgrades are not test setup.
 
 The test requires `ENGINEBOX_LAYERFS_LIVE=1`, `ENGINEBOX_LAYERFS_LIVE_CONFIG`, `ENGINEBOX_LAYERFS_EBOX`, `ENGINEBOX_LAYERFS_SEED` (synthetic package/lockfile directory), and a fresh `ENGINEBOX_LAYERFS_REPORT` path. Build with the pinned root workspace and run the resulting Linux release test executable with `--exact real_checkout_lifecycle --ignored --nocapture` under an outer timeout. It leaves evidence and any interrupted workspace intact for ownership-checked cleanup after export.
 
-Actual results and remaining limits are recorded in [the backend validation report](LAYERFS-BACKEND-VALIDATION.md). The earlier [LayerFS storage measurements](LAYERFS-VALIDATION.md) and [Rust VM startup benchmarks](RUST-BOOT-BENCHMARKS.md) have different workloads and timing boundaries.
+Actual results and remaining limits are recorded in [the backend validation report](reports/LAYERFS-BACKEND-VALIDATION.md). The earlier [LayerFS storage measurements](reports/LAYERFS-VALIDATION.md) and [Rust VM startup benchmarks](reports/RUST-BOOT-BENCHMARKS.md) have different workloads and timing boundaries.

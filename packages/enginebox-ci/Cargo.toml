@@ -4,16 +4,23 @@ version.workspace = true
 edition.workspace = true
 license-file = "../../LICENSE"
 publish = false
+description = "Optional non-agent CI jobs and native GitHub Actions runners"
 
 [[bin]]
 name = "enginebox-ci-worker"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-enginebox-core = { path = "../enginebox-core" }
 enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
 clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+enginebox-core = { path = "../enginebox-core" }
+anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = "2"
+tempfile = "3"
+fs2 = "0.4"
+sha2 = "0.10"
+sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }

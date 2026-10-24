@@ -2,11 +2,22 @@
 
 Decision recorded 2026-10-19: make [LayerFS checkout storage](LAYERFS-BACKEND.md) a first-class Engine Box capability, available through controller registration, durable jobs and MCP. Keep Incus responsible for compute and VM lifecycle. Storage nodes must satisfy the pinned runtime and capability checks before allocation; the normal feature does not require an experimental opt-in switch. Provider homes remain private.
 
-The [disposable Linux validation](LAYERFS-VALIDATION.md) establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. Its mtime, Git metadata, recovery and topology limits still apply. Making the backend first-class does not turn that evidence into a production durability guarantee.
+Owner decision, October 23: LayerFS is the game workspace/history foundation.
+[Game workspaces](GAME-WORKSPACES.md) maps the
+upstream core ideas to the existing container backend and its remaining gates.
+[Store distribution](STORE-DISTRIBUTION.md) specifies a storage origin, local NVMe
+worker Stores, immutable generation transfer and safe disk-pressure eviction.
+Those distributed services are planned; the local Docker integration already exists.
+
+The [disposable Linux validation](reports/LAYERFS-VALIDATION.md) establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. Its mtime, Git metadata, recovery and topology limits still apply. Making the backend first-class does not turn that evidence into a production durability guarantee.
 
 The upstream [README](https://github.com/Ephemeral-AI-Lab/layerfs) describes independent writable workspaces over a shared store, copy-on-write branches, content-addressed deduplication, chunking and versioned checkpoints. This matches Engine Box's goal of reusing large checkouts and installed dependencies without giving agents a shared writable project directory. Upstream performance examples are their measurements, not Engine Box benchmarks.
 
-As reviewed, the repository announces its first supported 1.0 release for October 21, 2026. Its current SDK and store format are explicitly unstable. The [SDK surface document](https://github.com/Ephemeral-AI-Lab/layerfs/blob/main/sdk.md) also records changes to the Rust API and storage access model. Pin and qualify a released revision before adding a dependency; do not build against a moving main branch.
+The separate October 23 probe qualifies selected v1.0.0 storage operations, while
+the product still pins the earlier preview below. Their SDK/API and Store-format
+boundaries differ. Pin and qualify the complete SDK/daemon/format combination
+before upgrading; do not build against a moving main branch or silently migrate
+existing Stores. [Current platform and format contract](https://layerfs.ai/docs/platform/).
 
 ## Pinned source review, October 19, 2026
 
@@ -82,4 +93,4 @@ The product feature is coordinated environment branching: code, prepared depende
 5. Specify file revision/VM checkpoint ordering and rollback compatibility. Preserve a stopped workspace for inspection on uncertain recovery; never silently discard uncommitted changes.
 6. Prove install, version pinning, upgrade, downgrade refusal for incompatible store formats and removal using disposable test data. A controller rollback must not silently downgrade a store.
 
-The existing [backend](LAYERFS-BACKEND-VALIDATION.md), [recovery](LAYERFS-RECOVERY-VALIDATION.md) and [Incus attachment](LAYERFS-INCUS.md) qualifications establish the initial disposable-workspace path. The next work extends that path to native agent sessions, representative projects and the proposed database publication adapters. No production migration or universal instant-start claim follows from the small fixtures alone.
+The existing [backend](reports/LAYERFS-BACKEND-VALIDATION.md), [recovery](reports/LAYERFS-RECOVERY-VALIDATION.md) and [Incus attachment](LAYERFS-INCUS.md) qualifications establish the initial disposable-workspace path. The next work extends that path to native agent sessions, representative projects and the proposed database publication adapters. No production migration or universal instant-start claim follows from the small fixtures alone.

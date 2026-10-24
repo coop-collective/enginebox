@@ -1,7 +1,7 @@
 //! GitHub remains the scheduler. Webhooks only request bounded runner capacity.
 use crate::{GitHub, api, full_name, name, number, text};
 use anyhow::{Context, Result, ensure};
-use enginebox_core::transport::run_process;
+use enginebox_core::transport::run_command;
 use ring::hmac;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -125,7 +125,7 @@ impl GitHub {
                 if job["status"] == "queued" {
                     job["status"] = json!("cancelled");
                 }
-            } else if action == "in_progress" {
+            } else if action == "in_progress" && job["github_status"] != "completed" {
                 job["github_status"] = json!("in_progress");
                 if job["status"] == "queued" {
                     job["status"] = json!("claimed_elsewhere");
@@ -270,8 +270,25 @@ impl GitHub {
             self.save(&data)?;
         }
         let request = json!({"schema":1,"name":runner_name,"job_id":job["id"],"repository":repo,"jitconfig":text(&generated,"encoded_jit_config")?,"timeout_seconds":pool.timeout_seconds});
-        let output = run_process(
-            &pool.worker,
+        let mut command = std::process::Command::new(&pool.worker[0]);
+        command.args(&pool.worker[1..]).env_clear();
+        for key in [
+            "PATH",
+            "HOME",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "WINDIR",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "SSH_AUTH_SOCK",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = run_command(
+            command,
             Some(&serde_json::to_vec(&request)?),
             Duration::from_secs(pool.timeout_seconds + 600),
         )?;

@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-23",
+  "scope": "Real Unreal content preparation and same-host archive restore baseline; no end-to-end playable cold-start or Lore/LayerFS large-project qualification",
+  "local_content": {
+    "content_files": 5282,
+    "content_bytes": 20657983914,
+    "content_hashes_match": true,
+    "project": {
+      "files": 5596,
+      "bytes": 21509289030
+    },
+    "clone_seconds": 1.8357057078974321,
+    "including_content_hash_verification_seconds": 38.37964658299461
+  },
+  "local_materialization": "APFS copy-on-write, not full physical copy or network restore",
+  "server_fixture": {
+    "files": 379,
+    "content_bytes": 11168790731,
+    "largest_file_bytes": 228269877,
+    "archive_bytes": 11124733098,
+    "archive_sha256": "d91a6f3f658a51c0bac67b5334cc2434d6d5c7011fdcdac1afa280893677b6a9"
+  },
+  "guest": {
+    "cpu": 4,
+    "memory_gib": 8,
+    "configured_root_gib": 80,
+    "observed_guest_filesystem_bytes": 31043616768,
+    "base_copy_seconds": 0.124386872,
+    "base_ready_seconds": 15.029553107,
+    "startup": "cold template allocation, no Unreal or game-capable GPU"
+  },
+  "seed_transfer": {
+    "initial_stream_seconds_before_transport_change": 1314.4156995830126,
+    "initial_stream_completed": false,
+    "verified_prefix_bytes": 5965414400,
+    "parallel_remainder_bytes": 5159318698,
+    "parallel_remainder_seconds": 642.6741470420966,
+    "parallel_connections": 4,
+    "reassembly_seconds": 18.09228832554072,
+    "full_archive_checksum_match": true,
+    "boundary": "Mac-to-server WAN seeding; changed transport mid-transfer, not a controlled serial/parallel comparison or server-to-GPU-node boot"
+  },
+  "restore_runs": [
+    {
+      "at": 1792753850.8641436,
+      "stage": "fresh",
+      "ok": true,
+      "free_before": 26885496832,
+      "hashes_match": true,
+      "verification_seconds": 10.253382114000033,
+      "files": 379,
+      "bytes": 11168790731,
+      "free_after": 15715618816,
+      "extraction_seconds": 26.188583410345018,
+      "including_guest_sync_seconds": 27.397391538135707,
+      "method": "same-host zstd archive piped through Incus into a fresh directory; no engine startup, Lore or LayerFS"
+    },
+    {
+      "at": 1792753888.350011,
+      "stage": "repeat",
+      "ok": true,
+      "free_before": 15715618816,
+      "hashes_match": true,
+      "verification_seconds": 10.760860763999972,
+      "files": 379,
+      "bytes": 11168790731,
+      "free_after": 4545748992,
+      "extraction_seconds": 25.029755644500256,
+      "including_guest_sync_seconds": 26.455173291265965,
+      "method": "same-host zstd archive piped through Incus into a fresh directory; no engine startup, Lore or LayerFS"
+    }
+  ],
+  "restore_cache_boundary": "Advisory eviction of this archive only; no global cache flush. Fresh guest target; other kernel/device caches uncontrolled.",
+  "cleanup": {
+    "disposable_vm_removed": true,
+    "scratch_upload_bytes_removed": 11124733098,
+    "verified_archive_retained_bytes": 11124733098,
+    "retention_purpose": "private seed cache on existing storage host for follow-up qualification, not an independent backup",
+    "duplicate_local_generated_archive_removed": true
+  },
+  "native_cache_qualification": "Not qualified. Rendering attempts exceeded the 900-second limit before package processing; headless map selection was corrected, but its target shader compilation did not finish within 300 seconds. No successful cold fill, warm fill, restored-cache run or first playable frame is claimed.",
+  "native_runs": [
+    {
+      "case": "rendering-empty-ddc",
+      "seconds": 910.6405971249333,
+      "exit_code": -9,
+      "stop_reason": "deadline",
+      "ddc_before": {
+        "files": 0,
+        "bytes": 0
+      },
+      "ddc_after": {
+        "files": 12,
+        "bytes": 974848
+      },
+      "commandlet_completed": false,
+      "map_processed": false,
+      "map_selected": false,
+      "no_packages_found": false,
+      "operator_stops": []
+    },
+    {
+      "case": "rendering-no-app-nap",
+      "seconds": 621.9317349169869,
+      "exit_code": -9,
+      "stop_reason": null,
+      "ddc_before": {
+        "files": 0,
+        "bytes": 0
+      },
+      "ddc_after": {
+        "files": 12,
+        "bytes": 974848
+      },
+      "commandlet_completed": false,
+      "map_processed": false,
+      "map_selected": false,
+      "no_packages_found": false,
+      "operator_stops": [
+        "Qualify realistic project-cold startup with installed engine DDC pack in a separate case. Empty-all-DDC shader compilation still running; no success claimed."
+      ]
+    },
+    {
+      "case": "rendering-installed-engine-pak",
+      "seconds": 910.846180332941,
+      "exit_code": -9,
+      "stop_reason": "deadline",
+      "ddc_before": {
+        "files": 0,
+        "bytes": 0
+      },
+      "ddc_after": {
+        "files": 12,
+        "bytes": 974848
+      },
+      "commandlet_completed": false,
+      "map_processed": false,
+      "map_selected": false,
+      "no_packages_found": false,
+      "operator_stops": []
+    },
+    {
+      "case": "headless-invalid-map-argument",
+      "seconds": 235.5336326669203,
+      "exit_code": -9,
+      "stop_reason": null,
+      "ddc_before": {
+        "files": 0,
+        "bytes": 0
+      },
+      "ddc_after": {
+        "files": 72,
+        "bytes": 1993598
+      },
+      "commandlet_completed": false,
+      "map_processed": false,
+      "map_selected": false,
+      "no_packages_found": true,
+      "operator_stops": [
+        "Commandlet rejected /Game map parameter; preserve failed invocation; corrected relative Content path requires fresh case."
+      ]
+    },
+    {
+      "case": "headless-corrected-map",
+      "seconds": 311.22309074993245,
+      "exit_code": -9,
+      "stop_reason": "deadline",
+      "ddc_before": {
+        "files": 0,
+        "bytes": 0
+      },
+      "ddc_after": {
+        "files": 72,
+        "bytes": 1993598
+      },
+      "commandlet_completed": false,
+      "map_processed": false,
+      "map_selected": true,
+      "no_packages_found": false,
+      "operator_stops": []
+    }
+  ],
+  "harness_correction": "DDC Map takes a relative content filename, not a /Game package path. Corrected headless run selected the map; readiness now requires observed Processing of that map as well as successful commandlet exit."
+}

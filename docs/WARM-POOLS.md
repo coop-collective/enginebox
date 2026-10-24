@@ -168,5 +168,5 @@ physical name.
 Full API allocation and replacement refill were then verified on the reference
 host. Two simultaneous requests received distinct warm VMs; full server jobs took
 0.626 and 0.625 seconds, including 0.386/0.399-second reservation-to-readiness
-paths. See [reference-host validation](VALIDATION.md) for timing boundaries,
+paths. See [reference-host validation](reports/VALIDATION.md) for timing boundaries,
 custom-resource checks and qualification limits.

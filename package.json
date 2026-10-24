@@ -2,20 +2,33 @@
   "name": "enginebox",
   "version": "0.3.0",
   "private": true,
-  "license": "SEE LICENSE IN LICENSE",
-  "packageManager": "pnpm@12.14.0",
+  "license": "BUSL-1.1",
+  "packageManager": "pnpm@12.15.0",
   "engines": {
-    "node": ">=22.12"
+    "node": ">=24"
   },
   "scripts": {
-    "build": "pnpm build:rust && pnpm --filter enginebox-dashboard build && pnpm --filter enginebox-site build",
+    "build": "pnpm build:rust && pnpm --filter enginebox-dashboard build && pnpm --filter enginebox-site build && pnpm build:fleet",
     "build:rust": "cargo build --workspace --release --locked",
-    "check": "cargo check --workspace --all-targets --locked && pnpm --filter enginebox-dashboard typecheck && pnpm --filter enginebox-site check",
-    "test": "cargo test --workspace --no-fail-fast --locked && pnpm --filter enginebox-dashboard test && pnpm --filter enginebox-site test && pnpm --filter @enginebox/deploy test",
+    "check": "cargo check --workspace --all-targets --locked && pnpm --filter enginebox-dashboard typecheck && pnpm --filter enginebox-site check && pnpm check:fleet",
+    "test": "cargo test --workspace --no-fail-fast --locked && pnpm --filter enginebox-dashboard test && pnpm --filter enginebox-site test && pnpm --filter @enginebox/deploy test && pnpm test:fleet && pnpm --filter @enginebox/environment-service test",
     "test:e2e": "pnpm --filter enginebox-dashboard test:e2e && pnpm --filter enginebox-site test:e2e",
+    "test:ci-templates": "cargo test --workspace --locked --test template_download -- --ignored",
     "fmt": "cargo fmt --all",
     "lint:rust": "cargo clippy --workspace --all-targets --locked -- -D warnings",
     "dev": "pnpm --filter enginebox-dashboard dev",
-    "dev:site": "pnpm --filter enginebox-site dev"
+    "dev:site": "pnpm --filter enginebox-site dev",
+    "fleet:dev": "node packages/fleet-dev/src/cli.mjs up",
+    "fleet:down": "node packages/fleet-dev/src/cli.mjs down",
+    "fleet:status": "node packages/fleet-dev/src/cli.mjs status",
+    "fleet:logs": "node packages/fleet-dev/src/cli.mjs logs",
+    "fleet:smoke": "node packages/fleet-dev/src/cli.mjs smoke",
+    "fleet:fixture": "node packages/fleet-dev/src/cli.mjs fixture",
+    "fleet:publish": "node packages/fleet-dev/src/cli.mjs publish",
+    "check:fleet": "pnpm --filter @enginebox/fleet-controller check && pnpm --filter @enginebox/fleet-node check",
+    "test:fleet": "pnpm --filter @enginebox/fleet-controller test && pnpm --filter @enginebox/fleet-node test",
+    "build:fleet": "pnpm --filter @enginebox/fleet-controller build && pnpm --filter @enginebox/fleet-node build",
+    "fleet:verify": "node packages/fleet-dev/src/cli.mjs verify",
+    "fleet:accept": "node packages/fleet-dev/src/cli.mjs accept"
   }
 }

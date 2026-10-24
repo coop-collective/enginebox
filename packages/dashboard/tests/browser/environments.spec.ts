@@ -1,0 +1,38 @@
+import { test, expect } from '@playwright/test';
+import { createHmac, randomBytes } from 'node:crypto';
+import { dashboardOrigin, fixtureOrigin } from './urls';
+
+test('persistent service status and authenticated HTTP/UDP route management use the protected dashboard API', async ({ page, request }) => {
+  await request.post(`${fixtureOrigin}/__test/reset`);
+  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3600000, nonce: randomBytes(24).toString('hex') })).toString('base64url');
+  const signature = createHmac('sha256', 'fixture-session-secret-at-least-32-characters').update('fixture-dashboard-password').update('\0').update(payload).digest('base64url');
+  await page.context().addCookies([{ name: 'enginebox_session', value: `${payload}.${signature}`, url: dashboardOrigin, httpOnly: true, sameSite: 'Strict' }]);
+  await page.goto('/');
+  await page.getByRole('navigation', { name: 'Control plane' }).getByRole('button', { name: 'Environments', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Live environments', exact: true })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Environment main' })).toContainText('Serving');
+  await expect(page.getByRole('article', { name: 'Project dev demo', exact: true })).toContainText('Serving');
+  await expect(page.getByRole('link', { name: 'Open demo', exact: true })).toHaveAttribute('href', 'https://demo.dev.example.com');
+  await expect(page.getByRole('article', { name: 'Project dev failed-app', exact: true })).toContainText('setup-failed');
+  await page.getByLabel('Route name', { exact: true }).fill('main-web');
+  await page.getByLabel('Environment', { exact: true }).selectOption('main');
+  await page.getByLabel('Service', { exact: true }).selectOption('web');
+  await page.getByLabel('Hostname', { exact: true }).fill('main.dev.example.com');
+  await expect(page.getByLabel('Access', { exact: true })).toHaveValue('authenticated');
+  await page.getByRole('button', { name: 'Save route' }).click();
+  await expect(page.getByRole('button', { name: 'Remove main-web' })).toBeVisible();
+  await page.getByLabel('Route name', { exact: true }).fill('game');
+  await page.getByLabel('Service', { exact: true }).selectOption('game');
+  await expect(page.getByLabel('Hostname', { exact: true })).toHaveCount(0);
+  await page.getByLabel('Transport listener', { exact: true }).selectOption('game-udp');
+  await page.getByRole('button', { name: 'Save route' }).click();
+  await expect(page.getByText('main / game → game-udp · private', { exact: true })).toBeVisible();
+  const catalog = await (await page.request.get('/api/environments')).json();
+  expect(catalog.routes).toEqual([{ id: 'main-web', environment: 'main', service: 'web', access: 'authenticated', hostname: 'main.dev.example.com' }, { id: 'game', environment: 'main', service: 'game', access: 'private', entrypoint: 'game-udp' }]);
+  await page.getByRole('button', { name: 'Remove main-web' }).click();
+  await expect(page.getByRole('button', { name: 'Remove main-web' })).toHaveCount(0);
+  await page.screenshot({ path: 'test-results/environments-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: 'test-results/environments-mobile.png', fullPage: true });
+});

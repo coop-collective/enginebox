@@ -1,9 +1,6 @@
+import { fixtureOrigin, dashboardOrigin, dashboardPort } from "./tests/browser/urls";
 import { defineConfig } from "@playwright/test";
 
-const dashboardPort = process.env.ENGINEBOX_E2E_DASHBOARD_PORT ?? "3007";
-const fixturePort = process.env.ENGINEBOX_E2E_FIXTURE_PORT ?? "18765";
-const dashboardOrigin = `http://127.0.0.1:${dashboardPort}`;
-const fixtureOrigin = `http://127.0.0.1:${fixturePort}`;
 export default defineConfig({
   testDir: "./tests/browser",
   workers: 1,
@@ -33,6 +30,8 @@ export default defineConfig({
           "fixture-session-secret-at-least-32-characters",
         ENGINEBOX_API_URL: fixtureOrigin,
         ENGINEBOX_API_TOKEN: "fixture-api-token-server-only-12345",
+        ENGINEBOX_ENVIRONMENTS_URL: fixtureOrigin,
+        ENGINEBOX_ENVIRONMENTS_TOKEN: "fixture-api-token-server-only-12345",
       },
     },
   ],

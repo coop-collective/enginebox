@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "kind": "dev",
+  "id": "vinext-web",
+  "revision": 1,
+  "image": "node@sha256:6449e19d8184d84062525b6a7524def03146c2cb04a7f08b076680d0e8e4240a",
+  "prepare": [
+    "corepack",
+    "pnpm",
+    "install",
+    "--frozen-lockfile",
+    "--store-dir",
+    "/app/.pnpm-store"
+  ],
+  "command": [
+    "corepack",
+    "pnpm",
+    "dev"
+  ],
+  "env": {
+    "COREPACK_HOME": "/app/.corepack"
+  },
+  "installInputs": [
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml"
+  ],
+  "ports": [
+    {
+      "name": "web",
+      "protocol": "http",
+      "port": 8787,
+      "expose": true
+    }
+  ],
+  "health": {
+    "port": "web",
+    "path": "/health"
+  },
+  "cpu": 2,
+  "memoryMiB": 2048,
+  "timeoutSeconds": 300,
+  "writableDirs": [
+    ".wrangler",
+    ".vinext",
+    ".next",
+    "node_modules/.mf",
+    "node_modules/.vite-temp"
+  ]
+}

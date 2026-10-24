@@ -57,6 +57,11 @@ fn api_fixture(responses: Vec<(&'static str, Value)>) -> (api::Api, std::thread:
                         || value["grant_type"] == "refresh_token"
                 );
             }
+            if expected == "/app/installations/4/access_tokens" {
+                let value: Value = serde_json::from_slice(&input).unwrap();
+                assert_eq!(value["repository_ids"], json!([101]));
+                assert_eq!(value["permissions"], json!({"contents":"read"}));
+            }
             let bytes = response.to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",bytes.len(),bytes).unwrap();
         }
@@ -120,9 +125,64 @@ fn pagination_refresh_and_repository_selection_are_authoritative() {
     assert_eq!(g.status()["repositories"][0]["private"], true);
     let (api, server) = api_fixture(vec![("page=1", json!({"repositories":[]}))]);
     g.api = api;
-    assert!(g.sync(101, "pull").is_err());
+    assert!(
+        g.transfer_credential("fixture/private", Some("main"), false)
+            .is_err()
+    );
     server.join().unwrap();
     assert!(!g.root.join("checkouts/101").exists());
+}
+#[test]
+fn transfer_credentials_are_scoped_to_the_selected_repository() {
+    let (_root, mut g) = service();
+    account(&g);
+    g.data.lock().unwrap().repositories.insert(
+        101,
+        Repository {
+            id: 101,
+            installation_id: 4,
+            full_name: "fixture/private".into(),
+            private: true,
+            branch: "main".into(),
+        },
+    );
+    assert!(
+        g.transfer_credential("fixture/private", Some("other"), false)
+            .is_err()
+    );
+    assert!(
+        g.transfer_credential("fixture/other", Some("main"), false)
+            .is_err()
+    );
+    let output = std::process::Command::new("openssl")
+        .args(["genrsa", "2048"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    g.config.as_mut().unwrap().repos.private_key = String::from_utf8(output.stdout).unwrap();
+    let (api, server) = api_fixture(vec![
+        (
+            "page=1",
+            json!({"repositories":[{"id":101,"full_name":"fixture/private","permissions":{"push":true}}]}),
+        ),
+        (
+            "/app/installations/4/access_tokens",
+            json!({"token":"ghs_APP.jwt-fixture"}),
+        ),
+    ]);
+    g.api = api;
+    let credential = g
+        .transfer_credential("fixture/private", Some("main"), false)
+        .unwrap();
+    assert_eq!(credential["token"], "ghs_APP.jwt-fixture");
+    server.join().unwrap();
+    assert!(!g.status().to_string().contains("ghs_APP"));
+    assert!(
+        !std::fs::read_to_string(g.root.join("state.json"))
+            .unwrap()
+            .contains("ghs_APP")
+    );
 }
 fn signed(g: &GitHub, payload: &Value) -> Value {
     let bytes = serde_json::to_vec(payload).unwrap();
@@ -164,6 +224,10 @@ fn webhook_duplicates_out_of_order_and_restart_do_not_replay_jobs() {
     event["action"] = json!("queued");
     signed(&g, &event);
     assert_eq!(g.status()["jobs"][0]["status"], "cancelled");
+    event["action"] = json!("in_progress");
+    signed(&g, &event);
+    assert_eq!(g.status()["jobs"][0]["github_status"], "completed");
+    event["action"] = json!("queued");
     event["workflow_job"]["id"] = json!(100);
     event["workflow_job"]["labels"] = json!(["self-hosted"]);
     assert_eq!(signed(&g, &event)["ignored"], true);

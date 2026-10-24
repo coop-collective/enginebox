@@ -1,7 +1,7 @@
 //! Optional GitHub integration. The runtime has no dependency on this crate.
 pub mod api;
 pub mod ci;
-pub mod git;
+mod config;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use enginebox_core::state;
@@ -28,6 +28,8 @@ pub struct App {
     pub slug: String,
     pub private_key: String,
     pub webhook_secret: String,
+    #[serde(default)]
+    pub workflows_write: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,7 +110,7 @@ impl GitHub {
         let root = controller_root.join("github");
         let config_path = controller_root.join("github.json");
         let config: Option<Config> = if config_path.exists() {
-            Some(serde_json::from_value(state::read_json(&config_path)?)?)
+            Some(config::load(&config_path)?)
         } else {
             None
         };
@@ -147,7 +149,6 @@ impl GitHub {
         }
         let mut data: Data = if config.is_some() {
             state::private_dir(&root)?;
-            state::private_dir(&root.join("checkouts"))?;
             if root.join("state.json").exists() {
                 serde_json::from_value(state::read_json(&root.join("state.json"))?)?
             } else {
@@ -301,7 +302,7 @@ impl GitHub {
         )
     }
     pub fn select(&self, installation: u64, repository: u64, branch: &str) -> Result<Value> {
-        git::branch(branch)?;
+        enginebox_storage_layerfs::github::branch(branch)?;
         let available = self.repositories(installation)?;
         let repo = available["repositories"]
             .as_array()
@@ -371,38 +372,70 @@ impl GitHub {
         self.save(&data)?;
         Ok(json!({"disconnected":true,"checkouts_retained":true}))
     }
-    pub fn sync(&self, repository: u64, direction: &str) -> Result<Value> {
-        let _lock = state::lock(&self.root.join(format!("repo-{repository}.lock")), false)?;
-        let (selected, token) = {
-            let mut data = self.data.lock().unwrap();
-            let selected = data
-                .repositories
-                .get(&repository)
-                .context("Select this repository first")?
-                .clone();
-            let token = self.user_token("repos", &mut data)?;
-            // Revalidate installation access immediately before each transfer.
-            let repos = self.api.pages(
-                &format!(
-                    "/user/installations/{}/repositories",
-                    selected.installation_id
-                ),
-                "repositories",
-                &token,
-            )?;
-            ensure!(
-                repos.iter().any(|r| r["id"] == repository
-                    && r["full_name"] == selected.full_name
-                    && (direction != "push" || r["permissions"]["push"] == true)),
-                "Repository grant changed; reconnect or reselect"
-            );
-            (selected, token)
-        };
-        git::sync(
-            &self.root.join("checkouts").join(repository.to_string()),
-            &selected,
-            &token,
-            direction,
+    pub fn configured(&self) -> bool {
+        self.config.is_some()
+    }
+
+    /// Private transport-only credential. Never expose through HTTP or job results.
+    /// Validate the connected owner's grant before minting a single-repository token.
+    pub fn transfer_credential(
+        &self,
+        repository: &str,
+        branch: Option<&str>,
+        write: bool,
+    ) -> Result<Value> {
+        full_name(repository)?;
+        let mut data = self.data.lock().unwrap();
+        let selected = data
+            .repositories
+            .values()
+            .find(|r| r.full_name == repository)
+            .context("Select this repository in the GitHub panel first")?
+            .clone();
+        ensure!(
+            branch.is_none_or(|b| b == selected.branch),
+            "Branch differs from the selected GitHub binding"
+        );
+        let user = self.user_token("repos", &mut data)?;
+        let repos = self.api.pages(
+            &format!(
+                "/user/installations/{}/repositories",
+                selected.installation_id
+            ),
+            "repositories",
+            &user,
+        )?;
+        ensure!(
+            repos.iter().any(|r| r["id"] == selected.id
+                && r["full_name"] == selected.full_name
+                && (!write || r["permissions"]["push"] == true)),
+            "Repository grant changed; reconnect or reselect"
+        );
+        let app = self.app("repos")?;
+        let mut permissions = json!({"contents": if write { "write" } else { "read" }});
+        if write && app.workflows_write {
+            permissions["workflows"] = json!("write");
+        }
+        let response = self.api.call(
+            "POST",
+            &format!(
+                "/app/installations/{}/access_tokens",
+                selected.installation_id
+            ),
+            &api::jwt(app)?,
+            Some(json!({"repository_ids":[selected.id], "permissions":permissions})),
+        )?;
+        let token = text(&response, "token")?;
+        ensure!(
+            !token.is_empty()
+                && token.len() <= 16384
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
+            "Invalid installation token"
+        );
+        Ok(
+            json!({"schema":1,"repository":selected.full_name,"branch":selected.branch,"token":token}),
         )
     }
 }

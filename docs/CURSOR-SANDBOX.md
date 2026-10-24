@@ -91,4 +91,4 @@ regressions cover constrained attachment construction, dry runs, idempotency,
 preservation of matching operator edits, local override/symlink/foreign-profile
 rejection and inclusion in bootstrap assets. This verifies the tested sandbox
 startup and boundaries, not all possible escape boundaries or provider inference.
-See [VALIDATION.md](VALIDATION.md) for separate native MCP/inference qualification.
+See [VALIDATION.md](reports/VALIDATION.md) for separate native MCP/inference qualification.

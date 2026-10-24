@@ -32,7 +32,7 @@ export const guides = [
       {
         id: 'self-hosting-license',
         title: 'Self-hosting and the license',
-        html: `<p>Engine Box is source-available under the Sustainable Use License. Personal and internal business self-hosting are permitted by its terms. Offering commercial hosted access or selling the software requires a separate agreement. This is not an OSI open-source license.</p><p>Read the ${source('LICENSE', 'license')} for the exact terms, then start with the <a href="/docs/quickstart/">source quickstart</a>.</p>`,
+        html: `<p>Engine Box is source-available under the Business Source License 1.1. Personal, non-commercial and non-production use is free. Production use by a business needs a license at $10 per node per month. Offering it to others as a hosted service requires a separate agreement. This is not an OSI open-source license.</p><p>Read <a href="/docs/licensing/">Licensing and pricing</a> and the ${source('LICENSE', 'license')} for the exact terms, then start with the <a href="/docs/quickstart/">source quickstart</a>.</p>`,
       },
     ],
   },
@@ -45,7 +45,7 @@ export const guides = [
       {
         id: 'requirements',
         title: 'Choose your operator and compute machines',
-        html: `<p>Use Node.js 22.12 or newer and the repository's pinned pnpm 12.14.0. The root workspace provisions Rust 1.96.0 through pnpm's Cargo integration. Python is not a runtime dependency.</p><p>Compute workspaces currently require a prepared Linux Incus/KVM host. A macOS or Windows operator can manage a separate Linux node; installing the controller does not contribute that laptop's CPU or GPU to the fleet. Check <a href="/docs/platform-support/">platform support</a> before provisioning.</p>`,
+        html: `<p>Use Node.js 22.12 or newer and the repository's pinned pnpm 12.15.0. The root workspace provisions Rust 1.96.0 through pnpm's Cargo integration. Python is not a runtime dependency.</p><p>Compute workspaces currently require a prepared Linux Incus/KVM host. A macOS or Windows operator can manage a separate Linux node; installing the controller does not contribute that laptop's CPU or GPU to the fleet. Check <a href="/docs/platform-support/">platform support</a> before provisioning.</p>`,
       },
       {
         id: 'build',
@@ -212,7 +212,7 @@ target/release/enginebox-controller --config fleet.toml`) + `<p>The token comman
       {
         id: 'recovery',
         title: 'Checkpoints and recovery have explicit boundaries',
-        html: `<p>A file checkpoint records a file revision. It does not capture active processes, sockets or guest RAM. Recovery verifies operation receipts and live owned resources; it does not silently replay commands or invent a successful outcome.</p><p>The pinned preview has no qualified power-loss durability guarantee. Keep irreplaceable state and authoritative application databases on separately qualified persistent storage. The current recovery and Incus tests do not establish live Wrangler database capture.</p><p>See ${source('docs/LAYERFS-RECOVERY-VALIDATION.md', 'recovery qualification')} and <a href="/docs/platform-support/">remaining availability gates</a>.</p>`,
+        html: `<p>A file checkpoint records a file revision. It does not capture active processes, sockets or guest RAM. Recovery verifies operation receipts and live owned resources; it does not silently replay commands or invent a successful outcome.</p><p>The pinned preview has no qualified power-loss durability guarantee. Keep irreplaceable state and authoritative application databases on separately qualified persistent storage. The current recovery and Incus tests do not establish live Wrangler database capture.</p><p>See ${source('docs/reports/LAYERFS-RECOVERY-VALIDATION.md', 'recovery qualification')} and <a href="/docs/platform-support/">remaining availability gates</a>.</p>`,
       },
     ],
   },
@@ -330,12 +330,35 @@ target/release/enginebox-fleet-mcp`) + `<p>The operator token stays on the opera
       {
         id: 'performance',
         title: 'Read timings as measurements of a specific path',
-        html: `<table><thead><tr><th>Measured path</th><th>Result</th></tr></thead><tbody><tr><td>Rust resume from paused VM</td><td>0.512 s median, 0.541 s p95; 20 samples</td></tr><tr><td>Rust start from stopped VM</td><td>6.034 s median, 7.096 s p95; 10 samples</td></tr><tr><td>Rust restore from hibernation</td><td>5.846 s median, 8.053 s p95; 5 samples</td></tr></tbody></table><p>These are readiness timings on the recorded Linux host with a 2-vCPU, 2-GiB VM. The stopped path reused a prepared disk and host caches; it was not a new-machine install. The measurements did not use a LayerFS-attached VM. They do not establish a controlled speedup over Python or a universal subsecond boot promise.</p><p>The LayerFS backend created fresh Docker workspaces in 1.437 seconds and a workspace from a prepared checkpoint in 1.549 seconds in its small-fixture qualification. These were individual observations with prepared images and caches. A cheap branch reference is not a booted VM or a completed application start. See ${source('docs/RUST-BOOT-BENCHMARKS.md', 'VM timing evidence')} and ${source('docs/LAYERFS-BACKEND-VALIDATION.md', 'storage measurements')}.</p>`,
+        html: `<table><thead><tr><th>Measured path</th><th>Result</th></tr></thead><tbody><tr><td>Rust resume from paused VM</td><td>0.512 s median, 0.541 s p95; 20 samples</td></tr><tr><td>Rust start from stopped VM</td><td>6.034 s median, 7.096 s p95; 10 samples</td></tr><tr><td>Rust restore from hibernation</td><td>5.846 s median, 8.053 s p95; 5 samples</td></tr></tbody></table><p>These are readiness timings on the recorded Linux host with a 2-vCPU, 2-GiB VM. The stopped path reused a prepared disk and host caches; it was not a new-machine install. The measurements did not use a LayerFS-attached VM. They do not establish a controlled speedup over Python or a universal subsecond boot promise.</p><p>The LayerFS backend created fresh Docker workspaces in 1.437 seconds and a workspace from a prepared checkpoint in 1.549 seconds in its small-fixture qualification. These were individual observations with prepared images and caches. A cheap branch reference is not a booted VM or a completed application start. See ${source('docs/reports/RUST-BOOT-BENCHMARKS.md', 'VM timing evidence')} and ${source('docs/reports/LAYERFS-BACKEND-VALIDATION.md', 'storage measurements')}.</p>`,
       },
       {
         id: 'release-gates',
         title: 'Before a wider release',
-        html: `<p>The reference fleet completed its initial Rust cutover on October 20, 2026. Separate disposable tests proved Codex/Claude coding, exact conversation resume and browser MCP use; Cursor remains provider-quota blocked. A fresh revision-4 warm allocation then passed real Codex/Claude code assertions through the installed operator MCP and HTTP controller, followed by exact conversation resume after MCP pause/resume with boot identity preserved. Cursor was not retried. Inference on LayerFS attachments, a fresh physical-host install, Windows service execution and an independent installation reproduction remain acceptance work.</p><p>Cloudflare environment publication is new product work, not a missing checkbox on the Rust migration. Its acceptance test must exercise concurrent writes, interruption during capture, complete binding state, two isolated forks and restart at representative sizes.</p><p>Use ${source('docs/VALIDATION.md', 'the validation record')} for evidence and ${source('docs/IMPLEMENTATION-PLAN.md', 'the implementation plan')} for delivery order.</p>`,
+        html: `<p>The reference fleet completed its initial Rust cutover on October 20, 2026. Separate disposable tests proved Codex/Claude coding, exact conversation resume and browser MCP use; Cursor remains provider-quota blocked. A fresh revision-4 warm allocation then passed real Codex/Claude code assertions through the installed operator MCP and HTTP controller, followed by exact conversation resume after MCP pause/resume with boot identity preserved. Cursor was not retried. Inference on LayerFS attachments, a fresh physical-host install, Windows service execution and an independent installation reproduction remain acceptance work.</p><p>Cloudflare environment publication is new product work, not a missing checkbox on the Rust migration. Its acceptance test must exercise concurrent writes, interruption during capture, complete binding state, two isolated forks and restart at representative sizes.</p><p>Use ${source('docs/reports/VALIDATION.md', 'the validation record')} for evidence and ${source('docs/IMPLEMENTATION-PLAN.md', 'the implementation plan')} for delivery order.</p>`,
+      },
+    ],
+  },
+  {
+    slug: 'licensing',
+    title: 'Licensing and pricing',
+    group: 'Operate',
+    summary: 'What is free, what needs a paid per-node license and how each version converts to Apache-2.0.',
+    sections: [
+      {
+        id: 'boundary',
+        title: 'Where the license boundary is',
+        html: `<table><thead><tr><th>Use</th><th>Terms</th></tr></thead><tbody><tr><td>Personal and non-commercial use</td><td>Free</td></tr><tr><td>Testing, evaluation, development and other non-production use</td><td>Free</td></tr><tr><td>Production use by or on behalf of a business</td><td>$10 per node per month</td></tr><tr><td>Offering Engine Box to third parties as a hosted or managed service</td><td>Separate agreement</td></tr></tbody></table><p>Engine Box is source-available under the Business Source License 1.1. It is not an OSI open-source license. You can copy and modify the source; modified copies are covered by the same license.</p>`,
+      },
+      {
+        id: 'nodes',
+        title: 'What counts as a node',
+        html: `<p>A node is each machine registered with an Engine Box controller to run workspaces. The controller itself does not count unless it also runs workspaces. Three Linux hosts registered to run workspaces are three nodes, or $30 per month.</p><p>The software does not currently enforce node counts. The license is the agreement. Provider subscriptions for Codex, Claude Code and Cursor stay with the provider and are not part of the price.</p>`,
+      },
+      {
+        id: 'change-date',
+        title: 'Change Date and history',
+        html: `<p>Each version converts to the Apache License, Version 2.0 four years after it is first publicly released. Earlier code keeps the license it was published under: Apache-2.0 through an early commit, then an earlier source-available license (see NOTICE).</p><p>See <a href="/pricing/">pricing</a> for plans and a worked example. The full policy is in ${source('docs/LICENSING.md', 'docs/LICENSING.md')} and the terms are in the ${source('LICENSE', 'license')}.</p>`,
       },
     ],
   },

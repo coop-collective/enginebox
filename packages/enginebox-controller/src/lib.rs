@@ -1,4 +1,7 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
+pub mod ci;
+mod ci_templates;
+mod environment;
 pub mod jobs;
 pub mod storage;
 
@@ -43,8 +46,15 @@ impl Mode {
 struct Runtime {
     agents: AgentService,
     jobs: jobs::Jobs,
+    ci_jobs: jobs::Jobs,
     storage: storage::Storage,
     github: enginebox_github::GitHub,
+    ci: ci::Ci,
+}
+impl Runtime {
+    fn pending_jobs(&self) -> usize {
+        self.jobs.pending() + self.ci_jobs.pending() + self.github.pending()
+    }
 }
 struct Gate {
     mode: Mode,
@@ -59,6 +69,8 @@ pub struct Controller {
     token: String,
     gate: Mutex<Gate>,
     observations: Mutex<std::collections::BTreeMap<String, Value>>,
+    // Last background reconcile failure (message, RFC 3339 time); cleared on success.
+    reconcile_error: Mutex<Option<(String, String)>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -91,6 +103,7 @@ impl Controller {
                 runtime: None,
             }),
             observations: Mutex::new(std::collections::BTreeMap::new()),
+            reconcile_error: Mutex::new(None),
         }))
     }
     pub fn activate(self: &Arc<Self>) -> Result<Value> {
@@ -105,9 +118,10 @@ impl Controller {
         ensure!(
             gate.requests == 0
                 && gate.background == 0
-                && gate.runtime.as_ref().is_none_or(|r| r.jobs.pending() == 0
-                    && r.agents.pending() == 0
-                    && r.github.pending() == 0),
+                && gate
+                    .runtime
+                    .as_ref()
+                    .is_none_or(|r| r.pending_jobs() == 0 && r.agents.pending() == 0),
             "Controller has not drained"
         );
         let owner = enginebox_core::state::lock(&self.root.join("controller-owner.lock"), false)
@@ -129,11 +143,25 @@ impl Controller {
         }
         // Reload under exclusive ownership on every activation, including rollback.
         // A standby process must never recover another process's active jobs.
+        let github = enginebox_github::GitHub::open(&self.root)?;
         let runtime = Runtime {
             agents: AgentService::new(&self.root, self.fleet.clone())?,
             jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
-            storage: storage::Storage::open(&self.root, self.fleet.clone())?,
-            github: enginebox_github::GitHub::open(&self.root)?,
+            // Older controller releases prune their ordinary job history. Keep
+            // CI deduplication records outside that directory across rollback.
+            ci_jobs: jobs::Jobs::open(&self.root.join("ci-jobs"))?,
+            storage: storage::Storage::open(&self.root, self.fleet.clone())?
+                .with_github(github.clone()),
+            github,
+            ci: ci::Ci::open(
+                &self.root,
+                &self
+                    .fleet
+                    .hosts()
+                    .into_iter()
+                    .map(|host| host.target)
+                    .collect::<Vec<_>>(),
+            )?,
         };
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -181,9 +209,10 @@ impl Controller {
         if g.mode == Mode::Active {
             g.mode = Mode::Draining;
         }
-        let pending = g.runtime.as_ref().map_or(0, |r| {
-            r.jobs.pending() + r.agents.pending() + r.github.pending()
-        });
+        let pending = g
+            .runtime
+            .as_ref()
+            .map_or(0, |r| r.pending_jobs() + r.agents.pending());
         if g.requests == 0 && g.background == 0 && pending == 0 {
             g.owner.take();
             g.mode = Mode::Drained;
@@ -192,7 +221,17 @@ impl Controller {
     }
     pub fn status(&self) -> Value {
         let g = self.gate.lock().unwrap();
-        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.jobs.pending()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION")})
+        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.pending_jobs()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION"),"background_reconcile_error":self.reconcile_error.lock().unwrap().as_ref().map(|(message,at)|json!({"message":message,"at":at}))})
+    }
+    fn record_reconcile(&self, errors: Vec<String>) {
+        let mut last = self.reconcile_error.lock().unwrap();
+        if errors.is_empty() {
+            *last = None;
+            return;
+        }
+        let message = errors.join("; ");
+        eprintln!("Background reconcile failed: {message}");
+        *last = Some((message, chrono::Utc::now().to_rfc3339()));
     }
     pub fn start_background(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
@@ -209,11 +248,27 @@ impl Controller {
                 };
                 let controller = this.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ = controller.fleet.reconcile();
-                    if let Some(r) = runtime {
-                        let _ = r.agents.reconcile();
-                        let _ = r.github.tick();
+                    let mut errors = Vec::new();
+                    if let Some(r) = &runtime
+                        && let Err(e) = r.github.tick()
+                    {
+                        errors.push(format!("github: {e:#}"));
                     }
+                    if let Some(r) = &runtime
+                        && let Err(e) = r.ci.reconcile(&r.ci_jobs)
+                    {
+                        // Installers run in the CI pool; report queue/state failures.
+                        errors.push(format!("ci: {e:#}"));
+                    }
+                    if let Err(e) = controller.fleet.reconcile() {
+                        errors.push(format!("fleet: {e:#}"));
+                    }
+                    if let Some(r) = runtime
+                        && let Err(e) = r.agents.reconcile()
+                    {
+                        errors.push(format!("agents: {e:#}"));
+                    }
+                    controller.record_reconcile(errors);
                 })
                 .await;
                 this.gate.lock().unwrap().background -= 1;
@@ -415,6 +470,8 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     }
     let maximum = if path == "/v1/templates" {
         1024 * 1024
+    } else if path == "/v1/ci/templates" {
+        65536
     } else {
         16384
     };
@@ -461,6 +518,12 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "fleet"] => c.fleet.summary(),
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
+        ["v1", "ci"] => Ok(c.runtime()?.ci.catalog()),
+        ["v1", "ci", "templates"] => Ok(c.runtime()?.ci.template_catalog()),
+        ["v1", "ci", "github", owner, repo, "runs", run] => {
+            enginebox_ci::github::Github::from_env()?
+                .status(&format!("{owner}/{repo}"), run.parse()?)
+        }
         ["v1", "agents"] => c.runtime()?.agents.status(),
         ["v1", "agent-runs"] => Ok(c.runtime()?.agents.list_runs()),
         ["v1", "agents", provider, "usage"] => {
@@ -469,7 +532,10 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "agents", provider, "sessions", session] => {
             Ok(json!({"session":c.runtime()?.agents.session(provider,session)?}))
         }
-        ["v1", "jobs", id] => Ok(json!({"job":c.runtime()?.jobs.get(id)?})),
+        ["v1", "jobs", id] => {
+            let runtime = c.runtime()?;
+            Ok(json!({"job":runtime.jobs.get(id).or_else(|_| runtime.ci_jobs.get(id))?}))
+        }
         ["v1", "hosts", host, "instances", name, "agent-runs", id] => {
             Ok(json!({"run":c.runtime()?.agents.get_run(host,name,id)?}))
         }
@@ -502,22 +568,6 @@ fn string<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
 async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(StatusCode, Value)> {
     if parts.get(1).is_some_and(|p| p == "github") {
         let github = c.runtime()?.github;
-        if parts.as_slice() == ["v1", "github", "sync"] {
-            keys(
-                &body,
-                &["repository_id", "direction"],
-                &["repository_id", "direction"],
-            )?;
-            let id = enginebox_github::number(&body, "repository_id")?;
-            let direction = string(&body, "direction")?.to_owned();
-            let job =
-                c.runtime()?
-                    .jobs
-                    .submit("github", "github_sync", &id.to_string(), move || {
-                        github.sync(id, &direction)
-                    })?;
-            return Ok((StatusCode::ACCEPTED, json!({"job":job})));
-        }
         let value = blocking(move || -> Result<Value> {
             let p: Vec<_> = parts.iter().map(String::as_str).collect();
             match p.as_slice() {
@@ -568,6 +618,59 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
     let runtime = c.runtime()?;
     let mut code = StatusCode::OK;
     let v = match p.as_slice() {
+        ["v1", "ci", "nodes"] => {
+            blocking(move || {
+                let result = runtime.ci.register(body)?;
+                let _ = runtime.ci.reconcile(&runtime.ci_jobs);
+                Ok(result)
+            })
+            .await?
+        }
+        ["v1", "ci", "templates"] => {
+            keys(&body, &["manifest"], &["manifest"])?;
+            blocking(move || {
+                runtime
+                    .ci
+                    .register_template(serde_json::from_value(body["manifest"].clone())?)?;
+                let _ = runtime.ci.reconcile(&runtime.ci_jobs);
+                Ok(runtime.ci.template_catalog())
+            })
+            .await?
+        }
+        [
+            "v1",
+            "ci",
+            "templates",
+            id,
+            action @ ("enable" | "disable" | "retry"),
+        ] => {
+            let id = id.to_string();
+            let action = action.to_string();
+            blocking(move || {
+                if action == "retry" {
+                    keys(&body, &["node"], &["node"])?;
+                    runtime.ci.retry_template(&id, string(&body, "node")?)?;
+                } else {
+                    empty(&body)?;
+                    runtime.ci.enable_template(&id, action == "enable")?;
+                }
+                let _ = runtime.ci.reconcile(&runtime.ci_jobs);
+                Ok(runtime.ci.template_catalog())
+            })
+            .await?
+        }
+        ["v1", "ci", "plan"] => runtime.ci.plan(&serde_json::from_value(body)?)?,
+        ["v1", "ci", "runs"] => {
+            code = StatusCode::ACCEPTED;
+            json!({"job":runtime.ci.submit(&runtime.ci_jobs, serde_json::from_value(body)?)?})
+        }
+        ["v1", "ci", "github", owner, repo, "runs", run, "cancel"] => {
+            empty(&body)?;
+            let repository = format!("{owner}/{repo}");
+            let run = run.parse()?;
+            blocking(move || enginebox_ci::github::Github::from_env()?.cancel(&repository, run))
+                .await?
+        }
         ["v1", "storage", "hosts", host, operation] => {
             let plan = runtime.storage.plan(host, operation, &body)?;
             let operation = plan.operation.clone();
@@ -894,6 +997,85 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn ci_routes_require_auth_and_obey_controller_activation_and_drain() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        let node = json!({"schema_version":1,"id":"mac-builder","target":"builder@dedicated-ci.example","os":"macos","architecture":"arm64","image":"xcode-v1","capabilities":["xcode"]}).to_string();
+        let trigger = json!({"schema_version":1,"request_id":"merge-ios","event":"merge","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["macos","xcode"],"shell":"bash","run":"true","timeout-minutes":1}}).to_string();
+        for path in [
+            "/v1/ci/nodes",
+            "/v1/ci/plan",
+            "/v1/ci/runs",
+            "/v1/ci/templates",
+            "/v1/ci/templates/example/enable",
+            "/v1/ci/templates/example/disable",
+            "/v1/ci/templates/example/retry",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, &trigger, false))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for path in [
+            "/v1/ci/nodes",
+            "/v1/ci/templates",
+            "/v1/ci/templates/example/enable",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, &node, true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        c.activate().unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::POST, "/v1/ci/nodes", &node, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, "/v1/ci/plan", &trigger, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(value["node_id"], "mac-builder");
+        c.drain();
+        for path in [
+            "/v1/ci/templates",
+            "/v1/ci/templates/example/enable",
+            "/v1/ci/templates/example/retry",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, "{}", true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            app.oneshot(request(Method::POST, "/v1/ci/runs", &trigger, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    #[tokio::test]
     async fn agent_run_listing_and_cancellation_require_operator_auth() {
         let (_temp, c) = setup();
         let app = router(c.clone());
@@ -970,7 +1152,7 @@ mod tests {
                 runtime
                     .storage
                     .clone()
-                    .with_runner(Arc::new(move |host, argv, _| {
+                    .with_runner(Arc::new(move |host, argv, _, _| {
                         assert_eq!(host.id, "worker");
                         assert!(argv.windows(3).any(|v| v == ["fork", "game", "agent-a"]));
                         started_send.send(()).unwrap();
@@ -1109,6 +1291,20 @@ mod tests {
         assert_eq!(c.status()["mode"], "drained");
     }
     #[tokio::test]
+    async fn status_reports_background_reconcile_failure_until_next_success() {
+        let (_temp, c) = setup();
+        assert!(c.status()["background_reconcile_error"].is_null());
+        c.record_reconcile(vec!["fleet: boom".into(), "agents: bang".into()]);
+        let s = c.status();
+        assert_eq!(
+            s["background_reconcile_error"]["message"],
+            "fleet: boom; agents: bang"
+        );
+        assert!(s["background_reconcile_error"]["at"].as_str().is_some());
+        c.record_reconcile(Vec::new());
+        assert!(c.status()["background_reconcile_error"].is_null());
+    }
+    #[tokio::test]
     async fn only_one_controller_can_activate_and_rollback_reloads_state() {
         let (temp, old) = setup();
         old.activate().unwrap();
@@ -1144,29 +1340,35 @@ mod tests {
     }
     #[tokio::test]
     async fn drain_waits_for_admitted_jobs_and_timeout_can_resume_old_owner() {
-        let (_temp, c) = setup();
-        c.activate().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        c.runtime()
-            .unwrap()
-            .jobs
-            .submit("worker", "test", "ebox-test", move || {
-                receive.recv().unwrap();
-                Ok(json!({"done":true}))
-            })
+        for ci in [false, true] {
+            let (_temp, c) = setup();
+            c.activate().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let runtime = c.runtime().unwrap();
+            let jobs = if ci { &runtime.ci_jobs } else { &runtime.jobs };
+            jobs.submit(
+                "worker",
+                if ci { "ci_automation" } else { "test" },
+                "ebox-test",
+                move || {
+                    receive.recv().unwrap();
+                    Ok(json!({"done":true}))
+                },
+            )
             .unwrap();
-        assert_eq!(c.drain()["drained"], false);
-        assert!(c.admit().is_err());
-        c.activate().unwrap();
-        assert_eq!(c.status()["accepting_mutations"], true);
-        send.send(()).unwrap();
-        while c.runtime().unwrap().jobs.pending() > 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(c.drain()["drained"], false);
+            assert!(c.admit().is_err());
+            c.activate().unwrap();
+            assert_eq!(c.status()["accepting_mutations"], true);
+            send.send(()).unwrap();
+            while c.runtime().unwrap().pending_jobs() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let request = c.admit().unwrap();
+            assert_eq!(c.drain()["drained"], false);
+            drop(request);
+            assert_eq!(c.drain()["drained"], true);
         }
-        let request = c.admit().unwrap();
-        assert_eq!(c.drain()["drained"], false);
-        drop(request);
-        assert_eq!(c.drain()["drained"], true);
     }
 
     #[tokio::test]

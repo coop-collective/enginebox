@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "enginebox-fleet",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true, "traces": { "enabled": true } },
+  "secrets": { "required": ["ADMIN_TOKEN"] },
+  "vars": { "ALLOW_HTTP_NODES": "false" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "REGISTRY", "class_name": "Registry" },
+      { "name": "NODES", "class_name": "FleetNode" },
+      { "name": "PROJECTS", "class_name": "Project" },
+    ],
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Registry", "FleetNode", "Project"] },
+  ],
+  "r2_buckets": [
+    { "binding": "STORE", "bucket_name": "enginebox-fleet-projects" },
+  ],
+}

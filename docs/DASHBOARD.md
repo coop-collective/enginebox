@@ -137,6 +137,6 @@ The v0.2 dependency audit reported six high-severity dependency entries from the
 
 ## GitHub repositories and Actions
 
-The **GitHub** panel connects the repository App, lists accessible installations and private repositories, selects a branch and submits explicit pull/push jobs against private controller checkouts. Runner administration is a separate App connection with organization approval. Pool status and draining are visible alongside runner job receipts. See [GitHub Actions setup and scope](GITHUB-ACTIONS.md), including live qualification and repository-to-VM assignment limits.
+The **GitHub** panel connects the repository App, lists accessible installations and private repositories, selects a branch and opens the existing Storage review/import/accepted-main export flow with that selection. The controller delegates repository-scoped credentials for each network operation. Runner administration is a separate App connection with organization approval. Pool status and draining are visible alongside runner job receipts. See [GitHub Actions setup and scope](GITHUB-ACTIONS.md), including live qualification and runner-pool distribution limits.
 
-Browser checks can use `ENGINEBOX_E2E_FIXTURE_PORT` and `ENGINEBOX_E2E_DASHBOARD_PORT` to avoid existing local services. GitHub feature tests use signed fixture sessions, as storage tests do, so they do not weaken or exhaust the production login limit.
+Browser checks can use `ENGINEBOX_TEST_FLEET_PORT` and `ENGINEBOX_TEST_DASHBOARD_PORT` to avoid existing local services. GitHub feature tests use signed fixture sessions, as storage tests do, so they do not weaken or exhaust the production login limit.

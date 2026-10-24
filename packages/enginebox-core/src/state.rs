@@ -103,6 +103,14 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
 pub struct StateLock {
     _file: File,
 }
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly inherit this file description before
+        // exec closes it. Release the scoped lock explicitly so that unrelated
+        // children cannot keep a completed worker operation locked.
+        let _ = FileExt::unlock(&self._file);
+    }
+}
 pub fn lock(path: &Path, blocking: bool) -> Result<StateLock> {
     let f = options().read(true).write(true).create(true).open(path)?;
     let m = f.metadata()?;
