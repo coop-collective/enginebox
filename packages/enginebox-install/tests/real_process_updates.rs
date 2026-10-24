@@ -99,7 +99,13 @@ fn second_controller(repo: &Path) -> Result<PathBuf> {
         "could not set isolated fixture version"
     );
     fs::write(source.join("Cargo.toml"), changed)?;
-    for file in ["Cargo.lock", "LICENSE", "NOTICE", "LICENSE-APACHE-2.0"] {
+    for file in [
+        "Cargo.lock",
+        "LICENSE",
+        "NOTICE",
+        "LICENSE-APACHE-2.0",
+        "LICENSE-SUSTAINABLE-USE-1.0",
+    ] {
         fs::copy(repo.join(file), source.join(file))?;
     }
     for package in ["enginebox-core", "enginebox-agents", "enginebox-controller"] {

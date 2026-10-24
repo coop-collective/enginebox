@@ -714,7 +714,12 @@ fn native_release_builder_and_installer_round_trip_with_deterministic_archives()
         };
         fs::write(bins.join(name), format!("fixture {binary}")).unwrap();
     }
-    for name in ["LICENSE", "NOTICE", "LICENSE-APACHE-2.0"] {
+    for name in [
+        "LICENSE",
+        "NOTICE",
+        "LICENSE-APACHE-2.0",
+        "LICENSE-SUSTAINABLE-USE-1.0",
+    ] {
         fs::write(directory.join(name), format!("public {name}")).unwrap();
     }
     let outputs = [directory.join("one"), directory.join("two")];

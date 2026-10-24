@@ -32,7 +32,7 @@ export const guides = [
       {
         id: 'self-hosting-license',
         title: 'Self-hosting and the license',
-        html: `<p>Engine Box is source-available under the Sustainable Use License. Personal and internal business self-hosting are permitted by its terms. Offering commercial hosted access or selling the software requires a separate agreement. This is not an OSI open-source license.</p><p>Read the ${source('LICENSE', 'license')} for the exact terms, then start with the <a href="/docs/quickstart/">source quickstart</a>.</p>`,
+        html: `<p>Engine Box is source-available under the Business Source License 1.1. Personal, non-commercial and non-production use is free. Production use by a business needs a license at $10 per node per month. Offering it to others as a hosted service requires a separate agreement. This is not an OSI open-source license.</p><p>Read <a href="/docs/licensing/">Licensing and pricing</a> and the ${source('LICENSE', 'license')} for the exact terms, then start with the <a href="/docs/quickstart/">source quickstart</a>.</p>`,
       },
     ],
   },
