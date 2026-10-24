@@ -4,6 +4,7 @@ export function check(value, code) { if (!value) throw new Error(code); }
 export const id = value => typeof value === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(value);
 export const port = value => Number.isInteger(value) && value >= 1024 && value <= 65535;
 export const hostname = value => typeof value === 'string' && value.length <= 253 && value.split('.').length >= 2 && value.split('.').every(x => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(x));
+export const sourcePath = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !value.includes('\\') && !value.includes('\0') && value.split('/').every(p => p && !['.', '..', '.git', '.enginebox-prepared'].includes(p));
 export function fields(value, allowed) {
   check(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => allowed.includes(k)), 'unknown-field');
 }
@@ -27,8 +28,14 @@ export function validateConfig(config) {
   check(Array.isArray(config.environments) && config.environments.length <= 64, 'invalid-environments');
   const names = new Set(); const bindings = new Set();
   for (const env of config.environments) {
-    fields(env, ['id', 'source', 'image', 'command', 'prepare', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds']);
+    fields(env, ['id', 'source', 'image', 'command', 'prepare', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds', 'updateMode', 'writableDirs']);
     check(id(env.id) && !names.has(env.id), 'duplicate-or-invalid-environment'); names.add(env.id);
+    check(env.updateMode === undefined || ['restart', 'files'].includes(env.updateMode), 'invalid-update-mode');
+    check(env.updateMode !== 'files' || ['layerfs', 'accepted'].includes(env.source.kind), 'files-update-requires-layerfs');
+    const dirs = env.writableDirs ?? [];
+    check(Array.isArray(dirs) && dirs.length <= 16 && dirs.every(p => sourcePath(p) && /^[A-Za-z0-9_./-]+$/.test(p)), 'invalid-writable-directories');
+    check(dirs.length === 0 || env.updateMode === 'files', 'writable-directories-require-files-mode');
+    for (let i = 0; i < dirs.length; i++) check(!dirs.slice(0, i).some(p => p === dirs[i] || p.startsWith(`${dirs[i]}/`) || dirs[i].startsWith(`${p}/`)), 'overlapping-writable-directories');
     if (env.source.kind === 'git') {
       fields(env.source, ['kind', 'url', 'branch']);
       check(typeof env.source.url === 'string' && (isAbsolute(env.source.url) || /^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9_./-]+$/.test(env.source.url)), 'invalid-source');

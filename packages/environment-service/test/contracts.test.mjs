@@ -43,6 +43,33 @@ test('pinned images, bounded resource claims and unique loopback ports are manda
   const config = fixture(); config.environments[0].ports[1].host = 18081;
   assert.throws(() => validateConfig(config), /duplicate-port/);
 });
+test('file watching requires verified storage and isolated nonoverlapping writable directories', () => {
+  const config = fixture(); const env = config.environments[0];
+  env.updateMode = 'files';
+  assert.throws(() => validateConfig(config), /files-update-requires-layerfs/);
+  env.source = { kind: 'layerfs', project: 'app', command: ['/opt/export-app'] };
+  for (const dirs of [['../escape'], ['.git'], ['cache', 'cache/nested'], ['cache', 'cache'], ['cache:rw'], ['cache,nodev'], ['/absolute']]) {
+    env.writableDirs = dirs; assert.throws(() => validateConfig(config));
+  }
+  env.writableDirs = ['.wrangler', 'node_modules/.vite']; validateConfig(config);
+  env.updateMode = 'restart'; assert.throws(() => validateConfig(config), /require-files-mode/);
+  env.updateMode = 'unknown'; assert.throws(() => validateConfig(config), /invalid-update-mode/);
+});
+test('dev processes get a stable read-only source, bounded writable caches and a usable private home', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ebox-watch-mounts-'));
+  try {
+    const config = fixture(root); const env = config.environments[0]; env.updateMode = 'files'; env.writableDirs = ['.wrangler', 'node_modules/.mf'];
+    const calls = []; const manager = new Environments(config, async (_program, args) => { calls.push(args); return ''; });
+    await manager.start(env, 'a'.repeat(64));
+    const argv = calls.find(args => args[0] === 'run');
+    assert(argv.includes(`type=bind,src=${join(root, 'main/workspace')},dst=/app,readonly`));
+    assert(argv.includes(`type=bind,src=${join(root, 'main/data')},dst=/data`));
+    assert(argv.includes(`/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`));
+    for (const path of env.writableDirs) assert(argv.includes(`/app/${path}:rw,nosuid,nodev,size=256m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`));
+    assert(argv.includes('127.0.0.1:18081:3000/tcp'));
+    assert(argv.some(value => value.startsWith('enginebox.environment.recipe=')));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 test('source follows only main, checks out exact commits, and preserves prior code and data', { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'ebox-environment-test-'));
   try {
