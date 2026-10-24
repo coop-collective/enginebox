@@ -7,7 +7,7 @@ async function openStorage(page: Page) {
   // twenty-attempt login budget or require weakening that protection.
   const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3_600_000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
   const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
-  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: "http://127.0.0.1:3007", httpOnly: true, sameSite: "Strict" }]);
+  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: `http://127.0.0.1:${process.env.EBOX_TEST_DASHBOARD_PORT ?? "3007"}`, httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/");
   await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Storage", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Shared checkout storage" })).toBeVisible();
@@ -88,7 +88,7 @@ test("empty and unavailable storage are explicit and proxy rejects arbitrary com
   await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/mode`, { data: { mode: "storage-empty" } });
   await openStorage(page);
   await expect(page.getByRole("heading", { name: "Storage setup required" })).toBeVisible();
-  expect((await page.request.post("/api/control/v1/storage/hosts/metal-01/exec", { headers: { origin: "http://127.0.0.1:3007" }, data: { argv: ["id"] } })).status()).toBe(404);
+  expect((await page.request.post("/api/control/v1/storage/hosts/metal-01/exec", { headers: { origin: `http://127.0.0.1:${process.env.EBOX_TEST_DASHBOARD_PORT ?? "3007"}` }, data: { argv: ["id"] } })).status()).toBe(404);
   await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/mode`, { data: { mode: "storage-error" } });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("Storage catalog unavailable");

@@ -1,7 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 
-const origin = "http://127.0.0.1:3007";
+const origin = `http://127.0.0.1:${process.env.EBOX_TEST_DASHBOARD_PORT ?? "3007"}`;
 async function signIn(page: Page) {
   await page.goto("/");
   await page.getByLabel("Operator password").fill("fixture-dashboard-password");
