@@ -38,3 +38,13 @@ CHECKOUT_URL=https://example.com/checkout pnpm --filter enginebox-site build
 - Unset, the plan shows a disabled "Checkout opening soon" button with no link, and the build prints a warning. No checkout exists yet.
 
 `SITE_URL` sets the canonical origin (default `https://enginebox.coopcollective.dev`) and `OUT_DIR` overrides the `dist/` output directory (used by the build tests).
+
+## Deploy
+
+The site is a static-assets Cloudflare Worker served at `https://enginebox.coopcollective.dev` (see `wrangler.jsonc`). With Wrangler signed in to the account:
+
+```sh
+pnpm --filter enginebox-site run deploy
+```
+
+This builds `dist/` and runs `wrangler deploy`, which also attaches the custom domain. Set `CHECKOUT_URL` in the same shell once license checkout opens.
