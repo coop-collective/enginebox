@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::Duration};
 
 const BRIDGE: &str = include_str!("bridge.mjs");
+#[path = "integration.rs"]
+mod integration;
 #[path = "recovery.rs"]
 mod recovery;
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,6 +25,8 @@ struct Project {
     status: String,
     commit: String,
     approval: String,
+    #[serde(default)]
+    source_only: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Workspace {
@@ -173,6 +177,16 @@ impl Runtime {
             );
         } else {
             fs::write(&bridge, BRIDGE)?;
+        }
+        let integration = self.config.root.join("integration.mjs");
+        if integration.exists() {
+            real_path(&integration)?;
+            ensure!(
+                fs::read_to_string(&integration)? == include_str!("integration.mjs"),
+                "Integration bridge content mismatch"
+            );
+        } else {
+            fs::write(integration, include_str!("integration.mjs"))?;
         }
         Ok(())
     }
@@ -438,6 +452,12 @@ impl Runtime {
         })?;
         let response: Value =
             serde_json::from_slice(&output).context("Invalid SDK response; outcome uncertain")?;
+        if operation == "integrate"
+            && response["ok"] == false
+            && response["error"]["code"] == "Conflict"
+        {
+            return Ok(json!({"ok":false,"conflict":response["error"]}));
+        }
         ensure!(
             response["ok"] == true,
             "LayerFS refusal: {}",
@@ -537,6 +557,7 @@ impl Runtime {
         repo: &std::path::Path,
         revision: &str,
         approval: &str,
+        source_only: bool,
     ) -> Result<Value> {
         identifier(name)?;
         let preview = source::preview(repo, revision)?;
@@ -572,11 +593,15 @@ impl Runtime {
             status: "importing".into(),
             commit: preview.commit.clone(),
             approval: preview.approval.clone(),
+            source_only,
         };
         let path = directory.join("project.json");
         state::write_json(&path, &json!(p))?;
         let outcome = (|| {
             source::stage(repo, &preview, &directory)?;
+            if source_only {
+                fs::remove_dir_all(directory.join("source/.git"))?;
+            }
             // Docker volume create otherwise silently adopts an existing name.
             let found = self.docker(
                 &[
@@ -631,6 +656,15 @@ impl Runtime {
         outcome
     }
     pub fn fork(&self, project: &str, name: &str, from: Option<&str>) -> Result<Value> {
+        self.fork_at(project, name, from, None)
+    }
+    fn fork_at(
+        &self,
+        project: &str,
+        name: &str,
+        from: Option<&str>,
+        exact_ref: Option<&str>,
+    ) -> Result<Value> {
         identifier(name)?;
         self.root()?;
         let _guard = state::lock(&self.config.root.join(".lock"), false)?;
@@ -678,7 +712,7 @@ impl Runtime {
             );
             parent.branch
         } else {
-            "main".into()
+            exact_ref.unwrap_or("main").into()
         };
         let key = format!("w-{}", uuid::Uuid::new_v4().simple());
         let mut w = Workspace {

@@ -1,3 +1,5 @@
+import { validateIntegration, type IntegrationJob } from "./integration.ts";
+export * from "./integration.ts";
 export const SCHEMA = 1;
 export const CHUNK_BYTES = 4 * 1024 * 1024;
 export const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -43,6 +45,7 @@ export type NodeSpec = {
   slots: number;
   cacheBytes: number;
   assistantProjects?: string[];
+  integrationProjects?: string[];
   taskOnly?: true;
 };
 export type NodeView = NodeSpec & {
@@ -77,7 +80,7 @@ export type AssistantJob = {
   argv?: never;
   check?: never;
 };
-export type JobSpec = StoreJob | AssistantJob;
+export type JobSpec = StoreJob | AssistantJob | IntegrationJob;
 export function readOnlyJob(job: { kind: string }) {
   return job.kind === "hydrate" || job.kind === "verify";
 }
@@ -243,6 +246,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "slots",
     "cacheBytes",
     "assistantProjects",
+    "integrationProjects",
     "taskOnly",
   ]);
   identifier(value.id);
@@ -261,7 +265,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     requireThat(
       value.taskOnly === true && value.role === "agent" &&
         value.projects.length === 1 && value.origin === null &&
-        value.assistantProjects === undefined,
+        value.assistantProjects === undefined && value.integrationProjects === undefined,
       "Task-only credentials require one project, agent role and no executor capability",
     );
   if (value.assistantProjects !== undefined) {
@@ -278,6 +282,10 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
         "Assistant project must be enrolled",
       );
     }
+  }
+  if (value.integrationProjects !== undefined) {
+    requireThat(value.role === "agent" && Array.isArray(value.integrationProjects) && value.integrationProjects.length <= 128, "Invalid integration projects");
+    for (const project of value.integrationProjects) { identifier(project); requireThat(value.projects.includes(project), "Integration project must be enrolled"); }
   }
   integer(value.slots, 1, 64);
   integer(value.cacheBytes, MAX_CHUNK_BYTES * 2, Number.MAX_SAFE_INTEGER);
@@ -313,6 +321,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     slots: value.slots,
     cacheBytes: value.cacheBytes,
     ...(value.taskOnly === true ? { taskOnly: true as const } : {}),
+    ...(value.integrationProjects === undefined ? {} : { integrationProjects: [...new Set(value.integrationProjects as string[])] }),
     ...(value.assistantProjects === undefined
       ? {}
       : {
@@ -331,9 +340,16 @@ export function validateJob(value: unknown): JobSpec {
     "timeoutSeconds",
     "check",
     "prompt",
+    "integration",
   ]);
   identifier(value.id);
   identifier(value.project);
+  if (value.kind === "integration") {
+    digest(value.generation);
+    requireThat(value.argv === undefined && value.check === undefined && value.prompt === undefined && value.timeoutSeconds === undefined, "Integration cannot carry arbitrary commands or CI evidence");
+    return { id: value.id, project: value.project, generation: value.generation, kind: "integration", integration: validateIntegration(value.integration) };
+  }
+  requireThat(value.integration === undefined, "Only integration jobs carry a plan");
   if (value.kind === "assistant") {
     requireThat(
       value.generation === null &&

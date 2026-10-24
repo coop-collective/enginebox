@@ -11,12 +11,14 @@ import {
   type NodeView,
   type CandidateSpec,
   type CheckRequirement,
+  type ChangeSubmission,
   type TaskActor,
   type TaskCreate,
   type TaskMove,
   type TaskStatus,
   type TaskUpdate,
 } from "@enginebox/fleet-protocol";
+import { Integrations } from "./integration.ts";
 import { Tasks } from "./tasks.ts";
 
 export class State extends DurableObject<Env> {
@@ -180,6 +182,7 @@ export class FleetNode extends State {
       "Node cannot execute this project",
       403,
     );
+    requireThat(job.kind !== "integration" || node.integrationProjects?.includes(job.project), "Node has no integration binding for this project", 403);
     const prior = this.get<Reservation>(`lease:${job.project}:${job.id}`);
     if (prior) {
       requireThat(
@@ -360,6 +363,9 @@ export class Project extends State {
   private tasks() {
     return new Tasks(this, this.ctx.storage.sql);
   }
+  private integrations() { return new Integrations(this, this.tasks()); }
+  async submitChange(spec: ChangeSubmission) { return this.integrations().submit(spec); }
+  async integrate(id:string, changes:string[]) { const job=this.integrations().freeze(id,changes); return this.enqueue(job); }
   async task(id: string) {
     return this.tasks().get(id);
   }
@@ -601,6 +607,7 @@ export class Project extends State {
     return { head: generation, decision: pending.id };
   }
   async enqueue(spec: JobSpec) {
+    if (spec.kind === "integration") this.integrations().validate(spec);
     requireThat(
       spec.kind === "assistant" || this.get(`generation:${spec.generation}`),
       "Generation is not published",
@@ -645,13 +652,14 @@ export class Project extends State {
     this.put(`job:${spec.id}`, job);
     return job;
   }
-  async next(allowAssistant = false) {
+  async next(allowAssistant = false, allowIntegration = false) {
     const row = this.ctx.storage.sql
       .exec<{
         value: string;
       }>(
-        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') ORDER BY rowid LIMIT 1",
+        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') AND (?=1 OR json_extract(value,'$.spec.kind')!='integration') ORDER BY rowid LIMIT 1",
         allowAssistant ? 1 : 0,
+        allowIntegration ? 1 : 0,
       )
       .toArray()[0];
     return row ? (JSON.parse(row.value) as JobRecord).spec : null;
@@ -673,6 +681,7 @@ export class Project extends State {
                   timeoutSeconds: assignment.timeoutSeconds,
                 }
               : {}),
+            ...(assignment.kind === "integration" ? { integration: assignment.integration } : {}),
             ...(assignment.check ? { check: assignment.check } : {}),
             ...(assignment.argv
               ? {
@@ -739,6 +748,7 @@ export class Project extends State {
         409,
       );
     }
+    if (ok && job.spec.kind === "integration") this.integrations().complete(job.spec, result);
     job.status = ok ? "completed" : "failed";
     job.result = result;
     this.put(key, job);
