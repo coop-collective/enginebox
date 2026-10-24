@@ -698,6 +698,41 @@ mod tests {
         );
     }
     #[test]
+    fn optional_dev_bindings_are_private_and_do_not_change_the_legacy_registry() {
+        let (root, storage) = configured();
+        assert!(
+            storage
+                .plan("node", "dev-status", &json!({"project":"app"}))
+                .is_err()
+        );
+        let directory = root.path().join("state/storage");
+        let original = std::fs::read(directory.join("config.json")).unwrap();
+        let service =
+            json!({"url":"http://127.0.0.1:18790/","token_file":root.path().join("private-token")});
+        state::write_json(
+            &directory.join("dev-services.json"),
+            &json!({"schema_version":1,"hosts":{"node":service}}),
+        )
+        .unwrap();
+        let configured = Storage::open(&root.path().join("state"), storage.fleet.clone()).unwrap();
+        assert!(
+            configured
+                .plan("node", "dev-status", &json!({"project":"app"}))
+                .is_ok()
+        );
+        assert_eq!(
+            std::fs::read(directory.join("config.json")).unwrap(),
+            original
+        );
+        assert!(!configured.catalog().to_string().contains("private-token"));
+        state::write_json(
+            &directory.join("dev-services.json"),
+            &json!({"schema_version":1,"hosts":{"unknown":service}}),
+        )
+        .unwrap();
+        assert!(Storage::open(&root.path().join("state"), storage.fleet).is_err());
+    }
+    #[test]
     fn github_requests_are_bound_to_node_credentials_and_exact_main_revisions() {
         let (_root, storage) = configured();
         let plan=storage.plan("node","github-preview",&json!({"project":"app","repository":"https://github.com/Owner/Repo.git","branch":"feature/new"})).unwrap();

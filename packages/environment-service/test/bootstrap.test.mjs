@@ -117,6 +117,7 @@ test('dependency updates prepare separately, preserve data, roll back failed rea
   try {
     const h = await harness(root); let m = await h.create(); await m.projects.register({ host: 'node', project: 'demo' }); await m.tick();
     const before = m.projects.catalog()[0]; const old = before.environment;
+    await m.setRoute({ id: 'custom-alias', environment: old, service: 'web', hostname: 'custom.dev.example.com', access: 'public' });
     await writeFile(join(root, before.id, 'data', 'state'), 'keep');
     await h.setSource(files('two', template(), '{"changed":true}')); h.failSetup(true); await m.tick();
     assert.equal(m.projects.catalog()[0].healthy, true); assert.equal(m.projects.catalog()[0].error, 'setup-failed');
@@ -129,6 +130,7 @@ test('dependency updates prepare separately, preserve data, roll back failed rea
     assert.equal(await readFile(join(root, before.id, 'data/state'), 'utf8'), 'keep');
     assert.equal(h.calls.filter(c => c[0] === 'pull').length, 1);
     assert.equal(m.routes[0].environment, m.projects.catalog()[0].environment);
+    assert.equal(m.routes.find(r => r.id === 'custom-alias').environment, m.projects.catalog()[0].environment);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
