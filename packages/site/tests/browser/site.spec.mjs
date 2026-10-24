@@ -1,4 +1,19 @@
 import { test,expect } from '@playwright/test';
+test('Get started and mobile Dashboard navigation open the dashboard with working assets and API',async({page,isMobile})=>{
+  await page.goto('/');
+  if(isMobile){
+    await page.getByRole('button',{name:'Toggle navigation'}).click();
+    await page.locator('#main-nav').getByRole('link',{name:'Dashboard',exact:true}).click();
+  }else{
+    await page.getByRole('link',{name:'Get started'}).click();
+  }
+  await expect(page).toHaveURL(/\/dashboard\/$/);
+  await expect(page.getByRole('heading',{name:'Dashboard fixture'})).toBeVisible();
+  await expect(page.locator('body')).toHaveAttribute('data-session','no');
+  const node=await page.request.post('/api/node/enroll',{data:{}});
+  expect(node.status()).toBe(401);
+  expect(await node.json()).toEqual({error:'unauthorized'});
+});
 test('environment concept preserves core and independent forks',async({page})=>{
   const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto('/'); await expect(page.getByRole('heading',{name:'Keep the world. Fork the work.'})).toBeVisible();

@@ -5,7 +5,7 @@ export const home = `
     <p class="eyebrow"><span class="tiny-square"></span> ENVIRONMENTS FOR NATIVE CODING AGENTS</p>
     <h1>Keep the world.<br> <span>Fork the work.</span></h1>
     <p class="hero-lede">A persistent home for your app. A fresh environment for every agent. On hardware you control.</p>
-    <div class="hero-actions"><a class="button primary" href="/docs/quickstart/">Start building <span aria-hidden="true">↗</span></a><a class="text-link" href="#how-it-works">See how it works <span aria-hidden="true">↓</span></a></div>
+    <div class="hero-actions"><a class="button primary" href="/dashboard/">Start building <span aria-hidden="true">↗</span></a><a class="text-link" href="#how-it-works">See how it works <span aria-hidden="true">↓</span></a></div>
     <p class="hero-note">Native clients. Your accounts. Your machines.</p>
   </div>
   <div class="hero-aside"><span class="outline-cube" aria-hidden="true">⌘</span><span>THE ENVIRONMENT STAYS.<br>THE EXPERIMENTS COME AND GO.</span><span class="edition">ENGINE BOX / DEVELOPMENT PREVIEW</span></div>
