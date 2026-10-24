@@ -322,13 +322,15 @@ pub fn materialize(
                 );
                 permissions(&path, *execute)?;
             }
+            #[cfg(unix)]
             Entry::Symlink { target, .. } => {
                 if fs::symlink_metadata(&path).is_ok() {
                     remove(&path)?;
                 }
-                #[cfg(unix)]
                 std::os::unix::fs::symlink(target, &path)?;
-                #[cfg(not(unix))]
+            }
+            #[cfg(not(unix))]
+            Entry::Symlink { .. } => {
                 anyhow::bail!(
                     "Source symlinks require the qualified Linux/macOS build environment"
                 );
