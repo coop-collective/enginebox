@@ -1,9 +1,10 @@
 # Persistent development services and exposure
 
 `packages/environment-service` is an optional Linux Docker supervisor for a
-project's persistent development service. It follows a configured Git branch or
-the Cloudflare project's **accepted** generation, prepares exact code, starts a
-bounded container, checks readiness and publishes Traefik routes. The dashboard's
+project's persistent development service. It follows LayerFS main, a closed preview,
+the Cloudflare project's **accepted** generation, or a configured Git branch.
+It prepares exact code, starts a bounded container, checks readiness and publishes
+Traefik routes. The dashboard's
 **Environments** section shows running/desired revisions and manages routes. Its
 private API token never reaches the browser. CI and agent execution remain separate.
 
@@ -32,7 +33,8 @@ that handoff still needs a live fleet-to-service qualification. A missing export
 reported explicitly while the existing service remains available. Cross-node
 export transport and private Git authentication are not supplied here.
 
-Only one process owns writable data: the old process stops before new code starts.
+With the default `updateMode: "restart"`, only one process owns writable data:
+the old process stops before new code starts.
 Readiness failure restores prior code and records the failed revision without
 repeated retries; a new source revision permits another attempt. Docker supervises
 containers while the control daemon restarts. Ownership labels prevent adoption
@@ -42,6 +44,67 @@ Framework HMR/WebSockets pass through; Enginebox does not inject reload scripts.
 The disposable test app reconnects a WebSocket and reloads on revision changes.
 Code rollback does **not** undo database writes/migrations. Schema changes need
 application-specific migration and backup procedures.
+
+## Stable dev with a running file watcher
+
+Use `updateMode: "files"` for a persistent dev command such as `wrangler dev` or
+Vite. Accepted main is the project's **stable dev**, including its locally simulated
+bindings. A promotion updates files inside the existing source bind mount. The
+container, command, port, installed dependencies and `/data` stay in place; no
+Enginebox build, process replacement or CD deployment runs for that source update.
+The dev server owns rebuilding, request handling and browser HMR/reload. HTTP and
+WebSocket traffic use the same generic port route.
+
+```json
+{
+  "updateMode":"files", "writableDirs":[".wrangler","node_modules/.mf"],
+  "source":{"kind":"layerfs", "project":"app",
+    "command":["/usr/bin/sudo","-n","/opt/enginebox/export-app-main"]},
+  "prepare":["npm","ci","--cache","/tmp/npm-cache"],
+  "command":["npm","run","dev"],
+  "ports":[{"name":"web","protocol":"http","container":8787,"host":18123}],
+  "health":{"port":"web","path":"/health"}
+}
+```
+
+These fields augment the operator-provisioned environment recipe below. For
+Wrangler, the project's dev script can use
+`wrangler dev --local --ip 0.0.0.0 --port 8787 --live-reload --persist-to /data/wrangler`.
+`--local` disables remote bindings; `--live-reload` supplies Wrangler's browser
+reload connection. This is a project command, not a framework-specific supervisor.
+Configure other dev servers' external host/HMR settings in their own project.
+
+Only verified `layerfs` and `accepted` sources support this mode. Every incoming
+file is verified in staging before live writes. Only changed managed files are
+replaced, each with an atomic rename; removed managed files are deleted. Unchanged
+files, untracked dependencies and generated files survive. An ownership journal
+allows an interrupted update to resume. Source errors leave a healthy process and
+its route running. On supervisor restart, owned containers receive a fresh health
+check before their routes are restored, without waiting for source retrieval.
+
+The app cannot write its source bind mount. `writableDirs` grants bounded, ephemeral
+tmpfs directories for framework caches (for example `.wrangler` or
+`node_modules/.mf` or `node_modules/.vite`); they cannot overlap managed source. Put durable simulated
+databases in `/data`, not these caches. Dependencies are prepared once. Changes to
+dependencies, runtime image, command or writable mount configuration may require a
+new environment; there is no automatic in-process dependency installation.
+Choose an image with the runtime prerequisites (including system CA certificates
+for workerd). npm's cache belongs in `/tmp`; the private home has a small quota.
+`ENGINEBOX_REVISION` is the startup revision, while the API's revision identifies
+the applied source tree, not proof of framework compilation success.
+
+File replacement is atomic per file, not across a whole tree. Dev servers must
+watch/debounce changes and handle rebuilds themselves. Invalid application code or
+a framework that stops serving during rebuilds can still cause errors; this mode
+does not promise universal zero downtime or automatic code rollback.
+
+Wrangler's built-in reload uses `/cdn-cgi/live-reload`. Cloudflare reserves
+`/cdn-cgi/` before requests reach a Worker, so the optional public Worker edge
+cannot transparently carry that particular connection. A direct port connection
+(including an SSH forward) supports it. Public reload needs an ingress that
+preserves that path, or a project dev server with a configurable HMR endpoint.
+Do not claim public Wrangler reload merely because ordinary WebSockets work.
+See Cloudflare's [reserved endpoint documentation](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/).
 
 ## Networking
 
@@ -139,6 +202,17 @@ fixture through actual Traefik: HTTP, WebSocket Upgrade/data, TCP, two UDP sessi
 verified TLS/SNI passthrough, route add/remove and access rejection. It does not
 qualify public UDP exposure.
 
+`test/wrangler` is a standalone importable fixture pinned to Wrangler 4.152.0.
+Its package lock belongs to that imported project. The opt-in
+`test/live-watch-browser.mjs URL BEFORE_VERSION AFTER_VERSION OUTPUT` requires
+`ENGINEBOX_LIVE_WATCH=1` and dashboard Playwright dependencies. It keeps a browser
+open while an operator promotes a new fixture revision, requires a successful
+WebSocket handshake and a real reload without calling `page.reload`, and checks
+that simulated KV identity and interactions survive. It writes `OUTPUT.ready`
+before the promotion and `OUTPUT` after success. Separately probe HTTP continuously
+and compare container ID, start time, restart count and Wrangler PIDs across the
+promotion; the browser test alone does not prove process continuity.
+
 Heavy CI and dev services should use separate pools or resource-limited VMs/
 containers. This is a single-owner, single-node service, not HA or a multi-tenant
 sandbox. It does not allocate physical nodes, install macOS/Windows images, manage
@@ -180,8 +254,9 @@ repository credentials nor the node's writable Store belong in the app container
 This adapter identifies its authority as `local-layerfs`. It does not substitute
 for the distributed controller's accepted-generation/fencing contract. The
 `accepted` adapter remains the path for distributed integration. A closed preview
-is immutable; a subsequent task uses a new workspace/preview. Live editing/HMR of
-an open LayerFS mount and automatic project enrollment are separate capabilities.
+is immutable; a subsequent task uses a new workspace/preview. File-watcher mode
+refreshes accepted main after promotion. Streaming edits from an open LayerFS
+workspace and automatic project enrollment remain separate capabilities.
 
 Live qualification found that Docker's archive API does not observe LayerFS mounts
 added after container creation. Both dev and GitHub exports now materialize files

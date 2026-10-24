@@ -1,0 +1,8 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "enginebox-watch-fixture",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-24",
+  "observability": { "enabled": true, "traces": { "enabled": true } },
+  "kv_namespaces": [{ "binding": "STATE", "id": "00000000000000000000000000000001" }]
+}

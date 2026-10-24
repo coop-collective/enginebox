@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile, rename, open, stat } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, open, stat, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { check, gatewayConfig, validateRoutes } from './config.mjs';
 import { acceptedSource, copyAccepted } from './accepted.mjs';
 import { layerfsSource } from './layerfs.mjs';
+import { syncFiles, writableDirectories } from './files.mjs';
 
 export async function atomic(file, value) {
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -48,8 +49,18 @@ export class Environments {
     check((metadata.mode & 0o077) === 0, 'state-directory-must-be-private');
     this.states = await load(this.stateFile, {});
     this.routes = validateRoutes(await load(this.routeFile, []), this.config);
-    // No stale healthy flag is trusted across a process restart.
+    // Recheck owned live processes before publishing routes. A control restart
+    // must not withdraw a working dev server while source fetching catches up.
     for (const state of Object.values(this.states)) state.healthy = false;
+    for (const env of this.config.environments) {
+      const state = this.states[env.id]; if (!state?.revision) continue;
+      try {
+        const recipe = createHash('sha256').update(JSON.stringify(env)).digest('hex');
+        const container = await this.inspect(env);
+        const matches = env.updateMode === 'files' ? container?.Config.Labels['enginebox.environment.recipe'] === recipe : container?.Config.Labels['enginebox.environment.revision'] === state.revision;
+        state.healthy = state.recipe === recipe && matches && !!container?.State.Running && await this.healthy(env);
+      } catch { state.healthy = false; }
+    }
     await this.render();
   }
   async save() { await atomic(this.stateFile, this.states); }
@@ -59,7 +70,7 @@ export class Environments {
   }
   catalog() {
     return { schema: 1, baseDomains: this.config.baseDomains, transportEntrypoints: this.config.transportEntrypoints, routes: this.routes,
-      environments: this.config.environments.map(e => ({ id: e.id, source: { kind: e.source.kind, branch: e.source.branch }, services: e.ports.map(({ name, protocol }) => ({ name, protocol })), cpu: e.cpu, memoryMiB: e.memoryMiB, ...(this.states[e.id] ?? { status: 'pending', healthy: false }) })) };
+      environments: this.config.environments.map(e => ({ id: e.id, updateMode: e.updateMode ?? 'restart', source: { kind: e.source.kind, branch: e.source.branch }, services: e.ports.map(({ name, protocol }) => ({ name, protocol })), cpu: e.cpu, memoryMiB: e.memoryMiB, ...(this.states[e.id] ?? { status: 'pending', healthy: false }) })) };
   }
   async setRoute(route) {
     const next = this.routes.filter(v => v.id !== route.id).concat([route]);
@@ -112,13 +123,18 @@ export class Environments {
     return release;
   }
   base(env, revision, suffix = '') {
-    return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', '/home/app:rw,nosuid,nodev,size=16m', '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, '--workdir', '/app'];
+    return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, '--workdir', '/app'];
   }
   async start(env, revision) {
     const root = join(this.config.stateDir, env.id); const data = join(root, 'data');
     await mkdir(data, { recursive: true, mode: 0o700 });
     await this.remove(env);
-    const args = [...this.base(env, revision), '--detach', '--restart=unless-stopped', '--mount', `type=bind,src=${join(root, revision)},dst=/app,readonly`, '--mount', `type=bind,src=${data},dst=/data`];
+    const files = env.updateMode === 'files';
+    const args = [...this.base(env, revision), '--detach', '--restart=unless-stopped', '--mount', `type=bind,src=${join(root, files ? 'workspace' : revision)},dst=/app,readonly`, '--mount', `type=bind,src=${data},dst=/data`];
+    if (files) {
+      args.push('--label', `enginebox.environment.recipe=${createHash('sha256').update(JSON.stringify(env)).digest('hex')}`);
+      for (const path of env.writableDirs ?? []) args.push('--tmpfs', `/app/${path}:rw,nosuid,nodev,size=256m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`);
+    }
     for (const p of env.ports) args.push('--publish', `127.0.0.1:${p.host}:${p.container}/${p.protocol === 'udp' ? 'udp' : 'tcp'}`);
     await this.docker([...args, env.image, ...env.command]);
   }
@@ -140,6 +156,7 @@ export class Environments {
     throw new Error('readiness-timeout');
   }
   async reconcile(env) {
+    if (env.updateMode === 'files') return this.reconcileFiles(env);
     const state = this.states[env.id] ??= { healthy: false, status: 'pending' };
     try {
       const recipe = createHash('sha256').update(JSON.stringify(env)).digest('hex');
@@ -182,6 +199,62 @@ export class Environments {
           await this.ready(env); state.healthy = true;
         } catch { state.healthy = false; }
       } else { state.healthy = false; await this.remove(env).catch(() => {}); }
+    }
+  }
+  async reconcileFiles(env) {
+    const state = this.states[env.id] ??= { healthy: false, status: 'pending' };
+    const root = join(this.config.stateDir, env.id); const workspace = join(root, 'workspace');
+    const receiptFile = join(root, 'files.json');
+    try {
+      const recipe = createHash('sha256').update(JSON.stringify(env)).digest('hex');
+      check(!state.recipe || state.recipe === recipe, 'recipe-changed-create-new-environment'); state.recipe = recipe;
+      const source = await this.source(env); state.desiredRevision = source.revision;
+      let receipt = await load(receiptFile, null);
+      if (!receipt) {
+        let existing; try { existing = await lstat(workspace); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        check(!existing, 'unowned-live-source-directory');
+        // Prepare dependencies once, before starting the long-lived dev command.
+        const prepared = await this.prepare(env, source);
+        check((await this.source(env)).revision === source.revision, 'source-superseded');
+        receipt = { schema: 1, initialRevision: source.revision, revision: null, entries: [], pendingEntries: source.manifest.entries };
+        await atomic(receiptFile, receipt);
+        await rename(prepared, workspace);
+      } else {
+        check(receipt.schema === 1 && /^[a-f0-9]{64}$/.test(receipt.initialRevision), 'invalid-live-source-receipt');
+        try { await stat(workspace); } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          check(receipt.revision === null, 'live-source-directory-missing');
+          await rename(join(root, receipt.initialRevision), workspace);
+        }
+      }
+      if (receipt.revision !== source.revision || receipt.pendingEntries) {
+        const entries = receipt.pendingEntries ?? receipt.entries;
+        state.status = 'syncing'; await this.save();
+        state.fileUpdate = await syncFiles(source, workspace, entries, env.writableDirs ?? [], async pendingEntries => {
+          check((await this.source(env)).revision === source.revision, 'source-superseded');
+          receipt.pendingEntries = pendingEntries; await atomic(receiptFile, receipt);
+        });
+        await writableDirectories(workspace, env.writableDirs ?? []);
+        receipt = { schema: 1, initialRevision: receipt.initialRevision, revision: source.revision, entries: source.manifest.entries };
+        await atomic(receiptFile, receipt);
+        state.previousRevision = state.revision ?? null; state.revision = source.revision;
+        state.updatedAt = new Date().toISOString();
+      } else state.revision = receipt.revision;
+      const container = await this.inspect(env);
+      check(!container || container.Config.Labels['enginebox.environment.recipe'] === recipe, 'live-process-recipe-mismatch');
+      if (!container?.State.Running) { await this.start(env, receipt.initialRevision); await this.ready(env); }
+      state.healthy = await this.healthy(env);
+      state.status = state.healthy ? 'ready' : 'unhealthy';
+      delete state.error; delete state.failedRevision;
+    } catch (error) {
+      state.error = /^[a-z0-9-]+$/.test(error.message) ? error.message : 'environment-update-failed';
+      state.status = 'update-failed';
+      // Source failures must not stop, replace or rebuild a live dev process.
+      try {
+        const container = await this.inspect(env);
+        const recipe = createHash('sha256').update(JSON.stringify(env)).digest('hex');
+        state.healthy = container?.Config.Labels['enginebox.environment.recipe'] === recipe && !!container?.State.Running && await this.healthy(env);
+      } catch { state.healthy = false; }
     }
   }
   async tick() {
