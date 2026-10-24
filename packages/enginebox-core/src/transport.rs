@@ -252,12 +252,42 @@ fn read_bounded(
     ensure!(!exceeded, "Command output exceeded its bound");
     Ok(result)
 }
-fn kill_tree(child: &mut Child) {
+/// Terminates a child that leads its own process group (`setsid`).
+///
+/// A zero `grace` kills immediately (SIGKILL) and returns without waiting. A
+/// non-zero `grace` sends SIGTERM first, polls for exit up to `grace`, then
+/// kills and reaps the child.
+pub fn kill_process_group(child: &mut Child, grace: Duration) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    let pid = child.id() as i32;
+    #[cfg(unix)]
+    let signal_group = |signal: i32| unsafe {
+        libc::kill(-pid, signal);
+    };
+    if grace.is_zero() {
+        #[cfg(unix)]
+        signal_group(libc::SIGKILL);
+        let _ = child.kill();
+        return;
     }
+    #[cfg(unix)]
+    signal_group(libc::SIGTERM);
+    #[cfg(not(unix))]
     let _ = child.kill();
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    #[cfg(unix)]
+    signal_group(libc::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+fn kill_tree(child: &mut Child) {
+    kill_process_group(child, Duration::ZERO);
 }
 pub fn host_command(host: &Host, argv: &[String]) -> Vec<String> {
     let mut result = vec!["sudo".into(), "-n".into()];
