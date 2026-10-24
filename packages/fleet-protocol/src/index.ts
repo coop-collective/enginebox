@@ -1,4 +1,6 @@
 import { validateIntegration, type IntegrationJob } from "./integration.ts";
+import { validateNativeSettings, type NativeSettings } from "./machines.ts";
+export * from "./machines.ts";
 export * from "./integration.ts";
 export * from "./engine-build.ts";
 import { validateEngineBuild, type EngineBuildJob } from "./engine-build.ts";
@@ -13,7 +15,7 @@ export const MAX_PAGES = 256;
 export const MAX_JSON_BYTES = 256 * 1024;
 export const LEASE_MS = 30_000;
 export const NODE_STALE_MS = 20_000;
-export type Role = "agent" | "storage";
+export type Role = "agent" | "storage" | "native";
 export type JsonValue =
   | null
   | boolean
@@ -54,6 +56,7 @@ export type NodeSpec = {
   buildProjects?: string[];
   taskOnly?: true;
   mediaProjects?: string[];
+  native?: NativeSettings;
 };
 export type NodeView = NodeSpec & {
   epoch: number;
@@ -262,10 +265,13 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "integrationProjects",
     "buildProjects",
     "taskOnly",
+    "native",
   ]);
   identifier(value.id);
   requireThat(
-    value.role === "agent" || value.role === "storage",
+    value.role === "agent" ||
+      value.role === "storage" ||
+      value.role === "native",
     "Invalid node role",
   );
   requireThat(
@@ -275,6 +281,23 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "Projects required",
   );
   for (const project of value.projects) identifier(project);
+  if (value.role === "native") {
+    requireThat(
+      value.projects.length === 1 &&
+        value.origin === null &&
+        value.assistantProjects === undefined &&
+        value.integrationProjects === undefined &&
+        value.buildProjects === undefined &&
+        value.mediaProjects === undefined &&
+        value.taskOnly === undefined,
+      "Native nodes require one project and cannot operate storage or agent executors",
+    );
+    validateNativeSettings(value.native);
+  } else
+    requireThat(
+      value.native === undefined,
+      "Native settings require the native role",
+    );
   if (value.taskOnly !== undefined)
     requireThat(
       value.taskOnly === true &&
@@ -381,6 +404,9 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     origin,
     slots: value.slots,
     cacheBytes: value.cacheBytes,
+    ...(value.role === "native"
+      ? { native: validateNativeSettings(value.native) }
+      : {}),
     ...(value.mediaProjects === undefined
       ? {}
       : { mediaProjects: [...new Set(value.mediaProjects as string[])] }),

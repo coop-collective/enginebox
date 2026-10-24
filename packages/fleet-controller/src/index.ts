@@ -32,6 +32,12 @@ import {
 import { assistantRoute } from "./assistant.ts";
 import { recordingRoute } from "./recording-routes.ts";
 import { artifactRoute } from "./artifacts.ts";
+import {
+  machineRoute,
+  nativeEnrollment,
+  nativeMachinePoll,
+  syncNative,
+} from "./machine-routes.ts";
 export { Registry, FleetNode, Project } from "./state.ts";
 
 const json = (value: unknown, status = 200) =>
@@ -189,9 +195,31 @@ export default {
       const parts = url.pathname.split("/").filter(Boolean);
       if (request.method === "GET" && url.pathname === "/health")
         return json({ ok: true, service: "enginebox-fleet", schema: 1 });
+      if (request.method === "POST" && url.pathname === "/v1/node/enroll")
+        return await nativeEnrollment(request, env);
       const p = await principal(request, env);
       const registry = env.REGISTRY.getByName("owner");
       requireThat(parts[0] === "v1", "Unknown API", 404);
+      if (!p.admin && p.node.role === "native")
+        requireThat(
+          (parts.length === 3 &&
+            parts[1] === "node" &&
+            ((parts[2] === "identity" && request.method === "GET") ||
+              (["hello", "heartbeat"].includes(parts[2]) &&
+                request.method === "POST"))) ||
+            (url.pathname === "/v1/node/machine-sessions/poll" &&
+              request.method === "POST") ||
+            (parts[1] === "projects" &&
+              parts[3] === "machine-sessions" &&
+              parts.length >= 5),
+          "Native machines cannot operate fleet jobs, providers or storage",
+          403,
+        );
+      if (
+        url.pathname === "/v1/node/machine-sessions/poll" &&
+        request.method === "POST"
+      )
+        return await nativeMachinePoll(request, env, p);
       if (!p.admin && p.node.taskOnly === true)
         requireThat(
           (parts.length === 3 &&
@@ -200,6 +228,7 @@ export default {
             request.method === "GET") ||
             (parts[1] === "projects" &&
               (parts[3] === "tasks" ||
+                ["machines", "machine-sessions"].includes(parts[3]) ||
                 ["test-contexts", "test-sessions", "recordings"].includes(
                   parts[3],
                 ) ||
@@ -247,6 +276,11 @@ export default {
             await jsonBody(request),
             String(env.ALLOW_HTTP_NODES) === "true",
           );
+          requireThat(
+            spec.role !== "native",
+            "Native machines require a project invitation",
+            400,
+          );
           for (const project of spec.projects)
             await requireProject(env, project);
           const secret =
@@ -267,6 +301,7 @@ export default {
         admin(p);
         identifier(parts[2]);
         await env.NODES.getByName(parts[2]).revoke();
+        await syncNative(env, parts[2]);
         return json({ revoked: true });
       }
       if (
@@ -304,7 +339,9 @@ export default {
               /^[a-f0-9-]{36}$/.test(body.session),
             "Invalid session",
           );
-          return json(await stub.hello(body.session));
+          const result = await stub.hello(body.session);
+          if (n.role === "native") await syncNative(env, n.id);
+          return json(result);
         }
         if (parts[2] === "identity" && request.method === "GET") {
           return json({
@@ -312,6 +349,7 @@ export default {
             role: n.role,
             projects: n.projects,
             taskOnly: n.taskOnly === true,
+            ...(n.native ? { native: n.native } : {}),
           });
         }
         if (parts[2] === "heartbeat" && request.method === "POST") {
@@ -496,6 +534,15 @@ export default {
         projectAccess(p, project);
         await requireProject(env, project);
         const authority = env.PROJECTS.getByName(project);
+        if (
+          [
+            "machines",
+            "machine-invitations",
+            "machine-session-grants",
+            "machine-sessions",
+          ].includes(parts[3])
+        )
+          return await machineRoute(request, env, project, parts, p);
         if (
           [
             "test-contexts",

@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><title>Owned native stream qualification</title>
+<video id="video" autoplay playsinline muted style="width:640px;height:360px"></video>
+<script>
+const video=document.querySelector('video');
+async function fixtureJson(path,init){const response=await fetch(path,init);const value=await response.json();if(!response.ok)throw Error(`Fixture ${path.split('/')[2]} HTTP${response.status}: ${String(value.error||'request failed').slice(0,500)}`);return value;}
+window.openSession=async(mode)=>{
+  window.proof=await fixtureJson('/fixture/scene');
+  const session=await fixtureJson('/fixture/open',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode})});
+  if(typeof session.id!=='string'||!Array.isArray(session.iceServers))throw Error('Fixture returned an invalid session');
+  window.session=session; window.pc=new RTCPeerConnection({iceServers:session.iceServers,iceTransportPolicy:session.iceTransportPolicy});
+  pc.addTransceiver('video',{direction:'recvonly'});
+  window.input=pc.createDataChannel('input',{ordered:true});
+  pc.ontrack=e=>{video.srcObject=e.streams[0]||new MediaStream([e.track]);video.play();};
+  const offer=await pc.createOffer();await pc.setLocalDescription(offer);
+  await new Promise((resolve,reject)=>{if(pc.iceGatheringState==='complete')return resolve();const timer=setTimeout(()=>reject(Error('browser ICE timeout')),15000);pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}});});
+  await fixtureJson('/fixture/offer/'+session.id,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(pc.localDescription)});
+  for(let i=0;i<150;i++){const answer=await fixtureJson('/fixture/answer/'+session.id);if(answer.sdp){await pc.setRemoteDescription(answer);return session.id;}await new Promise(r=>setTimeout(r,200));}throw Error('host answer timeout');
+};
+window.stats=async()=>{const s=await pc.getStats();const v=[...s.values()].find(v=>v.type==='inbound-rtp'&&v.kind==='video');const pair=[...s.values()].find(v=>v.type==='candidate-pair'&&v.state==='succeeded'&&v.nominated);return{frames:v?.framesDecoded||0,timestamp:v?.timestamp||0,reportedFramesPerSecond:v?.framesPerSecond??null,width:video.videoWidth,height:video.videoHeight,bytes:v?.bytesReceived||0,localType:pair?s.get(pair.localCandidateId)?.candidateType:null,remoteType:pair?s.get(pair.remoteCandidateId)?.candidateType:null,connection:pc.connectionState,input:input.readyState};};
+window.pixel=()=>{const c=document.createElement('canvas');c.width=proof.width;c.height=proof.height;c.getContext('2d').drawImage(video,0,0,c.width,c.height);return [...c.getContext('2d').getImageData(proof.pixelX,proof.pixelY,1,1).data].slice(0,3);};
+window.clickNative=()=>{input.send(JSON.stringify({type:'pointerdown',x:proof.clickX,y:proof.clickY,button:0}));input.send(JSON.stringify({type:'pointerup',x:proof.clickX,y:proof.clickY,button:0}));};
+window.closeSession=async()=>{pc.close();await fixtureJson('/fixture/end/'+session.id,{method:'POST'});};
+</script>
