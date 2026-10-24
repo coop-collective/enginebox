@@ -1,5 +1,7 @@
 # Installing Engine Box
 
+For a Windows NVIDIA or native Apple GPU contributor, use the separate [native GPU node installer](NATIVE-GPU-NODES.md). It enrolls with an existing controller using a short-lived credential; it does not install another controller. The operator/controller installation below has a different role.
+
 The Rust distribution uses a pinned release archive for each operating system and CPU architecture. Executable code lives in `packages/`. Python is not an installation dependency. The dashboard remains TypeScript/Vinext and requires Node.js 22.12 or newer.
 
 The commands below describe the Rust installer in this branch. Use a version whose matching release assets have actually been published and qualified; an unpublished `0.3.0` archive is not available simply because the source version is `0.3.0`.

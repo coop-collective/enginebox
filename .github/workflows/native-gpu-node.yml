@@ -1,0 +1,127 @@
+name: Build native GPU node installers
+on:
+  pull_request:
+    paths:
+      - 'packages/enginebox-install/**'
+      - 'packages/enginebox-controller/**'
+      - 'packages/enginebox-node-protocol/**'
+      - '.github/workflows/native-gpu-node.yml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      controller_preview:
+        description: Build a versioned controller preview for a reviewed maintenance deployment
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  windows-bootstrap:
+    if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Reproduce unsigned-script failure and verify bootstrap on Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/tests/native-bootstrap.ps1
+          if ($LASTEXITCODE) { throw 'Windows bootstrap regression failed' }
+  linux-image:
+    if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build separate NVIDIA node image
+        run: docker build -f packages/enginebox-install/containers/Dockerfile.nvidia -t enginebox-node:nvidia-ci .
+      - name: Verify native startup and reject missing NVIDIA hardware
+        shell: bash
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,size=256m enginebox-node:nvidia-ci --version
+          set +e
+          output=$(docker run --rm --read-only --tmpfs /tmp:rw,nosuid,size=256m enginebox-node:nvidia-ci 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -ne 0
+          test "$status" -ne 125
+          [[ "$output" == *'nvidia-smi'* ]]
+  package:
+    if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            profile: windows-nvidia
+          - os: ubuntu-24.04
+            profile: linux-nvidia
+          - os: macos-15
+            profile: macos-videotoolbox
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Verify and build native node
+        shell: bash
+        run: |
+          cargo test --locked -p enginebox-install --lib
+          cargo test --locked -p enginebox-install --test contributor_worker
+          cargo clippy --locked -p enginebox-install --all-targets -- -D warnings
+          cargo build --locked --release -p enginebox-install --bin enginebox-node
+      - name: Validate Windows installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens=$null; $errors=$null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/packages/enginebox-install/assets/install-worker-node.ps1",[ref]$tokens,[ref]$errors) | Out-Null
+          if ($errors.Count) { $errors | Format-List; throw 'Installer syntax failed' }
+          & target/release/enginebox-node.exe --version
+          if ($LASTEXITCODE) { throw 'Native executable failed' }
+      - name: Assemble installer artifact
+        shell: bash
+        run: |
+          mkdir -p .state/native-node
+          if [[ '${{ runner.os }}' == Windows ]]; then
+            cp target/release/enginebox-node.exe .state/native-node/
+            cp packages/enginebox-install/assets/install-native-node.ps1 .state/native-node/
+            cp packages/enginebox-install/assets/install-worker-node.ps1 .state/native-node/
+          else
+            cp target/release/enginebox-node .state/native-node/
+          fi
+          cp docs/NATIVE-GPU-NODES.md .state/native-node/README.md
+          cp LICENSE NOTICE .state/native-node/
+          cd .state/native-node
+          if command -v sha256sum >/dev/null; then sha256sum enginebox-node* > SHA256SUMS; else shasum -a 256 enginebox-node* > SHA256SUMS; fi
+      - name: Package version-pinned Windows bootstrap
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & packages/enginebox-install/assets/package-native-node.ps1 -PackageDirectory .state/native-node -OutputDirectory .state/bootstrap-release -Tag 'native-node-preview-${{ github.run_id }}'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: runner.os == 'Windows'
+        with:
+          name: native-node-bootstrap-${{ github.sha }}
+          path: .state/bootstrap-release/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: enginebox-node-${{ matrix.profile }}-${{ github.sha }}
+          path: .state/native-node/
+          include-hidden-files: true
+
+  controller-preview:
+    if: github.event_name == 'workflow_dispatch' && inputs.controller_preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@12.14.0
+      - name: Build and verify a versioned controller and dashboard without deploying
+        run: node packages/enginebox-deploy/src/build.mjs --version '0.3.1-workers.${{ github.run_id }}' --output .state/controller-preview
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: controller-preview-${{ github.sha }}
+          path: .state/controller-preview/
+          if-no-files-found: error

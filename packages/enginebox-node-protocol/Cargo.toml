@@ -1,0 +1,12 @@
+[package]
+name = "enginebox-node-protocol"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+

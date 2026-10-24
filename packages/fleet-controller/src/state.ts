@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
+import { timingSafeEqual } from "node:crypto";
 import {
   canonical,
   LEASE_MS,
@@ -87,11 +88,35 @@ export class Registry extends State {
 }
 
 type NodeRecord = NodeView & { secretHash: string };
+function sameHash(a: string, b: string) {
+  return a.length === b.length && timingSafeEqual(new TextEncoder().encode(a), new TextEncoder().encode(b));
+}
 type Reservation = Assignment & {
   state: "reserved" | "running" | "finished";
   outcome?: string;
 };
 export class FleetNode extends State {
+  async prepareEnrollment(spec: NodeSpec, secretHash: string, expires: number) {
+    requireThat(!this.get("node"), "Node already exists", 409);
+    this.put("enrollment", { spec, secretHash, expires });
+  }
+  async enroll(secretHash: string, nodeSecretHash: string) {
+    return this.ctx.storage.transactionSync(() => {
+      const invitation = this.get<{spec: NodeSpec; secretHash: string; expires: number}>("enrollment");
+      requireThat(invitation && invitation.expires > Date.now() && sameHash(invitation.secretHash, secretHash),
+        "Enrollment is invalid or expired", 401);
+      const existing = this.get<NodeRecord>("node");
+      // A lost response can be retried with the same locally persisted identity.
+      // The invitation can never bind a second identity, including after revocation.
+      if (existing) {
+        requireThat(!existing.revoked && sameHash(existing.secretHash, nodeSecretHash), "Enrollment already consumed", 409);
+      } else {
+        this.put("node", { ...invitation.spec, secretHash: nodeSecretHash,
+          epoch: 0, session: null, lastSeen: 0, revoked: false, ready: {}, stats: {} } satisfies NodeRecord);
+      }
+      return invitation.spec;
+    });
+  }
   async create(spec: NodeSpec, secretHash: string) {
     requireThat(!this.get("node"), "Node already exists", 409);
     this.put("node", {
