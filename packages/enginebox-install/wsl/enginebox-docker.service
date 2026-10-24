@@ -1,0 +1,14 @@
+[Unit]
+Description=Enginebox private template runtime
+After=network-online.target
+ConditionPathExists=/etc/enginebox/settings.json
+[Service]
+Type=notify
+Slice=enginebox.slice
+Delegate=yes
+ExecStart=/usr/bin/dockerd --host=unix:///run/enginebox-docker.sock --data-root=/var/lib/enginebox/docker --exec-root=/run/enginebox-docker --pidfile=/run/enginebox-docker.pid --exec-opt native.cgroupdriver=systemd --cgroup-parent=enginebox.slice --log-driver=local --log-opt=max-size=10m --log-opt=max-file=2
+KillMode=control-group
+TimeoutStopSec=30
+Restart=no
+[Install]
+WantedBy=multi-user.target

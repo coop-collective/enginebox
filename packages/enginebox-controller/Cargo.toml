@@ -18,6 +18,7 @@ enginebox-core = { path = "../enginebox-core" }
 enginebox-agents = { path = "../enginebox-agents" }
 enginebox-github = { path = "../enginebox-github" }
 enginebox-ci = { path = "../enginebox-ci" }
+enginebox-node-protocol = { path = "../enginebox-node-protocol" }
 enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
 anyhow = "1"
 axum = "0.8"

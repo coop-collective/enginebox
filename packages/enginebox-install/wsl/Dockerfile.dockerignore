@@ -1,0 +1,9 @@
+**/node_modules
+**/target
+**/.state
+**/.git
+**/dist
+**/.env*
+**/.dev.vars*
+**/*.pem
+**/*.key

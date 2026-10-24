@@ -1,0 +1,96 @@
+name: Windows WSL template runtime
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'packages/enginebox-install/**'
+      - 'packages/enginebox-node-protocol/**'
+      - '.github/workflows/windows-wsl.yml'
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate PowerShell 5.1 installer and input policy
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-installer.ps1
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build preinstalled Linux rootfs and template
+        run: packages/enginebox-install/wsl/build.sh .state/wsl-release
+      - name: Package immutable installer
+        run: python3 packages/enginebox-install/wsl/package.py .state/wsl-release wsl-node-preview-${{ github.run_id }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: enginebox-wsl-${{ github.sha }}
+          path: .state/wsl-release/
+          compression-level: 0
+          if-no-files-found: error
+  wsl-proof:
+    needs: image
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: enginebox-wsl-${{ github.sha }}
+          path: .state/wsl-release
+      - name: Enable WSL and boot disposable template runtime
+        shell: pwsh
+        run: |
+          function Get-WslVersion {
+            $previous=$ErrorActionPreference
+            try { $ErrorActionPreference='Continue'; $value=(& wsl.exe --version 2>$null | Out-String) -replace "`0",'' }
+            finally { $ErrorActionPreference=$previous }
+            $match=[regex]::Match($value,'\d+\.\d+\.\d+')
+            if ($match.Success) { return [version]$match.Value }
+            return $null
+          }
+          wsl.exe --install --no-distribution --web-download
+          if ($LASTEXITCODE) { throw 'This runner cannot enable WSL without a reboot; WSL execution is not qualified.' }
+          # Match the installer minimum without requiring Microsoft's update
+          # endpoint to be available when the runner already meets it.
+          $version=Get-WslVersion
+          if (-not $version -or $version -lt [version]'2.5.7') {
+            wsl.exe --update --web-download
+            if ($LASTEXITCODE) { throw 'WSL update failed' }
+            $version=Get-WslVersion
+          }
+          if (-not $version -or $version -lt [version]'2.5.7') { throw 'WSL 2.5.7 or newer is required for qualification.' }
+          wsl.exe --install --from-file "$PWD/.state/wsl-release/enginebox.wsl" --name EngineboxCI --location "$PWD/.state/wsl-ci" --version 2 --vhd-size 20GB --no-launch
+          if ($LASTEXITCODE) { throw 'WSL2 import/boot failed' }
+          [Security.Principal.WindowsIdentity]::GetCurrent().User.Value | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl claim
+          if ($LASTEXITCODE) { throw 'Windows-to-Linux ownership claim failed' }
+          '{"controller":"https://fixture.invalid","cpu":2,"memory_gib":4,"disk_gib":20}' | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl configure
+          if ($LASTEXITCODE) { throw 'Real WSL LayerFS/isolation qualification failed' }
+          wsl.exe -d EngineboxCI -u root --exec cat /var/lib/enginebox/qualification.json
+          if ($LASTEXITCODE) { throw 'Missing qualification receipt' }
+      - name: Exercise real outbound Linux node and revoked-lease cleanup
+        shell: pwsh
+        run: |
+          $source=[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/packages/enginebox-install/wsl/test-node.py"))
+          wsl.exe -d EngineboxCI -u root --exec python3 -c 'import base64,pathlib,sys; pathlib.Path("/tmp/enginebox-node-proof.py").write_bytes(base64.b64decode(sys.argv[1]))' $source
+          if ($LASTEXITCODE) { throw 'Could not stage node test in disposable distro' }
+          wsl.exe -d EngineboxCI -u root --exec python3 /tmp/enginebox-node-proof.py
+          if ($LASTEXITCODE) { throw 'Linux outbound node execution/cleanup qualification failed' }
+      - name: Runtime diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          wsl.exe -d EngineboxCI -u root --exec findmnt --target /var/lib/enginebox
+          wsl.exe -d EngineboxCI -u root --exec systemctl status enginebox-docker.service --no-pager
+          wsl.exe -d EngineboxCI -u root --exec journalctl -u enginebox-docker.service -n 80 --no-pager
+          wsl.exe -d EngineboxCI -u root --exec cat /proc/meminfo
+          exit 0
+      - name: Remove only the disposable CI distribution
+        if: always()
+        shell: pwsh
+        run: |
+          $names=@((wsl.exe --list --quiet) | ForEach-Object { ($_ -replace "`0",'').Trim() })
+          if ($names -contains 'EngineboxCI') { wsl.exe --unregister EngineboxCI }

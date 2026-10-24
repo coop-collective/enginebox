@@ -313,7 +313,7 @@ async fn status(State(supervisor): State<Supervisor>, headers: HeaderMap) -> Res
     if !supervisor.authorized(&headers) {
         return failure(StatusCode::UNAUTHORIZED, "authentication required");
     }
-    Json(serde_json::json!({"current":supervisor.current_version().await,"pending_mutations":256-supervisor.waiting.available_permits()})).into_response()
+    Json(serde_json::json!({"current":supervisor.current_version().await,"pending_mutations":256-supervisor.waiting.available_permits(),"node_protocol":1})).into_response()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -386,7 +386,16 @@ async fn proxy(supervisor: Supervisor, request: Request, dashboard: bool) -> Res
     // upgrade writer queues between the dashboard request and its API call.
     // Native observations can refresh credentials and need the same ownership
     // as writes. Pure reads continue against the draining controller.
+    // Scoped node authentication belongs to the active controller. Completion
+    // traffic must pass the upgrade gate so a draining owner can finish its jobs.
+    let node_action = (request.method() == Method::POST && !dashboard)
+        .then(|| path.strip_prefix("/v1/node/"))
+        .flatten()
+        .filter(|action| ["enroll", "hello", "heartbeat", "poll", "result"].contains(action));
+    let finishing_node =
+        node_action.is_some_and(|action| ["heartbeat", "result"].contains(&action));
     let owned_request = !dashboard
+        && !finishing_node
         && (!matches!(
             *request.method(),
             Method::GET | Method::HEAD | Method::OPTIONS
@@ -394,7 +403,7 @@ async fn proxy(supervisor: Supervisor, request: Request, dashboard: bool) -> Res
             && (path == "/v1/agents"
                 || (path.starts_with("/v1/agents/")
                     && (path.ends_with("/usage") || path.ends_with("/accounts"))))));
-    if owned_request && !supervisor.authorized(request.headers()) {
+    if owned_request && node_action.is_none() && !supervisor.authorized(request.headers()) {
         return failure(StatusCode::UNAUTHORIZED, "authentication required");
     }
     let permit = if owned_request {

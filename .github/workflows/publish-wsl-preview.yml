@@ -1,0 +1,86 @@
+name: Publish qualified WSL installer preview
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/publish-wsl-preview.yml'
+  workflow_dispatch:
+    inputs:
+      qualification_run:
+        description: Successful Windows WSL template runtime run containing the unchanged runtime image
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate this installer on Windows PowerShell 5.1
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-installer.ps1
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    needs: installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      QUALIFICATION_RUN: ${{ inputs.qualification_run }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Verify successful qualification and unchanged runtime sources
+        id: proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFICATION_RUN" =~ ^[0-9]+$ ]]
+          mkdir -p .state/publish-wsl
+          gh api "repos/$REPOSITORY/actions/runs/$QUALIFICATION_RUN" > .state/publish-wsl/run.json
+          gh api "repos/$REPOSITORY/actions/runs/$QUALIFICATION_RUN/artifacts" > .state/publish-wsl/artifacts.json
+          python3 - <<'PY'
+          import json,os,pathlib,re
+          root=pathlib.Path('.state/publish-wsl');r=json.loads((root/'run.json').read_text())
+          assert r['status']=='completed' and r['conclusion']=='success'
+          assert r['name']=='Windows WSL template runtime' and r['head_repository']['full_name']==os.environ['REPOSITORY']
+          artifacts=json.loads((root/'artifacts.json').read_text())['artifacts']
+          matches=[a for a in artifacts if re.fullmatch(r'enginebox-wsl-[a-f0-9]{40}',a['name']) and not a['expired']]
+          assert len(matches)==1
+          artifact=matches[0];commit=artifact['name'].removeprefix('enginebox-wsl-')
+          (root/'runtime-commit').write_text(commit)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:output.write('artifact='+artifact['name']+'\n')
+          PY
+          runtime_commit=$(cat .state/publish-wsl/runtime-commit)
+          git fetch --depth=1 origin "$runtime_commit"
+          # A newer installer can reuse a qualified image only if every runtime
+          # source, build recipe and dependency input remains identical.
+          git diff --exit-code "$runtime_commit" "$GITHUB_SHA" -- Cargo.toml Cargo.lock rust-toolchain.toml package.json pnpm-lock.yaml packages/ ':!packages/enginebox-install/wsl/install.ps1.in' ':!packages/enginebox-install/wsl/test-installer.ps1'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: ${{ steps.proof.outputs.artifact }}
+          run-id: ${{ inputs.qualification_run }}
+          github-token: ${{ github.token }}
+          path: .state/publish-wsl/release
+      - name: Package current tested installer and publish immutable preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .state/publish-wsl/release
+          sha256sum --check SHA256SUMS
+          cd ../../..
+          tag="wsl-node-preview-$GITHUB_RUN_ID"
+          python3 packages/enginebox-install/wsl/package.py .state/publish-wsl/release "$tag"
+          python3 - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path('.state/publish-wsl')
+          provenance={'installer_commit':os.environ['GITHUB_SHA'],'runtime_commit':(root/'runtime-commit').read_text(),'qualification_run':int(os.environ['QUALIFICATION_RUN']),'repository':os.environ['REPOSITORY']}
+          (root/'release/provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
+          (root/'notes.md').write_text('Windows x64 preview: a dedicated WSL2 runtime with preinstalled native-dev template tools. The installer prompts for controller, CPU, memory and disk, enables or updates WSL, and registers one scoped node.\n\nRuntime qualification: https://github.com/'+os.environ['REPOSITORY']+'/actions/runs/'+os.environ['QUALIFICATION_RUN']+'\n\nThe current installer passed Windows PowerShell 5.1 flow tests. Runtime source equality was checked before reusing the qualified image. See provenance.json and SHA256SUMS. Provider sign-in is workspace-local; live model inference and GPU/editor toolchains are separate qualifications.\n')
+          PY
+          gh release create "$tag" --target "$GITHUB_SHA" --prerelease --title "Windows WSL2 node preview $GITHUB_RUN_ID" --notes-file .state/publish-wsl/notes.md .state/publish-wsl/release/enginebox.wsl .state/publish-wsl/release/install.ps1 .state/publish-wsl/release/SHA256SUMS .state/publish-wsl/release/provenance.json

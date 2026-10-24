@@ -1,0 +1,208 @@
+# Release packaging replaces the two immutable rootfs placeholders below.
+[CmdletBinding()]
+param(
+  [string]$Controller,
+  [string]$EnrollmentCode,
+  [long]$EnrollmentExpires=0,
+  [int]$Cpu=0,
+  [int]$MemoryGiB=0,
+  [int]$DiskGiB=0,
+  [switch]$Resume,
+  [string]$InstallDirectory=(Join-Path $env:LOCALAPPDATA 'Enginebox\wsl-node')
+)
+$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+$DefaultController='https://enginebox.coopcollective.dev'
+$Distro='Enginebox'
+$TaskName='Enginebox WSL Node'
+$Marker='Enginebox WSL2 schema 1'
+function Read-Number([string]$Label,[int]$Value,[int]$Default,[int]$Minimum,[int]$Maximum) {
+  if ($Value -eq 0) { $inputValue=Read-Host "$Label [$Default]"; if (-not $inputValue) { $Value=$Default } elseif (-not [int]::TryParse($inputValue,[ref]$Value)) { throw "$Label must be a whole number." } }
+  if ($Value -lt $Minimum -or $Value -gt $Maximum) { throw "$Label must be between $Minimum and $Maximum." }
+  return $Value
+}
+function Assert-Origin([string]$Value) {
+  $uri=$null
+  if (-not [Uri]::TryCreate($Value,[UriKind]::Absolute,[ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -ne '/') { throw 'Controller must be an HTTPS origin without a path or credentials.' }
+  return $uri.GetLeftPart([UriPartial]::Authority)
+}
+function Protect-Directory([string]$Path) {
+  $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+  $acl=New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false)
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+function Invoke-Wsl([string[]]$Arguments) {
+  & wsl.exe @Arguments
+  if ($LASTEXITCODE -ne 0) { throw "WSL operation failed (exit $LASTEXITCODE). Setup can be resumed by running the installer again." }
+}
+function Get-WslVersion {
+  if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
+  $previous=$ErrorActionPreference
+  try { $ErrorActionPreference='Continue'; $value=(& wsl.exe --version 2>$null | Out-String) -replace "`0",'' }
+  finally { $ErrorActionPreference=$previous }
+  $match=[regex]::Match($value,'\d+\.\d+\.\d+')
+  if ($match.Success) { return [version]$match.Value }
+  return $null
+}
+function Get-RuntimeCapacity {
+  # Read the actual Linux VM limits, not Windows physical RAM. This also works
+  # with already-downloaded preview images, so failed setup can resume in place.
+  $probe=@'
+import json,os,pathlib
+mem=int(next(l.split()[1] for l in pathlib.Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemTotal:')))*1024
+committed=any(pathlib.Path(p).exists() for p in ['/etc/enginebox/settings.json','/var/lib/enginebox/private/worker.json'])
+print(json.dumps({'cpu':len(os.sched_getaffinity(0)),'memory_bytes':mem,'committed':committed}))
+'@
+  $raw=$probe | & wsl.exe --distribution $Distro --user root --exec python3 -
+  if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Enginebox Linux resources. Setup is retained; check the WSL error above and run the installer again.' }
+  $capacity=($raw | Out-String) | ConvertFrom-Json
+  if ($capacity.cpu -lt 1 -or $capacity.memory_bytes -le 0 -or $capacity.committed -isnot [bool]) { throw 'Invalid Linux resource inspection result.' }
+  return $capacity
+}
+# Tests may load validation helpers without inspecting or modifying Windows.
+if ($MyInvocation.InvocationName -eq '.') { return }
+if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { throw 'This release requires Windows x64.' }
+$root=[IO.Path]::GetFullPath($InstallDirectory)
+for ($cursor=$root; $cursor; $cursor=Split-Path -Parent $cursor) {
+  if ((Test-Path -LiteralPath $cursor) -and ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Installation path contains a junction or symlink.' }
+  if ((Split-Path -Parent $cursor) -eq $cursor) { break }
+}
+if ($root.Contains('"')) { throw 'Installation path contains a quote.' }
+$receiptPath=Join-Path $root 'setup.json'
+$resumeScript=Join-Path $root 'install.ps1'
+$existingTask=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask -and $existingTask.Description -ne $Marker) { throw 'An unrelated task owns the Enginebox task name.' }
+$settings=$null
+if (Test-Path -LiteralPath $receiptPath) {
+  $settings=Get-Content -Raw -LiteralPath $receiptPath | ConvertFrom-Json
+  if ($settings.marker -ne $Marker -or $settings.root -ne $root) { throw 'Installation ownership mismatch.' }
+  if (-not $Controller) { $Controller=$settings.controller }
+  if (-not $Cpu) { $Cpu=$settings.cpu }; if (-not $MemoryGiB) { $MemoryGiB=$settings.memory_gib }; if (-not $DiskGiB) { $DiskGiB=$settings.disk_gib }
+} elseif ((Test-Path -LiteralPath $root) -and @(Get-ChildItem -LiteralPath $root -Force).Count) { throw 'Installation directory is not empty and has no Enginebox receipt.' }
+if (-not $Controller) { $Controller=$DefaultController }
+$codeController=Assert-Origin $Controller
+if (-not $settings) { $chosen=Read-Host "Controller address [$Controller]"; if ($chosen) { $Controller=$chosen } }
+$Controller=Assert-Origin $Controller
+if ($EnrollmentCode -and $Controller -ne $codeController) {
+  $EnrollmentCode=$null; $EnrollmentExpires=0
+  Write-Host 'The supplied registration code belongs to the original controller. Setup will ask for a fresh code from the selected controller.'
+}
+$computer=Get-CimInstance Win32_ComputerSystem
+$cores=[int]$computer.NumberOfLogicalProcessors
+$memory=[int][math]::Floor([double]$computer.TotalPhysicalMemory/1GB)
+$drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($root))
+$free=[int][math]::Floor($drive.AvailableFreeSpace/1GB)
+if ($memory -lt 6 -or (-not $settings -and $free -lt 25)) { throw 'At least 6 GiB physical RAM and 25 GiB free disk are required for a new installation.' }
+$Cpu=Read-Number 'CPU cores to contribute' $Cpu ([math]::Max(1,[math]::Min(4,[math]::Floor($cores/2)))) 1 ([math]::Min(256,$cores))
+$MemoryGiB=Read-Number 'Memory allowance in GiB' $MemoryGiB ([math]::Max(4,[math]::Min(8,[math]::Floor($memory/2)))) 4 ([math]::Min(4096,$memory-2))
+# Existing VHD allocations already consume host free space. Resumption retains
+# the original maximum instead of requiring that capacity a second time.
+$diskMaximum=if ($settings) { [int]$settings.disk_gib } else { [math]::Min(65536,[math]::Max(20,$free-5)) }
+$DiskGiB=Read-Number 'Linux disk maximum in GiB (includes templates)' $DiskGiB ([math]::Max(20,[math]::Min(50,[math]::Floor($free/2)))) 20 $diskMaximum
+if ($settings -and ($settings.controller -ne $Controller -or $settings.cpu -ne $Cpu -or $settings.memory_gib -ne $MemoryGiB -or $settings.disk_gib -ne $DiskGiB)) { throw 'Existing installation has different settings. This installer preserves its identity, resources and workspaces.' }
+New-Item -ItemType Directory -Force -Path $root | Out-Null; Protect-Directory $root
+if ($PSCommandPath -ne $resumeScript) { Copy-Item -LiteralPath $PSCommandPath -Destination $resumeScript -Force }
+function Save-Setup {
+  @{marker=$Marker;root=$root;controller=$Controller;cpu=$Cpu;memory_gib=$MemoryGiB;disk_gib=$DiskGiB} | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+}
+Save-Setup
+# Keep resumption under the installing user. Elevation is limited to enabling
+# WSL; the distro and identity must not accidentally belong to another admin.
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Resume' -f $resumeScript)
+$trigger=New-ScheduledTaskTrigger -AtLogOn -User $sid
+$principal=New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Description $Marker -Force | Out-Null
+if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+  # Older Windows installations may omit the WSL launcher until its optional
+  # component is enabled. Only the Windows feature operation is elevated.
+  foreach ($feature in @('Microsoft-Windows-Subsystem-Linux','VirtualMachinePlatform')) {
+    $enable=Start-Process -FilePath 'dism.exe' -ArgumentList @('/online','/enable-feature',('/featurename:'+$feature),'/all','/norestart') -Verb RunAs -Wait -PassThru
+    if ($enable.ExitCode -notin @(0,3010,1641)) { throw "Windows could not enable $feature (exit $($enable.ExitCode))." }
+  }
+  Write-Host 'Restart Windows to finish enabling WSL. Setup resumes at your next sign-in.'
+  exit 3010
+}
+$wslVersion=Get-WslVersion
+if (-not $wslVersion -or $wslVersion -lt [version]'2.5.7') {
+  Write-Host 'Installing/updating WSL2. Windows may request administrator approval.'
+  if (-not $wslVersion) {
+    $install=Start-Process -FilePath 'wsl.exe' -ArgumentList '--install --no-distribution --web-download' -Verb RunAs -Wait -PassThru
+    if ($install.ExitCode -in @(3010,1641)) { Write-Host 'Restart Windows. Setup resumes at your next sign-in.'; exit 3010 }
+    if ($install.ExitCode -ne 0) { throw "WSL installation failed (exit $($install.ExitCode))." }
+  }
+  $update=Start-Process -FilePath 'wsl.exe' -ArgumentList '--update --web-download' -Verb RunAs -Wait -PassThru
+  if ($update.ExitCode -notin @(0,3010,1641)) { throw "WSL update failed (exit $($update.ExitCode))." }
+  if ($update.ExitCode -in @(3010,1641)) { Write-Host 'Restart Windows. Setup resumes at your next sign-in.'; exit 3010 }
+  $wslVersion=Get-WslVersion
+  if (-not $wslVersion -or $wslVersion -lt [version]'2.5.7') { throw 'WSL 2.5.7 or newer is required. The WSL update has not taken effect; restart Windows and resume setup.' }
+}
+& wsl.exe --status *> $null
+if ($LASTEXITCODE -ne 0) {
+  $enable=Start-Process -FilePath 'wsl.exe' -ArgumentList '--install --no-distribution --web-download' -Verb RunAs -Wait -PassThru
+  if ($enable.ExitCode -notin @(0,3010,1641)) { throw "WSL could not enable its Windows prerequisites (exit $($enable.ExitCode)). Check the Windows error above, including firmware virtualization if reported." }
+  Write-Host 'WSL prerequisites were enabled. Restart Windows, then setup resumes at your next sign-in. If Windows still reports a virtualization error, enable hardware virtualization in firmware. The machine has not registered yet.'
+  exit 3010
+}
+$distros=@((& wsl.exe --list --quiet) | ForEach-Object { ($_ -replace "`0",'').Trim() })
+if ($distros -contains $Distro) {
+  $owned=(& wsl.exe --distribution $Distro --user root --exec cat /etc/enginebox/installation-owner 2>$null | Out-String).Trim()
+  if ($owned -ne $sid) { throw 'An existing Enginebox distribution belongs to another installation. It will not be changed.' }
+} else {
+  $image=Join-Path $root 'enginebox.wsl'
+  [Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  if (-not (Test-Path -LiteralPath $image) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash -ne '@@ROOTFS_SHA256@@') {
+    Write-Host 'Downloading the preinstalled Linux runtime and templates...'
+    Invoke-WebRequest -UseBasicParsing -Uri '@@ROOTFS_URL@@' -OutFile $image
+  }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash -ne '@@ROOTFS_SHA256@@') { throw 'Linux image checksum mismatch.' }
+  Invoke-Wsl -Arguments @('--install','--from-file',$image,'--name',$Distro,'--location',(Join-Path $root 'distro'),'--version','2','--vhd-size',($DiskGiB.ToString()+'GB'),'--no-launch')
+  $sid | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl claim
+  if ($LASTEXITCODE -ne 0) { throw 'Could not record distribution ownership.' }
+  Remove-Item -LiteralPath $image -Force
+}
+$capacity=Get-RuntimeCapacity
+# Match the runtime's 512 MiB kernel-overhead tolerance when converting its
+# MemTotal observation back to whole-GiB allowances (e.g. a 4 GiB WSL VM).
+$linuxMemory=[int][math]::Floor(([double]$capacity.memory_bytes+512MB)/1GB)
+$linuxCpu=[int]$capacity.cpu
+$observedMemory=[math]::Round([double]$capacity.memory_bytes/1GB,2)
+Write-Host "WSL reports $linuxCpu CPU cores and $observedMemory GiB usable RAM."
+if ($linuxMemory -lt 4) {
+  throw "WSL has only $observedMemory GiB usable RAM; Enginebox requires a WSL memory limit of at least 4 GiB. Increase Memory size in WSL Settings (or the existing [wsl2] memory setting in $env:USERPROFILE\.wslconfig), save work in all WSL distributions, restart Windows, and rerun this installer. The installed image is retained. Global WSL settings were not changed."
+}
+if ($Cpu -gt $linuxCpu -or $MemoryGiB -gt $linuxMemory) {
+  if ($capacity.committed) {
+    throw "WSL capacity is below this installation's saved allowance ($Cpu CPU, $MemoryGiB GiB). Restore its WSL limits and restart Windows after saving work, then resume. Existing settings, identity and workspaces were preserved."
+  }
+  Write-Host 'The requested allowance exceeds WSL capacity. Choose a smaller allowance to finish this pending installation.'
+  if ($Cpu -gt $linuxCpu) { $Cpu=Read-Number 'CPU cores within WSL capacity' 0 $linuxCpu 1 $linuxCpu }
+  if ($MemoryGiB -gt $linuxMemory) { $MemoryGiB=Read-Number 'Memory allowance within WSL capacity in GiB' 0 $linuxMemory 4 $linuxMemory }
+  # Only an unconfigured, identity-free runtime can change its pending budget.
+  # The Linux configure command independently refuses changes to saved settings.
+  Save-Setup
+}
+$configuration=@{controller=$Controller;cpu=$Cpu;memory_gib=$MemoryGiB;disk_gib=$DiskGiB} | ConvertTo-Json -Compress
+$configuration | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl configure
+if ($LASTEXITCODE -ne 0) { throw 'Linux runtime setup/verification failed. The machine is not ready for workloads.' }
+& wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl enrolled
+$registered=$LASTEXITCODE -eq 0
+if (-not $registered) {
+  if ($EnrollmentExpires -gt 0 -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge $EnrollmentExpires) { $EnrollmentCode=$null; Write-Host 'The original registration code expired during setup. Generate a fresh code; installed components are retained.' }
+  if (-not $EnrollmentCode) {
+    Write-Host "Open $Controller/dashboard/ and create a fresh machine registration code."
+    $secret=Read-Host 'One-time registration code' -AsSecureString
+    $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+    try { $EnrollmentCode=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secret.Dispose() }
+  }
+  $EnrollmentCode | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl enroll
+  $EnrollmentCode=$null
+  if ($LASTEXITCODE -ne 0) { throw 'Registration failed. Keep the pending identity and inspect the preceding error; do not delete its state.' }
+}
+$action=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '--distribution Enginebox --user root --exec /usr/local/sbin/enginebox-wsl supervise'
+$taskSettings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description $Marker -Force | Out-Null
+Start-ScheduledTask -TaskName $TaskName
+Write-Host "Registered. WSL2 owns the Linux runtime and template workspaces: $Cpu CPU, $MemoryGiB GiB memory, $DiskGiB GiB virtual disk maximum."
+Write-Host "Agent tools are inside templates; sign in through an authorized workspace. Dashboard: $Controller/dashboard/"

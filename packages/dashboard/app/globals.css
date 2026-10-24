@@ -1616,3 +1616,17 @@ input::placeholder {
 .environment-panel .host-card p { margin: 8px 0; line-height: 1.5; overflow-wrap: anywhere; }
 .environment-panel form.host-card { display: grid; gap: 16px; }
 .environment-panel .button { justify-self: start; }
+.contributor-resources { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.contributor-resources input { width: 100%; }
+.storage-panel textarea { width: 100%; resize: vertical; font-family: monospace; }
+@media (max-width: 640px) { .contributor-resources { grid-template-columns: 1fr; } }
+
+.contributor-panel { display: grid; gap: 20px; }
+.contributor-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.contributor-panel .host-card { display: grid; gap: 12px; }
+.contributor-panel p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.contributor-panel h2 { font-size: 18px; }
+.contributor-panel .button { justify-self: start; }
+.contributor-form .contributor-choice { display: flex; align-items: center; gap: 9px; font-size: 13px; }
+.contributor-form .contributor-choice input { width: 16px; height: 16px; margin: 0; accent-color: var(--teal); }
+@media (max-width: 640px) { .contributor-heading { align-items: flex-start; flex-direction: column; } }

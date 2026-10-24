@@ -1,0 +1,21 @@
+import { test, expect } from '@playwright/test';
+import { createHmac, randomBytes } from 'node:crypto';
+import { dashboardOrigin, fixtureOrigin } from './urls';
+test('installer chooses resources while owner, copies enrollment, observes readiness and revokes Windows machine',async ({page,request})=>{
+  await request.post(`${fixtureOrigin}/__test/reset`);
+  const payload=Buffer.from(JSON.stringify({expires:Date.now()+3600000,nonce:randomBytes(24).toString('hex')})).toString('base64url');
+  const signature=createHmac('sha256','fixture-session-secret-at-least-32-characters').update('fixture-dashboard-password').update('\0').update(payload).digest('base64url');
+  await page.context().addCookies([{name:'enginebox_session',value:`${payload}.${signature}`,url:dashboardOrigin,httpOnly:true,sameSite:'Strict'}]);
+  await page.goto('/');await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Worker machines',exact:true}).click();
+  await page.getByLabel('Machine name',{exact:true}).fill('Windows RTX');await expect(page.getByLabel('CPU cores',{exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'Create install command'}).click();
+  const command=page.getByLabel('PowerShell install command');await expect(command).not.toHaveValue(/-Cpu|-MemoryGiB|-DiskGiB/);await expect(command).toHaveValue(/https:\/\/controller.fixture.example/);
+  await expect(page.getByRole('article',{name:'Machine Windows RTX'})).toContainText('Waiting for registration');
+  await page.context().grantPermissions(['clipboard-read','clipboard-write']);await page.getByRole('button',{name:'Copy install command'}).click();await expect(page.getByRole('button',{name:'Copied',exact:true})).toBeVisible();
+  expect(await page.evaluate(()=>navigator.clipboard.readText())).toContain('-Controller');
+  await page.screenshot({path:'test-results/contributors-desktop.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);await page.screenshot({path:'test-results/contributors-mobile.png',fullPage:true});
+  await request.post(`${fixtureOrigin}/__test/contributor-online`);await page.getByRole('button',{name:'Refresh machines'}).click();await expect(command).toHaveCount(0);
+  const card=page.getByRole('article',{name:'Machine Windows RTX'});await expect(card).toContainText('Online');await expect(card).toContainText('Templates: Ready in WSL2');await expect(card).toContainText('2 CPU · 4 GiB memory · 20 GiB disk allowance');
+  await card.getByRole('button',{name:'Revoke machine'}).click();await expect(card).toContainText('Revoked');
+});

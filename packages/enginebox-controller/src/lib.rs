@@ -1,6 +1,7 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
 pub mod ci;
 mod ci_templates;
+pub mod contributors;
 mod environment;
 pub mod jobs;
 pub mod storage;
@@ -50,6 +51,7 @@ struct Runtime {
     storage: storage::Storage,
     github: enginebox_github::GitHub,
     ci: ci::Ci,
+    contributors: contributors::Contributors,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -153,6 +155,7 @@ impl Controller {
             storage: storage::Storage::open(&self.root, self.fleet.clone())?
                 .with_github(github.clone()),
             github,
+            contributors: contributors::Contributors::open(&self.root)?,
             ci: ci::Ci::open(
                 &self.root,
                 &self
@@ -346,6 +349,9 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             "Browser requests must use the authenticated dashboard proxy.",
         );
     }
+    if path.starts_with("/v1/node/") {
+        return node_request(controller, request).await;
+    }
     // Only this narrow route accepts a GitHub signature instead of owner bearer auth.
     if method == Method::POST && path.starts_with("/v1/github/webhook/") {
         return github_webhook(controller, request).await;
@@ -507,6 +513,82 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     }
 }
 
+async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Response {
+    let action = request
+        .uri()
+        .path()
+        .strip_prefix("/v1/node/")
+        .unwrap_or("")
+        .to_owned();
+    if request.method() != Method::POST
+        || request.uri().query().is_some()
+        || !["enroll", "hello", "heartbeat", "poll", "result"].contains(&action.as_str())
+    {
+        return error(StatusCode::NOT_FOUND, "Unknown node operation.");
+    }
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_owned();
+    if token.len() > 200 || token.is_empty() {
+        return error(StatusCode::UNAUTHORIZED, "Node credential required.");
+    }
+    let admission = {
+        let mut gate = controller.gate.lock().unwrap();
+        // Already admitted work must keep its lease and finish during a drain.
+        let finishing = ["heartbeat", "result"].contains(&action.as_str());
+        if gate.mode != Mode::Active && !(finishing && gate.mode == Mode::Draining) {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Controller is not accepting node work.",
+            );
+        }
+        gate.requests += 1;
+        Admission(controller.clone())
+    };
+    let runtime = match controller.runtime() {
+        Ok(r) => r,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Controller unavailable."),
+    };
+    if action != "enroll" && !runtime.contributors.authenticated(&token) {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "Node credential expired or revoked.",
+        );
+    }
+    let bytes = match to_bytes(request.into_body(), 350_000).await {
+        Ok(b) => b,
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "Node request too large."),
+    };
+    let body = match enginebox_core::templates::decode_json(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return error(StatusCode::BAD_REQUEST, "Invalid node request."),
+    };
+    let result = admitted(admission, async move {
+        blocking(move || {
+            if action == "enroll" {
+                runtime
+                    .contributors
+                    .enroll(&token, serde_json::from_value(body)?)
+            } else {
+                runtime.contributors.node_call(&token, &action, body)
+            }
+        })
+        .await
+    })
+    .await;
+    match result {
+        Ok(v) => reply(StatusCode::OK, v),
+        Err(_) => error(
+            StatusCode::CONFLICT,
+            "Node request rejected. Check registration expiry, resource allowance, session or reconciliation state.",
+        ),
+    }
+}
+
 fn read(c: &Controller, p: &[String]) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
@@ -520,6 +602,7 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
         ["v1", "ci"] => Ok(c.runtime()?.ci.catalog()),
         ["v1", "ci", "templates"] => Ok(c.runtime()?.ci.template_catalog()),
+        ["v1", "contributors"] => Ok(c.runtime()?.contributors.catalog()),
         ["v1", "ci", "github", owner, repo, "runs", run] => {
             enginebox_ci::github::Github::from_env()?
                 .status(&format!("{owner}/{repo}"), run.parse()?)
@@ -658,6 +741,22 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
                 Ok(runtime.ci.template_catalog())
             })
             .await?
+        }
+        ["v1", "contributors", "enrollments"] => {
+            runtime.contributors.issue(serde_json::from_value(body)?)?
+        }
+        ["v1", "contributors", node, "revoke"] => {
+            empty(&body)?;
+            runtime.contributors.revoke(node)?
+        }
+        ["v1", "contributors", node, "reconcile"] => {
+            keys(&body, &["stopped"], &["stopped"])?;
+            ensure!(body["stopped"] == true, "Confirm the owned worker stopped");
+            runtime.contributors.reconcile(node)?
+        }
+        ["v1", "contributors", node, "runs"] => {
+            code = StatusCode::ACCEPTED;
+            json!({"job":runtime.contributors.submit(&runtime.ci_jobs,node,serde_json::from_value(body)?)?})
         }
         ["v1", "ci", "plan"] => runtime.ci.plan(&serde_json::from_value(body)?)?,
         ["v1", "ci", "runs"] => {
