@@ -108,7 +108,11 @@ export class Machines {
           `machine-signal:${row.view.id}:`,
           `machine-op:${row.view.id}:`,
         ])
-          this.sql.exec("DELETE FROM records WHERE key LIKE ?", `${prefix}%`);
+          this.sql.exec(
+            "DELETE FROM records WHERE key >= ? AND key < ?",
+            prefix,
+            `${prefix.slice(0, -1)};`,
+          );
       }
     }
     this.sql.exec(
@@ -184,7 +188,9 @@ export class Machines {
       this.sql
         .exec<{
           count: number;
-        }>("SELECT COUNT(*) AS count FROM records WHERE key LIKE 'machine-grant:%'")
+        }>(
+          "SELECT COUNT(*) AS count FROM records WHERE key LIKE 'machine-grant:%'",
+        )
         .one().count < 4096,
       "Grant capacity reached; retry later",
       429,

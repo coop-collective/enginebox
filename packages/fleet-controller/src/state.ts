@@ -58,10 +58,14 @@ export class State extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM records WHERE key = ?", key);
   }
   rows<T>(prefix: string): T[] {
+    // All record namespaces end in ':'. Indexed ranges avoid workerd SQLite's
+    // short LIKE-pattern limit when a valid project/session ID is in the prefix.
+    requireThat(prefix.endsWith(":"), "Record namespace prefix required");
     return this.ctx.storage.sql
       .exec<{ value: string }>(
-        "SELECT value FROM records WHERE key LIKE ? ORDER BY key",
-        `${prefix}%`,
+        "SELECT value FROM records WHERE key >= ? AND key < ? ORDER BY key",
+        prefix,
+        `${prefix.slice(0, -1)};`,
       )
       .toArray()
       .map((row) => JSON.parse(row.value) as T);
@@ -142,10 +146,7 @@ export class FleetNode extends State {
       revoked?: boolean;
     }>("invitation");
     requireThat(
-      invite &&
-        !invite.revoked &&
-        invite.tokenHash === tokenHash &&
-        invite.expires > Date.now(),
+      invite && !invite.revoked && invite.tokenHash === tokenHash,
       "Invalid or expired machine invitation",
       401,
     );
@@ -157,6 +158,11 @@ export class FleetNode extends State {
         409,
       );
     } else {
+      requireThat(
+        invite.expires > Date.now(),
+        "Machine invitation expired",
+        401,
+      );
       this.put("node", {
         ...invite.spec,
         secretHash,

@@ -797,3 +797,104 @@ it("garbage collects expired renewal grants and reuses original session relay cr
     expect(instance.rows("machine-grant:").length).toBe(2);
   });
 });
+
+it("recovers an already-claimed persisted identity after invitation expiry without extending epochs or accepting a new identity", async () => {
+  const { invite, host } = await setup();
+  await inspectDO(env.NODES.getByName("laptop") as any, (instance: any) => {
+    const row = instance.get("invitation");
+    row.expires = Date.now() - 1;
+    instance.put("invitation", row);
+  });
+  const recovered = await ok(
+    "/v1/node/enroll",
+    { nodeSecretHash: await sha256(host.token) },
+    invite.token,
+  );
+  expect(recovered.node.id).toBe("laptop");
+  const repeatedHello = await ok(
+    "/v1/node/hello",
+    { session: host.session },
+    host.token,
+  );
+  expect(repeatedHello.epoch).toBe(host.epoch);
+  expect(
+    (
+      await req(
+        "/v1/node/enroll",
+        { nodeSecretHash: "c".repeat(64) },
+        invite.token,
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await req(
+        "/v1/node/enroll",
+        { nodeSecretHash: await sha256(host.token) },
+        "laptop.enroll." + "d".repeat(64),
+      )
+    ).status,
+  ).toBe(401);
+  await ok(`${P}/machines/laptop/revoke`, { operationId: "revoke-recovery" });
+  expect(
+    (
+      await req(
+        "/v1/node/enroll",
+        { nodeSecretHash: await sha256(host.token) },
+        invite.token,
+      )
+    ).status,
+  ).toBe(401);
+});
+
+it("reads and collects mailboxes with maximum-length IDs without exceeding SQLite LIKE limits", async () => {
+  const { app, host } = await setup();
+  const id = "s".repeat(48);
+  const g = await grant("long-id-grant", id);
+  await ok(
+    `${P}/machine-sessions`,
+    { id, grant: g.grant, clientSecretHash: await sha256(client) },
+    app,
+  );
+  const offer = {
+    id: "long-offer",
+    signal: { type: "offer", sdp: "v=0\r\ns=long-id\r\n" },
+  };
+  await ok(
+    `${P}/machine-sessions/${id}/signals`,
+    offer,
+    app,
+    undefined,
+    client,
+  );
+  expect(
+    (await ok(`${P}/machine-sessions/${id}/signals`, undefined, host)).signals,
+  ).toEqual([{ ...offer, sequence: 1 }]);
+  await ok(
+    `${P}/machine-sessions/${id}/end`,
+    { id: "end-long" },
+    app,
+    undefined,
+    client,
+  );
+  await changeRecord(`machine-session:${id}`, (row) => {
+    row.view.endedAt = Date.now() - 25 * 60 * 60_000;
+  });
+  await ok("/v1/node/machine-sessions/poll", {}, host);
+  await inspectDO(env.PROJECTS.getByName("demo") as any, (instance: any) => {
+    expect(instance.get(`machine-session:${id}`)).toBeUndefined();
+    expect(instance.rows(`machine-signal:${id}:`)).toEqual([]);
+    expect(instance.rows(`machine-op:${id}:`)).toEqual([]);
+  });
+  const project = "p".repeat(48);
+  await ok("/v1/projects", { id: project });
+  await ok(`/v1/projects/${project}/machine-invitations`, {
+    id: "long-project-node",
+    label: "Long project",
+    ownerAccountId: "fixture-account",
+    allowControl: false,
+  });
+  expect((await ok(`/v1/projects/${project}/machines`)).machines[0].id).toBe(
+    "long-project-node",
+  );
+});

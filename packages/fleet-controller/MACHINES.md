@@ -38,7 +38,9 @@ creation requests return 409; use a new ID for a replacement host. A host token
 is generated and persisted locally **before** claiming the invitation. Redeeming
 `<node>.enroll.<64hex>` at `POST /v1/node/enroll` with
 `{nodeSecretHash:SHA256("<node>.<64hex>")}` atomically claims the identity. The
-same persisted hash can retry until original invitation expiry; another hash
+same invitation token and persisted hash can recover an already-claimed identity
+after invitation expiry; this does not extend the lease or change the epoch. New
+claims still require an unexpired invitation. Another hash or a revoked identity
 cannot take over. The invitation is never an owner, app, or normal node token.
 
 The host uses a fresh UUID per process for `POST /v1/node/hello {session}`. The
