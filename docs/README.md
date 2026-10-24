@@ -9,7 +9,7 @@ Engine Box is in early development; each guide states what is implemented, quali
 - [Server bootstrap](BOOTSTRAP.md): inspect, plan and prepare a Linux/KVM host and a credential-free workspace base.
 - [Native agent clients](NATIVE-CLIENTS.md): installing and signing into Codex, Claude Code and Cursor Agent.
 - [Portable hosts](PORTABLE-HOSTS.md): which operating systems can operate or contribute resources.
-- [Licensing](LICENSING.md): the Sustainable Use License boundary and the historical Apache-2.0 grant.
+- [Licensing](LICENSING.md): the Business Source License, per-node pricing, the Change Date and license history.
 
 ## Guides and reference
 

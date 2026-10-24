@@ -6,7 +6,7 @@ Updated October 23, 2026. Scope: portable environments for native Codex, Cursor 
 
 | ID | Deliverable | Depends on | Acceptance |
 |---|---|---|---|
-| P0 | Clean source-available repository and reusable runtime | None | No owner host defaults or private artifacts; Sustainable Use License and historical Apache notices; offline config/command/lifecycle tests; honest capability documentation. |
+| P0 | Clean source-available repository and reusable runtime | None | No owner host defaults or private artifacts; Business Source License with historical license notices; offline config/command/lifecycle tests; honest capability documentation. |
 | P1 | Versioned config, inventory and `doctor` | P0 | Validate host/guest parameters and capabilities without mutation; actionable results for missing KVM, incompatible versions, low disk and conflicting networks/resources. |
 | P2 | Deterministic `plan` and resumable `apply` | P1 | Fresh supported host gets one workspace; second apply is unchanged; failure injection resumes; unrelated Incus/Docker/NFS resources remain intact. |
 | P3 | Native-client preparation and clean base | P2 | Official Codex/Cursor/Claude clients launch directly; version/update policy recorded; no auth in reusable base; supported MCP config merges without overwriting user entries. |

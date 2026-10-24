@@ -30,7 +30,7 @@
     "test": "tsx --test tests/*.test.ts",
     "test:e2e": "playwright test"
   },
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "BUSL-1.1",
   "engines": {
     "node": ">=22.12"
   }
