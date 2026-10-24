@@ -3,6 +3,7 @@ extends Node3D
 var pawn: MeshInstance3D
 var rotor: MeshInstance3D
 var label: Label
+var indicator: ColorRect
 var input_count := 0
 var elapsed := 0.0
 
@@ -53,8 +54,17 @@ func _ready() -> void:
 	button.text = "Test click"
 	button.position = Vector2(28, 145)
 	button.size = Vector2(180, 52)
-	button.pressed.connect(func(): input_count += 1)
+	button.pressed.connect(func():
+		input_count += 1
+		indicator.color = Color("#e95821") if input_count % 2 == 1 else Color("#174063")
+	)
 	hud.add_child(button)
+	indicator = ColorRect.new()
+	indicator.position = Vector2(280, 200)
+	indicator.size = Vector2(60, 60)
+	indicator.color = Color("#174063")
+	indicator.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud.add_child(indicator)
 
 func _process(delta: float) -> void:
 	elapsed += delta

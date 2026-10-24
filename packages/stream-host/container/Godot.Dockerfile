@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock LICENSE ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo test --locked -j 4 && cargo build --release --locked -j 4 \
+    cargo test --release --locked -j 4 && cargo build --release --locked -j 4 \
     && install -m 755 target/release/enginebox-stream-host /usr/local/bin/enginebox-stream-host
 
 FROM debian:bookworm-slim AS godot
