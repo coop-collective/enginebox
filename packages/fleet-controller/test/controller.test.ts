@@ -64,7 +64,11 @@ async function setup(
   const hello = await ok("/v1/node/hello", { session }, secret);
   return { token: secret, session, epoch: hello.epoch };
 }
-async function publish(text = "snapshot", parent: string | null = null, metadata: Record<string,string> = {}) {
+async function publish(
+  text = "snapshot",
+  parent: string | null = null,
+  metadata: Record<string, string> = {},
+) {
   await ok("/v1/projects", { id: "demo" });
   const hash = await sha256(text);
   await ok(`/v1/data/demo/chunks/${hash}`, text, token, "PUT");
@@ -1320,69 +1324,303 @@ it("serializes competing task edits and preserves one operation receipt", async 
 });
 
 async function integrationFixture() {
-  await ok("/v1/projects",{id:"demo"});
-  const baseRef="32"+"a".repeat(64),baseRoot="b".repeat(64),ref="12"+"c".repeat(64),root="d".repeat(64);
-  const base=await publish("base",null,{projectName:"source",layerfsRef:baseRef,layerfsRoot:baseRoot});
-  await ok("/v1/projects/demo/accept",{generation:base.id,expected:null});
-  const change=await publish("change",base.id,{projectName:"source",layerfsRef:ref,layerfsRoot:root});
-  await ok("/v1/projects/demo/checks",{checks:[{name:"full",kind:"verify",recipe:"f".repeat(64)}]});
-  await ok("/v1/projects/demo/tasks",{id:"feature",title:"Frozen requirements",type:"idea"});
-  const spec={id:"feature",project:"demo",base:base.id,generation:change.id,layerfsProject:"source",baseRef,baseRoot,ref,root};
-  return {base,change,spec};
+  await ok("/v1/projects", { id: "demo" });
+  const baseRef = "32" + "a".repeat(64),
+    baseRoot = "b".repeat(64),
+    ref = "12" + "c".repeat(64),
+    root = "d".repeat(64);
+  const base = await publish("base", null, {
+    projectName: "source",
+    layerfsRef: baseRef,
+    layerfsRoot: baseRoot,
+  });
+  await ok("/v1/projects/demo/accept", { generation: base.id, expected: null });
+  const change = await publish("change", base.id, {
+    projectName: "source",
+    layerfsRef: ref,
+    layerfsRoot: root,
+  });
+  await ok("/v1/projects/demo/checks", {
+    checks: [{ name: "full", kind: "verify", recipe: "f".repeat(64) }],
+  });
+  await ok("/v1/projects/demo/tasks", {
+    id: "feature",
+    title: "Frozen requirements",
+    type: "idea",
+  });
+  const spec = {
+    id: "feature",
+    project: "demo",
+    base: base.id,
+    generation: change.id,
+    layerfsProject: "source",
+    baseRef,
+    baseRoot,
+    ref,
+    root,
+  };
+  return { base, change, spec };
 }
-it("freezes exact-base integration submissions, fences capabilities and stages only verified output provenance",async()=>{
-  const {base,change,spec}=await integrationFixture();
-  await ok("/v1/projects/demo/submissions",spec);
-  expect((await request("/v1/projects/demo/submissions",{...spec,root:"e".repeat(64)})).status).toBe(409);
-  const frozen=await ok("/v1/projects/demo/integrations",{id:"batch-merge",changes:["feature"]});
-  expect((await ok("/v1/projects/demo/integrations",{id:"batch-merge",changes:["feature"]})).spec).toEqual(frozen.spec);
-  const ordinary=await setup(); expect((await ok("/v1/node/poll",{},ordinary)).assignment).toBeNull();
-  const identity=await ok("/v1/nodes",{id:"merger",role:"agent",projects:["demo"],origin:null,slots:1,cacheBytes:16777216,integrationProjects:["demo"]});
-  const session=crypto.randomUUID(); const hello=await ok("/v1/node/hello",{session},identity.token);
-  const actor={token:identity.token,epoch:hello.epoch,session};
-  const {assignment}=await ok("/v1/node/poll",{},actor);
-  expect(assignment.integration.changes).toEqual([{id:"feature",submission:"feature",generation:change.id,ref:spec.ref,root:spec.root}]);
-  expect((await request("/v1/node/finish",{assignment,ok:true,result:{generation:change.id,ref:spec.ref,root:spec.root,treeHash:"e".repeat(64)}},actor)).status).toBe(409);
-  const result={ref:"12"+"1".repeat(64),root:"2".repeat(64),treeHash:"3".repeat(64)};
-  const output=await publish("merged",base.id,{projectName:"source",layerfsRef:result.ref,layerfsRoot:result.root,treeHash:result.treeHash,integration:"batch-merge"});
-  await ok("/v1/node/finish",{assignment,ok:true,result:{...result,generation:output.id}},actor);
-  await ok("/v1/node/finish",{assignment,ok:true,result:{...result,generation:output.id}},actor);
-  expect((await ok("/v1/projects/demo/candidates/batch-merge")).spec).toEqual({id:"batch-merge",project:"demo",base:base.id,generation:output.id,changes:[{id:"feature",generation:change.id}]});
+it("freezes exact-base integration submissions, fences capabilities and stages only verified output provenance", async () => {
+  const { base, change, spec } = await integrationFixture();
+  await ok("/v1/projects/demo/submissions", spec);
+  expect(
+    (
+      await request("/v1/projects/demo/submissions", {
+        ...spec,
+        root: "e".repeat(64),
+      })
+    ).status,
+  ).toBe(409);
+  const frozen = await ok("/v1/projects/demo/integrations", {
+    id: "batch-merge",
+    changes: ["feature"],
+  });
+  expect(
+    (
+      await ok("/v1/projects/demo/integrations", {
+        id: "batch-merge",
+        changes: ["feature"],
+      })
+    ).spec,
+  ).toEqual(frozen.spec);
+  const ordinary = await setup();
+  expect((await ok("/v1/node/poll", {}, ordinary)).assignment).toBeNull();
+  const identity = await ok("/v1/nodes", {
+    id: "merger",
+    role: "agent",
+    projects: ["demo"],
+    origin: null,
+    slots: 1,
+    cacheBytes: 16777216,
+    integrationProjects: ["demo"],
+  });
+  const session = crypto.randomUUID();
+  const hello = await ok("/v1/node/hello", { session }, identity.token);
+  const actor = { token: identity.token, epoch: hello.epoch, session };
+  const { assignment } = await ok("/v1/node/poll", {}, actor);
+  expect(assignment.integration.changes).toEqual([
+    {
+      id: "feature",
+      submission: "feature",
+      generation: change.id,
+      ref: spec.ref,
+      root: spec.root,
+    },
+  ]);
+  expect(
+    (
+      await request(
+        "/v1/node/finish",
+        {
+          assignment,
+          ok: true,
+          result: {
+            generation: change.id,
+            ref: spec.ref,
+            root: spec.root,
+            treeHash: "e".repeat(64),
+          },
+        },
+        actor,
+      )
+    ).status,
+  ).toBe(409);
+  const result = {
+    ref: "12" + "1".repeat(64),
+    root: "2".repeat(64),
+    treeHash: "3".repeat(64),
+  };
+  const output = await publish("merged", base.id, {
+    projectName: "source",
+    layerfsRef: result.ref,
+    layerfsRoot: result.root,
+    treeHash: result.treeHash,
+    integration: "batch-merge",
+  });
+  await ok(
+    "/v1/node/finish",
+    { assignment, ok: true, result: { ...result, generation: output.id } },
+    actor,
+  );
+  await ok(
+    "/v1/node/finish",
+    { assignment, ok: true, result: { ...result, generation: output.id } },
+    actor,
+  );
+  expect((await ok("/v1/projects/demo/candidates/batch-merge")).spec).toEqual({
+    id: "batch-merge",
+    project: "demo",
+    base: base.id,
+    generation: output.id,
+    changes: [{ id: "feature", generation: change.id }],
+  });
   expect((await ok("/v1/projects/demo")).head).toBe(base.id);
-  expect((await request("/v1/projects/demo/accept",{generation:output.id,expected:base.id,candidate:"batch-merge"})).status).toBe(409);
-  const task=await ok("/v1/projects/demo/tasks/feature");
-  expect(task).toMatchObject({status:"testing",candidate:"batch-merge",resultGeneration:change.id});
-  const inventory=await ok("/v1/projects/demo");
-  expect(inventory.jobs.filter((job:any)=>job.spec.check?.candidate==="batch-merge")).toHaveLength(1);
-  const check=(await ok("/v1/node/poll",{},ordinary)).assignment;
-  expect(check).toMatchObject({kind:"verify",generation:output.id,check:{candidate:"batch-merge",scope:"full"}});
-  await ok("/v1/node/finish",{assignment:check,ok:true,result:{check:check.check}},ordinary);
+  expect(
+    (
+      await request("/v1/projects/demo/accept", {
+        generation: output.id,
+        expected: base.id,
+        candidate: "batch-merge",
+      })
+    ).status,
+  ).toBe(409);
+  const task = await ok("/v1/projects/demo/tasks/feature");
+  expect(task).toMatchObject({
+    status: "testing",
+    candidate: "batch-merge",
+    resultGeneration: change.id,
+  });
+  const inventory = await ok("/v1/projects/demo");
+  expect(
+    inventory.jobs.filter(
+      (job: any) => job.spec.check?.candidate === "batch-merge",
+    ),
+  ).toHaveLength(1);
+  const check = (await ok("/v1/node/poll", {}, ordinary)).assignment;
+  expect(check).toMatchObject({
+    kind: "verify",
+    generation: output.id,
+    check: { candidate: "batch-merge", scope: "full" },
+  });
+  await ok(
+    "/v1/node/finish",
+    { assignment: check, ok: true, result: { check: check.check } },
+    ordinary,
+  );
   expect((await ok("/v1/projects/demo")).head).toBe(base.id);
-  expect((await ok("/v1/projects/demo/tasks/feature/approve",{operationId:"review-integrated",expectedRevision:task.revision})).status).toBe("shipped");
+  expect(
+    (
+      await ok("/v1/projects/demo/tasks/feature/approve", {
+        operationId: "review-integrated",
+        expectedRevision: task.revision,
+      })
+    ).status,
+  ).toBe("shipped");
   expect((await ok("/v1/projects/demo")).head).toBe(output.id);
 });
-it("task-only credentials cannot submit or execute integration and arbitrary jobs cannot invent a frozen batch",async()=>{
-  const {spec}=await integrationFixture();
-  const scoped=await ok("/v1/nodes",{id:"task-client",role:"agent",projects:["demo"],origin:null,slots:1,cacheBytes:16777216,taskOnly:true});
-  expect((await request("/v1/projects/demo/submissions",spec,scoped.token)).status).toBe(403);
-  expect((await request("/v1/projects/demo/integrations",{id:"merge",changes:["feature"]},scoped.token)).status).toBe(403);
-  expect((await request("/v1/nodes",{id:"bad-scope",role:"agent",projects:["demo"],origin:null,slots:1,cacheBytes:16777216,taskOnly:true,integrationProjects:["demo"]})).status).toBe(400);
-  expect((await request("/v1/projects/demo/jobs",{id:"invented",project:"demo",kind:"integration",generation:spec.base,integration:{id:"invented",layerfsProject:spec.layerfsProject,baseRef:spec.baseRef,baseRoot:spec.baseRoot,changes:[{id:spec.id,submission:spec.id,generation:spec.generation,ref:spec.ref,root:spec.root}],taskRequirements:{}}})).status).toBe(409);
+it("task-only credentials cannot submit or execute integration and arbitrary jobs cannot invent a frozen batch", async () => {
+  const { spec } = await integrationFixture();
+  const scoped = await ok("/v1/nodes", {
+    id: "task-client",
+    role: "agent",
+    projects: ["demo"],
+    origin: null,
+    slots: 1,
+    cacheBytes: 16777216,
+    taskOnly: true,
+  });
+  expect(
+    (await request("/v1/projects/demo/submissions", spec, scoped.token)).status,
+  ).toBe(403);
+  expect(
+    (
+      await request(
+        "/v1/projects/demo/integrations",
+        { id: "merge", changes: ["feature"] },
+        scoped.token,
+      )
+    ).status,
+  ).toBe(403);
+  expect(
+    (
+      await request("/v1/nodes", {
+        id: "bad-scope",
+        role: "agent",
+        projects: ["demo"],
+        origin: null,
+        slots: 1,
+        cacheBytes: 16777216,
+        taskOnly: true,
+        integrationProjects: ["demo"],
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await request("/v1/projects/demo/jobs", {
+        id: "invented",
+        project: "demo",
+        kind: "integration",
+        generation: spec.base,
+        integration: {
+          id: "invented",
+          layerfsProject: spec.layerfsProject,
+          baseRef: spec.baseRef,
+          baseRoot: spec.baseRoot,
+          changes: [
+            {
+              id: spec.id,
+              submission: spec.id,
+              generation: spec.generation,
+              ref: spec.ref,
+              root: spec.root,
+            },
+          ],
+          taskRequirements: {},
+        },
+      })
+    ).status,
+  ).toBe(409);
 });
 
-it("invalidates queued integration after requirement edits while ordinary task moves retain semantic binding",async()=>{
- const {spec}=await integrationFixture();
- await ok("/v1/projects/demo/submissions",spec);
- await ok("/v1/projects/demo/tasks/feature/move",{operationId:"start",expectedRevision:1,status:"in_progress"});
- const frozen=await ok("/v1/projects/demo/integrations",{id:"before-edit",changes:["feature"]});
- expect(frozen.spec.integration.taskRequirements.feature).toMatch(/^[a-f0-9]{64}$/);
- await ok("/v1/projects/demo/tasks/feature/update",{operationId:"new-requirements",expectedRevision:2,patch:{title:"Different requirements"}});
- expect((await request("/v1/projects/demo/integrations",{id:"after-edit",changes:["feature"]})).status).toBe(409);
- const output=await publish("stale-merged",spec.base,{projectName:"source",layerfsRef:spec.ref,layerfsRoot:spec.root,treeHash:"3".repeat(64),integration:"before-edit"});
- await runInDurableObject(env.PROJECTS.getByName("demo"),async(instance)=>{
-  const assignment={...frozen.spec,node:"test-node",epoch:1,session:crypto.randomUUID(),expires:Date.now()+30_000,attempt:crypto.randomUUID()};
-  await instance.assign(assignment);
-  await expect(instance.finish(assignment,canonical({generation:output.id,ref:spec.ref,root:spec.root,treeHash:"3".repeat(64)}),true)).rejects.toThrow("Task requirements changed");
-  expect(await instance.candidate("before-edit")).toBeNull();
- });
+it("invalidates queued integration after requirement edits while ordinary task moves retain semantic binding", async () => {
+  const { spec } = await integrationFixture();
+  await ok("/v1/projects/demo/submissions", spec);
+  await ok("/v1/projects/demo/tasks/feature/move", {
+    operationId: "start",
+    expectedRevision: 1,
+    status: "in_progress",
+  });
+  const frozen = await ok("/v1/projects/demo/integrations", {
+    id: "before-edit",
+    changes: ["feature"],
+  });
+  expect(frozen.spec.integration.taskRequirements.feature).toMatch(
+    /^[a-f0-9]{64}$/,
+  );
+  await ok("/v1/projects/demo/tasks/feature/update", {
+    operationId: "new-requirements",
+    expectedRevision: 2,
+    patch: { title: "Different requirements" },
+  });
+  expect(
+    (
+      await request("/v1/projects/demo/integrations", {
+        id: "after-edit",
+        changes: ["feature"],
+      })
+    ).status,
+  ).toBe(409);
+  const output = await publish("stale-merged", spec.base, {
+    projectName: "source",
+    layerfsRef: spec.ref,
+    layerfsRoot: spec.root,
+    treeHash: "3".repeat(64),
+    integration: "before-edit",
+  });
+  await runInDurableObject(env.PROJECTS.getByName("demo"), async (instance) => {
+    const assignment = {
+      ...frozen.spec,
+      node: "test-node",
+      epoch: 1,
+      session: crypto.randomUUID(),
+      expires: Date.now() + 30_000,
+      attempt: crypto.randomUUID(),
+    };
+    await instance.assign(assignment);
+    await expect(
+      instance.finish(
+        assignment,
+        canonical({
+          generation: output.id,
+          ref: spec.ref,
+          root: spec.root,
+          treeHash: "3".repeat(64),
+        }),
+        true,
+      ),
+    ).rejects.toThrow("Task requirements changed");
+    expect(await instance.candidate("before-edit")).toBeNull();
+  });
 });

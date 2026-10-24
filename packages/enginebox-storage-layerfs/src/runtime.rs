@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::Duration};
 
 const BRIDGE: &str = include_str!("bridge.mjs");
-#[path = "integration.rs"]
-mod integration;
 #[path = "github_runtime.rs"]
 mod github_runtime;
+#[path = "integration.rs"]
+mod integration;
 #[path = "publication.rs"]
 mod publication;
 #[path = "recovery.rs"]

@@ -45,11 +45,11 @@ function requirements(task: Task) {
     .digest("hex");
 }
 export function recordingSummary(value: Recording) {
-  const { chunks, output, ...summary } = value;
+  const { chunks, output, events, ...summary } = value;
   return {
     ...summary,
     uploadedChunks: chunks.filter((chunk) => chunk.uploaded).length,
-    eventCount: value.events.length,
+    eventCount: events.length,
   };
 }
 export class Recordings {
@@ -76,7 +76,9 @@ export class Recordings {
     const rows = this.sql
       .exec<{
         value: string;
-      }>("SELECT value FROM records WHERE key LIKE 'task:%' AND json_extract(value,'$.status')='testing' ORDER BY key LIMIT 100")
+      }>(
+        "SELECT value FROM records WHERE key LIKE 'task:%' AND json_extract(value,'$.status')='testing' ORDER BY key LIMIT 100",
+      )
       .toArray();
     return rows.flatMap(({ value }) => {
       const task = JSON.parse(value) as Task;
@@ -261,7 +263,11 @@ export class Recordings {
     const active = this.sql
       .exec<{
         n: number;
-      }>("SELECT COUNT(*) AS n FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.actor')=? AND json_extract(value,'$.state') IN ('recording','uploading','finalizing') AND json_extract(value,'$.uploadExpiresAt')>?", actor, Date.now())
+      }>(
+        "SELECT COUNT(*) AS n FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.actor')=? AND json_extract(value,'$.state') IN ('recording','uploading','finalizing') AND json_extract(value,'$.uploadExpiresAt')>?",
+        actor,
+        Date.now(),
+      )
       .one().n;
     requireThat(active < 8, "Too many active recordings for this service", 429);
     const value: Recording = {
@@ -554,7 +560,10 @@ export class Recordings {
     const rows = this.sql
       .exec<{
         value: string;
-      }>("SELECT value FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.taskId')=? AND json_extract(value,'$.state')='ready' ORDER BY rowid DESC LIMIT 100", task.id)
+      }>(
+        "SELECT value FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.taskId')=? AND json_extract(value,'$.state')='ready' ORDER BY rowid DESC LIMIT 100",
+        task.id,
+      )
       .toArray();
     return rows
       .map((row) => JSON.parse(row.value) as Recording)
@@ -611,7 +620,12 @@ export class Recordings {
       .exec<{
         key: string;
         value: string;
-      }>("SELECT key,value FROM records WHERE key LIKE 'recording:%' AND key>? AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-cleaned:' || substr(records.key,11)) AND (json_extract(value,'$.expiresAt')<=? OR (json_extract(value,'$.uploadExpiresAt')<=? AND json_extract(value,'$.state') IN ('recording','uploading'))) ORDER BY key LIMIT 20", cursor, Date.now(), Date.now())
+      }>(
+        "SELECT key,value FROM records WHERE key LIKE 'recording:%' AND key>? AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-cleaned:' || substr(records.key,11)) AND (json_extract(value,'$.expiresAt')<=? OR (json_extract(value,'$.uploadExpiresAt')<=? AND json_extract(value,'$.state') IN ('recording','uploading'))) ORDER BY key LIMIT 20",
+        cursor,
+        Date.now(),
+        Date.now(),
+      )
       .toArray();
   }
   expire(id: string) {

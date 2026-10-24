@@ -87,7 +87,12 @@ export type AssistantJob = {
   argv?: never;
   check?: never;
 };
-export type JobSpec = StoreJob | AssistantJob | MediaFinalizeJob | IntegrationJob | EngineBuildJob;
+export type JobSpec =
+  | StoreJob
+  | AssistantJob
+  | MediaFinalizeJob
+  | IntegrationJob
+  | EngineBuildJob;
 export function readOnlyJob(job: { kind: string }) {
   return job.kind === "hydrate" || job.kind === "verify";
 }
@@ -272,9 +277,14 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
   for (const project of value.projects) identifier(project);
   if (value.taskOnly !== undefined)
     requireThat(
-      value.taskOnly === true && value.role === "agent" &&
-        value.projects.length === 1 && value.origin === null &&
-        value.assistantProjects === undefined && value.mediaProjects === undefined && value.integrationProjects === undefined && value.buildProjects === undefined,
+      value.taskOnly === true &&
+        value.role === "agent" &&
+        value.projects.length === 1 &&
+        value.origin === null &&
+        value.assistantProjects === undefined &&
+        value.mediaProjects === undefined &&
+        value.integrationProjects === undefined &&
+        value.buildProjects === undefined,
       "Task-only credentials require one project, agent role and no executor capability",
     );
   if (value.assistantProjects !== undefined) {
@@ -293,18 +303,50 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     }
   }
   if (value.mediaProjects !== undefined) {
-    requireThat(value.role === "agent" && Array.isArray(value.mediaProjects) && value.mediaProjects.length <= 128, "Invalid media projects");
+    requireThat(
+      value.role === "agent" &&
+        Array.isArray(value.mediaProjects) &&
+        value.mediaProjects.length <= 128,
+      "Invalid media projects",
+    );
     for (const project of value.mediaProjects) {
-      identifier(project); requireThat(value.projects.includes(project), "Media project must be enrolled");
+      identifier(project);
+      requireThat(
+        value.projects.includes(project),
+        "Media project must be enrolled",
+      );
     }
   }
   if (value.integrationProjects !== undefined) {
-    requireThat(value.role === "agent" && Array.isArray(value.integrationProjects) && value.integrationProjects.length <= 128, "Invalid integration projects");
-    for (const project of value.integrationProjects) { identifier(project); requireThat(value.projects.includes(project), "Integration project must be enrolled"); }
+    requireThat(
+      value.role === "agent" &&
+        Array.isArray(value.integrationProjects) &&
+        value.integrationProjects.length <= 128,
+      "Invalid integration projects",
+    );
+    for (const project of value.integrationProjects) {
+      identifier(project);
+      requireThat(
+        value.projects.includes(project),
+        "Integration project must be enrolled",
+      );
+    }
   }
-  if(value.buildProjects!==undefined){
-    requireThat(value.role==='agent' && !value.taskOnly && Array.isArray(value.buildProjects) && value.buildProjects.length<=128,'Invalid build projects');
-    for(const project of value.buildProjects){identifier(project);requireThat(value.projects.includes(project),'Build project must be enrolled');}
+  if (value.buildProjects !== undefined) {
+    requireThat(
+      value.role === "agent" &&
+        !value.taskOnly &&
+        Array.isArray(value.buildProjects) &&
+        value.buildProjects.length <= 128,
+      "Invalid build projects",
+    );
+    for (const project of value.buildProjects) {
+      identifier(project);
+      requireThat(
+        value.projects.includes(project),
+        "Build project must be enrolled",
+      );
+    }
   }
   integer(value.slots, 1, 64);
   integer(value.cacheBytes, MAX_CHUNK_BYTES * 2, Number.MAX_SAFE_INTEGER);
@@ -339,10 +381,20 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     origin,
     slots: value.slots,
     cacheBytes: value.cacheBytes,
-    ...(value.mediaProjects === undefined ? {} : {mediaProjects: [...new Set(value.mediaProjects as string[])]}),
+    ...(value.mediaProjects === undefined
+      ? {}
+      : { mediaProjects: [...new Set(value.mediaProjects as string[])] }),
     ...(value.taskOnly === true ? { taskOnly: true as const } : {}),
-    ...(value.integrationProjects === undefined ? {} : { integrationProjects: [...new Set(value.integrationProjects as string[])] }),
-    ...(value.buildProjects === undefined ? {} : {buildProjects:[...new Set(value.buildProjects as string[])]}),
+    ...(value.integrationProjects === undefined
+      ? {}
+      : {
+          integrationProjects: [
+            ...new Set(value.integrationProjects as string[]),
+          ],
+        }),
+    ...(value.buildProjects === undefined
+      ? {}
+      : { buildProjects: [...new Set(value.buildProjects as string[])] }),
     ...(value.assistantProjects === undefined
       ? {}
       : {
@@ -352,7 +404,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
 }
 export function validateJob(value: unknown): JobSpec {
   record(value);
-  if(value.kind === "engine-build") return validateEngineBuild(value);
+  if (value.kind === "engine-build") return validateEngineBuild(value);
   exactKeys(value, [
     "id",
     "project",
@@ -369,10 +421,25 @@ export function validateJob(value: unknown): JobSpec {
   identifier(value.project);
   if (value.kind === "integration") {
     digest(value.generation);
-    requireThat(value.argv === undefined && value.check === undefined && value.prompt === undefined && value.timeoutSeconds === undefined, "Integration cannot carry arbitrary commands or CI evidence");
-    return { id: value.id, project: value.project, generation: value.generation, kind: "integration", integration: validateIntegration(value.integration) };
+    requireThat(
+      value.argv === undefined &&
+        value.check === undefined &&
+        value.prompt === undefined &&
+        value.timeoutSeconds === undefined,
+      "Integration cannot carry arbitrary commands or CI evidence",
+    );
+    return {
+      id: value.id,
+      project: value.project,
+      generation: value.generation,
+      kind: "integration",
+      integration: validateIntegration(value.integration),
+    };
   }
-  requireThat(value.integration === undefined, "Only integration jobs carry a plan");
+  requireThat(
+    value.integration === undefined,
+    "Only integration jobs carry a plan",
+  );
   if (value.kind === "assistant") {
     requireThat(
       value.generation === null &&
@@ -400,11 +467,25 @@ export function validateJob(value: unknown): JobSpec {
   requireThat(value.prompt === undefined, "Only assistant jobs accept prompts");
   digest(value.generation);
   if (value.kind === "media-finalize") {
-    identifier(value.recording); integer(value.timeoutSeconds, 1, 900);
-    requireThat(value.argv === undefined && value.check === undefined, "Media jobs cannot claim CI evidence");
-    return {id:value.id,project:value.project,generation:value.generation,kind:"media-finalize",recording:value.recording,timeoutSeconds:value.timeoutSeconds};
+    identifier(value.recording);
+    integer(value.timeoutSeconds, 1, 900);
+    requireThat(
+      value.argv === undefined && value.check === undefined,
+      "Media jobs cannot claim CI evidence",
+    );
+    return {
+      id: value.id,
+      project: value.project,
+      generation: value.generation,
+      kind: "media-finalize",
+      recording: value.recording,
+      timeoutSeconds: value.timeoutSeconds,
+    };
   }
-  requireThat(value.recording === undefined, "Only media jobs accept a recording");
+  requireThat(
+    value.recording === undefined,
+    "Only media jobs accept a recording",
+  );
   requireThat(
     ["hydrate", "verify", "layerfs-exec"].includes(String(value.kind)),
     "Unknown job kind",
@@ -466,12 +547,23 @@ export function validateChecks(value: unknown): CheckRequirement[] {
     identifier(v.name);
     digest(v.recipe);
     requireThat(
-      v.kind === "verify" || v.kind === "layerfs-exec" || v.kind === "engine-build",
+      v.kind === "verify" ||
+        v.kind === "layerfs-exec" ||
+        v.kind === "engine-build",
       "Invalid check executor",
     );
-    if(v.kind === 'engine-build') {
-      requireThat(v.argv===undefined,'Build checks only accept a protected recipe hash');integer(v.timeoutSeconds,1,7200);
-      return {name:v.name,recipe:v.recipe,kind:'engine-build',timeoutSeconds:v.timeoutSeconds} as CheckRequirement;
+    if (v.kind === "engine-build") {
+      requireThat(
+        v.argv === undefined,
+        "Build checks only accept a protected recipe hash",
+      );
+      integer(v.timeoutSeconds, 1, 7200);
+      return {
+        name: v.name,
+        recipe: v.recipe,
+        kind: "engine-build",
+        timeoutSeconds: v.timeoutSeconds,
+      } as CheckRequirement;
     }
     const executor = validateJob({
       id: "recipe",

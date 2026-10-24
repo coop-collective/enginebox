@@ -62,14 +62,17 @@ export async function mediaCommand(
       stopped = false,
       killTimer: ReturnType<typeof setTimeout> | undefined,
       settleTimer: ReturnType<typeof setTimeout> | undefined,
-      outputBytes=0, settled=false, killFailed=false;
+      outputBytes = 0,
+      settled = false,
+      killFailed = false;
     function kill(signal: NodeJS.Signals) {
       if (child.pid)
         try {
           process.kill(-child.pid, signal);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-            errors += "; process termination failed";killFailed=true;
+            errors += "; process termination failed";
+            killFailed = true;
           }
         }
     }
@@ -78,14 +81,25 @@ export async function mediaCommand(
       stopped = true;
       kill("SIGTERM");
       killTimer = setTimeout(() => kill("SIGKILL"), 2000);
-      settleTimer=setTimeout(()=>{if(!settled){settled=true;cleanup();reject(new UncertainNativeRun(`Media process group ${child.pid} did not confirm cancellation; retain its reservation`));}},4000);
+      settleTimer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(
+            new UncertainNativeRun(
+              `Media process group ${child.pid} did not confirm cancellation; retain its reservation`,
+            ),
+          );
+        }
+      }, 4000);
     }
     const timer = setTimeout(stop, timeoutMs);
     signal.addEventListener("abort", stop, { once: true });
     child.stdout.on("data", (data) => {
-      const available=Math.max(0,1024*1024-outputBytes);
-      output+=data.subarray(0,available).toString();outputBytes+=Math.min(available,data.length);
-      if(data.length>available)stop();
+      const available = Math.max(0, 1024 * 1024 - outputBytes);
+      output += data.subarray(0, available).toString();
+      outputBytes += Math.min(available, data.length);
+      if (data.length > available) stop();
     });
     child.stderr.on("data", (data) => {
       errors = (errors + data.toString()).slice(-16 * 1024);
@@ -93,17 +107,30 @@ export async function mediaCommand(
     const cleanup = () => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
-      if(settleTimer)clearTimeout(settleTimer);
+      if (settleTimer) clearTimeout(settleTimer);
       signal.removeEventListener("abort", stop);
     };
     child.once("error", (error) => {
-      cleanup();if(settled)return;settled=true;reject(error);
+      cleanup();
+      if (settled) return;
+      settled = true;
+      reject(error);
     });
     child.once("close", (code) => {
       // A parent can exit before descendants that ignore SIGTERM. Finish the
       // owned process group before clearing its escalation timer.
-      kill("SIGKILL");cleanup();if(settled)return;settled=true;
-      if(killFailed){reject(new UncertainNativeRun(`Media process group ${child.pid} could not be confirmed stopped`));return;}
+      kill("SIGKILL");
+      cleanup();
+      if (settled) return;
+      settled = true;
+      if (killFailed) {
+        reject(
+          new UncertainNativeRun(
+            `Media process group ${child.pid} could not be confirmed stopped`,
+          ),
+        );
+        return;
+      }
       if (code !== 0 || stopped || signal.aborted)
         reject(
           new Error(
@@ -138,37 +165,42 @@ export async function executeMedia(
       cancel.abort();
   }, 100);
   const signal = cancel.signal;
-  let directory:string|undefined,uncertain=false;
+  let directory: string | undefined,
+    uncertain = false;
   try {
-  const base = join(state, "media");
-  await mkdir(base, { recursive: true, mode: 0o700 });
-  directory = await mkdtemp(join(base, "attempt-"));
-  const prefix = `/v1/projects/${assignment.project}/recordings/${assignment.recording}`;
-  const formats = [
-    "-protocol_whitelist",
-    "file,pipe",
-    "-format_whitelist",
-    "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2",
-  ];
-  const common = [
-    "-hide_banner",
-    "-nostdin",
-    "-loglevel",
-    "error",
-    "-max_alloc",
-    "67108864",
-  ];
-  const command = (args: string[]) =>
-    mediaCommand(
-      config.ffmpeg,
-      [...common, ...args],
-      directory!,
-      signal,
-      Math.min(120_000, Math.max(1, deadline - Date.now())),
-    );
+    const base = join(state, "media");
+    await mkdir(base, { recursive: true, mode: 0o700 });
+    directory = await mkdtemp(join(base, "attempt-"));
+    const prefix = `/v1/projects/${assignment.project}/recordings/${assignment.recording}`;
+    const formats = [
+      "-protocol_whitelist",
+      "file,pipe",
+      "-format_whitelist",
+      "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2",
+    ];
+    const common = [
+      "-hide_banner",
+      "-nostdin",
+      "-loglevel",
+      "error",
+      "-max_alloc",
+      "67108864",
+    ];
+    const command = (args: string[]) =>
+      mediaCommand(
+        config.ffmpeg,
+        [...common, ...args],
+        directory!,
+        signal,
+        Math.min(120_000, Math.max(1, deadline - Date.now())),
+      );
     signal.throwIfAborted();
-    const recordingResponse=await client.request(prefix,{signal});
-    const recording=JSON.parse(new TextDecoder().decode(await readBounded(recordingResponse.body,256*1024))) as Recording;
+    const recordingResponse = await client.request(prefix, { signal });
+    const recording = JSON.parse(
+      new TextDecoder().decode(
+        await readBounded(recordingResponse.body, 2 * 1024 * 1024),
+      ),
+    ) as Recording;
     requireThat(
       recording.state === "finalizing" &&
         recording.generation === assignment.generation &&
@@ -230,7 +262,8 @@ export async function executeMedia(
             "-v",
             "error",
             ...formats,
-            "-max_alloc","67108864",
+            "-max_alloc",
+            "67108864",
             "-show_streams",
             "-show_format",
             "-of",
@@ -280,8 +313,17 @@ export async function executeMedia(
         files.map((file) => `file '${file}'`).join("\n"),
         { mode: 0o600, flag: "wx" },
       );
-      const concatFormats=[...formats];concatFormats[3]+=",concat";
-      input = [...concatFormats, "-f", "concat", "-safe", "1", "-i", "segments.txt"];
+      const concatFormats = [...formats];
+      concatFormats[3] += ",concat";
+      input = [
+        ...concatFormats,
+        "-f",
+        "concat",
+        "-safe",
+        "1",
+        "-i",
+        "segments.txt",
+      ];
     }
     const output = `recording.${extension}`;
     // Remux instead of re-encoding; this creates a seekable index at low CPU cost.
@@ -309,7 +351,8 @@ export async function executeMedia(
           "-v",
           "error",
           ...formats,
-          "-max_alloc","67108864",
+          "-max_alloc",
+          "67108864",
           "-show_streams",
           "-show_format",
           "-of",
@@ -405,11 +448,13 @@ export async function executeMedia(
       mimeType: extension === "webm" ? "video/webm" : "video/mp4",
     };
     return { recording: recording.id, media };
-  } catch(error) {
-    uncertain=error instanceof UncertainNativeRun;throw error;
+  } catch (error) {
+    uncertain = error instanceof UncertainNativeRun;
+    throw error;
   } finally {
     clearInterval(watchdog);
     outerSignal.removeEventListener("abort", onAbort);
-    if(directory && !uncertain)await rm(directory, { recursive: true, force: true });
+    if (directory && !uncertain)
+      await rm(directory, { recursive: true, force: true });
   }
 }
