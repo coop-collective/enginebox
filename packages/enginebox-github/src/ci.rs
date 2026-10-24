@@ -188,8 +188,7 @@ impl GitHub {
                     let job = data.jobs.get_mut(&key).unwrap();
                     match outcome {
                         Ok(result) => {
-                            job["status"] = json!("finished");
-                            job["result"] = result;
+                            finish_capacity(job, result);
                         }
                         Err(_) => {
                             job["status"] = json!("uncertain");
@@ -312,18 +311,41 @@ impl GitHub {
             "POST",
             &format!("/app/installations/{}/access_tokens", pool.installation_id),
             &api::jwt(self.app("runners")?)?,
-            Some(json!({"permissions":{"organization_self_hosted_runners":"write"}})),
+            Some(json!({"permissions":{"organization_self_hosted_runners":"write","actions":"read"}})),
         )?;
         self.api.cleanup_runner(
             &format!("/orgs/{}/actions/runners/{runner_id}", pool.organization),
             text(&cleanup_token, "token")?,
             &runner_name,
         )?;
+        // JIT runners accept any matching job. Only proved cleanup plus a live
+        // queued observation permits a new capacity attempt for this demand.
+        let remaining = self.api.call(
+            "GET",
+            &format!("/repos/{repo}/actions/jobs/{}", number(&job, "id")?),
+            text(&cleanup_token, "token")?,
+            None,
+        )?;
+        ensure!(
+            remaining["id"] == job["id"] && remaining["run_id"] == job["run_id"],
+            "Workflow job identity changed"
+        );
         // Do not publish arbitrary worker stdout (could include JIT or workflow secrets).
         Ok(
-            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"]}),
+            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued"}),
         )
     }
+}
+fn finish_capacity(job: &mut Value, result: Value) {
+    // A newer webhook wins over the earlier API observation.
+    job["status"] = json!(
+        if result["demand_pending"] == true && job["github_status"] == "queued" {
+            "queued"
+        } else {
+            "finished"
+        }
+    );
+    job["result"] = result;
 }
 fn job_persistence_failure(data: &mut crate::Data, key: &str) {
     data.jobs.get_mut(key).unwrap()["status"] = json!("uncertain");
@@ -412,6 +434,10 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
                 json!({"name":"fixture-created-runner","busy":false}),
             ),
             ("DELETE /orgs/fixture/actions/runners/501", json!({})),
+            (
+                "/repos/fixture/private/actions/jobs/99",
+                json!({"id":99,"run_id":44,"status":"queued"}),
+            ),
         ]);
         g.api = api;
         let result = g
@@ -420,6 +446,13 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         server.join().unwrap();
         assert_eq!(result["cleaned"], true);
         assert_eq!(result["runner_id"], 501);
+        assert_eq!(result["demand_pending"], true);
+        let mut demand = json!({"status":"running","github_status":"queued"});
+        finish_capacity(&mut demand, result.clone());
+        assert_eq!(demand["status"], "queued");
+        demand["github_status"] = json!("completed");
+        finish_capacity(&mut demand, result.clone());
+        assert_eq!(demand["status"], "finished");
         for secret in [
             "fixture-jit-config",
             "fixture-installation-token",
