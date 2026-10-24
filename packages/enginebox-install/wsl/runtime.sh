@@ -12,7 +12,7 @@ case "${1:-}" in
     ;;
   configure)
     [[ $(uname -m) == x86_64 ]] || { echo 'Linux x64 is required' >&2; exit 1; }
-    [[ $(findmnt -n -o FSTYPE /var/lib/enginebox) == ext4 ]] || { echo 'WSL ext4 filesystem required' >&2; exit 1; }
+    [[ $(findmnt -n -o FSTYPE --target /var/lib/enginebox) == ext4 ]] || { echo 'WSL ext4 filesystem required' >&2; exit 1; }
     [[ $(stat -fc %T /sys/fs/cgroup) == cgroup2fs ]] || { echo 'WSL2 with cgroup v2 is required' >&2; exit 1; }
     incoming=$(mktemp /etc/enginebox/settings.XXXXXX)
     trap 'rm -f "$incoming"' EXIT

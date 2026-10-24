@@ -54,6 +54,15 @@ jobs:
           if ($LASTEXITCODE) { throw 'Real WSL LayerFS/isolation qualification failed' }
           wsl.exe -d EngineboxCI -u root --exec cat /var/lib/enginebox/qualification.json
           if ($LASTEXITCODE) { throw 'Missing qualification receipt' }
+      - name: Runtime diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          wsl.exe -d EngineboxCI -u root --exec findmnt --target /var/lib/enginebox
+          wsl.exe -d EngineboxCI -u root --exec systemctl status enginebox-docker.service --no-pager
+          wsl.exe -d EngineboxCI -u root --exec journalctl -u enginebox-docker.service -n 80 --no-pager
+          wsl.exe -d EngineboxCI -u root --exec cat /proc/meminfo
+          exit 0
       - name: Remove only the disposable CI distribution
         if: always()
         shell: pwsh
