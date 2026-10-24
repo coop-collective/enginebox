@@ -10,7 +10,7 @@ export async function executeIntegration(config:IntegrationConfig, assignment:As
   requireThat(assignment.kind==='integration','Integration assignment required');
   requireThat(isAbsolute(config.binary) && isAbsolute(config.config),'Provision absolute integration binary/config paths');
   requireThat(config.projects[assignment.project]===assignment.integration.layerfsProject,'No same-Store integration binding for this project');
-  identifier(assignment.id);
+  identifier(assignment.id); identifier(assignment.project);
   const dir=join(state,'integration',assignment.project,assignment.id);
   await mkdir(dir,{recursive:true,mode:0o700});
   const request=join(dir,'request.json');
@@ -19,16 +19,19 @@ export async function executeIntegration(config:IntegrationConfig, assignment:As
   catch(error) { if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error; requireThat(await readFile(request,'utf8')===payload,'Local integration request differs',409); }
   const stdout=await new Promise<string>((resolve,reject)=>{
     const child=spawn(config.binary,['--host','local','storage','layerfs','--config',config.config,'integrate','--request',request],{stdio:['ignore','pipe','pipe'],signal,env:{PATH:process.env.PATH,HOME:process.env.HOME}});
-    let output='',stderr=''; let stopped=false;
-    const timeout=setTimeout(()=>{stopped=true;child.kill('SIGTERM');},30*60_000);
-    child.stdout.on('data',chunk=>{output+=chunk; if(output.length>1024*1024){stopped=true;child.kill('SIGTERM');}});
+    let output='',stderr=''; let stopped=false; let killTimer:ReturnType<typeof setTimeout>|undefined;
+    const terminate=()=>{stopped=true;child.kill('SIGTERM'); killTimer=setTimeout(()=>child.kill('SIGKILL'),5000);};
+    const timeout=setTimeout(terminate,30*60_000);
+    child.stdout.on('data',chunk=>{output+=chunk; if(output.length>1024*1024&&!stopped)terminate();});
     child.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-8192);});
-    child.on('error',error=>reject(new UncertainNativeRun(`Integration launch interrupted: ${error.message}`))); child.on('close',code=>{clearTimeout(timeout); (code===0 || code===2)&&!stopped?resolve(output):reject(new UncertainNativeRun(`Integration executor failed or uncertain (${code}); inspect retained receipt: ${stderr}`));});
+    child.on('error',error=>reject(new UncertainNativeRun(`Integration launch interrupted: ${error.message}`))); child.on('close',code=>{clearTimeout(timeout); if(killTimer)clearTimeout(killTimer); (code===0 || code===2)&&!stopped?resolve(output):reject(new UncertainNativeRun(`Integration executor failed or uncertain (${code}); inspect retained receipt: ${stderr}`));});
   });
-  const raw=JSON.parse(stdout); const result=raw.result ?? raw;
+  let result:Record<string,any>;
+  try {const raw=JSON.parse(stdout); result=raw.result ?? raw; requireThat(result&&typeof result==='object','Invalid executor reply');}
+  catch {throw new UncertainNativeRun('Integration executor returned an invalid outcome; inspect its receipt');}
   if(result.ok===false && result.conflict) throw new Error(`LayerFS merge conflict: ${JSON.stringify(result.conflict)}`);
   requireThat(result.ok!==false,"Integration executor refused output");
-  for(const field of ['snapshot','sourceManifest','sourceRoot'])requireThat(typeof result[field]==='string'&&isAbsolute(result[field]),'Invalid integration export');
+  for(const field of ['snapshot','sourceManifest','sourceRoot']) if(typeof result[field]!=='string'||!isAbsolute(result[field])) throw new UncertainNativeRun('Invalid integration export; inspect the native receipt');
   const published=await publishSnapshot(client,assignment.project,result.snapshot,dir,assignment.generation,{layerfsRevision:result.layerfsRevision,projectName:assignment.integration.layerfsProject,layerfsRef:result.ref,layerfsRoot:result.root,treeHash:result.treeHash,integration:assignment.id});
   const source=JSON.parse(await readFile(result.sourceManifest,'utf8'));
   requireThat(source.project===assignment.project && source.treeHash===result.treeHash && source.layerfs.ref===result.ref && source.layerfs.root===result.root,'Export provenance differs');
