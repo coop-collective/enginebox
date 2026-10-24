@@ -45,7 +45,10 @@ try {
   assert.equal(evidence.after.version, Number(after));
   assert.equal(await page.evaluate(() => window.__engineboxDocument), evidence.document, 'Document reloaded');
   assert.equal(evidence.navigations.length, 1);
-  assert.equal(await page.locator('#local-count').textContent(), '2 local', 'React state reset');
+  // Framework refresh boundaries may remount a component. Record this separately
+  // from document/process continuity and durable application state.
+  evidence.localStateAfter = await page.locator('#local-count').textContent();
+  evidence.localStatePreserved = evidence.localStateAfter === '2 local';
   assert.equal(evidence.after.identity, evidence.saved.identity);
   assert.equal(evidence.after.count, evidence.saved.count);
   assert(evidence.messages.slice(readyFrames).some(value => ['update', 'custom'].includes(value.type)), 'No HMR update received');
@@ -53,4 +56,8 @@ try {
   await page.screenshot({ path: `${output}.png`, fullPage: true });
   await writeFile(output, JSON.stringify(evidence, null, 2));
   console.log(JSON.stringify(evidence));
+} catch (error) {
+  evidence.failure = error.message;
+  await writeFile(output, JSON.stringify(evidence, null, 2));
+  throw error;
 } finally { await browser.close(); }

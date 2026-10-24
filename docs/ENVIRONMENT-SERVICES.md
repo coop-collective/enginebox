@@ -66,7 +66,9 @@ The importable `test/vinext` fixture demonstrates this setup with a pinned pnpm
 lockfile, local KV under `/data`, an explicit allowed public host and Vite's HMR
 client pointed at the public HTTPS port. Its cache mounts are documented in its
 README. `test/live-vinext-browser.mjs` checks the public WebSocket, a source update
-without page navigation, retained React state and retained simulated KV state.
+without page navigation and retained simulated KV state. It records React state
+preservation separately: framework HMR can remount components and reset their
+in-memory state while the dev process and persisted application data stay intact.
 
 ```json
 {

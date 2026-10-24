@@ -21,7 +21,9 @@ Start `../live-vinext-browser.mjs URL BEFORE_VERSION AFTER_VERSION OUTPUT` with
 `ENGINEBOX_LIVE_VINEXT=1`. Wait for `OUTPUT.ready`, then edit `app/release.ts` in a
 new Git-free LayerFS branch, checkpoint/close it and promote against observed main.
 The probe requires public WebSocket Upgrade, a framework HMR update, changed page
-version with no document navigation, preserved React interaction state and
-persisted KV data. Independently probe HTTP and compare dev process/container
+version with no document navigation and persisted KV data. It separately records
+whether the framework preserves or resets component-local React state; remounts
+are framework behavior, not evidence of an environment process restart.
+Independently probe HTTP and compare dev process/container
 identities across the promotion. Use only a disposable project; real projects need
 an appropriate access policy for their dev server and local simulator.
