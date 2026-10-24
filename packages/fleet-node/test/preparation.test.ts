@@ -35,7 +35,13 @@ class Transport extends Client {
   }
 }
 test('approved dependency generation hydrates on an empty node; revocation and wrong repository stop activation', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'ebox-prep-transfer-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await mkdtemp(join(tmpdir(), 'ebox-prep-transfer-'));
+  let cache: Cache | undefined;
+  t.after(async () => {
+    // Windows cannot unlink an open SQLite database. Keep teardown ordered.
+    cache?.close();
+    await rm(root, { recursive: true, force: true });
+  });
   const source = new DatabaseSync(join(root, 'source.sqlite'));
   source.exec("CREATE TABLE fixture(value TEXT); INSERT INTO fixture VALUES ('prepared-dependencies')"); source.close();
   const client = new Transport(), key = 'a'.repeat(64);
@@ -46,7 +52,7 @@ test('approved dependency generation hydrates on an empty node; revocation and w
     layerfsRevision: '968a5d0be0ea3e9456b06f9148b65523138e9490', projectName: 'fixture', preparationKey: key, preparationRecipe: 'pnpm-installed-v1',
   }, expected);
   const state = join(root, 'empty-node'); await mkdir(state);
-  const cache = new Cache(state, 16 * 1024 * 1024, 0); t.after(() => cache.db.close());
+  cache = new Cache(state, 16 * 1024 * 1024, 0);
   const generations = new Generations(client, cache, state);
   let activated = 0;
   const activate = async (snapshot: string) => {
