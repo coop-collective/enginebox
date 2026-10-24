@@ -38,7 +38,10 @@ call('fork','welcome',a); call('fork','welcome',b)
 for workspace in [a,b]:
     w=json.loads((root/'layerfs/workspaces'/f'{workspace}.json').read_text())
     inspected=json.loads(subprocess.check_output(['docker','--host','unix:///run/enginebox-docker.sock','inspect',w['container']],text=True))[0]
-    assert inspected['HostConfig']['CgroupParent']=='enginebox.slice'
+    # Docker may leave HostConfig.CgroupParent empty when it inherits the
+    # daemon default. Check the running process's actual kernel membership.
+    membership=pathlib.Path(f"/proc/{int(inspected['State']['Pid'])}/cgroup").read_text()
+    assert any(line.startswith('0::/enginebox.slice/') for line in membership.splitlines()), 'Workspace escaped the resource slice: '+membership
     assert inspected['HostConfig']['Memory'] > 0
     assert not inspected['HostConfig'].get('Privileged')
 canary=root/'private-canary';canary.write_text(uuid.uuid4().hex);canary.chmod(0o600)

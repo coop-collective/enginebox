@@ -21,6 +21,9 @@ try {
 
 # Exercise the actual installer orchestration with Windows effects replaced by
 # fixtures. Real WSL/container behavior is covered by the separate WSL job.
+# ScheduledTasks exports CDXML functions. Load it before overriding its effects;
+# autoloading it later would replace the fixture functions with real commands.
+Import-Module ScheduledTasks
 $testRoot=Join-Path $env:TEMP ('enginebox-wsl-flow-'+[Guid]::NewGuid())
 New-Item -ItemType Directory $testRoot | Out-Null
 $flowScript=Join-Path $testRoot 'install.ps1'
