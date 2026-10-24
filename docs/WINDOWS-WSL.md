@@ -124,6 +124,15 @@ PowerShell 5.1 and attempts a real WSL import plus LayerFS proof. A runner that
 cannot enable virtualization/reboot fails the qualification step; it is not a
 passing WSL test.
 
+The Windows startup task runs under the installing user at sign-in; it is not a
+SYSTEM service that starts before anyone signs in. WSL runtime services run
+inside the dedicated distribution.
+
+The `Publish qualified WSL installer preview` workflow accepts a successful
+qualification run. It verifies that runtime sources are identical, tests the
+current installer on Windows, and publishes an immutable preview with hashes
+and separate image/installer provenance.
+
 The installer currently targets Windows x64. Do not replace the deployed
 installer pin until its artifact build and applicable runtime checks pass.
 

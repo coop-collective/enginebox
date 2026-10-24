@@ -31,7 +31,7 @@ $fixtureImage=Join-Path $testRoot 'image-fixture'
 [IO.File]::WriteAllText($fixtureImage,'fixture-rootfs')
 $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 (Get-Content -Raw -LiteralPath $path).Replace('@@ROOTFS_URL@@','https://fixture.invalid/enginebox.wsl').Replace('@@ROOTFS_SHA256@@',$fixtureHash) | Set-Content -LiteralPath $flowScript -Encoding UTF8
-$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0 }
+$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null }
 function global:Get-CimInstance { [pscustomobject]@{NumberOfLogicalProcessors=16;TotalPhysicalMemory=32GB} }
 function global:Get-ScheduledTask { return $null }
 function global:Register-ScheduledTask {
@@ -41,8 +41,12 @@ function global:Register-ScheduledTask {
 function global:Start-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.starts++ }
 function global:Read-Host {
   param($Prompt,[switch]$AsSecureString)
-  if ($AsSecureString) { throw 'An already registered fixture must not prompt for a secret' }
+  if ($AsSecureString) {
+    if (-not $global:EngineboxWslFixture.secret) { throw 'Unexpected secret prompt' }
+    return ConvertTo-SecureString $global:EngineboxWslFixture.secret -AsPlainText -Force
+  }
   $global:EngineboxWslFixture.prompts+=@($Prompt)
+  if ($Prompt -like 'Controller address*' -and $global:EngineboxWslFixture.controllerChoice) { return $global:EngineboxWslFixture.controllerChoice }
   return ''
 }
 function global:Start-Process {
@@ -103,6 +107,10 @@ try {
   $code=('a'*32)+'.'+('b'*64)
   & $flowScript -InstallDirectory (Join-Path $testRoot 'fresh') -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
   if ($f.downloads -ne 1 -or $f.claim -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or $f.code -ne $code -or -not $f.enrolled) { throw 'Fresh distribution import/claim/registration failed' }
+  $f.enrolled=$false; $f.controllerChoice='https://override.example'; $f.secret=('c'*32)+'.'+('d'*64)
+  & $flowScript -InstallDirectory (Join-Path $testRoot 'override') -Controller 'https://original.example' -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
+  if ($f.configuration.controller -ne $f.controllerChoice -or $f.code -ne $f.secret) { throw 'A controller override must not receive another controller''s registration code' }
+  $f.controllerChoice=$null; $f.secret=$null
   $f.version=''; $f.calls=@(); $beforeStarts=$f.starts
   $rebootRoot=Join-Path $testRoot 'reboot'
   & $flowScript -InstallDirectory $rebootRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code

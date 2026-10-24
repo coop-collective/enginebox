@@ -66,8 +66,13 @@ if (Test-Path -LiteralPath $receiptPath) {
   if (-not $Cpu) { $Cpu=$settings.cpu }; if (-not $MemoryGiB) { $MemoryGiB=$settings.memory_gib }; if (-not $DiskGiB) { $DiskGiB=$settings.disk_gib }
 } elseif ((Test-Path -LiteralPath $root) -and @(Get-ChildItem -LiteralPath $root -Force).Count) { throw 'Installation directory is not empty and has no Enginebox receipt.' }
 if (-not $Controller) { $Controller=$DefaultController }
+$codeController=Assert-Origin $Controller
 if (-not $settings) { $chosen=Read-Host "Controller address [$Controller]"; if ($chosen) { $Controller=$chosen } }
 $Controller=Assert-Origin $Controller
+if ($EnrollmentCode -and $Controller -ne $codeController) {
+  $EnrollmentCode=$null; $EnrollmentExpires=0
+  Write-Host 'The supplied registration code belongs to the original controller. Setup will ask for a fresh code from the selected controller.'
+}
 $computer=Get-CimInstance Win32_ComputerSystem
 $cores=[int]$computer.NumberOfLogicalProcessors
 $memory=[int][math]::Floor([double]$computer.TotalPhysicalMemory/1GB)
