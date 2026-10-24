@@ -2,11 +2,74 @@
 
 Prepared environments for native coding agents, on hardware you control.
 
-Engine Box manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Native clients keep their planning loops; Enginebox owns the reusable task, workspace, integration and validation workflow that apps such as Gamejam consume.
+Engine Box is a source-available (not open-source; see [License](#source-available-and-commercial-boundary)) toolkit that manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Native clients keep their planning loops; Engine Box owns the reusable task, workspace, integration and validation workflow that apps such as Gamejam consume.
 
 The goal is less repeated setup and faster, trustworthy feedback from builds and tests. Self-hosted CI optimization is an optional module on the same foundation.
 
-The [product site and developer guide](packages/site/README.md) run locally with `pnpm dev:site`. They explain the environment model, getting started, native agent state, templates, storage and the API. The [persistent development environment design](docs/DEV-ENVIRONMENTS.md) describes the next step: a core app that retains development data while agents work in disposable private forks.
+Terms used below: **`ebox`** is the Engine Box command-line tool; a **fleet** is the set of machines (nodes) one owner manages through a single controller; **Vinext** is a Vite-based runtime for Next.js apps on Cloudflare Workers, used for the dashboard.
+
+The [product site and developer guide](packages/site/README.md) run locally with `pnpm dev:site`; all documentation is indexed in [docs/README.md](docs/README.md). The [persistent development environment design](docs/DEV-ENVIRONMENTS.md) describes the next step: a core app that retains development data while agents work in disposable private forks.
+
+## Quick start
+
+Requires Node 24+ and the pinned pnpm 12.14.0 (see [Local fleet](docs/LOCAL-FLEET.md) for Docker requirements).
+
+### Run a local fleet (no Cloudflare account)
+
+Use Node 24+, pnpm 12.14.0 and Docker Compose with Linux containers on Linux, macOS or Windows (Docker Desktop/WSL2). No Cloudflare account is needed:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm fleet:dev --storage
+pnpm fleet:fixture
+pnpm fleet:status
+pnpm fleet:smoke
+pnpm fleet:down
+```
+
+This starts Wrangler with persistent local Durable Objects/R2, two agent nodes and an optional storage cache. Source edits reload automatically; database state stays on Linux named volumes. Health is at **http://127.0.0.1:8799/health**. Omit `--storage` for R2-only shared storage. `fleet:down` preserves development data; the smoke test creates and removes its own isolated fleet.
+
+See [local development, debugging, recovery and current limits](docs/LOCAL-FLEET.md). The new stack implements generation publication, verification, cache reads, fallback and job leases. Existing native/provider/engine services retain their separate launchers; `pnpm dev` still starts only the dashboard. Automatic restored-Store activation and production controller migration remain explicit release gates.
+
+### Bootstrap a server
+
+Use the [terminal installer](docs/INSTALL.md) for release binaries. Admin/operator tools can run on Linux, macOS and Windows; the current compute backend needs a Linux server with usable KVM, Incus and administrative access. The controller and Linux node have separate installation roles. Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
+
+To build from source, install Rust, Node 24+ and the pinned pnpm version, then use the root workspace. Python is not a runtime prerequisite.
+
+```sh
+git clone https://github.com/coop-collective/enginebox.git
+cd enginebox
+pnpm install --frozen-lockfile
+pnpm build
+target/release/ebox init --output enginebox.toml
+# Edit enginebox.toml for your host, storage and networking.
+target/release/ebox doctor --config enginebox.toml
+target/release/ebox plan --config enginebox.toml
+target/release/ebox apply --config enginebox.toml
+```
+
+Inside a prepared guest, launch `codex`, `agent` or `claude` directly. Provider subscriptions and limits remain with the provider; Engine Box does not pool credentials or resell inference.
+
+## Architecture
+
+```text
+ Owner ── Vinext dashboard ─┐
+ Operator MCP / ebox CLI ───┼─► Controller (fleet API; target: Cloudflare Workers + Durable Objects)
+ ACP clients ───────────────┘          │  capacity-aware placement, templates, leases
+                                       │  durable storage: R2 generations (+ optional storage-node caches)
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        ▼                        ▼
+        Node (Linux/KVM)         Node (Linux/KVM)         Node ...
+        Incus VMs + LayerFS      Incus VMs + LayerFS
+              │
+              ▼
+        Workspace (private VM)
+        LayerFS project files · persistent agent state · headless Chromium MCP
+        native CLIs: Codex · Claude Code · Cursor Agent
+```
+
+The controller authorizes and places work; nodes run isolated workspaces; each workspace runs the official provider CLIs unmodified. The Cloudflare-hosted controller is the target design; today a native Rust controller manages nodes. See [DESIGN.md](docs/DESIGN.md) for the full component diagram and migration boundary.
 
 ## Status
 
@@ -32,46 +95,9 @@ multi-node project execution requires shared storage, which R2 directly can prov
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 | Controller-managed LayerFS storage, GitHub import/export with conflict-agent handoff, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
-The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The reference fleet now runs Rust 0.3.1-live.1 with native-dev revision 5. All three providers passed delegated MCP launches and exact conversation resume; Codex also passed ACP continuation. Existing private workspace boots and recorded native histories were preserved. The [timing report](docs/REMOTE-AGENT-TIMING-2026-10-23.md) records the small sample, an unresolved admission rejection and the blocked Cursor Cloud comparison. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The reference fleet now runs Rust 0.3.1-live.1 with native-dev revision 5. All three providers passed delegated MCP launches and exact conversation resume; Codex also passed ACP continuation. Existing private workspace boots and recorded native histories were preserved. The [timing report](docs/reports/REMOTE-AGENT-TIMING-2026-10-23.md) records the small sample, an unresolved admission rejection and the blocked Cursor Cloud comparison. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
-[Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
-
-## Develop the Cloudflare fleet locally
-
-Use Node 24+, pnpm 12.14.0 and Docker Compose with Linux containers on Linux, macOS or Windows (Docker Desktop/WSL2). No Cloudflare account is needed:
-
-```sh
-pnpm install --frozen-lockfile
-pnpm fleet:dev --storage
-pnpm fleet:fixture
-pnpm fleet:status
-pnpm fleet:smoke
-pnpm fleet:down
-```
-
-This starts Wrangler with persistent local Durable Objects/R2, two agent nodes and an optional storage cache. Source edits reload automatically; database state stays on Linux named volumes. Health is at **http://127.0.0.1:8799/health**. Omit `--storage` for R2-only shared storage. `fleet:down` preserves development data; the smoke test creates and removes its own isolated fleet.
-
-See [local development, debugging, recovery and current limits](docs/LOCAL-FLEET.md). The new stack implements generation publication, verification, cache reads, fallback and job leases. Existing native/provider/engine services retain their separate launchers; `pnpm dev` still starts only the dashboard. Automatic restored-Store activation and production controller migration remain explicit release gates.
-
-## Bootstrap a server
-
-Use the [terminal installer](docs/INSTALL.md) for release binaries. Admin/operator tools can run on Linux, macOS and Windows; the current compute backend needs a Linux server with usable KVM, Incus and administrative access. The controller and Linux node have separate installation roles. Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
-
-To build from source, install Rust, Node 24+ and the pinned pnpm version, then use the root workspace. Python is not a runtime prerequisite.
-
-```sh
-git clone https://github.com/coop-collective/enginebox.git
-cd enginebox
-pnpm install --frozen-lockfile
-pnpm build
-target/release/ebox init --output enginebox.toml
-# Edit enginebox.toml for your host, storage and networking.
-target/release/ebox doctor --config enginebox.toml
-target/release/ebox plan --config enginebox.toml
-target/release/ebox apply --config enginebox.toml
-```
-
-Inside a prepared guest, launch `codex`, `agent` or `claude` directly. Provider subscriptions and limits remain with the provider; Engine Box does not pool credentials or resell inference.
+[Reference-host validation](docs/reports/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
 
 ## Manage workspaces
 
@@ -90,6 +116,9 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 
 ## Design and implementation
 
+Full index: [docs/README.md](docs/README.md).
+
+
 - [Persistent development environments and private data forks](docs/DEV-ENVIRONMENTS.md)
 - [Live services and HTTP/WebSocket/TCP/UDP exposure](docs/ENVIRONMENT-SERVICES.md)
 - [Terminal installation and platform roles](docs/INSTALL.md)
@@ -97,7 +126,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)
 - [LayerFS workspace storage evaluation](docs/LAYERFS.md)
 - [LayerFS checkout storage and measured validation](docs/LAYERFS-BACKEND.md)
-- [Interrupted-command and daemon recovery qualification](docs/LAYERFS-RECOVERY-VALIDATION.md)
+- [Interrupted-command and daemon recovery qualification](docs/reports/LAYERFS-RECOVERY-VALIDATION.md)
 - [LayerFS checkout attachment to Incus](docs/LAYERFS-INCUS.md)
 - [Storage registration, controller API and MCP](docs/STORAGE-API.md)
 - [GitHub import, optional sync and specialized conflict environments](docs/GITHUB-SYNC.md)
