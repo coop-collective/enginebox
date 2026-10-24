@@ -11,10 +11,12 @@ assert(['http:', 'https:'].includes(new URL(url).protocol));
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 950 } });
 const evidence = { url, handshakes: [], messages: [], navigations: [], errors: [] };
-const cdp = await page.context().newCDPSession(page); await cdp.send('Network.enable');
+const cdp = await page.context().newCDPSession(page); await cdp.send('Network.enable'); await cdp.send('Page.enable');
 cdp.on('Network.webSocketHandshakeResponseReceived', event => evidence.handshakes.push(event.response.status));
+// Playwright's framenavigated also fires for history.replaceState during React
+// hydration. CDP frameNavigated counts document loads, not same-document history.
+cdp.on('Page.frameNavigated', event => { if (!event.frame.parentId) evidence.navigations.push(event.frame.url); });
 page.on('pageerror', error => evidence.errors.push(error.message));
-page.on('framenavigated', frame => { if (frame === page.mainFrame()) evidence.navigations.push(frame.url()); });
 page.on('websocket', socket => {
   socket.on('framereceived', frame => {
     try { const value = JSON.parse(String(frame.payload)); evidence.messages.push({ type: value.type, event: value.event, paths: value.updates?.map(update => update.path) }); }
