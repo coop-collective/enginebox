@@ -108,6 +108,11 @@ test("GitHub import, LayerFS promotion and conflict-agent handoff use exact revi
   await page.getByRole("checkbox", { name: "I reviewed this source", exact: false }).check();
   await importButton.click();
   await expect(page.getByLabel("Connected project")).toHaveValue("web-app");
+  await expect(page.getByText('Dev setup: queued.', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Check dev status', exact: true }).click();
+  await expect(page.getByRole('link', { name: 'Open dev environment', exact: true })).toHaveAttribute('href', 'https://demo.dev.example.com');
+  await page.getByRole('button', { name: 'Start or retry dev', exact: true }).click();
+  await expect(page.getByText('Dev: queued.', { exact: false })).toBeVisible();
   // This setting changes only after its durable controller job succeeds.
   await page.getByRole("checkbox", { name: "Sync accepted main revisions to GitHub" }).click();
   await expect(page.getByRole("checkbox", { name: "Sync accepted main revisions to GitHub" })).toBeChecked();

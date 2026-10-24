@@ -233,7 +233,7 @@ export async function proxy(request: Request, segments: string[]) {
       : request.method === "POST" &&
         (accountWrite ||
           /^v1\/ci\/templates(?:\/[a-zA-Z0-9_-]{1,48}\/(?:enable|disable|retry))?$/.test(path) ||
-          /^v1\/storage\/hosts\/[a-z0-9][a-z0-9-]{0,48}\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover|github-preview|github-import|github-fork|github-settings|github-promote|github-delivery)$/.test(path) ||
+          /^v1\/storage\/hosts\/[a-z0-9][a-z0-9-]{0,48}\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover|github-preview|github-import|github-fork|github-settings|github-promote|github-delivery|dev-start|dev-status)$/.test(path) ||
           /^(?:v1\/templates(?:\/[a-z][a-z0-9-]{0,31}\/sync)?|v1\/hosts\/[a-zA-Z0-9_-]{1,63}\/(?:templates\/[a-z][a-z0-9-]{0,31}\/install|allocations|instances(?:\/ebox-[a-z0-9-]{1,49}\/actions)?))$/.test(
             path,
           ));

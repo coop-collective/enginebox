@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile, rename, open, stat, lstat } from 'node:fs/promises';
+import { mkdir, rename, stat, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { check, gatewayConfig, validateRoutes } from './config.mjs';
@@ -7,17 +7,10 @@ import { acceptedSource, copyAccepted } from './accepted.mjs';
 import { layerfsSource } from './layerfs.mjs';
 import { syncFiles, writableDirectories } from './files.mjs';
 
-export async function atomic(file, value) {
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  const handle = await open(temporary, 'wx', 0o600);
-  try { await handle.writeFile(JSON.stringify(value, null, 2)); await handle.sync(); } finally { await handle.close(); }
-  await rename(temporary, file);
-  const parent = await open(join(file, '..'), 'r');
-  try { await parent.sync(); } finally { await parent.close(); }
-}
-export async function load(file, fallback) {
-  try { return JSON.parse(await readFile(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
-}
+import { atomic, load } from './state.mjs';
+import { ProjectBootstrap } from './bootstrap.mjs';
+export { atomic, load } from './state.mjs';
+
 export function command(program, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(program, args, { cwd: options.cwd, env: { PATH: process.env.PATH, LANG: 'C.UTF-8', HOME: options.home ?? '/nonexistent', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -36,7 +29,9 @@ export function command(program, args, options = {}) {
 export class Environments {
   constructor(config, run = command) {
     this.config = config; this.run = run; this.states = {}; this.routes = []; this.busy = false;
-    this.gatewayWrites = Promise.resolve();
+    this.gatewayWrites = Promise.resolve(); this.routeWrites = Promise.resolve();
+    this.staticIds = new Set(config.environments.map(e => e.id));
+    this.projects = new ProjectBootstrap(this);
     this.owner = createHash('sha256').update(config.stateDir).digest('hex').slice(0, 16);
     this.routeFile = join(config.stateDir, 'routes.json');
     this.stateFile = join(config.stateDir, 'environments.json');
@@ -48,6 +43,7 @@ export class Environments {
     const metadata = await stat(this.config.stateDir);
     check((metadata.mode & 0o077) === 0, 'state-directory-must-be-private');
     this.states = await load(this.stateFile, {});
+    await this.projects.init();
     this.routes = validateRoutes(await load(this.routeFile, []), this.config);
     // Recheck owned live processes before publishing routes. A control restart
     // must not withdraw a working dev server while source fetching catches up.
@@ -61,6 +57,7 @@ export class Environments {
         state.healthy = state.recipe === recipe && matches && !!container?.State.Running && await this.healthy(env);
       } catch { state.healthy = false; }
     }
+    await this.projects.recover();
     await this.render();
   }
   async save() { await atomic(this.stateFile, this.states); }
@@ -69,15 +66,22 @@ export class Environments {
     this.gatewayWrites = write.catch(() => {}); await write;
   }
   catalog() {
-    return { schema: 1, baseDomains: this.config.baseDomains, transportEntrypoints: this.config.transportEntrypoints, routes: this.routes,
+    return { schema: 1, projects: this.projects.catalog(), baseDomains: this.config.baseDomains, transportEntrypoints: this.config.transportEntrypoints, routes: this.routes,
       environments: this.config.environments.map(e => ({ id: e.id, updateMode: e.updateMode ?? 'restart', source: { kind: e.source.kind, branch: e.source.branch }, services: e.ports.map(({ name, protocol }) => ({ name, protocol })), cpu: e.cpu, memoryMiB: e.memoryMiB, ...(this.states[e.id] ?? { status: 'pending', healthy: false }) })) };
   }
-  async setRoute(route) {
-    const next = this.routes.filter(v => v.id !== route.id).concat([route]);
-    validateRoutes(next, this.config);
-    await atomic(this.routeFile, next); this.routes = next; await this.render();
+  async updateRoutes(transform) {
+    const write = this.routeWrites.then(async () => {
+      const next = transform(this.routes); validateRoutes(next, this.config);
+      await atomic(this.routeFile, next); this.routes = next; await this.render();
+    });
+    this.routeWrites = write.catch(() => {}); await write;
   }
-  async deleteRoute(id) { const next = this.routes.filter(r => r.id !== id); await atomic(this.routeFile, next); this.routes = next; await this.render(); }
+  async setRoute(route) {
+    const projectEnvs = Object.values(this.projects.records).flatMap(p => [p.pending?.env.id, p.retired?.env.id]).filter(Boolean);
+    check(!projectEnvs.includes(route.environment), 'project-environment-not-active');
+    await this.updateRoutes(routes => routes.filter(v => v.id !== route.id).concat([route]));
+  }
+  async deleteRoute(id) { await this.updateRoutes(routes => routes.filter(r => r.id !== id)); }
   container(env, suffix = '') { return `ebox-dev-${this.owner}-${env.id}${suffix}`; }
   async docker(args, options) { return this.run(this.config.docker ?? 'docker', args, options); }
   async inspect(env, suffix = '') {
@@ -93,8 +97,14 @@ export class Environments {
   async remove(env, suffix = '') { if (await this.inspect(env, suffix)) await this.docker(['rm', '-f', this.container(env, suffix)]); }
   async source(env) {
     const root = join(this.config.stateDir, env.id); await mkdir(root, { recursive: true, mode: 0o700 });
-    if (env.source.kind === 'accepted') return acceptedSource(env, this.config.stateDir);
-    if (env.source.kind === 'layerfs') return layerfsSource(env, this.config.stateDir, this.run);
+    if (['accepted', 'layerfs'].includes(env.source.kind)) {
+      const source = env.source.kind === 'accepted' ? await acceptedSource(env, this.config.stateDir) : await layerfsSource(env, this.config.stateDir, this.run);
+      for (const [path, hash] of Object.entries(env.sourceInputs ?? {})) {
+        const entries = source.manifest.entries.filter(e => e.path === path);
+        check(entries.length === 1 && entries[0].kind === 'file' && entries[0].sha256 === hash, 'project-configuration-changed');
+      }
+      return source;
+    }
     const repo = join(root, 'repository.git');
     try { await stat(repo); } catch (error) { if (error.code !== 'ENOENT') throw error; await this.run('git', ['init', '--bare', repo]); }
     await this.run('git', ['-c', 'core.hooksPath=/dev/null', '-C', repo, 'fetch', '--no-tags', '--force', '--', env.source.url, `refs/heads/${env.source.branch}:refs/heads/tracked`]);
@@ -112,6 +122,10 @@ export class Environments {
       await this.run('git', ['-c', 'core.hooksPath=/dev/null', 'clone', '--no-hardlinks', '--no-checkout', source.repo, checkout]);
       await this.run('git', ['-c', 'core.hooksPath=/dev/null', '-C', checkout, 'checkout', '--detach', source.revision]);
     }
+    if (env.cwd && env.cwd !== '.') {
+      let path = checkout;
+      for (const part of env.cwd.split('/')) { path = join(path, part); check((await lstat(path)).isDirectory(), 'working-directory-invalid'); }
+    }
     if (env.prepare?.length) {
       await this.remove(env, '-prepare');
       try {
@@ -123,10 +137,10 @@ export class Environments {
     return release;
   }
   base(env, revision, suffix = '') {
-    return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, '--workdir', '/app'];
+    return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, ...(env.publicHost ? ['--env', `ENGINEBOX_PUBLIC_HOST=${env.publicHost}`, '--env', `ENGINEBOX_PUBLIC_URL=${env.publicScheme}://${env.publicHost}`] : []), ...Object.entries(env.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--workdir', env.cwd && env.cwd !== '.' ? `/app/${env.cwd}` : '/app'];
   }
   async start(env, revision) {
-    const root = join(this.config.stateDir, env.id); const data = join(root, 'data');
+    const root = join(this.config.stateDir, env.id); const data = join(this.config.stateDir, env.dataId ?? env.id, 'data');
     await mkdir(data, { recursive: true, mode: 0o700 });
     await this.remove(env);
     const files = env.updateMode === 'files';
@@ -260,7 +274,10 @@ export class Environments {
   async tick() {
     if (this.busy) return;
     this.busy = true;
-    try { for (const env of this.config.environments) { await this.reconcile(env); await this.save(); await this.render(); } }
+    try {
+      for (const env of this.config.environments.filter(e => this.staticIds.has(e.id))) { await this.reconcile(env); await this.save(); await this.render(); }
+      await this.projects.tick(); await this.save(); await this.render();
+    }
     finally { this.busy = false; }
   }
 }
