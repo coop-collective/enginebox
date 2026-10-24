@@ -2,7 +2,7 @@
 // Never reads a production connection file or uses remote Cloudflare bindings.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
 import {
@@ -154,7 +154,9 @@ try {
       main: path.join(controllerRoot, "src/index.ts"),
       compatibility_date: "2026-10-19",
       compatibility_flags: ["nodejs_compat"],
-      secrets: { required: ["ADMIN_TOKEN"] },
+      // With this Wrangler version, required also filters local .dev.vars.
+      // This fixture always supplies both; production TURN remains optional.
+      secrets: { required: ["ADMIN_TOKEN", "MACHINE_TURN_CONFIG"] },
       vars: { ALLOW_HTTP_NODES: "true" },
       durable_objects: {
         bindings: [
@@ -262,6 +264,70 @@ try {
     401,
     "Disposable controller must deny anonymous authority",
   );
+  const call = async (route, body, token = ownerToken, headers = {}) => {
+    const response = await fetch(`${controller}${route}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
+    });
+    assert(
+      response.ok,
+      `Disposable authority preflight ${route.split("/").at(-1)} HTTP${response.status}`,
+    );
+    return response.json();
+  };
+  // Authority-only probe: exercise local relay configuration before starting
+  // Docker, without claiming this synthetic heartbeat is a working media host.
+  const probe = `probe-${unique}`,
+    base = `/v1/projects/${project}`;
+  const invitation = await call(`${base}/machine-invitations`, {
+    id: probe,
+    label: "Disposable relay configuration probe",
+    ownerAccountId: "fixture-probe",
+    allowControl: false,
+  });
+  try {
+    const nativeToken = `${probe}.${randomBytes(32).toString("hex")}`;
+    await call(
+      "/v1/node/enroll",
+      {
+        nodeSecretHash: createHash("sha256").update(nativeToken).digest("hex"),
+      },
+      invitation.token,
+    );
+    const session = randomUUID();
+    const hello = await call("/v1/node/hello", { session }, nativeToken);
+    await call(
+      "/v1/node/heartbeat",
+      { stats: { webrtc: 1, video: 1 } },
+      nativeToken,
+      {
+        "x-enginebox-epoch": String(hello.epoch),
+        "x-enginebox-session": session,
+      },
+    );
+    const grant = await call(`${base}/machine-session-grants`, {
+      id: `grant-${unique}`,
+      sessionId: `view-${unique}`,
+      nodeId: probe,
+      actorId: "fixture-probe",
+      mode: "watch",
+    });
+    assert.equal(
+      grant.nodeId,
+      probe,
+      "Local relay grant must retain native scope",
+    );
+  } finally {
+    await call(`${base}/machines/${probe}/revoke`, {
+      operationId: "probe-cleanup",
+    });
+  }
   if (checkOnly) {
     await writeFile(
       path.join(evidence, "controller-check.json"),
@@ -273,6 +339,7 @@ try {
           project,
           port,
           anonymousDenied: true,
+          localRelayGrant: true,
         },
         null,
         2,

@@ -118,6 +118,12 @@ TURN allocation. Configured TTL may be 120–3600 seconds.
 An explicitly local fixture may use
 `{"local":true,"iceServers":[...],"iceTransportPolicy":"all"|"relay"}` only when
 `ALLOW_HTTP_NODES=true`. This is test configuration, not production relay proof.
+Wrangler 4.152.0 filters local `.dev.vars` through `secrets.required` when that
+configuration is present. A separate machine-development configuration must
+list both `ADMIN_TOKEN` and `MACHINE_TURN_CONFIG`, or omit that local allowlist.
+The checked-in `stream-host/test/start-fleet.mjs` supplies both and verifies an
+actual disposable relay grant before launching containers. Do not make TURN a
+required binding for storage-only production deployments.
 
 Limits are 8 simultaneous peers per host, one control peer, 64 live peers per
 project, 4096 retained sessions/project, and 4096 recent grants/project. Grant
