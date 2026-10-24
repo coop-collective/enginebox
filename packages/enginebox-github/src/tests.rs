@@ -9,7 +9,7 @@ fn config() -> Value {
     let mut runners = app.clone();
     runners["client_id"] = json!("fixture-runners");
     runners["slug"] = json!("fixture-runners");
-    json!({"schema":1,"callback_url":"https://example.invalid/api/github/callback","repos":app,"runners":runners,"pools":[{"id":"linux","installation_id":2,"organization":"fixture","runner_group_id":1,"labels":["self-hosted","Linux","X64","enginebox-linux"],"max_runners":1,"timeout_seconds":300,"worker":["/fixture/worker"]}]})
+    json!({"schema":1,"callback_url":"https://example.invalid/api/github/callback","repos":app,"runners":runners,"pools":[{"id":"linux","installation_id":2,"organization":"fixture","runner_group_id":1,"labels":["self-hosted","Linux","X64","enginebox-linux"],"max_runners":1,"timeout_seconds":300,"worker":[std::env::current_exe().unwrap()]}]})
 }
 pub(crate) fn service() -> (tempfile::TempDir, GitHub) {
     let root = tempfile::tempdir().unwrap();
@@ -143,6 +143,7 @@ fn pagination_refresh_and_repository_selection_are_authoritative() {
     server.join().unwrap();
     assert!(!g.root.join("checkouts/101").exists());
 }
+#[cfg(unix)] // Generates an ephemeral RSA fixture with the Unix OpenSSL tool.
 #[test]
 fn transfer_credentials_are_scoped_to_the_selected_repository() {
     let (_root, mut g) = service();

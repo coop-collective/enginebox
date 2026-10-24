@@ -497,7 +497,12 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
             ],
             max_runners: 1,
             timeout_seconds: 300,
-            worker: vec!["/fixture/worker".into()],
+            worker: vec![
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
         };
         validate_pools(std::slice::from_ref(&pool)).unwrap();
         let mut payload = json!({"installation":{"id":1},"repository":{"owner":{"login":"fixture"}},"workflow_job":{"labels":["self-hosted","linux","enginebox-linux"]}});
