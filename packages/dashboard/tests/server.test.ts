@@ -338,7 +338,7 @@ test("native account proxy routes stay scoped to known providers and session ope
 
 test("storage proxy exposes bounded operations and never a general command or restore endpoint", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ job: { id: "storage-1", status: "queued" } }, { status: 202 }));
-  for (const operation of ["inspect", "list", "preview", "import", "fork", "deps", "checkpoint", "remount", "close", "recover"]) {
+  for (const operation of ["inspect", "list", "preview", "import", "fork", "deps", "checkpoint", "remount", "close", "recover", "github-preview", "github-import", "github-fork", "github-settings", "github-promote", "github-delivery"]) {
     const response = await proxy(request(undefined, "POST", {}), ["v1", "storage", "hosts", "node", operation]);
     assert.equal(response.status, 202);
   }
@@ -353,5 +353,5 @@ test("storage proxy exposes bounded operations and never a general command or re
   crossOrigin.headers.set("origin", "https://attacker.example");
   await assert.rejects(proxy(crossOrigin, ["v1", "storage", "hosts", "node", "import"]),
     (error: unknown) => error instanceof HttpError && error.status === 403);
-  assert.equal(fetch.mock.callCount(), 11);
+  assert.equal(fetch.mock.callCount(), 17);
 });

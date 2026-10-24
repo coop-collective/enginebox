@@ -31,11 +31,32 @@ pub fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 pub fn run_process(argv: &[String], input: Option<&[u8]>, timeout: Duration) -> Result<Vec<u8>> {
+    run_process_environment(argv, input, timeout, None)
+}
+/// Execute with only the supplied environment. Sensitive values stay out of argv
+/// and are never included in diagnostics by this runner.
+pub fn run_isolated_process(
+    argv: &[String],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    environment: &[(&str, &str)],
+) -> Result<Vec<u8>> {
+    run_process_environment(argv, input, timeout, Some(environment))
+}
+fn run_process_environment(
+    argv: &[String],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    environment: Option<&[(&str, &str)]>,
+) -> Result<Vec<u8>> {
     ensure!(
         !argv.is_empty() && argv.iter().all(|v| !v.contains('\0')),
         "Invalid command argv"
     );
     let mut cmd = Command::new(&argv[0]);
+    if let Some(environment) = environment {
+        cmd.env_clear().envs(environment.iter().copied());
+    }
     #[cfg(windows)]
     if std::path::Path::new(&argv[0])
         .file_name()

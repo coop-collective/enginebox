@@ -19,6 +19,8 @@ struct Node {
     executable: String,
     config: String,
     projects: Vec<Project>,
+    #[serde(default)]
+    github_token_file: Option<String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +191,9 @@ impl Storage {
             ensure!(nodes.insert(&node.host_id), "Duplicate storage node");
             node_path(&node.executable)?;
             node_path(&node.config)?;
+            if let Some(path) = &node.github_token_file {
+                node_path(path)?;
+            }
             ensure!(
                 node.projects.len() <= 1024,
                 "Too many registered storage projects"
@@ -211,7 +216,7 @@ impl Storage {
         })
     }
     pub fn catalog(&self) -> Value {
-        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
+        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","github":{"enabled":true,"private_auth_configured":node.github_token_file.is_some()},"projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["github-settings","github-promote","github-delivery","github-preview","github-import","github-fork","compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
     }
     pub fn plan(&self, host_id: &str, operation: &str, body: &Value) -> Result<Plan> {
         let node = self
@@ -238,6 +243,129 @@ impl Storage {
         let name;
         let mut action = Action::Node;
         let timeout = match operation {
+            "github-settings" | "github-promote" | "github-delivery" => {
+                let (allowed, required): (&[&str], &[&str]) = match operation {
+                    "github-settings" => (&["project", "enabled"], &["project"]),
+                    "github-promote" => (
+                        &["project", "name", "expected_main", "merge", "message"],
+                        &["project", "name", "expected_main"],
+                    ),
+                    _ => (&["project", "action", "attempt"], &["project", "action"]),
+                };
+                fields(body, allowed, required)?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                name = project.to_owned();
+                argv.extend([operation.into(), project.into()]);
+                if operation == "github-settings" {
+                    if let Some(enabled) = body.get("enabled") {
+                        argv.extend([
+                            "--enabled".into(),
+                            enabled
+                                .as_bool()
+                                .context("enabled must be boolean")?
+                                .to_string(),
+                        ]);
+                    }
+                } else if operation == "github-promote" {
+                    let workspace = text(body, "name")?;
+                    identifier(workspace)?;
+                    let expected = text(body, "expected_main")?;
+                    hex(expected, &[64])?;
+                    argv.extend([workspace.into(), "--expected-main".into(), expected.into()]);
+                    if let Some(merge) = body.get("merge")
+                        && merge.as_bool().context("merge must be boolean")?
+                    {
+                        argv.push("--merge".into());
+                    }
+                    if body.get("message").is_some() {
+                        let message = text(body, "message")?;
+                        ensure!(
+                            message.len() <= 4096 && !message.contains('\0'),
+                            "Invalid promotion message"
+                        );
+                        argv.extend(["--message".into(), message.into()]);
+                    }
+                } else {
+                    let action = text(body, "action")?;
+                    ensure!(
+                        ["export", "deliver", "resolve", "retry", "agent-task"].contains(&action),
+                        "Unsupported sync action"
+                    );
+                    argv.extend(["--action".into(), action.into()]);
+                    if action != "export" {
+                        let attempt = text(body, "attempt")?;
+                        identifier(attempt)?;
+                        argv.extend(["--attempt".into(), attempt.into()]);
+                    } else {
+                        ensure!(
+                            body.get("attempt").is_none(),
+                            "Export selects the accepted main revision"
+                        );
+                    }
+                }
+                if operation != "github-settings"
+                    && let Some(path) = &node.github_token_file
+                {
+                    argv.extend(["--token-file".into(), path.clone()]);
+                }
+                1800
+            }
+            "github-preview" => {
+                fields(
+                    body,
+                    &["project", "repository", "branch"],
+                    &["project", "repository"],
+                )?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                let repository =
+                    enginebox_storage_layerfs::github::repository(text(body, "repository")?)?;
+                name = project.to_owned();
+                argv.extend([
+                    operation.into(),
+                    project.into(),
+                    "--repository".into(),
+                    repository,
+                ]);
+                if body.get("branch").is_some() {
+                    let branch = text(body, "branch")?;
+                    enginebox_storage_layerfs::github::branch(branch)?;
+                    argv.extend(["--branch".into(), branch.into()]);
+                }
+                if let Some(path) = &node.github_token_file {
+                    argv.extend(["--token-file".into(), path.clone()]);
+                }
+                780
+            }
+            "github-import" => {
+                fields(
+                    body,
+                    &["project", "revision", "approval", "credential_free"],
+                    &["project", "revision", "approval", "credential_free"],
+                )?;
+                let project = text(body, "project")?;
+                identifier(project)?;
+                let revision = text(body, "revision")?;
+                let approval = text(body, "approval")?;
+                hex(revision, &[40, 64])?;
+                hex(approval, &[64])?;
+                ensure!(
+                    body["credential_free"] == true,
+                    "Explicit credential-free source approval required"
+                );
+                name = project.to_owned();
+                argv.extend([
+                    operation.into(),
+                    project.into(),
+                    "--revision".into(),
+                    revision.into(),
+                    "--approval".into(),
+                    approval.into(),
+                    "--credential-free".into(),
+                ]);
+                900
+            }
             "compatibility" | "prepare" => {
                 argv.truncate(6);
                 argv.push("node-protocol".into());
@@ -343,16 +471,17 @@ impl Storage {
                 ]);
                 if operation == "import" { 900 } else { 300 }
             }
-            "fork" => {
+            "fork" | "github-fork" => {
                 fields(body, &["project", "name", "from"], &["project", "name"])?;
                 let project = text(body, "project")?;
                 ensure!(
-                    node.projects.iter().any(|p| p.id == project),
+                    operation == "github-fork" || node.projects.iter().any(|p| p.id == project),
                     "Unknown registered storage project"
                 );
+                identifier(project)?;
                 name = text(body, "name")?.to_owned();
                 identifier(&name)?;
-                argv.extend(["fork".into(), project.into(), name.clone()]);
+                argv.extend([operation.into(), project.into(), name.clone()]);
                 if body.get("from").is_some() {
                     let from = text(body, "from")?;
                     identifier(from)?;
@@ -428,6 +557,51 @@ mod tests {
         state::write_json(&state_root.join("storage/config.json"),&json!({"schema_version":1,"nodes":[{"host_id":"node","executable":"/opt/enginebox/current/bin/ebox","config":"/etc/enginebox/layerfs.json","projects":[{"id":"game","repository":"/srv/repositories/game"}]}]})).unwrap();
         let storage = Storage::open(&state_root, fleet).unwrap();
         (root, storage)
+    }
+    #[test]
+    fn github_requests_are_bound_to_node_credentials_and_exact_main_revisions() {
+        let (_root, storage) = configured();
+        let plan=storage.plan("node","github-preview",&json!({"project":"app","repository":"https://github.com/Owner/Repo.git","branch":"feature/new"})).unwrap();
+        assert!(
+            plan.argv
+                .windows(2)
+                .any(|v| v == ["--repository", "owner/repo"])
+        );
+        assert!(!plan.argv.iter().any(|s| s == "--token-file"));
+        assert!(storage.plan("node","github-promote",&json!({"project":"app","name":"agent","expected_main":"a".repeat(64),"merge":true})).is_ok());
+        for (op, body) in [
+            (
+                "github-preview",
+                json!({"project":"app","repository":"https://token@github.com/a/b"}),
+            ),
+            (
+                "github-preview",
+                json!({"project":"app","repository":"a/b","token_file":"/private/token"}),
+            ),
+            (
+                "github-import",
+                json!({"project":"app","revision":"HEAD","approval":"a".repeat(64),"credential_free":true}),
+            ),
+            (
+                "github-promote",
+                json!({"project":"app","name":"agent","expected_main":"main"}),
+            ),
+            ("github-settings", json!({"project":"app","enabled":"true"})),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"resolve","attempt":"../other"}),
+            ),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"push","attempt":"sync-a"}),
+            ),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"export","attempt":"sync-a"}),
+            ),
+        ] {
+            assert!(storage.plan("node", op, &body).is_err(), "{op}: {body}");
+        }
     }
     #[test]
     fn registry_controls_paths_and_import_requires_exact_reviewed_commit() {

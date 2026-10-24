@@ -30,7 +30,7 @@ multi-node project execution requires shared storage, which R2 directly can prov
 | Pause/resume, hibernate, disk/memory snapshots and forks | Qualified CI image provisioning and compatible persistent build caches |
 | Optional CI triggers, dedicated native build-node registry and GitHub Actions runner adapter | Live cross-platform CI/runner qualification and signing integrations |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
-| Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
+| Controller-managed LayerFS storage, GitHub import/export with conflict-agent handoff, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
 The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The reference fleet now runs Rust 0.3.1-live.1 with native-dev revision 5. All three providers passed delegated MCP launches and exact conversation resume; Codex also passed ACP continuation. Existing private workspace boots and recorded native histories were preserved. The [timing report](docs/REMOTE-AGENT-TIMING-2026-10-23.md) records the small sample, an unresolved admission rejection and the blocked Cursor Cloud comparison. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
@@ -99,6 +99,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Interrupted-command and daemon recovery qualification](docs/LAYERFS-RECOVERY-VALIDATION.md)
 - [LayerFS checkout attachment to Incus](docs/LAYERFS-INCUS.md)
 - [Storage registration, controller API and MCP](docs/STORAGE-API.md)
+- [GitHub import, optional sync and specialized conflict environments](docs/GITHUB-SYNC.md)
 - [Local Cloudflare fleet, shared Store transport and debugging](docs/LOCAL-FLEET.md)
 - [Enginebox integration, batching and protected CI evidence](docs/INTEGRATION-CI.md)
 - [Native Codex task-assistant setup and recovery](docs/TASK-ASSISTANT.md)

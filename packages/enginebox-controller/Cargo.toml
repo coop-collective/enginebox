@@ -17,6 +17,7 @@ path = "src/compat.rs"
 enginebox-core = { path = "../enginebox-core" }
 enginebox-agents = { path = "../enginebox-agents" }
 enginebox-ci = { path = "../enginebox-ci" }
+enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }

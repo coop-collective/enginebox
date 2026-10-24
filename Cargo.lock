@@ -403,6 +403,7 @@ dependencies = [
  "enginebox-agents",
  "enginebox-ci",
  "enginebox-core",
+ "enginebox-storage-layerfs",
  "fs2",
  "http-body-util",
  "libc",
@@ -470,6 +471,7 @@ name = "enginebox-storage-layerfs"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "enginebox-core",
  "fs2",
