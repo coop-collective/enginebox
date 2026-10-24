@@ -1,0 +1,32 @@
+name: iOS build
+on:
+  workflow_dispatch:
+    inputs:
+      enginebox_sha:
+        description: Exact source commit supplied by Engine Box
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_IOS_RUNNER || '"macos-15"') }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.enginebox_sha }}
+          persist-credentials: false
+      - name: Build simulator app
+        shell: bash
+        run: |
+          xcodebuild -project App.xcodeproj -scheme App -configuration Release -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent build/Build/Products/Release-iphonesimulator dist/ios-simulator.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-${{ inputs.enginebox_sha }}
+          path: |
+            dist/ios-simulator.zip
+          if-no-files-found: error
+          retention-days: 7

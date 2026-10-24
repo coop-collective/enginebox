@@ -136,3 +136,5 @@ A local transport observation on October 24 used the existing **631,517,184-byte
 For the optional CPU media validator, frozen build playback and batch review APIs, see [PLAYTEST-EVIDENCE.md](PLAYTEST-EVIDENCE.md). Start a fresh fleet with `pnpm fleet:dev --storage --media`; existing enrollment and preview volumes stay intact.
 
 Dashboard browser tests use disposable fixture ports. If port 18765 or 3007 is already used by a native preview, set `EBOX_TEST_FLEET_PORT` and `EBOX_TEST_DASHBOARD_PORT` to free loopback ports before `pnpm test:e2e`. The test launcher refuses to reuse or reset an existing server.
+
+The shared browser fixture also supports `ENGINEBOX_TEST_FLEET_PORT` and `ENGINEBOX_TEST_DASHBOARD_PORT`; those names take precedence over their `EBOX_TEST_*` aliases.

@@ -13,6 +13,7 @@ import { api, RequestError } from "@/lib/client";
 import { TemplateCatalog } from "@/components/template-catalog";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
+import { EnvironmentsPanel } from "@/components/environments-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -26,6 +27,11 @@ const bytes = (value?: number) =>
     : "—";
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
+  environments: {
+    title: "Environments",
+    description: "Run persistent development services and manage their endpoints.",
+    icon: "server",
+  },
   fleet: {
     title: "Fleet overview",
     description: "Manage your machines and give every workspace room to build.",
@@ -882,7 +888,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates", "storage"] as const)
+          {(["fleet", "agents", "templates", "storage", "environments"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1044,6 +1050,7 @@ export default function Dashboard() {
               {section === "storage" && (
                 <StoragePanel refreshToken={updated?.getTime() ?? 0} />
               )}
+              {section === "environments" && <EnvironmentsPanel />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

@@ -130,3 +130,13 @@ Rust controller or qualify distributed GitHub delivery.
 Protocol references: [Git fetch](https://git-scm.com/docs/git-fetch),
 [conditional pushes](https://git-scm.com/docs/git-push), and the pinned
 [LayerFS branch API](https://github.com/Ephemeral-AI-Lab/layerfs/blob/968a5d0be0ea3e9456b06f9148b65523138e9490/sdk/js/src/index.js).
+
+The October 24 disposable live-app qualification exercised a private GitHub import,
+Git-free LayerFS edits, application tests/build, closed-checkpoint preview, main
+promotion and a real conditional GitHub push. The resulting commit changed only
+the intended source file; ignored build output stayed out of GitHub. The main dev
+service followed LayerFS and retained its separate application data. This closes
+the clean-path Linux publication/export and GitHub-write qualification for that
+single-owner fixture. Live conflict-agent dispatch and distributed delivery remain
+separate gates. The test also caught and corrected empty exports from Docker's
+archive API when `/project` is a later-installed LayerFS mount.

@@ -115,6 +115,11 @@ function poolMode() {
 function hasMetadata() {
   return poolMode() || mode === "typed" || mode === "catalog";
 }
+let environmentRoutes = [];
+const environmentCatalog = () => ({
+  baseDomains: ['dev.example.com'], transportEntrypoints: [{ name: 'game-udp', protocol: 'udp', port: 21000, public: false }], routes: environmentRoutes,
+  environments: [{ id: 'main', source: { kind: 'git', branch: 'main' }, services: [{ name: 'web', protocol: 'http' }, { name: 'game', protocol: 'udp' }], status: 'ready', healthy: true, revision: 'a'.repeat(40), desiredRevision: 'a'.repeat(40), cpu: 1, memoryMiB: 256 }],
+});
 reset();
 createServer(async (req, res) => {
   function send(status, body) {
@@ -127,6 +132,7 @@ createServer(async (req, res) => {
   if (req.url === "/healthz") return send(200, { ok: true });
   if (req.url === "/__test/reset") {
     reset();
+    environmentRoutes = [];
     return send(200, { ok: true });
   }
   if (req.url === "/__test/storage-requests") return send(200, storageRequests);
@@ -166,6 +172,12 @@ createServer(async (req, res) => {
   }
   if (req.headers.authorization !== `Bearer ${token}`)
     return send(401, { error: "Wrong backend token" });
+  if (req.url === '/v1/environments' && req.method === 'GET') return send(200, environmentCatalog());
+  if (req.url === '/v1/environments/routes' && req.method === 'POST') {
+    environmentRoutes = environmentRoutes.filter(r => r.id !== (data.remove ?? data.id));
+    if (!data.remove) environmentRoutes.push(data);
+    return send(200, environmentCatalog());
+  }
   if (req.url === "/v1/storage" && req.method === "GET") {
     if (mode === "storage-error") return send(503, { error: "Storage catalog unavailable." });
     return send(200, { backend: "layerfs", configured: mode !== "storage-empty", nodes: mode === "storage-empty" ? [] : [{ host_id: "metal-01", status: "registered", github: { enabled: true, private_auth_configured: false }, projects: [{ id: "game" }, { id: "demo" }] }], incus_attachment: false, automatic_replay: false });
@@ -668,6 +680,6 @@ createServer(async (req, res) => {
     });
   }
   send(404, { error: "Not found" });
-}).listen(Number(process.env.EBOX_TEST_FLEET_PORT ?? "18765"), "127.0.0.1", () =>
+}).listen(Number(process.env.ENGINEBOX_TEST_FLEET_PORT ?? process.env.EBOX_TEST_FLEET_PORT ?? "18765"), "127.0.0.1", () =>
   process.stdout.write("Test fleet API listening on loopback.\n"),
 );

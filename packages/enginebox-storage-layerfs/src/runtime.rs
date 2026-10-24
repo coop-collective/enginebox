@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::Duration};
 
 const BRIDGE: &str = include_str!("bridge.mjs");
+#[path = "dev_export.rs"]
+mod dev_export;
 #[path = "github_runtime.rs"]
 mod github_runtime;
 #[path = "integration.rs"]
@@ -124,6 +126,35 @@ pub(crate) fn verify_socket(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 impl Runtime {
+    fn export_workspace_files(&self, w: &Workspace, destination: &std::path::Path) -> Result<()> {
+        let container = w.container.as_deref().context("Export container missing")?;
+        // Docker's archive API reads the container root filesystem, not mounts
+        // installed later by LayerFS. Materialize from inside the mount namespace
+        // first; copying /project directly can silently produce an empty tree.
+        let staging = format!("/tmp/ebox-export-{}", uuid::Uuid::new_v4().simple());
+        self.docker(
+            &[
+                "exec".into(),
+                "--user=501:20".into(),
+                container.into(),
+                "sh".into(),
+                "-c".into(),
+                format!("set -eu; mkdir -m 700 {staging}; cp -a -- /project/. {staging}/"),
+            ],
+            None,
+            300,
+        )?;
+        self.docker(
+            &[
+                "cp".into(),
+                format!("{container}:{staging}/."),
+                destination.to_string_lossy().into_owned(),
+            ],
+            None,
+            300,
+        )?;
+        Ok(())
+    }
     fn docker(&self, args: &[String], input: Option<&[u8]>, seconds: u64) -> Result<Vec<u8>> {
         docker_at(&self.config.docker_socket, args, input, seconds)
     }

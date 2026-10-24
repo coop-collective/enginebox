@@ -50,6 +50,8 @@ pub struct Jobs {
     records: Arc<Mutex<BTreeMap<String, Value>>>,
     pending: Arc<AtomicUsize>,
     workers: Arc<Semaphore>,
+    ci_pending: Arc<AtomicUsize>,
+    ci_workers: Arc<Semaphore>,
 }
 
 impl Jobs {
@@ -101,10 +103,12 @@ impl Jobs {
             records: Arc::new(Mutex::new(records)),
             pending: Arc::new(AtomicUsize::new(0)),
             workers: Arc::new(Semaphore::new(4)),
+            ci_pending: Arc::new(AtomicUsize::new(0)),
+            ci_workers: Arc::new(Semaphore::new(4)),
         })
     }
     pub fn pending(&self) -> usize {
-        self.pending.load(Ordering::SeqCst)
+        self.pending.load(Ordering::SeqCst) + self.ci_pending.load(Ordering::SeqCst)
     }
     pub fn get(&self, id: &str) -> Result<Value> {
         ensure!(valid_id(id), "Invalid job ID");
@@ -115,11 +119,74 @@ impl Jobs {
             .cloned()
             .context("Unknown job")
     }
+    pub fn existing_request(&self, key: &str, digest: &str) -> Result<Option<Value>> {
+        let id =
+            enginebox_core::state::digest(&json!({"namespace":"ci-v1","key":key}))[..32].to_owned();
+        let records = self.records.lock().unwrap();
+        let record = records.get(&id);
+        ensure!(
+            record.is_none_or(|r| r["request_digest"] == digest),
+            "Request ID was already used for different CI content"
+        );
+        Ok(record.cloned())
+    }
     pub fn submit<F>(&self, host: &str, operation: &str, name: &str, work: F) -> Result<Value>
     where
         F: FnOnce() -> Result<Value> + Send + 'static,
     {
+        self.submit_inner(host, operation, name, None, work)
+    }
+    /// A durable caller identity prevents a merge delivery or lost HTTP reply
+    /// from replaying a build/deploy trigger. Keyed records are never pruned.
+    pub fn submit_once<F>(
+        &self,
+        host: &str,
+        operation: &str,
+        name: &str,
+        identity: (&str, &str),
+        work: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce() -> Result<Value> + Send + 'static,
+    {
+        self.submit_inner(host, operation, name, Some(identity), work)
+    }
+    fn submit_inner<F>(
+        &self,
+        host: &str,
+        operation: &str,
+        name: &str,
+        identity: Option<(&str, &str)>,
+        work: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce() -> Result<Value> + Send + 'static,
+    {
         let mut records = self.records.lock().unwrap();
+        let id = match identity {
+            Some((key, digest)) => {
+                let id = enginebox_core::state::digest(&json!({"namespace":"ci-v1","key":key}))
+                    [..32]
+                    .to_owned();
+                if let Some(existing) = records.get(&id) {
+                    ensure!(
+                        existing["request_digest"] == digest,
+                        "Request ID was already used for different CI content"
+                    );
+                    return Ok(existing.clone());
+                }
+                ensure!(
+                    records
+                        .values()
+                        .filter(|r| r.get("request_digest").is_some())
+                        .count()
+                        < 10000,
+                    "CI request journal is full; archive it during controller maintenance"
+                );
+                id
+            }
+            None => uuid::Uuid::new_v4().simple().to_string(),
+        };
         if operation == "install_template"
             && let Some(v) = records.values().find(|v| {
                 v["operation"] == operation
@@ -130,23 +197,39 @@ impl Jobs {
         {
             return Ok(v.clone());
         }
-        if self.pending() >= 32 {
+        let is_ci = operation.starts_with("ci_");
+        let pool_pending = if is_ci {
+            self.ci_pending.load(Ordering::SeqCst)
+        } else {
+            self.pending.load(Ordering::SeqCst)
+        };
+        if pool_pending >= 32 {
             bail!("Fleet queue is full; wait for existing jobs");
         }
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let record = json!({"id":id,"host_id":host,"operation":operation,"name":name,"status":"queued","created_at":Utc::now().to_rfc3339()});
+        let mut record = json!({"id":id,"host_id":host,"operation":operation,"name":name,"status":"queued","created_at":Utc::now().to_rfc3339()});
+        if let Some((key, digest)) = identity {
+            record["request_id"] = json!(key);
+            record["request_digest"] = json!(digest);
+        }
         write_private(&self.root.join(format!("{id}.json")), &record)?;
         records.insert(id.clone(), record.clone());
-        self.pending.fetch_add(1, Ordering::SeqCst);
+        if is_ci {
+            self.ci_pending.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.pending.fetch_add(1, Ordering::SeqCst);
+        }
         drop(records);
         let this = self.clone();
         tokio::spawn(async move {
-            let _permit = this
-                .workers
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("Job semaphore never closed");
+            let _permit = if is_ci {
+                &this.ci_workers
+            } else {
+                &this.workers
+            }
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Job semaphore never closed");
             let started = std::time::Instant::now();
             let mut v = this.get(&id).expect("Admitted job exists");
             v["status"] = json!("running");
@@ -178,7 +261,11 @@ impl Jobs {
             if this.save(&id, v.clone()).is_err() {
                 this.records.lock().unwrap().insert(id.clone(), v);
             }
-            this.pending.fetch_sub(1, Ordering::SeqCst);
+            if is_ci {
+                this.ci_pending.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                this.pending.fetch_sub(1, Ordering::SeqCst);
+            }
         });
         Ok(record)
     }
@@ -186,10 +273,17 @@ impl Jobs {
         let mut records = self.records.lock().unwrap();
         write_private(&self.root.join(format!("{id}.json")), &value)?;
         records.insert(id.to_owned(), value);
-        if records.len() > 200 {
+        let ordinary_records = records
+            .values()
+            .filter(|v| v.get("request_digest").is_none())
+            .count();
+        if ordinary_records > 200 {
             let mut done: Vec<_> = records
                 .iter()
-                .filter(|(_, v)| matches!(v["status"].as_str(), Some("succeeded" | "failed")))
+                .filter(|(_, v)| {
+                    v.get("request_digest").is_none()
+                        && matches!(v["status"].as_str(), Some("succeeded" | "failed"))
+                })
                 .map(|(id, v)| {
                     (
                         v["created_at"].as_str().unwrap_or("").to_owned(),
@@ -198,7 +292,7 @@ impl Jobs {
                 })
                 .collect();
             done.sort();
-            for (_, old) in done.into_iter().take(records.len() - 200) {
+            for (_, old) in done.into_iter().take(ordinary_records - 200) {
                 fs::remove_file(self.root.join(format!("{old}.json")))?;
                 records.remove(&old);
             }
@@ -210,6 +304,144 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn ci_history_does_not_evict_workspace_operation_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("jobs");
+        private_dir(&root).unwrap();
+        for n in 0..201 {
+            let id = format!("{n:032x}");
+            write_private(
+                &root.join(format!("{id}.json")),
+                &json!({"id":id,"status":"succeeded","request_digest":"fixture"}),
+            )
+            .unwrap();
+        }
+        let jobs = Jobs::open(&root).unwrap();
+        let job = jobs
+            .submit("agents", "resume", "ebox-interactive", || {
+                Ok(json!({"resumed":true}))
+            })
+            .unwrap();
+        while jobs.pending() > 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            jobs.get(job["id"].as_str().unwrap()).unwrap()["status"],
+            "succeeded"
+        );
+    }
+    #[tokio::test]
+    async fn saturated_ci_pool_leaves_agent_workspace_operations_admissible_and_runnable() {
+        use std::sync::atomic::AtomicBool;
+        let tmp = tempfile::tempdir().unwrap();
+        let jobs = Jobs::open(&tmp.path().join("jobs")).unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        for _ in 0..32 {
+            let release = release.clone();
+            jobs.submit("ci", "ci_automation", "heavy-build", move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(json!({"built":true}))
+            })
+            .unwrap();
+        }
+        assert!(
+            jobs.submit("ci", "ci_automation", "overflow", || Ok(json!({})))
+                .is_err()
+        );
+        let (sent, received) = tokio::sync::oneshot::channel();
+        jobs.submit("agents", "create", "ebox-interactive", move || {
+            let _ = sent.send(());
+            Ok(json!({"created":true}))
+        })
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), received).await;
+        release.store(true, Ordering::SeqCst);
+        assert!(
+            result.is_ok(),
+            "Agent work waited for the saturated CI pool"
+        );
+        while jobs.pending() > 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    #[tokio::test]
+    async fn keyed_triggers_execute_once_and_keep_identity_after_restart() {
+        use std::sync::atomic::AtomicUsize;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("jobs");
+        let jobs = Jobs::open(&root).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let first = jobs
+            .submit_once(
+                "github",
+                "ci_github_dispatch",
+                "build",
+                ("merge-1", "digest"),
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"dispatched":true}))
+                },
+            )
+            .unwrap();
+        let second = jobs
+            .submit_once(
+                "github",
+                "ci_github_dispatch",
+                "build",
+                ("merge-1", "digest"),
+                || panic!("Duplicate request executed"),
+            )
+            .unwrap();
+        assert_eq!(first["id"], second["id"]);
+        assert!(
+            jobs.submit_once(
+                "github",
+                "ci_github_dispatch",
+                "build",
+                ("merge-1", "different"),
+                || Ok(json!({}))
+            )
+            .is_err()
+        );
+        while jobs.pending() > 0 {
+            tokio::task::yield_now().await;
+        }
+        let recovered = Jobs::open(&root).unwrap();
+        assert_eq!(
+            recovered
+                .submit_once(
+                    "github",
+                    "ci_github_dispatch",
+                    "build",
+                    ("merge-1", "digest"),
+                    || panic!("Restart replayed trigger")
+                )
+                .unwrap()["status"],
+            "succeeded"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut record = recovered.get(first["id"].as_str().unwrap()).unwrap();
+        record["status"] = json!("running");
+        write_private(
+            &root.join(format!("{}.json", first["id"].as_str().unwrap())),
+            &record,
+        )
+        .unwrap();
+        let recovered = Jobs::open(&root).unwrap();
+        assert_eq!(
+            recovered
+                .existing_request("merge-1", "digest")
+                .unwrap()
+                .unwrap()["status"],
+            "failed"
+        );
+        assert!(recovered.existing_request("merge-1", "different").is_err());
+    }
     #[tokio::test]
     async fn completed_jobs_survive_restart_and_unfinished_jobs_are_not_replayed() {
         let tmp = tempfile::tempdir().unwrap();
