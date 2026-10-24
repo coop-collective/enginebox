@@ -55,6 +55,8 @@ jobs:
         with:
           node-version: '24'
       - name: Qualify two real browsers through TURN
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           npm install --global pnpm@12.14.0
           pnpm install --frozen-lockfile --filter '@enginebox/fleet-controller...'
@@ -65,7 +67,10 @@ jobs:
             --ignored lease_watchdog
           docker build -t enginebox-stream-relay:qualification -f packages/stream-host/test/relay.Dockerfile packages/stream-host/test
           docker build -t enginebox-stream-browser:qualification -f packages/stream-host/test/browser.Dockerfile .
-          STREAM_EVIDENCE_DIR="$RUNNER_TEMP/stream-evidence" node packages/stream-host/test/start-fleet.mjs
+          STREAM_HOST_TEST_IMAGE="enginebox-stream-host:$ARCH" \
+            STREAM_ENGINE_CONFIG="$GITHUB_WORKSPACE/packages/stream-host/test/godot.json" \
+            STREAM_SCENE_KIND=godot STREAM_EVIDENCE_DIR="$RUNNER_TEMP/stream-evidence" \
+            node packages/stream-host/test/start-fleet.mjs
       - name: Publish immutable architecture tag
         if: github.event_name == 'workflow_dispatch' && inputs.publish
         env:
