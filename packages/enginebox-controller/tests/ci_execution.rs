@@ -93,7 +93,7 @@ fn real_controller_runs_a_native_build_once_and_preserves_artifacts_across_resta
     node["target"] = json!("local");
     assert_eq!(server.request("/v1/ci/nodes", Some(&node)).0, 200);
     let script = if cfg!(windows) {
-        "New-Item -ItemType Directory dist | Out-Null\nSet-Content -NoNewline dist/build.txt built"
+        "New-Item -ItemType Directory -Path dist | Out-Null\nSet-Content -NoNewline -Path dist/build.txt -Value built"
     } else {
         "mkdir dist\nprintf built > dist/build.txt"
     };
@@ -123,12 +123,22 @@ fn real_controller_runs_a_native_build_once_and_preserves_artifacts_across_resta
             }
         }
     }
+    let artifact = tmp
+        .path()
+        .join("worker")
+        .join("artifacts")
+        .join("merge-build-1")
+        .join("dist")
+        .join("build.txt");
     assert_eq!(
-        std::fs::read_to_string(
-            tmp.path()
-                .join("worker/artifacts/merge-build-1/dist/build.txt")
-        )
-        .unwrap(),
+        std::fs::read_to_string(&artifact).unwrap_or_else(|error| {
+            let inventory = std::fs::read_dir(artifact.parent().unwrap()).map(|entries| {
+                entries
+                    .map(|entry| entry.map(|e| e.file_name()))
+                    .collect::<Vec<_>>()
+            });
+            panic!("Missing fixture artifact {artifact:?}: {error}; directory: {inventory:?}")
+        }),
         "built"
     );
     assert!(
