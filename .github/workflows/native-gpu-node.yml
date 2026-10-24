@@ -9,6 +9,25 @@ on:
 permissions:
   contents: read
 jobs:
+  linux-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build separate NVIDIA node image
+        run: docker build -f packages/enginebox-install/containers/Dockerfile.nvidia -t enginebox-node:nvidia-ci .
+      - name: Verify native startup and reject missing NVIDIA hardware
+        shell: bash
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,size=256m enginebox-node:nvidia-ci --version
+          set +e
+          output=$(docker run --rm --read-only --tmpfs /tmp:rw,nosuid,size=256m enginebox-node:nvidia-ci 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -ne 0
+          test "$status" -ne 125
+          [[ "$output" == *'nvidia-smi'* ]]
   package:
     strategy:
       fail-fast: false
