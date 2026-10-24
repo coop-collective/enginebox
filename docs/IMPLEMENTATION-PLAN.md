@@ -20,7 +20,7 @@ Updated October 23, 2026. Scope: portable environments for native Codex, Cursor 
 
 Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and wider deployment qualification remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
-The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. Automatic placement and integration execution remain Enginebox follow-up work, with the current gate described in [integration and CI](INTEGRATION-CI.md).
+The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. Automatic placement remains Enginebox follow-up work. Operator-selected same-Store integration and protected builds now execute through the Cloudflare fleet, with the current boundary described in [integration and CI](INTEGRATION-CI.md).
 
 ## Cloudflare control-plane delivery
 
@@ -153,7 +153,7 @@ CPU/RAM limits are the first resource contract. GPU contribution is a separate o
 
 Public multi-tenancy requires real tenant authorization and private account/state storage. The current single-owner controller and per-workspace native homes do not establish that guarantee. Shared writable `.claude`, `.codex` or Cursor state across unrelated users is prohibited. Moving a tenant's state between workspaces needs stable paths, exclusive writer leases and recovery tests; see [native state](TENANT-AGENT-STATE.md).
 
-Automatic placement, task/merge orchestration and engine-pool recipes are Enginebox work; their native execution gates remain incomplete. GPU memory restoration remains unqualified. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
+Automatic placement and engine-pool scheduling remain Enginebox work. Task/merge orchestration, protected engine recipes and review gates are implemented with same-Store/Godot qualification; cross-Store import and native Unity/Unreal validation remain incomplete. GPU memory restoration remains unqualified. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
 
 ## Checkout storage and large game assets
 
@@ -202,4 +202,4 @@ Delivery order: project registry and owned startup service; code updates that pr
 
 ## Shared integration and CI ownership
 
-[Integration and CI](INTEGRATION-CI.md) applies the Beanstalk principles within Enginebox: private task results, frozen batched candidates, protected full checks and conditional accepted-head promotion. The Cloudflare candidate gate is implemented and tested with a 100-change record; automatic batch composition, logical LayerFS merge/import, red-batch isolation and native engine validation remain Enginebox work. Gamejam consumes the APIs and presents application state; it does not own a second integration queue or CI authority.
+[Integration and CI](INTEGRATION-CI.md) applies the Beanstalk principles within Enginebox: private task results, frozen batched candidates, protected full checks and conditional accepted-head promotion. The Cloudflare candidate gate is tested with a 100-change record. A separate real two-task flow qualifies same-Store logical LayerFS integration, protected Godot Web/Linux builds, browser recording, CPU validation and reviewed batch promotion. Automatic batch composition, cross-Store import, red-batch isolation, native Unity/Unreal builds and engine-pool scheduling remain Enginebox work. Gamejam consumes the APIs and presents application state; it does not own a second integration queue or CI authority.
