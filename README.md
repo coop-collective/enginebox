@@ -12,8 +12,6 @@ The [product site and developer guide](packages/site/README.md) run locally with
 
 ## Quick start
 
-Requires Node 24+ and the pinned pnpm 12.14.0 (see [Local fleet](docs/LOCAL-FLEET.md) for Docker requirements).
-
 ### Run a local fleet (no Cloudflare account)
 
 Use Node 24+, pnpm 12.14.0 and Docker Compose with Linux containers on Linux, macOS or Windows (Docker Desktop/WSL2). No Cloudflare account is needed:
