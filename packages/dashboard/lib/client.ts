@@ -7,6 +7,41 @@ export class RequestError extends Error {
   }
 }
 
+const GENERIC_FAILURE = "The request failed. Try again.";
+
+export function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string" && err) return err;
+  return GENERIC_FAILURE;
+}
+
+/** Parses a response body without throwing; non-JSON bodies (e.g. a proxy's 502 HTML page) yield undefined. */
+export async function readJson(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+type ErrorBody = {
+  error?: unknown;
+  detail?: unknown;
+};
+
+export function failureMessage(data: unknown): string {
+  if (!data || typeof data !== "object") return GENERIC_FAILURE;
+  const { error, detail } = data as ErrorBody;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return typeof detail === "string" ? detail : GENERIC_FAILURE;
+}
+
 export async function api<T>(
   path: string,
   options: RequestInit = {},
@@ -17,14 +52,12 @@ export async function api<T>(
     credentials: "same-origin",
     cache: "no-store",
   });
-  const data = await response.json();
+  const data = await readJson(response);
   if (!response.ok)
+    throw new RequestError(failureMessage(data), response.status);
+  if (data === undefined)
     throw new RequestError(
-      typeof data.error === "string"
-        ? data.error
-        : (data.error?.message ??
-            data.detail ??
-            "The request failed. Try again."),
+      "The server returned an unreadable response. Try again.",
       response.status,
     );
   return data as T;
