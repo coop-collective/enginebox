@@ -66,7 +66,12 @@ def serve(control, seconds):
             src = directory_at(view, ['prepared', key])
             dest = directory_at(view, parts)
             # Refuse even an existing dangling symlink. Never overwrite a job's install.
-            assert 'node_modules' not in os.listdir(dest)
+            try:
+                os.stat('node_modules', dir_fd=dest, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError('Destination already contains dependencies')
             module = os.open('node_modules', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src)
             os.close(module)
             os.rename('node_modules', 'node_modules', src_dir_fd=src, dst_dir_fd=dest)

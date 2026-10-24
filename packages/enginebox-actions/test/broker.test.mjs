@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat, symlink, rename } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -36,9 +36,13 @@ test('root handoff protects approved bytes, refuses escaping/symlink targets and
     await rm(join(control, 'requests/restore.json')); await rm(join(control, 'restored.json'));
   }
   await request({ key, inputs: { ...inputs, workspace: dir }, source: dir }, false);
-  const link = join(root, 'work/repo/link'); await symlink(source, link);
-  await request({ key, inputs: { ...inputs, workspace: link }, source: link }, false);
+  await rename(source, `${source}-actual`); await symlink(`${source}-actual`, source);
+  await request({ key, inputs, source }, false);
+  await rm(source); await rename(`${source}-actual`, source);
   await request({ key, inputs: { ...inputs, policy: { scripts: 'run' } }, source }, false);
+  await mkdir(join(source, 'node_modules'));
+  await request({ key, inputs, source }, false);
+  await rm(join(source, 'node_modules'));
   const before = await stat(join(root, 'prepared', key, 'node_modules/fixture'));
   await request({ key, inputs, source }, true);
   const after = await stat(join(source, 'node_modules/fixture'));

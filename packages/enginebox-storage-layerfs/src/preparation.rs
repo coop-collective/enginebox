@@ -31,6 +31,48 @@ fn snapshot_digest(path: &Path, expected: &str, limit: u64) -> Result<u64> {
     Ok(bytes)
 }
 impl Runtime {
+    /// Check an already activated immutable base without rehydrating or rescanning its snapshot.
+    pub fn preparation_ready(
+        &self,
+        project: &str,
+        hash: &str,
+        key: &str,
+        revision: &str,
+        record_hash: &str,
+    ) -> Result<Value> {
+        identifier(project)?;
+        ensure!(
+            revision == crate::REVISION
+                && [hash, key, record_hash]
+                    .iter()
+                    .all(|v| crate::config::digest(v)),
+            "Invalid preparation identity"
+        );
+        self.root()?;
+        let _guard = state::lock(&self.config.root.join(".lock"), false)?;
+        self.bind_config()?;
+        if !self.project_dir(project).exists() {
+            return Ok(json!({"ok":true,"ready":false,"project":project,"key":key}));
+        }
+        let p = self.project(project)?;
+        let prior = state::read_json(&self.project_dir(project).join("preparation.json"))?;
+        ensure!(
+            p.status == "ready"
+                && prior["snapshot"] == hash
+                && prior["key"] == key
+                && prior["record"] == record_hash
+                && prior["revision"] == revision,
+            "Existing project is not this immutable preparation"
+        );
+        self.owned_volume(&p)?;
+        ensure!(
+            prior["main"]
+                == state::digest(&self.bridge(&p, "project-head", json!({"branch":"main"}), 30)?),
+            "Prepared main changed after activation"
+        );
+        Ok(json!({"ok":true,"ready":true,"project":project,"key":key}))
+    }
+
     pub fn preparation_restore(
         &self,
         project: &str,
@@ -252,6 +294,59 @@ if(Object.values(db.prepare('PRAGMA integrity_check').get())[0]!=='ok'||db.prepa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warm_inspection_distinguishes_absence_from_uncertain_or_different_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let runtime = Runtime {
+            config: serde_json::from_value(json!({
+                "schema":1,"root":base.join("state"),"sdk":base.join("sdk"),"daemon":base.join("daemon"),
+                "native_sha256":"a".repeat(64),"daemon_sha256":"b".repeat(64),"image":format!("sha256:{}", "c".repeat(64)),
+                "max_workspaces":2,"cpus_per_workspace":1,"memory_mib_per_workspace":1024,"disk_reserve_gib":1,"import_limit_gib":1,"pnpm_store":null,"pnpm_metadata":null
+            }))?,
+        };
+        let hash = "a".repeat(64);
+        let key = "b".repeat(64);
+        let record = "c".repeat(64);
+        assert!(
+            runtime
+                .preparation_ready("fixture", &hash, "invalid", crate::REVISION, &record)
+                .is_err()
+        );
+        assert!(!runtime.config.root.exists());
+        assert_eq!(
+            runtime.preparation_ready("fixture", &hash, &key, crate::REVISION, &record)?["ready"],
+            false
+        );
+        let directory = runtime.project_dir("fixture");
+        state::private_dir(&directory)?;
+        state::write_json(
+            &directory.join("project.json"),
+            &json!({"schema":1,"name":"fixture","volume":format!("ebox-lfs-{}", "d".repeat(32)),"owner":"d".repeat(32),"status":"uncertain","commit":hash,"approval":key,"source_only":true}),
+        )?;
+        state::write_json(
+            &directory.join("preparation.json"),
+            &json!({"schema":1,"snapshot":hash,"key":key,"revision":crate::REVISION,"record":record,"main":"e".repeat(64)}),
+        )?;
+        assert!(
+            runtime
+                .preparation_ready("fixture", &hash, &key, crate::REVISION, &record)
+                .unwrap_err()
+                .to_string()
+                .contains("immutable preparation")
+        );
+        let mut project = state::read_json(&directory.join("project.json"))?;
+        project["status"] = json!("ready");
+        state::write_json(&directory.join("project.json"), &project)?;
+        assert!(
+            runtime
+                .preparation_ready("fixture", &hash, &key, crate::REVISION, &"f".repeat(64))
+                .unwrap_err()
+                .to_string()
+                .contains("immutable preparation")
+        );
+        Ok(())
+    }
     #[test]
     fn activation_requires_exact_bytes_before_any_runtime_mutation() {
         let tmp = tempfile::tempdir().unwrap();

@@ -12,7 +12,7 @@ fleet volumes and GitHub runners were preserved.
 | Protected handoff | Disposable Linux read-only bind refuses writes; root helper rejects escaping/symlink/mismatched-policy targets; matching inode before/after proves a move without copying |
 | Lifecycle policy | `deny` is explicit; `run` executes the project's install lifecycle and never substitutes a prepared tree |
 | Fleet catalog | Owner approval, node denial, published-generation/record binding, immutable keys and revocation surviving Durable Object eviction |
-| Fleet transfer | Publication then hydration into an empty node cache, warm local data reuse, wrong repository/missing scope refusal, revocation during transfer prevents activation |
+| Fleet transfer | Publication then hydration into an empty node cache, warm local data reuse, active native bases skip snapshot reads, wrong repository/missing scope refusal, revocation during transfer prevents activation |
 | Native SDK | Linux arm64, upstream revision `968a5d0be0ea3e9456b06f9148b65523138e9490` built from a clean source archive with Rust 1.85.1; SQLite snapshot reopened with the product preparation bridge and its copied discovery record; missing record refused; independent branches preserve main and sibling data |
 
 The native test is

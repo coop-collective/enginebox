@@ -2,12 +2,12 @@ import { spawn } from 'node:child_process';
 import { mkdir, lstat, readFile, writeFile, rm } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { canonical, digest, identifier, requireThat, sha256, validatePreparation, type Preparation } from '@enginebox/fleet-protocol';
+import { canonical, digest, identifier, requireThat, sha256, validateGeneration, validatePreparation, type Preparation } from '@enginebox/fleet-protocol';
 import { Client } from './client.ts';
 import { Cache } from './cache.ts';
 import { Generations, type Published } from './generations.ts';
 
-export async function resolvePreparation(client: Client, generations: Generations, project: string, key: string, expected: Pick<Preparation, 'namespace' | 'repository' | 'trust' | 'image' | 'pnpm'>, activate: (snapshot: string, manifest: Published, preparation: Preparation) => Promise<void>) {
+export async function resolvePreparation(client: Client, generations: Generations, project: string, key: string, expected: Pick<Preparation, 'namespace' | 'repository' | 'trust' | 'image' | 'pnpm'>, activate: (snapshot: string, manifest: Published, preparation: Preparation) => Promise<void>, ready?: (manifest: Published, preparation: Preparation) => Promise<boolean>) {
   identifier(project); digest(key);
   requireThat(expected && Object.keys(expected).sort().join(',') === 'image,namespace,pnpm,repository,trust', 'Exact preparation scope required', 403);
   digest(expected.image);
@@ -16,9 +16,15 @@ export async function resolvePreparation(client: Client, generations: Generation
   const preparation = validatePreparation(await client.json(route));
   requireThat(preparation.project === project && preparation.key === key && Object.entries(expected).every(([k, v]) => preparation[k as keyof Preparation] === v), 'Preparation scope or image differs', 403);
   const published = await client.json<Published>(`/v1/projects/${project}/generations/${preparation.generation}`);
+  validateGeneration(published.manifest);
+  requireThat(published.manifest.project === project && await sha256(canonical(published.manifest)) === published.id, 'Preparation manifest identity differs', 409);
   requireThat(published.id === preparation.generation && published.manifest.metadata.preparationKey === key && published.manifest.metadata.preparationRecipe === preparation.recipe, 'Preparation generation differs', 409);
   requireThat(await sha256(Buffer.from(preparation.projectRecord, 'base64')) === published.manifest.metadata.projectRecordHash, 'Preparation discovery record differs', 409);
   const started = performance.now();
+  if (ready && await ready(published, preparation)) {
+    requireThat(canonical(await client.json(route)) === canonical(preparation), 'Preparation approval changed during inspection', 409);
+    return { preparation, hydrateAndActivateMs: performance.now() - started, stats: generations.stats, source: 'native-warm' };
+  }
   const snapshot = await generations.hydrate(project, preparation.generation);
   const pin = `${project}/${preparation.generation}`;
   generations.snapshots.active.add(pin);
@@ -27,15 +33,15 @@ export async function resolvePreparation(client: Client, generations: Generation
     requireThat(canonical(await client.json(route)) === canonical(preparation), 'Preparation approval changed during transfer', 409);
     await activate(snapshot, published, preparation);
   } finally { generations.snapshots.active.delete(pin); }
-  return { preparation, hydrateAndActivateMs: performance.now() - started, stats: generations.stats };
+  return { preparation, hydrateAndActivateMs: performance.now() - started, stats: generations.stats, source: 'hydrated' };
 }
 async function invoke(binary: string, argv: string[]) {
-  return await new Promise<void>((resolve, reject) => {
+  return await new Promise<Record<string, unknown>>((resolve, reject) => {
     const child = spawn(binary, argv, { stdio: ['ignore', 'pipe', 'ignore'], signal: AbortSignal.timeout(900_000) });
     let output = ''; child.stdout.on('data', data => { output += data; if (output.length > 256 * 1024) child.kill(); });
     child.once('error', reject);
     child.once('exit', code => {
-      try { requireThat(code === 0 && JSON.parse(output).ok === true, 'Native preparation activation failed; inspect its private receipt', 409); resolve(); }
+      try { const result = JSON.parse(output); requireThat(code === 0 && result.ok === true, 'Native preparation activation failed; inspect its private receipt', 409); resolve(result); }
       catch (e) { reject(e); }
     });
   });
@@ -63,6 +69,12 @@ async function main(path: string) {
       const record = join(lock, 'project.record');
       await writeFile(record, Buffer.from(preparation.projectRecord, 'base64'), { mode: 0o600, flag: 'wx' });
       await invoke(config.ebox, ['--host', 'local', 'storage', 'layerfs', '--config', config.layerfs, 'preparation-restore', config.localProject, '--snapshot', snapshot, '--snapshot-hash', published.manifest.snapshotHash, '--key', config.key, '--revision', metadata.layerfsRevision, '--record', record, '--record-hash', metadata.projectRecordHash!, '--credential-free']);
+    }, async (published) => {
+      const metadata = published.manifest.metadata;
+      requireThat(metadata.projectName === config.localProject && typeof metadata.layerfsRevision === 'string', 'Native preparation project/revision required', 409);
+      const value = await invoke(config.ebox, ['--host', 'local', 'storage', 'layerfs', '--config', config.layerfs, 'preparation-ready', config.localProject, '--snapshot-hash', published.manifest.snapshotHash, '--key', config.key, '--revision', metadata.layerfsRevision, '--record-hash', metadata.projectRecordHash!]);
+      requireThat(typeof value.ready === 'boolean' && value.project === config.localProject && value.key === config.key, 'Invalid native preparation inspection', 409);
+      return value.ready;
     });
     await writeFile(join(config.state, 'resolved.json'), canonical(result), { mode: 0o600 });
     await rm(lock, { recursive: true });

@@ -159,7 +159,9 @@ private and exclusive. The worker invokes this resolver before forking:
 node packages/fleet-node/src/preparation.ts /etc/enginebox/preparation-resolver.json
 ```
 
-The resolver checks approval/scope, hydrates verified SQLite chunks through the
+The resolver checks approval/scope and first calls native `preparation-ready`. An already activated base must match the approved snapshot/key/record/revision and unchanged main; it then skips snapshot hydration and full snapshot hashing. Missing state permits cold activation; uncertain or different state fails. Approval is checked again after inspection.
+
+On a cold node it hydrates verified SQLite chunks through the
 existing local/storage-origin/R2 path, rechecks revocation and invokes native
 `preparation-restore`. Native activation verifies snapshot and discovery bytes,
 SDK revision, SQLite integrity and prepared-tree shape, then copies into a **new

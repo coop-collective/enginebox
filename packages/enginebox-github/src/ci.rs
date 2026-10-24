@@ -552,7 +552,7 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
             ),
             (
                 "generate-jitconfig",
-                json!({"runner":{"id":501},"encoded_jit_config":"fixture-jit-config"}),
+                json!({"runner":{"id":501},"encoded_jit_config":"fixture-jit-config","expected_work_folder":if prepared {"/project/work"} else {"_work"}}),
             ),
             (
                 "/app/installations/2/access_tokens",

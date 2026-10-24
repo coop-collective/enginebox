@@ -24,6 +24,18 @@ enum Backend {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Verify an already activated immutable preparation without reading a transported snapshot.
+    PreparationReady {
+        project: String,
+        #[arg(long)]
+        snapshot_hash: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        record_hash: String,
+    },
     /// Explicitly activate an approved immutable dependency Store on a new node.
     PreparationRestore {
         project: String,
@@ -250,6 +262,13 @@ pub fn run(args: Storage) -> Result<Value> {
     }
     let runtime = Runtime::new(config)?;
     match command {
+        Command::PreparationReady {
+            project,
+            snapshot_hash,
+            key,
+            revision,
+            record_hash,
+        } => runtime.preparation_ready(&project, &snapshot_hash, &key, &revision, &record_hash),
         Command::PreparationRestore {
             project,
             snapshot,

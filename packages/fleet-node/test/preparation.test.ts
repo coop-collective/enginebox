@@ -58,6 +58,11 @@ test('approved dependency generation hydrates on an empty node; revocation and w
   const fetched = generations.stats.originFetches;
   await resolvePreparation(client, generations, 'fixture', key, expected, activate);
   assert.equal(generations.stats.originFetches, fetched); assert.equal(activated, 2);
+  const hydrate = generations.hydrate.bind(generations);
+  generations.hydrate = async () => { throw new Error('Warm native base must not rescan/hydrate a snapshot'); };
+  const warm = await resolvePreparation(client, generations, 'fixture', key, expected, activate, async () => true);
+  assert.equal(warm.source, 'native-warm'); assert.equal(activated, 2);
+  generations.hydrate = hydrate;
   await assert.rejects(resolvePreparation(client, generations, 'fixture', key, { ...expected, repository: '102' }, activate), /scope/);
   await assert.rejects(resolvePreparation(client, generations, 'fixture', key, {} as typeof expected, activate), /scope/);
   client.revokeAfter = client.reads + 1;

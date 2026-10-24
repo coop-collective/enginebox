@@ -78,7 +78,7 @@ if (process.argv[2] === 'rebuild') {
   const p = (values, q) => [...values].sort((a,b) => a-b)[Math.ceil(values.length*q)-1];
   const report = { node: process.version, pnpm: policy.pnpm, platform: process.platform, arch: process.arch, dependencyBytes: manifest.modules.bytes, runs: conventional.length, conventionalMs: { p50: p(conventional,.5), p95: p(conventional,.95), samples: conventional }, preparedMs: { p50: p(prepared,.5), p95: p(prepared,.95), samples: prepared }, speedup: p(conventional,.5)/p(prepared,.5), downloadedPackages: 0, correctness: true, includes: ['runtime/config/source fingerprint', protectedMode ? 'read-only generation verification and root handoff' : 'full dependency content scan', 'tree handoff', 'receipt'], excludes: ['VM provision', 'LayerFS fork/mount', 'checkout', 'generation transfer', 'build/test'] };
   const minimum = Number(process.env.BENCHMARK_MIN_SPEEDUP || '1.2');
-  assert(Number.isFinite(minimum) && minimum >= 1.0 && minimum <= 10);
+  assert(Number.isFinite(minimum) && minimum >= 1.2 && minimum <= 10);
   report.benefitQualified = report.speedup >= minimum && report.preparedMs.p95 < report.conventionalMs.p95;
   report.minimumSpeedup = minimum;
   await writeFile(join(root, `result-${process.argv[2] || 'baseline'}.json`), JSON.stringify(report, null, 2));
