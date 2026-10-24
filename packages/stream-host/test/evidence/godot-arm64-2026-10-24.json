@@ -1,0 +1,54 @@
+{
+  "date": "2026-10-24",
+  "platform": "linux/arm64 on Docker Desktop",
+  "profile": "Godot CPU software rendering; video-only",
+  "runtimeSource": "2d92d561f4b974d9918efe5c36d04575124824aa",
+  "localImage": "sha256:db2be6769cbada93cbe5bc0686c32f68fe1e72a749770c53c93d7212a9b4aae2",
+  "resources": {
+    "cpus": 4,
+    "memory": "4g",
+    "pids": 256
+  },
+  "authority": "Fresh local Wrangler Durable Objects and R2 bindings; local TURN relay",
+  "viewer": "Actual Gamejam Agents/viewer assets; Chromium via Playwright 1.64.1",
+  "viewers": [
+    {
+      "width": 1280,
+      "height": 720,
+      "localCandidate": "relay",
+      "remoteCandidate": "relay",
+      "measurement": {
+        "durationMs": 3242.468994140625,
+        "framesDecoded": 99,
+        "decodedFps": 30.532288875822754
+      }
+    },
+    {
+      "width": 1280,
+      "height": 720,
+      "localCandidate": "relay",
+      "remoteCandidate": "relay",
+      "measurement": {
+        "durationMs": 3243.77099609375,
+        "framesDecoded": 99,
+        "decodedFps": 30.520033664281137
+      }
+    }
+  ],
+  "checks": {
+    "identityRestartEpoch": 2,
+    "watchInputRejected": true,
+    "invalidCoordinatesRejected": true,
+    "leaseReclaimed": true,
+    "revocationClosed": true
+  },
+  "actualNativeInputVisible": true,
+  "ownerTokenInBrowser": false,
+  "controllerStopped": true,
+  "privateConnectionAndStateRemoved": true,
+  "limitations": [
+    "The FPS measurement is browser decoded video, not aggregate native render FPS.",
+    "The CPU fixture does not qualify arbitrary project performance, audio, or GPU passthrough.",
+    "This receipt is the local ARM64 image; architecture-specific CI receipts are separate."
+  ]
+}
