@@ -189,7 +189,14 @@ pub fn execute_at(node: &Node, request: &Request, root: &Path) -> Result<Value> 
             cmd
         }
     };
-    cmd.arg(script)
+    // Windows canonical paths use the \\?\ prefix, which PowerShell's
+    // RemoteSigned authorization can misclassify as a remote script. Resolve
+    // our fixed sibling script from the workspace without changing host policy.
+    let script_argument = match shell {
+        Shell::Pwsh => Path::new("..").join("job.ps1"),
+        Shell::Bash => script,
+    };
+    cmd.arg(script_argument)
         .env("ENGINEBOX_SHA", &request.sha)
         .env("ENGINEBOX_REQUEST_ID", &request.request_id)
         .env(
