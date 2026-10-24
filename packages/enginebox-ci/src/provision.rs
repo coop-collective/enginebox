@@ -110,7 +110,31 @@ fn checked_path(prefix: &Path, path: &str) -> Result<PathBuf> {
         resolved.starts_with(prefix.canonicalize()?),
         "Toolchain path escapes installation"
     );
-    Ok(resolved)
+    command_path(&resolved)
+}
+// Rust canonical Windows paths use a verbatim prefix. PowerShell's script
+// authorization/discovery does not consistently accept that prefix in PATH.
+// Convert only when the ordinary spelling resolves to the exact same entry.
+fn command_path(path: &Path) -> Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    #[cfg(windows)]
+    {
+        let value = canonical
+            .to_str()
+            .context("Toolchain paths must be Unicode on Windows")?;
+        let ordinary = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{unc}"))
+        } else {
+            PathBuf::from(value.strip_prefix(r"\\?\").unwrap_or(value))
+        };
+        ensure!(
+            ordinary.canonicalize()? == canonical,
+            "Toolchain path changes meaning without its verbatim prefix"
+        );
+        Ok(ordinary)
+    }
+    #[cfg(not(windows))]
+    Ok(canonical)
 }
 /// Installed paths are private to one manifest digest and may not escape it.
 pub fn environment(command: &mut Command, template: &Template, prefix: &Path) -> Result<()> {
@@ -125,7 +149,7 @@ pub fn environment(command: &mut Command, template: &Template, prefix: &Path) ->
     }
     command
         .env("PATH", std::env::join_paths(paths)?)
-        .env("ENGINEBOX_TOOLCHAIN", prefix);
+        .env("ENGINEBOX_TOOLCHAIN", command_path(prefix)?);
     for (key, value) in &template.environment {
         command.env(key, checked_path(prefix, value)?);
     }
@@ -169,8 +193,8 @@ fn script(
     // A relative script avoids PowerShell's verbatim Windows path authorization bug.
     command
         .arg(format!("./{file_name}"))
-        .env("ENGINEBOX_TOOLCHAIN", prefix)
-        .env("ENGINEBOX_ASSETS_DIR", prefix.join("assets"));
+        .env("ENGINEBOX_TOOLCHAIN", command_path(prefix)?)
+        .env("ENGINEBOX_ASSETS_DIR", command_path(prefix)?.join("assets"));
     if with_environment {
         environment(&mut command, template, prefix)?;
     }

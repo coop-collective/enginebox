@@ -23,7 +23,15 @@ fn installed_toolchain_is_reused_verified_and_available_to_a_real_build() {
     let root = tmp.path().join("worker");
     let request = install(template(), 'a');
     let outcome = provision::install_at(&request, &root).unwrap();
-    assert!(outcome.ok, "{outcome:?}");
+    if !outcome.ok {
+        let diagnostic = std::fs::read_to_string(
+            root.join("templates/fixture-toolchain")
+                .join(request.manifest.digest())
+                .join(&request.attempt)
+                .join("error.json"),
+        );
+        panic!("Fixture install failed: {outcome:?}; {diagnostic:?}");
+    }
     let receipt = outcome.receipt.unwrap();
     receipt.validate(&request.node, &request.manifest).unwrap();
     let directory = root
