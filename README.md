@@ -14,7 +14,7 @@ The [product site and developer guide](packages/site/README.md) run locally with
 
 ### Run a local fleet (no Cloudflare account)
 
-Use Node 24+, pnpm 12.14.0 and Docker Compose with Linux containers on Linux, macOS or Windows (Docker Desktop/WSL2). No Cloudflare account is needed:
+Use Node 24+, pnpm 12.15.0 and Docker Compose with Linux containers on Linux, macOS or Windows (Docker Desktop/WSL2). No Cloudflare account is needed:
 
 ```sh
 pnpm install --frozen-lockfile

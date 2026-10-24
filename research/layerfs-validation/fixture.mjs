@@ -8,7 +8,7 @@ mkdirSync(join(root, 'src'));
 mkdirSync(join(root, 'files'));
 writeFileSync(join(root, 'README.md'), 'Engine Box disposable LayerFS fixture. No private source or credentials.\n');
 writeFileSync(join(root, '.gitignore'), 'node_modules/\ndist/\n*.tsbuildinfo\n');
-writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'enginebox-layerfs-fixture', private: true, version: '1.0.0', packageManager: 'pnpm@12.14.0', devDependencies: { typescript: '5.9.3' } }, null, 2));
+writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'enginebox-layerfs-fixture', private: true, version: '1.0.0', packageManager: 'pnpm@12.15.0', devDependencies: { typescript: '5.9.3' } }, null, 2));
 writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { composite: true, removeComments: true, outDir: 'dist', target: 'ES2022', module: 'CommonJS' }, include: ['src/**/*.ts'] }, null, 2));
 writeFileSync(join(root, 'src/index.ts'), 'export const answer: number = 42;\n');
 writeFileSync(join(root, 'mtime-sentinel.txt'), 'unchanged content for explicit mtime-only commit probe\n');
