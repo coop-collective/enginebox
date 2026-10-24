@@ -458,12 +458,36 @@ export default {
           const { assignment: a, body } = await assignmentBody(request, p);
           requireThat(typeof body.ok === "boolean", "Result status required");
           requireThat(body.result !== undefined, "Result body required");
-          const job = await env.PROJECTS.getByName(a.project).finish(
-            a,
-            canonical(body.result),
-            body.ok,
-          );
-          await stub.finish(a, canonical(body.result));
+          const authority = env.PROJECTS.getByName(a.project),
+            result = canonical(body.result);
+          let job;
+          try {
+            job = await authority.finish(a, result, body.ok);
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : "Completion failed";
+            const status =
+              error instanceof ProtocolError
+                ? error.status
+                : Number(message.match(/\[EBOX (\d{3})\]/)?.[1]);
+            if (![400, 409].includes(status)) throw error;
+            const recorded = await authority.job(a.id);
+            if (
+              !recorded ||
+              !["completed", "failed"].includes(recorded.status) ||
+              recorded.assignment?.node !== a.node ||
+              recorded.assignment.epoch !== a.epoch ||
+              recorded.assignment.session !== a.session ||
+              recorded.assignment.attempt !== a.attempt ||
+              recorded.result !== result ||
+              (recorded.status === "completed") !== body.ok
+            )
+              throw error;
+            // The executor result is durable. A later queue/promotion conflict
+            // must not keep already-exited native work occupying a fleet slot.
+            job = await authority.noteCompletionError(a, message);
+          }
+          await stub.finish(a, result);
           return json(job);
         }
       }

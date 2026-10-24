@@ -362,6 +362,7 @@ type JobRecord = {
   status: "queued" | "assigned" | "completed" | "failed";
   assignment?: Assignment;
   result?: string;
+  followupError?: string;
 };
 type Decision = {
   id: string;
@@ -1119,7 +1120,11 @@ export class Project extends State {
         409,
       );
     }
-    if (job.spec.kind === "media-finalize")
+    if (
+      job.spec.kind === "media-finalize" &&
+      (ok ||
+        this.recordingState().get(job.spec.recording)?.state === "finalizing")
+    )
       this.recordingState().complete(
         job.spec.recording,
         JSON.parse(result),
@@ -1139,6 +1144,23 @@ export class Project extends State {
       const recording = this.recordingState().get(job.spec.recording);
       if (recording) await this.promoteReviewed(recording.candidate);
     }
+    return job;
+  }
+  async noteCompletionError(assignment: Assignment, message: string) {
+    const key = `job:${assignment.id}`,
+      job = this.get<JobRecord>(key);
+    requireThat(
+      job &&
+        ["completed", "failed"].includes(job.status) &&
+        job.assignment?.node === assignment.node &&
+        job.assignment.epoch === assignment.epoch &&
+        job.assignment.session === assignment.session &&
+        job.assignment.attempt === assignment.attempt,
+      "Completion acknowledgment changed",
+      409,
+    );
+    job.followupError = message.slice(0, 500);
+    this.put(key, job);
     return job;
   }
   async interrupt(assignment: Assignment) {

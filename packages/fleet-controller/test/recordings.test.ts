@@ -550,3 +550,102 @@ it("refuses a published alternate recipe as evidence for the protected release a
     f.build.id,
   ]);
 });
+
+it("confirmed media interruption leaves a terminal recording rather than endless finalization", async () => {
+  const f = await fixture(),
+    chunk = "input",
+    digest = await sha256(chunk),
+    path = "projects/demo/recordings/recording-one";
+  await ok(`${path}/chunks/0`, chunk, f.app, "PUT", {
+    "x-chunk-sha256": digest,
+    "x-recording-segment": "0",
+  });
+  await ok(
+    `${path}/finish`,
+    {
+      operationId: "finish",
+      outcome: "pass",
+      feedback: "",
+      segments: [{ index: 0, chunks: [0], durationMs: 1000, offsetMs: 0 }],
+      durationMs: 1000,
+      bytes: chunk.length,
+    },
+    f.app,
+  );
+  const { assignment } = await ok("node/poll", {}, f.executor);
+  expect(assignment.kind).toBe("media-finalize");
+  await ok("nodes/media-worker/reconcile", { assignment, stopped: true });
+  const failed = await ok(path, undefined, f.app);
+  expect(failed.state).toBe("failed");
+  expect(failed.media).toBeNull();
+});
+
+it("acknowledges an exited worker when later promotion fails, preserving a visible retryable error", async () => {
+  const f = await fixture(),
+    input = {
+      operationId: "approve-before-check",
+      expectedRevision: f.task.revision,
+    };
+  expect((await ok("projects/demo/tasks/task-one/approve", input)).status).toBe(
+    "testing",
+  );
+  // Simulate lost artifact metadata after a valid build, so the subsequent
+  // check completes but its promotion callback must refuse acceptance.
+  await runInDurableObject(env.PROJECTS.getByName("demo"), (instance) =>
+    instance.remove(`artifact:${f.build.id}`),
+  );
+  await greenCheck(f);
+  const job = await ok("projects/demo/jobs/verify-full");
+  expect(job.status).toBe("completed");
+  expect(job.followupError).toMatch(/published artifact/);
+  expect((await ok("projects/demo")).head).toBeNull();
+  expect((await ok("node/poll", {}, f.ordinary)).assignment).toBeNull();
+  await runInDurableObject(env.PROJECTS.getByName("demo"), (instance) =>
+    instance.put(`artifact:${f.build.id}`, f.build),
+  );
+  expect((await ok("projects/demo/tasks/task-one/approve", input)).status).toBe(
+    "shipped",
+  );
+});
+
+it("releases a failed media executor after retention without resurrecting expired evidence", async () => {
+  const f = await fixture(),
+    chunk = "input",
+    digest = await sha256(chunk),
+    path = "projects/demo/recordings/recording-one";
+  await ok(`${path}/chunks/0`, chunk, f.app, "PUT", {
+    "x-chunk-sha256": digest,
+    "x-recording-segment": "0",
+  });
+  await ok(
+    `${path}/finish`,
+    {
+      operationId: "finish",
+      outcome: "pass",
+      feedback: "",
+      segments: [{ index: 0, chunks: [0], durationMs: 1000, offsetMs: 0 }],
+      durationMs: 1000,
+      bytes: chunk.length,
+    },
+    f.app,
+  );
+  const { assignment } = await ok("node/poll", {}, f.executor),
+    authority = env.PROJECTS.getByName("demo");
+  await runInDurableObject(authority, (instance) => {
+    const value = instance.get<Recording>("recording:recording-one")!;
+    value.expiresAt = 0;
+    instance.put("recording:recording-one", value);
+  });
+  await runDurableObjectAlarm(authority);
+  expect(
+    (
+      await ok(
+        "node/finish",
+        { assignment, ok: false, result: { error: "Expired media input" } },
+        f.executor,
+      )
+    ).status,
+  ).toBe("failed");
+  expect((await ok(path, undefined, f.app)).state).toBe("expired");
+  expect((await ok("node/poll", {}, f.executor)).assignment).toBeNull();
+});
