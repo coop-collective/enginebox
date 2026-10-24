@@ -50,25 +50,7 @@ pub fn command(
     Ok(cmd)
 }
 pub fn stop(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGTERM);
-    }
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let deadline = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    enginebox_core::transport::kill_process_group(child, Duration::from_millis(250));
 }
 #[cfg(unix)]
 pub fn raw_pipe<T: std::os::fd::AsRawFd>(pipe: &T) -> usize {

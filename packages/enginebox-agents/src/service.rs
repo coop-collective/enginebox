@@ -331,7 +331,7 @@ impl AgentService {
             Ok(m) => {
                 let expiry = m["expires_at"].as_f64();
                 if let Some(expiry) = expiry {
-                    result["expires_at"] = json!(iso(expiry));
+                    result["expires_at"] = json!(usage::iso(expiry));
                 }
                 result["delegation_status"] = json!(if self.refresh_blocked(p).unwrap_or(true)
                     || expiry.is_some_and(|e| e <= chrono::Utc::now().timestamp() as f64)
@@ -737,7 +737,7 @@ impl AgentService {
                 result["generation"] = request["generation"].clone();
                 result["refresh_credentials"] = json!(false);
                 if let Some(expiry) = expiry {
-                    result["expires_at"] = json!(iso(expiry));
+                    result["expires_at"] = json!(usage::iso(expiry));
                 }
                 let id = delivered["instance_id"]
                     .as_str()
@@ -1187,9 +1187,6 @@ impl AgentService {
 }
 fn active_session(v: &Value) -> bool {
     ["starting", "waiting"].contains(&v["status"].as_str().unwrap_or(""))
-}
-fn iso(n: f64) -> Option<String> {
-    chrono::DateTime::from_timestamp(n as i64, 0).map(|d| d.to_rfc3339())
 }
 fn receipt_key(host: &str, name: &str) -> String {
     use sha2::{Digest, Sha256};
