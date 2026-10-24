@@ -247,6 +247,8 @@ importers:
 
   packages/enginebox-install: {}
 
+  packages/environment-service: {}
+
   packages/fleet-controller:
     dependencies:
       '@enginebox/fleet-protocol':
