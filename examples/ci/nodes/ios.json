@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "ios-builder",
+  "target": "builder@ios-node.example.invalid",
+  "os": "macos",
+  "architecture": "arm64",
+  "image": "macos-15-xcode",
+  "capabilities": [
+    "xcode"
+  ]
+}

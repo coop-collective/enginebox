@@ -95,6 +95,10 @@ Report individual operation timings and resource conditions. Separate pause/resu
 
 ## Optional CI slice
 
+The experimental [CI execution module](CI.md) now supplies a dedicated native build-node registry, capability-matched shell automations, GitHub workflow dispatch/status/cancellation, an official ephemeral runner adapter, and iOS/Android/Windows/Linux example templates. The merge/LayerFS integration can submit the common trigger envelope; it does not depend on a forge service. Request IDs prevent duplicate submissions and unfinished triggers are never automatically replayed after restart. A successful workflow dispatch is distinct from a successful build.
+
+Default execution uses dedicated CI capacity, with one concurrent job per worker. Registration and placement reject configured agent-host targets. Do not share physical resources through aliases or VM placement and assume labels provide isolation. Shared agent/CI capacity requires enforced CPU/RAM/storage reservations and qualification before it becomes an option. This implementation does not complete P5: live native runners, cross-platform image provisioning, signing, compatible caches and performance measurements below remain open.
+
 First support one native GitHub Actions runner and one representative build/test workflow. Runner registration is explicit and token input is transient. Use compatible versioned tools and persistent caches with separate working directories; keep runner maintenance aware of active jobs.
 
 Benchmark the same commit/resources with a cold cache and repeated warm runs. Include dependency/toolchain invalidation, a known failing test, cache removal/recovery, job cancellation and an agent workspace running alongside CI. Use test cache namespaces and workflows without deployment/signing side effects. Measure queue/preparation/build/test time, failures, disk use and resource contention; do not infer savings solely from cache size.

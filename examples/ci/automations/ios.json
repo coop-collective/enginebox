@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "request_id": "merge-COMMIT-ios",
+  "event": "merge",
+  "sha": "0000000000000000000000000000000000000000",
+  "job": {
+    "runner": "automation",
+    "runs-on": [
+      "self-hosted",
+      "enginebox",
+      "macos",
+      "image:macos-15-xcode",
+      "xcode"
+    ],
+    "checkout": {
+      "url": "https://github.com/your-org/your-app.git"
+    },
+    "shell": "bash",
+    "run": "xcodebuild -project App.xcodeproj -scheme App -configuration Release -sdk iphonesimulator -destination \"generic/platform=iOS Simulator\" -derivedDataPath build CODE_SIGNING_ALLOWED=NO build\nmkdir -p dist\nditto -c -k --sequesterRsrc --keepParent build/Build/Products/Release-iphonesimulator dist/ios-simulator.zip",
+    "artifacts": [
+      "dist/ios-simulator.zip"
+    ],
+    "timeout-minutes": 60
+  }
+}

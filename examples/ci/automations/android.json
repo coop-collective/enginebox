@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "request_id": "merge-COMMIT-android",
+  "event": "merge",
+  "sha": "0000000000000000000000000000000000000000",
+  "job": {
+    "runner": "automation",
+    "runs-on": [
+      "self-hosted",
+      "enginebox",
+      "linux",
+      "image:ubuntu-24.04-android",
+      "android-sdk",
+      "jdk-17"
+    ],
+    "checkout": {
+      "url": "https://github.com/your-org/your-app.git"
+    },
+    "shell": "bash",
+    "run": "./gradlew --no-daemon assembleDebug testDebugUnitTest",
+    "artifacts": [
+      "app/build/outputs/apk/debug"
+    ],
+    "timeout-minutes": 60
+  }
+}

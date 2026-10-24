@@ -1,4 +1,5 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
+pub mod ci;
 pub mod jobs;
 pub mod storage;
 
@@ -43,7 +44,14 @@ impl Mode {
 struct Runtime {
     agents: AgentService,
     jobs: jobs::Jobs,
+    ci_jobs: jobs::Jobs,
     storage: storage::Storage,
+    ci: ci::Ci,
+}
+impl Runtime {
+    fn pending_jobs(&self) -> usize {
+        self.jobs.pending() + self.ci_jobs.pending()
+    }
 }
 struct Gate {
     mode: Mode,
@@ -107,7 +115,7 @@ impl Controller {
                 && gate
                     .runtime
                     .as_ref()
-                    .is_none_or(|r| r.jobs.pending() == 0 && r.agents.pending() == 0),
+                    .is_none_or(|r| r.pending_jobs() == 0 && r.agents.pending() == 0),
             "Controller has not drained"
         );
         let owner = enginebox_core::state::lock(&self.root.join("controller-owner.lock"), false)
@@ -132,7 +140,19 @@ impl Controller {
         let runtime = Runtime {
             agents: AgentService::new(&self.root, self.fleet.clone())?,
             jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
+            // Older controller releases prune their ordinary job history. Keep
+            // CI deduplication records outside that directory across rollback.
+            ci_jobs: jobs::Jobs::open(&self.root.join("ci-jobs"))?,
             storage: storage::Storage::open(&self.root, self.fleet.clone())?,
+            ci: ci::Ci::open(
+                &self.root,
+                &self
+                    .fleet
+                    .hosts()
+                    .into_iter()
+                    .map(|host| host.target)
+                    .collect::<Vec<_>>(),
+            )?,
         };
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -183,7 +203,7 @@ impl Controller {
         let pending = g
             .runtime
             .as_ref()
-            .map_or(0, |r| r.jobs.pending() + r.agents.pending());
+            .map_or(0, |r| r.pending_jobs() + r.agents.pending());
         if g.requests == 0 && g.background == 0 && pending == 0 {
             g.owner.take();
             g.mode = Mode::Drained;
@@ -192,7 +212,7 @@ impl Controller {
     }
     pub fn status(&self) -> Value {
         let g = self.gate.lock().unwrap();
-        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.jobs.pending()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION")})
+        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.pending_jobs()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION")})
     }
     pub fn start_background(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
@@ -449,6 +469,11 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "fleet"] => c.fleet.summary(),
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
+        ["v1", "ci"] => Ok(c.runtime()?.ci.catalog()),
+        ["v1", "ci", "github", owner, repo, "runs", run] => {
+            enginebox_ci::github::Github::from_env()?
+                .status(&format!("{owner}/{repo}"), run.parse()?)
+        }
         ["v1", "agents"] => c.runtime()?.agents.status(),
         ["v1", "agent-runs"] => Ok(c.runtime()?.agents.list_runs()),
         ["v1", "agents", provider, "usage"] => {
@@ -457,7 +482,10 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "agents", provider, "sessions", session] => {
             Ok(json!({"session":c.runtime()?.agents.session(provider,session)?}))
         }
-        ["v1", "jobs", id] => Ok(json!({"job":c.runtime()?.jobs.get(id)?})),
+        ["v1", "jobs", id] => {
+            let runtime = c.runtime()?;
+            Ok(json!({"job":runtime.jobs.get(id).or_else(|_| runtime.ci_jobs.get(id))?}))
+        }
         ["v1", "hosts", host, "instances", name, "agent-runs", id] => {
             Ok(json!({"run":c.runtime()?.agents.get_run(host,name,id)?}))
         }
@@ -492,6 +520,19 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
     let runtime = c.runtime()?;
     let mut code = StatusCode::OK;
     let v = match p.as_slice() {
+        ["v1", "ci", "nodes"] => blocking(move || runtime.ci.register(body)).await?,
+        ["v1", "ci", "plan"] => runtime.ci.plan(&serde_json::from_value(body)?)?,
+        ["v1", "ci", "runs"] => {
+            code = StatusCode::ACCEPTED;
+            json!({"job":runtime.ci.submit(&runtime.ci_jobs, serde_json::from_value(body)?)?})
+        }
+        ["v1", "ci", "github", owner, repo, "runs", run, "cancel"] => {
+            empty(&body)?;
+            let repository = format!("{owner}/{repo}");
+            let run = run.parse()?;
+            blocking(move || enginebox_ci::github::Github::from_env()?.cancel(&repository, run))
+                .await?
+        }
         ["v1", "storage", "hosts", host, operation] => {
             let plan = runtime.storage.plan(host, operation, &body)?;
             let operation = plan.operation.clone();
@@ -692,6 +733,57 @@ mod tests {
         assert_eq!(
             app.oneshot(browser).await.unwrap().status(),
             StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn ci_routes_require_auth_and_obey_controller_activation_and_drain() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        let node = json!({"schema_version":1,"id":"mac-builder","target":"builder@dedicated-ci.example","os":"macos","architecture":"arm64","image":"xcode-v1","capabilities":["xcode"]}).to_string();
+        let trigger = json!({"schema_version":1,"request_id":"merge-ios","event":"merge","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["macos","xcode"],"shell":"bash","run":"true","timeout-minutes":1}}).to_string();
+        for path in ["/v1/ci/nodes", "/v1/ci/plan", "/v1/ci/runs"] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, &trigger, false))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::POST, "/v1/ci/nodes", &node, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        c.activate().unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::POST, "/v1/ci/nodes", &node, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, "/v1/ci/plan", &trigger, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(value["node_id"], "mac-builder");
+        c.drain();
+        assert_eq!(
+            app.oneshot(request(Method::POST, "/v1/ci/runs", &trigger, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
     #[tokio::test]
@@ -945,29 +1037,35 @@ mod tests {
     }
     #[tokio::test]
     async fn drain_waits_for_admitted_jobs_and_timeout_can_resume_old_owner() {
-        let (_temp, c) = setup();
-        c.activate().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        c.runtime()
-            .unwrap()
-            .jobs
-            .submit("worker", "test", "ebox-test", move || {
-                receive.recv().unwrap();
-                Ok(json!({"done":true}))
-            })
+        for ci in [false, true] {
+            let (_temp, c) = setup();
+            c.activate().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let runtime = c.runtime().unwrap();
+            let jobs = if ci { &runtime.ci_jobs } else { &runtime.jobs };
+            jobs.submit(
+                "worker",
+                if ci { "ci_automation" } else { "test" },
+                "ebox-test",
+                move || {
+                    receive.recv().unwrap();
+                    Ok(json!({"done":true}))
+                },
+            )
             .unwrap();
-        assert_eq!(c.drain()["drained"], false);
-        assert!(c.admit().is_err());
-        c.activate().unwrap();
-        assert_eq!(c.status()["accepting_mutations"], true);
-        send.send(()).unwrap();
-        while c.runtime().unwrap().jobs.pending() > 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(c.drain()["drained"], false);
+            assert!(c.admit().is_err());
+            c.activate().unwrap();
+            assert_eq!(c.status()["accepting_mutations"], true);
+            send.send(()).unwrap();
+            while c.runtime().unwrap().pending_jobs() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let request = c.admit().unwrap();
+            assert_eq!(c.drain()["drained"], false);
+            drop(request);
+            assert_eq!(c.drain()["drained"], true);
         }
-        let request = c.admit().unwrap();
-        assert_eq!(c.drain()["drained"], false);
-        drop(request);
-        assert_eq!(c.drain()["drained"], true);
     }
 
     #[tokio::test]

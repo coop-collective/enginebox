@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod ci;
 pub mod tasks;
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
@@ -107,6 +108,30 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 }
 pub fn tools() -> Vec<Value> {
     vec![
+        tool(
+            "ci_nodes",
+            "List registered build workers and their declared OS/image/toolchain capabilities.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "ci_register",
+            "Register an authorized, already provisioned dedicated CI node. Does not install an OS image.",
+            json!({"manifest":{"type":"object"}}),
+            &["manifest"],
+        ),
+        tool(
+            "ci_plan",
+            "Resolve a non-agent CI trigger without executing it.",
+            json!({"request":{"type":"object"}}),
+            &["request"],
+        ),
+        tool(
+            "ci_trigger",
+            "Trigger a shell automation or GitHub workflow once per request_id; poll fleet_job. GitHub dispatch is not build success.",
+            json!({"request":{"type":"object"}}),
+            &["request"],
+        ),
         tool(
             "fleet_inventory",
             "List configured hosts, capacity budgets, prepared templates and workspaces.",
@@ -292,6 +317,20 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         );
     }
     let result = match name {
+        "ci_nodes" => ("/v1/ci".into(), None),
+        "ci_register" => {
+            let node: enginebox_ci::Node = serde_json::from_value(args["manifest"].clone())?;
+            node.validate()?;
+            ("/v1/ci/nodes".into(), Some(serde_json::to_value(node)?))
+        }
+        "ci_plan" | "ci_trigger" => {
+            let request: enginebox_ci::Request = serde_json::from_value(args["request"].clone())?;
+            request.validate()?;
+            (
+                format!("/v1/ci/{}", if name == "ci_plan" { "plan" } else { "runs" }),
+                Some(serde_json::to_value(request)?),
+            )
+        }
         "fleet_inventory" => ("/v1/fleet".into(), None),
         "template_catalog" => ("/v1/templates".into(), None),
         "agent_connections" => ("/v1/agents".into(), None),
@@ -616,7 +655,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            22
+            26
         );
     }
     #[test]

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "request_id": "merge-COMMIT-ios",
+  "event": "merge",
+  "sha": "0000000000000000000000000000000000000000",
+  "job": {
+    "runner": "github-actions",
+    "repository": "your-org/your-app",
+    "workflow": "ios.yml",
+    "ref": "main",
+    "inputs": {}
+  }
+}
