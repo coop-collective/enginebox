@@ -2,6 +2,7 @@
 pub mod ci;
 mod ci_templates;
 pub mod contributors;
+mod environment;
 pub mod jobs;
 pub mod storage;
 

@@ -265,6 +265,18 @@ pub fn tools() -> Vec<Value> {
             &["host_id"],
         ),
         tool(
+            "storage_dev_start",
+            "Bootstrap or retry the project's dev environment from its accepted LayerFS .enginebox/config.json. Poll fleet_job, then storage_dev_status for readiness and URLs.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"}}),
+            &["host_id", "project"],
+        ),
+        tool(
+            "storage_dev_status",
+            "Read project bootstrap readiness, errors and dev URLs. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"}}),
+            &["host_id", "project"],
+        ),
+        tool(
             "storage_github_settings",
             "Inspect a LayerFS project's main revision and optional GitHub delivery state; set enabled to change outbound synchronization. Poll fleet_job.",
             json!({"host_id":{"type":"string"},"project":{"type":"string"},"enabled":{"type":"boolean"}}),
@@ -290,7 +302,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "storage_github_import",
-            "Import a reviewed GitHub tree into LayerFS without Git metadata. LayerFS owns subsequent main revisions. Poll fleet_job.",
+            "Import a reviewed GitHub tree into LayerFS without Git metadata and queue repo-defined dev bootstrap when configured. Poll fleet_job, then storage_dev_status for dev readiness.",
             json!({"host_id":{"type":"string"},"project":{"type":"string"},"revision":{"type":"string"},"approval":{"type":"string"},"credential_free":{"type":"boolean","const":true}}),
             &[
                 "host_id",
@@ -435,7 +447,9 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         "agent_connections" => ("/v1/agents".into(), None),
         "agent_runs" => ("/v1/agent-runs".into(), None),
         "storage_catalog" => ("/v1/storage".into(), None),
-        "storage_inspect"
+        "storage_dev_start"
+        | "storage_dev_status"
+        | "storage_inspect"
         | "storage_preview"
         | "storage_import"
         | "storage_fork"
@@ -450,6 +464,14 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         | "storage_github_delivery" => {
             let mut body = json!({});
             let operation = match name {
+                "storage_dev_start" | "storage_dev_status" => {
+                    body = json!({"project": storage_id(args, "project")?});
+                    if name == "storage_dev_start" {
+                        "dev-start"
+                    } else {
+                        "dev-status"
+                    }
+                }
                 "storage_inspect" => {
                     let operation = args
                         .get("operation")
@@ -832,7 +854,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            36
+            38
         );
     }
     #[test]
@@ -870,6 +892,22 @@ mod tests {
     }
     #[test]
     fn storage_tools_preserve_review_and_do_not_expose_shell_or_paths() {
+        for (tool, operation) in [
+            ("storage_dev_start", "dev-start"),
+            ("storage_dev_status", "dev-status"),
+        ] {
+            let (path, body) =
+                tool_request(tool, &json!({"host_id":"worker","project":"app"})).unwrap();
+            assert_eq!(path, format!("/v1/storage/hosts/worker/{operation}"));
+            assert_eq!(body.unwrap(), json!({"project":"app"}));
+            assert!(
+                tool_request(
+                    tool,
+                    &json!({"host_id":"worker","project":"app","image":"untrusted"})
+                )
+                .is_err()
+            );
+        }
         let (path, body) = tool_request("storage_prepare", &json!({"host_id":"worker","project":"game","name":"ebox-agent","template":"native","size":"minimum"})).unwrap();
         assert_eq!(path, "/v1/storage/hosts/worker/prepare");
         assert_eq!(body.unwrap()["name"], "ebox-agent");

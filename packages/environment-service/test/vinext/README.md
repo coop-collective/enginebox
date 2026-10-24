@@ -27,3 +27,12 @@ are framework behavior, not evidence of an environment process restart.
 Independently probe HTTP and compare dev process/container
 identities across the promotion. Use only a disposable project; real projects need
 an appropriate access policy for their dev server and local simulator.
+
+## Repository bootstrap
+
+The tracked `.enginebox/config.json` selects `.enginebox/templates/web-dev.json`.
+Importing this fixture through a controller configured for project bootstrap
+installs its pinned runtime and packages, starts `pnpm dev`, and publishes the
+named HTTP port after readiness. Engine Box supplies `ENGINEBOX_PUBLIC_HOST` for
+the framework's allowed-host and public HMR settings. See
+[project config](../../../../docs/PROJECT-CONFIG.md) for operator setup.

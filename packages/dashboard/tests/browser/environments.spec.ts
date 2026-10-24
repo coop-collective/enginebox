@@ -11,6 +11,9 @@ test('persistent service status and authenticated HTTP/UDP route management use 
   await page.getByRole('navigation', { name: 'Control plane' }).getByRole('button', { name: 'Environments', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Live environments', exact: true })).toBeVisible();
   await expect(page.getByRole('article', { name: 'Environment main' })).toContainText('Serving');
+  await expect(page.getByRole('article', { name: 'Project dev demo', exact: true })).toContainText('Serving');
+  await expect(page.getByRole('link', { name: 'Open demo', exact: true })).toHaveAttribute('href', 'https://demo.dev.example.com');
+  await expect(page.getByRole('article', { name: 'Project dev failed-app', exact: true })).toContainText('setup-failed');
   await page.getByLabel('Route name', { exact: true }).fill('main-web');
   await page.getByLabel('Environment', { exact: true }).selectOption('main');
   await page.getByLabel('Service', { exact: true }).selectOption('web');
