@@ -1,5 +1,6 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
 pub mod ci;
+mod ci_templates;
 pub mod jobs;
 pub mod storage;
 
@@ -229,6 +230,10 @@ impl Controller {
                 };
                 let controller = this.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(r) = &runtime {
+                        // Queue CI work; installers run in their own execution pool.
+                        let _ = r.ci.reconcile(&r.ci_jobs);
+                    }
                     let _ = controller.fleet.reconcile();
                     if let Some(r) = runtime {
                         let _ = r.agents.reconcile();
@@ -428,6 +433,8 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     }
     let maximum = if path == "/v1/templates" {
         1024 * 1024
+    } else if path == "/v1/ci/templates" {
+        65536
     } else {
         16384
     };
@@ -470,6 +477,7 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
         ["v1", "ci"] => Ok(c.runtime()?.ci.catalog()),
+        ["v1", "ci", "templates"] => Ok(c.runtime()?.ci.template_catalog()),
         ["v1", "ci", "github", owner, repo, "runs", run] => {
             enginebox_ci::github::Github::from_env()?
                 .status(&format!("{owner}/{repo}"), run.parse()?)
@@ -520,7 +528,47 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
     let runtime = c.runtime()?;
     let mut code = StatusCode::OK;
     let v = match p.as_slice() {
-        ["v1", "ci", "nodes"] => blocking(move || runtime.ci.register(body)).await?,
+        ["v1", "ci", "nodes"] => {
+            blocking(move || {
+                let result = runtime.ci.register(body)?;
+                let _ = runtime.ci.reconcile(&runtime.ci_jobs);
+                Ok(result)
+            })
+            .await?
+        }
+        ["v1", "ci", "templates"] => {
+            keys(&body, &["manifest"], &["manifest"])?;
+            blocking(move || {
+                runtime
+                    .ci
+                    .register_template(serde_json::from_value(body["manifest"].clone())?)?;
+                let _ = runtime.ci.reconcile(&runtime.ci_jobs);
+                Ok(runtime.ci.template_catalog())
+            })
+            .await?
+        }
+        [
+            "v1",
+            "ci",
+            "templates",
+            id,
+            action @ ("enable" | "disable" | "retry"),
+        ] => {
+            let id = id.to_string();
+            let action = action.to_string();
+            blocking(move || {
+                if action == "retry" {
+                    keys(&body, &["node"], &["node"])?;
+                    runtime.ci.retry_template(&id, string(&body, "node")?)?;
+                } else {
+                    empty(&body)?;
+                    runtime.ci.enable_template(&id, action == "enable")?;
+                }
+                let _ = runtime.ci.reconcile(&runtime.ci_jobs);
+                Ok(runtime.ci.template_catalog())
+            })
+            .await?
+        }
         ["v1", "ci", "plan"] => runtime.ci.plan(&serde_json::from_value(body)?)?,
         ["v1", "ci", "runs"] => {
             code = StatusCode::ACCEPTED;
@@ -741,7 +789,15 @@ mod tests {
         let app = router(c.clone());
         let node = json!({"schema_version":1,"id":"mac-builder","target":"builder@dedicated-ci.example","os":"macos","architecture":"arm64","image":"xcode-v1","capabilities":["xcode"]}).to_string();
         let trigger = json!({"schema_version":1,"request_id":"merge-ios","event":"merge","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["macos","xcode"],"shell":"bash","run":"true","timeout-minutes":1}}).to_string();
-        for path in ["/v1/ci/nodes", "/v1/ci/plan", "/v1/ci/runs"] {
+        for path in [
+            "/v1/ci/nodes",
+            "/v1/ci/plan",
+            "/v1/ci/runs",
+            "/v1/ci/templates",
+            "/v1/ci/templates/example/enable",
+            "/v1/ci/templates/example/disable",
+            "/v1/ci/templates/example/retry",
+        ] {
             assert_eq!(
                 app.clone()
                     .oneshot(request(Method::POST, path, &trigger, false))
@@ -751,14 +807,20 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
-        assert_eq!(
-            app.clone()
-                .oneshot(request(Method::POST, "/v1/ci/nodes", &node, true))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        for path in [
+            "/v1/ci/nodes",
+            "/v1/ci/templates",
+            "/v1/ci/templates/example/enable",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, &node, true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
         c.activate().unwrap();
         assert_eq!(
             app.clone()
@@ -778,6 +840,20 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
         assert_eq!(value["node_id"], "mac-builder");
         c.drain();
+        for path in [
+            "/v1/ci/templates",
+            "/v1/ci/templates/example/enable",
+            "/v1/ci/templates/example/retry",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::POST, path, "{}", true))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
         assert_eq!(
             app.oneshot(request(Method::POST, "/v1/ci/runs", &trigger, true))
                 .await

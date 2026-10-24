@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "node24-macos-x64",
+  "label": "Node.js 24.22.1 (macos x64)",
+  "revision": 1,
+  "os": "macos",
+  "architecture": "x64",
+  "image": "node-24.22.1",
+  "capabilities": [
+    "node-24"
+  ],
+  "minimum": {
+    "cpu": 1,
+    "memory_mib": 256,
+    "disk_mib": 512
+  },
+  "shell": "bash",
+  "assets": [
+    {
+      "name": "node-archive",
+      "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-darwin-x64.tar.gz",
+      "sha256": "d132557e7ee2b85af08b0c8c34338e65c6430f2238d01f727728ef42dc83b035",
+      "max_bytes": 134217728
+    }
+  ],
+  "install": "mkdir toolchain\ntar -xzf \"$ENGINEBOX_ASSETS_DIR/node-archive\" -C toolchain --strip-components=1",
+  "verify": [
+    {
+      "capability": "node-24",
+      "run": "./toolchain/bin/node --version",
+      "expected_stdout": "v24.22.1"
+    }
+  ],
+  "paths": [
+    "toolchain/bin"
+  ],
+  "timeout_minutes": 10
+}

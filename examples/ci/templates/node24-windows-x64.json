@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "node24-windows-x64",
+  "label": "Node.js 24.22.1 (windows x64)",
+  "revision": 1,
+  "os": "windows",
+  "architecture": "x64",
+  "image": "node-24.22.1",
+  "capabilities": [
+    "node-24",
+    "pwsh"
+  ],
+  "minimum": {
+    "cpu": 1,
+    "memory_mib": 256,
+    "disk_mib": 512
+  },
+  "shell": "pwsh",
+  "assets": [
+    {
+      "name": "node-archive",
+      "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-win-x64.zip",
+      "sha256": "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5",
+      "max_bytes": 134217728
+    }
+  ],
+  "install": "Copy-Item -LiteralPath ./assets/node-archive -Destination ./node.zip\nExpand-Archive -LiteralPath ./node.zip -DestinationPath .\nMove-Item -LiteralPath ./node-v24.22.1-win-x64 -Destination ./toolchain\nRemove-Item ./node.zip",
+  "verify": [
+    {
+      "capability": "node-24",
+      "run": "& ./toolchain/node.exe --version",
+      "expected_stdout": "v24.22.1"
+    },
+    {
+      "capability": "pwsh",
+      "run": "if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw 'PowerShell 7.3+ required' }; Write-Output 'pwsh-ready'",
+      "expected_stdout": "pwsh-ready"
+    }
+  ],
+  "paths": [
+    "toolchain"
+  ],
+  "timeout_minutes": 10
+}

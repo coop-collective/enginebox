@@ -274,6 +274,21 @@ test("template registration alone accepts larger manifests up to one MiB", async
   assert.equal(fetch.mock.callCount(), 1);
 });
 
+test("CI template proxy admits only catalog and authenticated bounded mutations", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ ok: true }));
+  for (const [method, path] of [
+    ["GET", "v1/ci/templates"], ["POST", "v1/ci/templates"],
+    ["POST", "v1/ci/templates/node-linux/enable"], ["POST", "v1/ci/templates/node-linux/disable"],
+    ["POST", "v1/ci/templates/node-linux/retry"],
+  ]) assert.equal((await proxy(request(undefined, method, method === "POST" ? {} : undefined), path.split("/"))).status, 200);
+  assert.equal(fetch.mock.callCount(), 5);
+  for (const path of ["v1/ci/templates/node-linux/delete", "v1/ci/templates/node-linux/enable/extra", "v1/ci/runs"])
+    await assert.rejects(proxy(request(undefined, "POST", {}), path.split("/")), (err: unknown) => err instanceof HttpError && err.status === 404);
+  await assert.rejects(proxy(request(undefined, "POST", { manifest: "x".repeat(65536) }), ["v1", "ci", "templates"]), (err: unknown) => err instanceof HttpError && err.status === 413);
+  await assert.rejects(proxy(request(undefined, "GET", undefined, false), ["v1", "ci", "templates"]), (err: unknown) => err instanceof HttpError && err.status === 401);
+  assert.equal(fetch.mock.callCount(), 5);
+});
+
 test("native account proxy routes stay scoped to known providers and session operations", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () =>
     Response.json({ ok: true }),

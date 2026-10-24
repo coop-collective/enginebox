@@ -27,14 +27,17 @@ excludes a concurrent Engine Box-managed GitHub runner. Jobs on different nodes
 can run concurrently. CI has its own four execution slots and 32 pending-job
 limit, separate from workspace lifecycle operations, so a full CI queue does not
 block agent create/resume admission. Registering two SSH usernames for one hostname does not add capacity.
-No CPU/RAM budget, cgroup or hypervisor admission is implied by this registry.
+Template installation checks available CPU, RAM (including Linux cgroup memory)
+and disk before changing a worker. This is a point-in-time admission check, not
+an enforced CPU/RAM budget, disk quota or hypervisor reservation.
 Shared agent/CI hosts require a future implementation of enforceable reservations
 and workload isolation; they are not an opt-in switch in this slice.
 
 ## Prepare and register a worker
 
 Each worker is an already provisioned Linux, macOS or Windows OS with `ebox`, Git,
-its build toolchain, and Bash or PowerShell 7.3+. A worker may itself be a VM.
+and Bash or PowerShell 7.3+. Supply its build toolchain manually or enable a
+managed toolchain template as described below. A worker may itself be a VM.
 The `image` field identifies the installed recipe/revision. It does not provision
 or emulate an OS. macOS jobs require macOS workers and Windows jobs require
 Windows workers; the executable rejects an OS or architecture mismatch.
@@ -61,12 +64,86 @@ rejected when the fleet already uses a local agent host.
 OS, architecture, `image:<revision>` and explicit capabilities such as `xcode`,
 `android-sdk`, `jdk-17`, `cmake`, `msvc`, or `pwsh`. If multiple nodes match, specify
 `job.node`; there is no load-aware placement yet. Mark a manifest `disabled: true`
-and re-register it to prevent new placements. Already admitted jobs retain their
-selected registration; disable does not cancel them.
+and re-register it to prevent new placements. Queued jobs recheck registration
+before starting; a disabled or changed node fails that queued attempt. Running
+jobs continue.
 
 The catalog reports `health: not_probed` and `capabilities_verified: false`.
 An operator's label is not a successful build qualification. An unreachable or
 misconfigured worker fails its job; it is never silently replaced with an agent host.
+
+## Enable and synchronize CI toolchain templates
+
+The owner registers a versioned toolchain manifest, then enables it. Enabling
+queues installation on every compatible, enabled dedicated CI node, including
+nodes registered later. Compatibility requires the exact native OS and
+architecture. The controller checks desired state on registration/change and
+periodically while active; a standby or draining controller starts no new work.
+Installations use the CI queue and the same per-target and worker file locks as
+builds, keeping agent queue capacity separate. An independently running Actions
+listener that already owns the worker lock causes a visible busy failure; retry
+after that listener exits.
+
+```sh
+ebox ci template-register --manifest examples/ci/templates/node24-linux-x64.json
+ebox ci template-enable node24-linux-x64
+ebox ci templates
+ebox ci template-retry node24-linux-x64 --node linux-builder
+ebox ci template-disable node24-linux-x64
+```
+
+The dashboard's **Templates → CI toolchain templates** panel has the same JSON
+import, enable/disable, per-node status and retry controls. New recipes start
+disabled. Changed recipes require a higher revision; an enabled recipe stays
+enabled and synchronizes the update automatically. Identical registration and
+enable requests are idempotent. Recipes and their scripts are owner-authored
+trusted code; do not import scripts you have not reviewed.
+
+Recipes install into private, immutable-version directories under
+`ENGINEBOX_CI_ROOT/templates/<id>/<manifest-digest>/<attempt>`. HTTPS assets require
+SHA-256 and download size bounds. All downloads finish and verify before the
+installer runs. Scripts run as the dedicated worker account with a private HOME
+and a restricted environment; they receive `ENGINEBOX_TOOLCHAIN` and
+`ENGINEBOX_ASSETS_DIR`. Nothing installs through sudo or modifies a global PATH.
+These are native trusted processes, so host/VM isolation still supplies security
+and resource enforcement. Declared download hashes do not restrict network calls
+made by an owner-authored installer itself.
+
+Every declared capability needs an executable probe with exact expected stdout.
+Only successful probes produce a receipt tied to the full manifest and node
+registration. The CI template catalog reports `ready` and
+`capabilities_verified: true` only for that matching receipt. Require it in an
+automation with `job.template: "node24-linux-x64"`; `runs-on` then matches the
+template's verified capabilities and image, plus the node's actual OS and
+architecture. Plans include the selected template revision and manifest digest.
+Queued jobs recheck the binding, and every managed build re-runs the probes under
+the worker lock before checkout/execution. Jobs without `job.template` retain
+the manually prepared-node behavior. GitHub Actions dispatch and independently
+launched listeners do not consume managed template bindings automatically.
+
+Minimum CPU, available RAM and free disk are checked before installation, with a
+256 MiB disk reserve beyond the recipe minimum. Budget for both compressed assets
+and expanded files. These checks do not reserve capacity against unrelated host
+processes; scripts run within the configured 1–120 minute deadline and bounded
+output. Capacity, download, installer and verification failures remain visible
+per node. Bounded diagnostic details stay in private `*.error.json`/`error.json`
+files on that worker; the API exposes phase codes instead of script output.
+
+Failures are never silently replayed. Inspect the worker before explicitly
+retrying; each retry uses a fresh attempt directory. A controller restart marks
+uncertain queued/installing attempts failed and re-verifies earlier ready
+installations without replaying their installers. Disabling a template stops
+new placements and queued starts, and lets running jobs finish. Disabling,
+upgrading and retrying retain old files; cleanup is an operator maintenance task.
+
+Both controller and worker must have this version of `ebox`; `ebox ci inspect`
+reports `template_installation: 1`. The existing forced SSH command
+`ebox ci execute` handles the bounded installation protocol. Older workers fail
+visibly and need upgrading. Template installation does not create OS images,
+accept licenses, install signing identities or register GitHub Actions listeners.
+The [pinned example recipes](../examples/ci/templates) install Node on Linux,
+macOS and Windows; Xcode, Android SDK, JDK and MSVC prerequisites for the existing
+platform builds remain owner-prepared or require corresponding owner recipes.
 
 ## Trigger format and merge handoff
 
@@ -231,6 +308,10 @@ All endpoints use the existing owner authentication and controller drain gate.
 |---|---|
 | `GET /v1/ci` | Capabilities and runner catalog |
 | `POST /v1/ci/nodes` | Register/update a native node manifest |
+| `GET /v1/ci/templates` | Desired toolchains and per-node readiness/failures |
+| `POST /v1/ci/templates` | Register `{ "manifest": ... }`, initially disabled |
+| `POST /v1/ci/templates/{id}/enable` or `/disable` | Set desired enablement with `{}` |
+| `POST /v1/ci/templates/{id}/retry` | Retry a failed installation with `{ "node": "id" }` |
 | `POST /v1/ci/plan` | Validate and resolve a request |
 | `POST /v1/ci/runs` | Submit an idempotent trigger; returns existing fleet job |
 | `GET /v1/jobs/{id}` | Durable trigger/automation result |
@@ -238,12 +319,15 @@ All endpoints use the existing owner authentication and controller drain gate.
 | `POST /v1/ci/github/{owner}/{repo}/runs/{id}/cancel` | Request GitHub cancellation |
 
 Operator MCP adds `ci_nodes`, `ci_register`, `ci_plan`, `ci_trigger`, with
-`fleet_job` for results. Node execution uses the bounded `ebox ci execute` stdin
+`fleet_job` for results. Toolchains add `ci_templates`, `ci_template_register`,
+`ci_template_enable` (boolean `enabled`) and `ci_template_retry`.
+Node execution uses the bounded `ebox ci execute` stdin
 protocol through SSH. CI does not change native provider account delegation.
 
 Tests cover matching, dedicated-host fencing, CI queue isolation, native shell success/failure,
 artifact retention/escapes, request deduplication/restart, HTTP authentication and
-draining, and mock GitHub dispatch/status/cancel responses. `actionlint` checks the
+draining, pinned toolchain install/probe/build/retry/restart, later-node
+synchronization, dashboard controls, and mock GitHub dispatch/status/cancel responses. `actionlint` checks the
 four workflows. Live signed mobile builds, Windows worker execution, official
 runner registration, image provisioning, cache benchmarks and real GitHub
 dispatch remain separate qualification; local tests do not establish them.

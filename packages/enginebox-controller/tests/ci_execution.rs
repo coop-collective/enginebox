@@ -6,6 +6,8 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+#[path = "../../enginebox-ci/tests/support/mod.rs"]
+mod template_fixture;
 
 struct Server {
     child: Child,
@@ -77,6 +79,155 @@ impl Server {
         let response = request.bearer_auth("x".repeat(32)).send().unwrap();
         (response.status().as_u16(), response.json().unwrap())
     }
+    fn template_state(&self, expected: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let catalog = self.request("/v1/ci/templates", None).1;
+            let state = &catalog["templates"][0]["nodes"][0];
+            if state["status"] == expected {
+                return catalog;
+            }
+            assert!(
+                state["status"] != "failed" || expected == "failed",
+                "Installation unexpectedly failed: {catalog}"
+            );
+            assert!(Instant::now() < deadline, "Expected {expected}: {catalog}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn enabled_templates_install_on_later_nodes_gate_builds_and_reverify_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("fleet.toml"),
+        "schema_version=1\n[[hosts]]\nid='agents'\ntarget='agent@agent-host'\n",
+    )
+    .unwrap();
+    let server = Server::start(tmp.path());
+    let recipe = template_fixture::template();
+    let node = serde_json::to_value(template_fixture::node()).unwrap();
+    let recipe_value = serde_json::to_value(&recipe).unwrap();
+    let path = "/v1/ci/templates/fixture-toolchain";
+    let registered = server.request("/v1/ci/templates", Some(&json!({"manifest":recipe_value})));
+    assert_eq!(registered.0, 200, "{registered:?}");
+    assert_eq!(registered.1["templates"][0]["enabled"], false);
+    assert_eq!(
+        server
+            .request(&format!("{path}/enable"), Some(&json!({})))
+            .0,
+        200
+    );
+    let mut trigger = json!({"schema_version":1,"request_id":"managed-build-1","event":"merge","sha":"a".repeat(40),"job":{"runner":"automation","template":"fixture-toolchain","runs-on":["enginebox","fixture-tool"],"shell":if cfg!(windows){"pwsh"}else{"bash"},"run":"ebox-fixture","timeout-minutes":1}});
+    assert_eq!(server.request("/v1/ci/plan", Some(&trigger)).0, 400);
+    // Enabling before any worker exists still drives installation on registration.
+    assert_eq!(server.request("/v1/ci/nodes", Some(&node)).0, 200);
+    let ready = server.template_state("ready");
+    assert_eq!(
+        ready["templates"][0]["nodes"][0]["capabilities_verified"],
+        true
+    );
+    assert!(!ready.to_string().contains("agent@"));
+    let plan = server.request("/v1/ci/plan", Some(&trigger));
+    assert_eq!(plan.0, 200, "{plan:?}");
+    assert_eq!(plan.1["template"]["revision"], 1);
+    let (status, run) = server.request("/v1/ci/runs", Some(&trigger));
+    assert_eq!(status, 202, "{run}");
+    let id = run["job"]["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let result = server.request(&format!("/v1/jobs/{id}"), None).1;
+        if result["job"]["status"] == "succeeded" {
+            assert_eq!(
+                result["job"]["result"]["stdout"].as_str().unwrap().trim(),
+                "fixture-1"
+            );
+            break;
+        }
+        assert_ne!(result["job"]["status"], "failed", "{result}");
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let receipt_path = tmp
+        .path()
+        .join("worker/templates/fixture-toolchain")
+        .join(recipe.digest())
+        .join("receipt.json");
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        server
+            .request(&format!("{path}/disable"), Some(&json!({})))
+            .0,
+        200
+    );
+    assert_eq!(server.request("/v1/ci/plan", Some(&trigger)).0, 400);
+    assert!(receipt_path.is_file());
+    assert_eq!(
+        server
+            .request(&format!("{path}/enable"), Some(&json!({})))
+            .0,
+        200
+    );
+    server.template_state("ready");
+    drop(server);
+    let server = Server::start(tmp.path());
+    server.template_state("ready");
+    let observed: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(
+        observed["installation"], receipt["installation"],
+        "Restart must probe without replaying installer"
+    );
+    let mut disabled_node = node.clone();
+    disabled_node["disabled"] = json!(true);
+    let before_disable =
+        server.template_state("ready")["templates"][0]["nodes"][0]["job_id"].clone();
+    assert_eq!(server.request("/v1/ci/nodes", Some(&disabled_node)).0, 200);
+    assert_eq!(server.request("/v1/ci/plan", Some(&trigger)).0, 400);
+    assert_eq!(server.request("/v1/ci/nodes", Some(&node)).0, 200);
+    let reenabled = server.template_state("ready");
+    assert_ne!(
+        reenabled["templates"][0]["nodes"][0]["job_id"], before_disable,
+        "Returning to an earlier node registration must reverify with a new attempt identity"
+    );
+    // A new revision invalidates old readiness; installer failure is durable and explicit.
+    let mut broken = recipe_value.clone();
+    broken["revision"] = json!(2);
+    broken["install"] = json!("exit 1");
+    assert_eq!(
+        server
+            .request("/v1/ci/templates", Some(&json!({"manifest":broken})))
+            .0,
+        200
+    );
+    let failed = server.template_state("failed");
+    assert_eq!(
+        failed["templates"][0]["nodes"][0]["error"],
+        "installation-failed"
+    );
+    assert_eq!(server.request("/v1/ci/plan", Some(&trigger)).0, 400);
+    let old_job = failed["templates"][0]["nodes"][0]["job_id"].clone();
+    assert_eq!(
+        server
+            .request(&format!("{path}/retry"), Some(&json!({"node":"fixture"})))
+            .0,
+        200
+    );
+    let retried = server.template_state("failed");
+    assert_ne!(retried["templates"][0]["nodes"][0]["job_id"], old_job);
+    let mut corrected = recipe_value;
+    corrected["revision"] = json!(3);
+    assert_eq!(
+        server
+            .request("/v1/ci/templates", Some(&json!({"manifest":corrected})))
+            .0,
+        200
+    );
+    server.template_state("ready");
+    // Desired enabled state survives revision updates, and the prior version remains on disk.
+    assert!(receipt_path.is_file());
+    trigger["request_id"] = json!("managed-build-2");
+    assert_eq!(server.request("/v1/ci/plan", Some(&trigger)).0, 200);
 }
 
 #[test]
