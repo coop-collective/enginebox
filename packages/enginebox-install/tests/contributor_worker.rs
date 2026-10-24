@@ -211,8 +211,10 @@ async fn windows_enrollment_runs_legacy_ci_refuses_host_agents_then_revokes() {
     assert!(!root.join("installation/work/agents/agent-proof").exists());
     // Revocation must terminate a running native job and its detached descendant.
     let pid_file = root.join("descendant.pid");
+    // File existence must mean Set-Content has closed the complete PID; otherwise
+    // the observer can read an empty or partial value before revoking the job.
     let script = format!(
-        "$p=Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 90') -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Start-Sleep -Seconds 90",
+        "$p=Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 90') -PassThru; Set-Content -LiteralPath '{0}.pending' -Value $p.Id; Move-Item -LiteralPath '{0}.pending' -Destination '{0}'; Start-Sleep -Seconds 90",
         pid_file.to_string_lossy().replace("'", "''")
     );
     api(&client,&url,&path,Some(json!({"request_id":"revoke-proof","kind":"ci","request":{"schema_version":1,"request_id":"revoke-proof","event":"workflow_dispatch","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["windows","pwsh"],"shell":"pwsh","run":script,"artifacts":[],"timeout-minutes":1}}}))).await;
