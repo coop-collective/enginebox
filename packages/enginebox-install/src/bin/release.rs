@@ -116,6 +116,7 @@ fn main() -> Result<()> {
     let mut binaries = vec![
         "ebox".to_string(),
         "enginebox-controller".into(),
+        "enginebox-ci-worker".into(),
         "enginebox-supervisor".into(),
         "enginebox-install".into(),
         "enginebox-host".into(),

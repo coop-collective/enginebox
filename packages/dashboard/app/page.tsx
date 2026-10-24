@@ -11,6 +11,7 @@ import type {
 } from "@/lib/types";
 import { api, RequestError } from "@/lib/client";
 import { TemplateCatalog } from "@/components/template-catalog";
+import { GitHubPanel } from "@/components/github-panel";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
@@ -26,6 +27,7 @@ const bytes = (value?: number) =>
     : "—";
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
+  github: { title: "GitHub", description: "Connect repositories and run GitHub Actions on your infrastructure.", icon: "terminal" },
   fleet: {
     title: "Fleet overview",
     description: "Manage your machines and give every workspace room to build.",
@@ -682,6 +684,7 @@ export default function Dashboard() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const loading = useRef(false);
   useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("panel") === "github") setSection("github");
     api<{ authenticated: boolean }>("/api/session")
       .then((data) => setSession(data.authenticated ? "ready" : "login"))
       .catch((err) => {
@@ -882,7 +885,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates", "storage"] as const)
+          {(["fleet", "agents", "templates", "storage", "github"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1031,6 +1034,7 @@ export default function Dashboard() {
                   </button>
                 </div>
               )}
+              {section === "github" && <GitHubPanel />}
               {section === "agents" && (
                 <AgentsPanel close={() => navigate("fleet")} />
               )}

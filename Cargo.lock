@@ -363,6 +363,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "enginebox-ci"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "enginebox-core",
+ "enginebox-storage-layerfs",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "enginebox-cli"
 version = "0.3.0"
 dependencies = [
@@ -388,6 +401,7 @@ dependencies = [
  "clap",
  "enginebox-agents",
  "enginebox-core",
+ "enginebox-github",
  "fs2",
  "http-body-util",
  "libc",
@@ -419,6 +433,23 @@ dependencies = [
  "tempfile",
  "toml",
  "toml_edit",
+ "url",
+ "uuid",
+ "wait-timeout",
+]
+
+[[package]]
+name = "enginebox-github"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "enginebox-core",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
  "url",
  "uuid",
  "wait-timeout",

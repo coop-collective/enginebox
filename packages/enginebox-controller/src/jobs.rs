@@ -167,9 +167,15 @@ impl Jobs {
                 }
                 Err(_) => {
                     v["status"] = json!("failed");
-                    v["error"] = json!(
-                        "Fleet operation failed; inspect the workspace and controller diagnostics before retrying."
-                    );
+                    v["error"] = if v["operation"] == "github_sync" {
+                        json!(
+                            "Repository sync failed. Check GitHub access, the selected branch, uncommitted files and diverged history before retrying."
+                        )
+                    } else {
+                        json!(
+                            "Fleet operation failed; inspect the workspace and controller diagnostics before retrying."
+                        )
+                    };
                 }
             }
             v["duration_seconds"] = json!(started.elapsed().as_secs_f64());

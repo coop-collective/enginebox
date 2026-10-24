@@ -1,6 +1,6 @@
 # Implementation plan
 
-Updated October 20, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
+Updated October 24, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
 
 ## Milestones
 
@@ -38,6 +38,8 @@ LayerFS now has compatibility-checked, durable allocation preparation and conser
 - `packages/enginebox-core`: validated configuration, SSH/Incus transport, conservative capacity, bootstrap, guest preparation, templates, fresh warm pools and host capability inventory.
 - `packages/enginebox-agents`: original CLI installation, central native credentials, access-only delegation, bounded native runs and exact resume, usage observations, private browser/computer tools.
 - `packages/enginebox-controller`: authenticated REST, private durable jobs, reconciliation and exclusive controller ownership.
+- `packages/enginebox-github`: optional GitHub App OAuth, selected private Git pull/push, signed workflow job inbox and bounded organization JIT provisioning.
+- `packages/enginebox-ci`: disposable native Actions runner worker with reserved Incus cloning and optional private LayerFS attachment; live workflow acceptance remains open.
 - `packages/enginebox-cli`: operator terminal and fleet MCP access.
 - `packages/enginebox-install`: immutable native release artifacts, checksum-verified installation, platform service plans, supervised upgrade and compatible rollback.
 - `packages/enginebox-storage-layerfs`: first-class checkout storage with pinned node-local execution, stable project paths, immutable pnpm reuse and file checkpoints. Controller registration and bounded API/MCP jobs expose the backend. Private provider homes and RAM snapshots retain separate contracts; see [backend scope and limits](LAYERFS-BACKEND.md).
@@ -94,6 +96,8 @@ Cover these behaviors:
 Report individual operation timings and resource conditions. Separate pause/resume, hibernate/wake, disk fork and cold readiness. A mostly idle single measurement is not a general startup guarantee.
 
 ## Optional CI slice
+
+Implemented October 24: repository App OAuth with PKCE/refresh, selected-repo picker, explicit controller-checkout pull/push, separate runner administration App, signed/durable workflow job admission, bounded JIT provisioning, drain and restart uncertainty, disposable Incus worker, optional private LayerFS forks, dashboard controls and offline regression coverage. See [GitHub Actions](GITHUB-ACTIONS.md). P5 remains partial until real OAuth and a successful disposable workflow, cancellation, crash/recovery and benchmark qualification pass. Automatic VM repo assignment, missed-event backfill, old-runner replacement automation, distributed cache placement/replication and private CI retention cleanup remain unimplemented.
 
 First support one native GitHub Actions runner and one representative build/test workflow. Runner registration is explicit and token input is transient. Use compatible versioned tools and persistent caches with separate working directories; keep runner maintenance aware of active jobs.
 

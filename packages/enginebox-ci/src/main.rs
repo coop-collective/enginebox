@@ -1,0 +1,324 @@
+//! Administrator-provisioned, one-shot Incus worker. All workflow execution is native GitHub runner execution.
+use anyhow::{Context, Result, ensure};
+use clap::Parser;
+use enginebox_core::{
+    Fleet, Resources, capacity, capacity::inventory, operation_lock, state, transport::shell_quote,
+};
+use enginebox_storage_layerfs::{
+    Runtime as LayerRuntime, config::Config as LayerConfig, incus::Target,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Run one native GitHub Actions runner in a disposable Engine Box CI VM"
+)]
+struct Args {
+    #[arg(long)]
+    config: PathBuf,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    schema: u32,
+    fleet: PathBuf,
+    state_root: PathBuf,
+    host_id: String,
+    template: String,
+    resources: Resources,
+    /// Exact official runner version installed in the credential-free template.
+    runner_version: String,
+    /// Optional Linux-node-local LayerFS adapter and approved per-repository bases.
+    layerfs: Option<PathBuf>,
+    #[serde(default)]
+    projects: BTreeMap<String, PreparedProject>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedProject {
+    project: String,
+    from: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    schema: u32,
+    name: String,
+    job_id: u64,
+    repository: String,
+    jitconfig: String,
+    timeout_seconds: u64,
+}
+fn validate(request: &Request, config: &Config) -> Result<()> {
+    ensure!(
+        request.schema == 1 && config.schema == 1 && request.job_id > 0,
+        "Unsupported worker request"
+    );
+    enginebox_core::identifier(&request.name, true)?;
+    ensure!(
+        request.name.starts_with("ebox-ci-") && uuid::Uuid::parse_str(&request.name[8..]).is_ok(),
+        "Use a unique disposable CI name"
+    );
+    ensure!(
+        (60..=21600).contains(&request.timeout_seconds)
+            && (1..=65536).contains(&request.jitconfig.len())
+            && request
+                .jitconfig
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b)),
+        "Invalid JIT input"
+    );
+    ensure!(
+        config.runner_version.split('.').count() == 3
+            && config
+                .runner_version
+                .split('.')
+                .all(|p| p.parse::<u32>().is_ok()),
+        "Pin an official runner version"
+    );
+    config.resources.validate(None)?;
+    Ok(())
+}
+fn run(config: Config, request: Request) -> Result<Value> {
+    validate(&request, &config)?;
+    state::private_dir(&config.state_root)?;
+    let receipts = config.state_root.join("ci-receipts");
+    state::private_dir(&receipts)?;
+    let receipt_path = receipts.join(format!("{}.json", request.name));
+    ensure!(
+        !receipt_path.try_exists()?,
+        "Worker request already has a receipt; inspect instead of replaying"
+    );
+    let _lease = state::lock(&receipts.join(format!("{}.lock", request.name)), false)?;
+    let fleet = Fleet::load(&config.fleet, &config.state_root)?;
+    let host = fleet.host(&config.host_id)?;
+    ensure!(
+        host.project.starts_with("enginebox-ci-") && host.target == "local",
+        "CI worker requires a dedicated enginebox-ci-* project on the local Linux node"
+    );
+    ensure!(
+        host.warm_pools.is_empty(),
+        "CI workers use fresh clones, not agent reserves"
+    );
+    let bx = host.engine_box();
+    let started = Instant::now();
+    let mut receipt = json!({"schema":1,"name":request.name,"job_id":request.job_id,"repository":request.repository,"status":"preparing","runner_version":config.runner_version,"cleaned":false});
+    state::write_json(&receipt_path, &receipt)?;
+    let outcome = (|| -> Result<()> {
+        let prepared = enginebox_core::preparation::prepare(
+            &fleet,
+            &host.id,
+            "ci",
+            &json!({"name":request.name,"template":config.template,"resources":config.resources,"size":"custom"}),
+        )?;
+        let uuid = bx.instance(&request.name)?["config"]["volatile.uuid"]
+            .as_str()
+            .context("Missing clone identity")?
+            .to_owned();
+        receipt["allocation_id"] = prepared["allocation"]["id"].clone();
+        receipt["instance_uuid"] = json!(uuid);
+        state::write_json(&receipt_path, &receipt)?;
+        let checkout = format!("ci-{}", &request.name[8..]);
+        let layer = if let Some(path) = &config.layerfs {
+            let project = config
+                .projects
+                .get(&request.repository)
+                .context("No approved LayerFS base for this repository")?;
+            let runtime = LayerRuntime::new(LayerConfig::load(path)?)?;
+            receipt["checkout"] = json!(checkout);
+            state::write_json(&receipt_path, &receipt)?;
+            runtime.fork(&project.project, &checkout, project.from.as_deref())?;
+            runtime.incus_attach(
+                &checkout,
+                Target {
+                    project: host.project.clone(),
+                    instance: request.name.clone(),
+                    owner: host.project.clone(),
+                    uid: host.guest.uid,
+                    gid: host.guest.gid,
+                },
+            )?;
+            Some(runtime)
+        } else {
+            None
+        };
+        {
+            let _host_lock = operation_lock(&host)?;
+            owned(&bx.instance(&request.name)?, &receipt)?;
+            let room = capacity(&host, &inventory(&host)?)?;
+            ensure!(
+                room["cpu_available"].as_u64().unwrap_or(0) >= config.resources.cpu
+                    && room["memory_budget_available_bytes"].as_u64().unwrap_or(0)
+                        >= config.resources.memory_gib * enginebox_core::GIB,
+                "Insufficient capacity to start CI clone"
+            );
+            bx.call(&["start", &request.name])?;
+        }
+        enginebox_core::fleet::wait_ready_unlocked(&bx, &request.name)?;
+        receipt["status"] = json!("running");
+        state::write_json(&receipt_path, &receipt)?;
+        // Tokens never enter host command arguments, environment, logs or a reusable image.
+        // The official runner requires the opaque JIT value on its own guest argv.
+        let script = format!(
+            r#"set -eu
+umask 077
+cd "$HOME"
+test ! -e ci-runner
+for file in /opt/actions-runner/.runner /opt/actions-runner/.credentials /opt/actions-runner/.credentials_rsaparams; do
+  test ! -e "$file"
+done
+cp -a /opt/actions-runner ci-runner
+cd ci-runner
+test "$(./bin/Runner.Listener --version)" = {version}
+IFS= read -r jit
+set +e
+timeout --signal=TERM --kill-after=30s {seconds}s ./run.sh --jitconfig "$jit" > runner.log 2>&1
+code=$?
+unset jit
+printf '%s\n' "$code" > exit-code
+exit 0
+"#,
+            version = shell_quote(&config.runner_version),
+            seconds = request.timeout_seconds
+        );
+        let command = bx.exec_args(&request.name, &["bash".into(), "-c".into(), script])?;
+        bx.run_input(
+            &command,
+            format!("{}\n", request.jitconfig).as_bytes(),
+            Duration::from_secs(request.timeout_seconds + 90),
+        )?;
+        owned(&bx.instance(&request.name)?, &receipt)?;
+        // Export private diagnostics before deleting the disposable VM. Never return logs to the API.
+        let logs = receipts.join(format!("{}-logs.tar", request.name));
+        let log_command = bx.exec_args(
+            &request.name,
+            &[
+                "tar".into(),
+                "-cf".into(),
+                "-".into(),
+                "-C".into(),
+                format!("{}/ci-runner", host.guest.home),
+                "_diag".into(),
+                "runner.log".into(),
+                "exit-code".into(),
+            ],
+        )?;
+        let bytes = bx.run(&log_command, Duration::from_secs(30))?;
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(logs)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        bx.call(&["stop", &request.name, "--timeout=60"])?;
+        if let Some(runtime) = layer {
+            runtime.incus_detach(&checkout)?;
+            // This is a PRIVATE job checkpoint, never a reusable source or cache publication.
+            runtime.operate(
+                &checkout,
+                "checkpoint",
+                &[],
+                120,
+                "Private CI result; do not reuse as a base",
+            )?;
+            runtime.operate(&checkout, "close", &[], 120, "")?;
+            receipt["private_checkout_retained"] = json!(true);
+        }
+        let _host_lock = operation_lock(&host)?;
+        let vm = bx.instance(&request.name)?;
+        owned(&vm, &receipt)?;
+        ensure!(
+            vm["status"] == "Stopped" && vm["stateful"] != true,
+            "Refusing to delete running or stateful CI clone"
+        );
+        bx.call(&["delete", &request.name])?;
+        receipt["cleaned"] = json!(true);
+        Ok(())
+    })();
+    receipt["duration_seconds"] = json!(started.elapsed().as_secs_f64());
+    receipt["status"] = json!(if outcome.is_ok() {
+        "finished"
+    } else {
+        "uncertain"
+    });
+    if outcome.is_err() {
+        receipt["error"] = json!(
+            "Inspect the exact disposable VM, allocation and storage receipts; no automatic replay or deletion after uncertainty."
+        );
+    }
+    state::write_json(&receipt_path, &receipt)?;
+    outcome?;
+    Ok(receipt)
+}
+fn owned(vm: &Value, receipt: &Value) -> Result<()> {
+    ensure!(
+        receipt["instance_uuid"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+            && receipt["allocation_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+            && vm["config"]["volatile.uuid"] == receipt["instance_uuid"]
+            && vm["config"]["user.enginebox.allocation.id"] == receipt["allocation_id"]
+            && vm["config"]["user.enginebox.pool.state"] == "preparing",
+        "Disposable VM identity changed"
+    );
+    Ok(())
+}
+fn main() {
+    let args = Args::parse();
+    let result = (|| -> Result<Value> {
+        ensure!(
+            cfg!(target_os = "linux"),
+            "CI worker requires a local Linux Incus node"
+        );
+        let config: Config = serde_json::from_value(state::read_json(&args.config)?)?;
+        let mut input = vec![];
+        std::io::stdin()
+            .take(128 * 1024 + 1)
+            .read_to_end(&mut input)?;
+        ensure!(input.len() <= 128 * 1024, "Oversized CI request");
+        run(config, serde_json::from_slice(&input)?)
+    })();
+    match result {
+        Ok(value) => println!("{value}"),
+        Err(_) => {
+            eprintln!(
+                "CI worker failed; inspect its private receipt and disposable environment. No request or credential was logged."
+            );
+            std::process::exit(1);
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cleanup_is_bound_to_allocation_and_instance_identity() {
+        let receipt = json!({"instance_uuid":"fixture-uuid","allocation_id":"fixture-allocation"});
+        let mut vm = json!({"config":{"volatile.uuid":"fixture-uuid","user.enginebox.allocation.id":"fixture-allocation","user.enginebox.pool.state":"preparing"}});
+        owned(&vm, &receipt).unwrap();
+        assert!(
+            owned(
+                &json!({"config":{"user.enginebox.pool.state":"preparing"}}),
+                &json!({})
+            )
+            .is_err()
+        );
+        vm["config"]["volatile.uuid"] = json!("replaced");
+        assert!(owned(&vm, &receipt).is_err());
+    }
+}

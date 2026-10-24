@@ -44,6 +44,7 @@ struct Runtime {
     agents: AgentService,
     jobs: jobs::Jobs,
     storage: storage::Storage,
+    github: enginebox_github::GitHub,
 }
 struct Gate {
     mode: Mode,
@@ -104,10 +105,9 @@ impl Controller {
         ensure!(
             gate.requests == 0
                 && gate.background == 0
-                && gate
-                    .runtime
-                    .as_ref()
-                    .is_none_or(|r| r.jobs.pending() == 0 && r.agents.pending() == 0),
+                && gate.runtime.as_ref().is_none_or(|r| r.jobs.pending() == 0
+                    && r.agents.pending() == 0
+                    && r.github.pending() == 0),
             "Controller has not drained"
         );
         let owner = enginebox_core::state::lock(&self.root.join("controller-owner.lock"), false)
@@ -133,6 +133,7 @@ impl Controller {
             agents: AgentService::new(&self.root, self.fleet.clone())?,
             jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
             storage: storage::Storage::open(&self.root, self.fleet.clone())?,
+            github: enginebox_github::GitHub::open(&self.root)?,
         };
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -180,10 +181,9 @@ impl Controller {
         if g.mode == Mode::Active {
             g.mode = Mode::Draining;
         }
-        let pending = g
-            .runtime
-            .as_ref()
-            .map_or(0, |r| r.jobs.pending() + r.agents.pending());
+        let pending = g.runtime.as_ref().map_or(0, |r| {
+            r.jobs.pending() + r.agents.pending() + r.github.pending()
+        });
         if g.requests == 0 && g.background == 0 && pending == 0 {
             g.owner.take();
             g.mode = Mode::Drained;
@@ -212,6 +212,7 @@ impl Controller {
                     let _ = controller.fleet.reconcile();
                     if let Some(r) = runtime {
                         let _ = r.agents.reconcile();
+                        let _ = r.github.tick();
                     }
                 })
                 .await;
@@ -290,6 +291,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             "Browser requests must use the authenticated dashboard proxy.",
         );
     }
+    // Only this narrow route accepts a GitHub signature instead of owner bearer auth.
+    if method == Method::POST && path.starts_with("/v1/github/webhook/") {
+        return github_webhook(controller, request).await;
+    }
     if !controller.authorized(&request) {
         return error(StatusCode::UNAUTHORIZED, "Authentication required.");
     }
@@ -338,8 +343,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     if method == Method::GET {
         // Native auth/status programs may refresh their own home. Keep them in
         // the ownership barrier; serve the last observation during handoff.
-        let native_observation =
-            path == "/v1/agents" || path.ends_with("/usage") || path.ends_with("/accounts");
+        let native_observation = path == "/v1/agents"
+            || path.ends_with("/usage")
+            || path.ends_with("/accounts")
+            || path.starts_with("/v1/github");
         let admission = if native_observation {
             match controller.admit() {
                 Ok(a) => Some(a),
@@ -446,6 +453,11 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
 fn read(c: &Controller, p: &[String]) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
+        ["v1", "github"] => Ok(c.runtime()?.github.status()),
+        ["v1", "github", kind, "installations"] => c.runtime()?.github.list_installations(kind),
+        ["v1", "github", "installations", id, "repositories"] => {
+            c.runtime()?.github.repositories(id.parse()?)
+        }
         ["v1", "fleet"] => c.fleet.summary(),
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
@@ -488,6 +500,70 @@ fn string<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(StatusCode, Value)> {
+    if parts.get(1).is_some_and(|p| p == "github") {
+        let github = c.runtime()?.github;
+        if parts.as_slice() == ["v1", "github", "sync"] {
+            keys(
+                &body,
+                &["repository_id", "direction"],
+                &["repository_id", "direction"],
+            )?;
+            let id = enginebox_github::number(&body, "repository_id")?;
+            let direction = string(&body, "direction")?.to_owned();
+            let job =
+                c.runtime()?
+                    .jobs
+                    .submit("github", "github_sync", &id.to_string(), move || {
+                        github.sync(id, &direction)
+                    })?;
+            return Ok((StatusCode::ACCEPTED, json!({"job":job})));
+        }
+        let value = blocking(move || -> Result<Value> {
+            let p: Vec<_> = parts.iter().map(String::as_str).collect();
+            match p.as_slice() {
+                ["v1", "github", kind, "connect"] => {
+                    empty(&body)?;
+                    github.connect(kind)
+                }
+                ["v1", "github", kind, "disconnect"] => {
+                    empty(&body)?;
+                    github.disconnect(kind)
+                }
+                ["v1", "github", "callback"] => {
+                    keys(&body, &["state", "code"], &["state", "code"])?;
+                    github.callback(string(&body, "state")?, string(&body, "code")?)
+                }
+                ["v1", "github", "select"] => {
+                    keys(
+                        &body,
+                        &["installation_id", "repository_id", "branch"],
+                        &["installation_id", "repository_id", "branch"],
+                    )?;
+                    github.select(
+                        enginebox_github::number(&body, "installation_id")?,
+                        enginebox_github::number(&body, "repository_id")?,
+                        string(&body, "branch")?,
+                    )
+                }
+                ["v1", "github", "remove"] => {
+                    keys(&body, &["repository_id"], &["repository_id"])?;
+                    github.remove(enginebox_github::number(&body, "repository_id")?)
+                }
+                ["v1", "github", "drain"] => {
+                    keys(&body, &["draining"], &["draining"])?;
+                    github.set_draining(
+                        body["draining"]
+                            .as_bool()
+                            .context("draining must be boolean")?,
+                    )
+                }
+                _ => anyhow::bail!("Unknown GitHub operation"),
+            }
+        })
+        .await?;
+        return Ok((StatusCode::OK, value));
+    }
+
     let p: Vec<_> = parts.iter().map(String::as_str).collect();
     let runtime = c.runtime()?;
     let mut code = StatusCode::OK;
@@ -640,6 +716,58 @@ fn submit(
     })
 }
 
+async fn github_webhook(c: Arc<Controller>, request: Request<Body>) -> Response {
+    let kind = request
+        .uri()
+        .path()
+        .trim_start_matches("/v1/github/webhook/")
+        .to_owned();
+    if !["repos", "runners"].contains(&kind.as_str()) || request.uri().query().is_some() {
+        return error(StatusCode::NOT_FOUND, "Unknown webhook.");
+    }
+    let event = request
+        .headers()
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let signature = request
+        .headers()
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let body = match to_bytes(request.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "Webhook too large."),
+    };
+    let admission = match c.admit() {
+        Ok(a) => a,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Controller is draining; redeliver this event.",
+            );
+        }
+    };
+    let result = admitted(admission, async move {
+        blocking(move || {
+            c.runtime()?
+                .github
+                .webhook(&kind, &event, &signature, &body)
+        })
+        .await
+    })
+    .await;
+    match result {
+        Ok(value) => reply(StatusCode::ACCEPTED, value),
+        Err(_) => error(
+            StatusCode::BAD_REQUEST,
+            "Webhook rejected; check signature, installation, payload and inbox capacity.",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,6 +820,77 @@ mod tests {
         assert_eq!(
             app.oneshot(browser).await.unwrap().status(),
             StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn github_is_optional_and_webhook_exception_cannot_bypass_owner_auth() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v1/github", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/github/repos/connect",
+                    "{}",
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        c.activate().unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/v1/github", "", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["configured"], false);
+        assert!(!c.root.join("github").exists());
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/github/webhook/runners",
+                    "{}",
+                    false
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::POST, "/v1/github/select", "{}", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        c.drain();
+        assert_eq!(
+            app.oneshot(request(
+                Method::POST,
+                "/v1/github/webhook/runners",
+                "{}",
+                false
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
     #[tokio::test]

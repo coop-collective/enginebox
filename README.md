@@ -100,3 +100,5 @@ Personal computers are an optional resource-contribution track. Owners choose ho
 This repository contains the source-available environment foundation. Personal and internal company self-hosting are permitted under the community license. Commercial hosting, selling access and commercial redistribution require a separate agreement. Reusable optional modules, including CI integration, will live here as they are implemented. Managed hosting and proprietary workspace recipes can be separate offerings. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
 
 New versions use the [Sustainable Use License 1.0](LICENSE), originally published by n8n. This is not OSI open source. Previously published Apache-2.0 code retains its existing rights; see the [licensing boundary](docs/LICENSING.md).
+
+GitHub integration: see [repository connections and the optional Actions service](docs/GITHUB-ACTIONS.md) for private repo selection, explicit pull/push, separate organization runner permissions, disposable native runners and the LayerFS qualification plan. Live GitHub CI validation remains a separate gate.

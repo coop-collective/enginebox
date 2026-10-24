@@ -1600,3 +1600,13 @@ input::placeholder {
     animation: none;
   }
 }
+
+.github-panel { display: grid; gap: 20px; }
+.github-card { padding: 24px; border: 1px solid var(--border, #ddd); border-radius: 12px; background: var(--surface, #fff); min-width: 0; }
+.github-card h2 { margin-bottom: 12px; }
+.github-card p { margin: 10px 0; overflow-wrap: anywhere; }
+.github-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 14px 0; }
+.github-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 14px; margin-top: 18px; align-items: end; }
+.github-fields label { display: grid; gap: 7px; }
+.github-fields select, .github-fields input { border: 1px solid #ccc; border-radius: 6px; padding: 10px; width: 100%; min-width: 0; background: white; }
+.github-repo { border-top: 1px solid var(--border, #ddd); padding-top: 15px; margin-top: 16px; overflow-wrap: anywhere; }

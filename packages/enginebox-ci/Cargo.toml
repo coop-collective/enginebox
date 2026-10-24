@@ -1,0 +1,19 @@
+[package]
+name = "enginebox-ci"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+
+[[bin]]
+name = "enginebox-ci-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+enginebox-core = { path = "../enginebox-core" }
+enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

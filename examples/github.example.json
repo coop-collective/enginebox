@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "callback_url": "https://enginebox.example.com/api/github/callback",
+  "repos": {
+    "client_id": "REPOSITORY_APP_CLIENT_ID",
+    "client_secret": "REPLACE_IN_PRIVATE_CONTROLLER_CONFIG",
+    "slug": "your-enginebox-repositories",
+    "private_key": "REPLACE_WITH_REPOSITORY_APP_PEM_IN_PRIVATE_CONFIG",
+    "webhook_secret": "REPLACE_WITH_RANDOM_SECRET_AT_LEAST_32_CHARACTERS"
+  },
+  "runners": {
+    "client_id": "RUNNER_APP_CLIENT_ID",
+    "client_secret": "REPLACE_IN_PRIVATE_CONTROLLER_CONFIG",
+    "slug": "your-enginebox-runners",
+    "private_key": "REPLACE_WITH_RUNNER_APP_RSA_PEM_IN_PRIVATE_CONFIG",
+    "webhook_secret": "REPLACE_WITH_A_DIFFERENT_RANDOM_32_CHARACTER_SECRET"
+  },
+  "pools": [
+    {
+      "id": "linux",
+      "installation_id": 123,
+      "organization": "example-org",
+      "runner_group_id": 456,
+      "labels": ["self-hosted", "Linux", "X64", "enginebox-linux"],
+      "max_runners": 1,
+      "timeout_seconds": 3600,
+      "worker": ["/opt/enginebox/bin/enginebox-ci-worker", "--config", "/etc/enginebox/ci-worker.json"]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # Portable self-hosted environment design
 
-Status: implementation design updated October 19, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
+Status: implementation design updated October 24, 2026. The Rust runtime, bootstrap, native-client/browser preparation, fleet REST/MCP and Vinext dashboard are implemented. Compatible Rust service upgrades and rollback are tested; initial legacy cutover, portable cache services, live CI and backup/recovery qualification remain separate work. See the operational guides for supported commands.
 
 ## Outcome
 
@@ -139,6 +139,8 @@ Registered templates are controller-owned desired state. Importing or revising o
 The Vinext server authenticates the owner and proxies a narrow REST surface. API tokens stay server-side. Operator MCP calls the same REST service. A guest receives browser/computer tools, not fleet credentials. See [fleet operations](FLEET.md) and [dashboard deployment](DASHBOARD.md).
 
 ## Optional CI module
+
+The October 24 integration implements GitHub App OAuth, selected private repository pull/push and a webhook-driven native JIT runner service in separate `enginebox-github` and `enginebox-ci` packages. Repository and organization-runner permissions use separate App connections. The worker creates reserved disposable Incus VMs and can attach an approved private LayerFS fork. GitHub still schedules jobs; core bootstrap never registers a runner. See [the GitHub/Actions design and setup](GITHUB-ACTIONS.md) for current APIs, permission upgrade, storage boundaries and live acceptance gates. Repository sync currently operates on private controller checkouts; automatic VM source assignment and distributed cache replication remain planned.
 
 Keep GitHub Actions workflows, scheduling, checks and logs. The module supplies prepared execution environments, runner lifecycle integration, persistent cache policies, resource limits and measurements. Model account credentials are not required for ordinary build/test CI or for this repository's tests.
 

@@ -134,3 +134,9 @@ The Node tests cover signed sessions, expiry, credential rotation, exact origins
 Tested initial dependency versions: Vinext 1.2.1, React 19.3.1, Vite 8.3.4. Exact versions and transitive integrity hashes are in the root `pnpm-lock.yaml`. The scaffold was generated with the official `create-vinext-app --platform=node` workflow; see the [upstream setup and Node hosting docs](https://github.com/cloudflare/vinext#starting-a-new-vinext-project).
 
 The v0.2 dependency audit reported six high-severity dependency entries from the `braces` 3.0.3 glob-tooling chain. They trace to [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm); 3.0.3 was the version inspected at the time. The dashboard does not pass user input to these glob APIs. The `fflate` advisory was addressed with a compatible 0.7.5 override. Keep the remaining advisory visible during dependency upgrades; do not force-downgrade Vinext to satisfy the audit tool's suggested major-version replacement.
+
+## GitHub repositories and Actions
+
+The **GitHub** panel connects the repository App, lists accessible installations and private repositories, selects a branch and submits explicit pull/push jobs against private controller checkouts. Runner administration is a separate App connection with organization approval. Pool status and draining are visible alongside runner job receipts. See [GitHub Actions setup and scope](GITHUB-ACTIONS.md), including live qualification and repository-to-VM assignment limits.
+
+Browser checks can use `ENGINEBOX_E2E_FIXTURE_PORT` and `ENGINEBOX_E2E_DASHBOARD_PORT` to avoid existing local services. GitHub feature tests use signed fixture sessions, as storage tests do, so they do not weaken or exhaust the production login limit.
