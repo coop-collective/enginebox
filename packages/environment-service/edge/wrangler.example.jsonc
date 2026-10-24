@@ -1,0 +1,10 @@
+{
+  "name": "enginebox-environment-edge",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-24",
+  "workers_dev": false,
+  "observability": { "enabled": true, "traces": { "enabled": true, "head_sampling_rate": 0.1 } },
+  "vars": { "PUBLIC_HOSTS": "main-dev.example.com" },
+  "vpc_services": [{ "binding": "GATEWAY", "service_id": "PROVISIONED_GATEWAY_SERVICE_ID" }],
+  "routes": [{ "pattern": "main-dev.example.com", "custom_domain": true }]
+}
