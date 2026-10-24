@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "request_id": "merge-COMMIT-windows",
+  "event": "merge",
+  "sha": "0000000000000000000000000000000000000000",
+  "job": {
+    "runner": "automation",
+    "runs-on": [
+      "self-hosted",
+      "enginebox",
+      "windows",
+      "image:windows-2025-msvc",
+      "cmake",
+      "msvc",
+      "pwsh"
+    ],
+    "checkout": {
+      "url": "https://github.com/your-org/your-app.git"
+    },
+    "shell": "pwsh",
+    "run": "cmake -S . -B build\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\ncmake --build build --config Release --parallel\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nctest --test-dir build -C Release --output-on-failure\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\ncmake --install build --prefix dist --config Release\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nCompress-Archive -Path dist/* -DestinationPath windows-build.zip",
+    "artifacts": [
+      "windows-build.zip"
+    ],
+    "timeout-minutes": 60
+  }
+}

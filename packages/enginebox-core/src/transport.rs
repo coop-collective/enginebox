@@ -53,7 +53,6 @@ fn run_process_environment(
         !argv.is_empty() && argv.iter().all(|v| !v.contains('\0')),
         "Invalid command argv"
     );
-    let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(&argv[0]);
     if let Some(environment) = environment {
         cmd.env_clear().envs(environment.iter().copied());
@@ -68,6 +67,31 @@ fn run_process_environment(
         // PowerShell 5 cannot load. Reconstruct this child's default paths.
         cmd.env_remove("PSModulePath");
     }
+    cmd.args(&argv[1..]);
+    run_command(cmd, input, timeout)
+}
+
+/// Run an explicitly configured command with the same bounded I/O and process-tree
+/// cleanup as the SSH transport. Callers may set a private cwd/environment.
+pub fn run_command(cmd: Command, input: Option<&[u8]>, timeout: Duration) -> Result<Vec<u8>> {
+    run_command_bounded(cmd, input, timeout, 16 * 1024 * 1024, 64 * 1024)
+}
+
+/// Build tools can emit substantial stderr even on success. Callers still choose
+/// bounded streams; ordinary transport commands retain the stricter defaults.
+pub fn run_command_bounded(
+    mut cmd: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    max_stdout: usize,
+    max_stderr: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        (1..=64 * 1024 * 1024).contains(&max_stdout)
+            && (1..=64 * 1024 * 1024).contains(&max_stderr),
+        "Invalid process output bounds"
+    );
+    let deadline = Instant::now() + timeout;
     // A child can stop reading stdin while its descendant retains that handle.
     // An anonymous private file removes the otherwise unbounded writer thread.
     if let Some(data) = input.filter(|data| !data.is_empty()) {
@@ -78,17 +102,13 @@ fn run_process_environment(
     } else {
         cmd.stdin(Stdio::null());
     }
-    cmd.args(&argv[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Cannot start {}", argv[0]))?;
+    let mut child = cmd.spawn().context("Cannot start command")?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let stdout_raw = pipe_handle(&stdout);
@@ -96,11 +116,10 @@ fn run_process_environment(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_out = cancel.clone();
     let cancel_err = cancel.clone();
-    let out = thread::spawn(move || {
-        read_bounded(stdout, stdout_raw, 16 * 1024 * 1024, deadline, &cancel_out)
-    });
+    let out =
+        thread::spawn(move || read_bounded(stdout, stdout_raw, max_stdout, deadline, &cancel_out));
     let err =
-        thread::spawn(move || read_bounded(stderr, stderr_raw, 64 * 1024, deadline, &cancel_err));
+        thread::spawn(move || read_bounded(stderr, stderr_raw, max_stderr, deadline, &cancel_err));
     // Keep the parent unreaped until its streams finish. If a descendant keeps
     // a pipe open, the original process-group ID cannot be recycled before kill.
     let stdout = out

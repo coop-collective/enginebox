@@ -1601,3 +1601,9 @@ input::placeholder {
     animation: none;
   }
 }
+
+.environment-panel { display: flex; flex-direction: column; gap: 20px; }
+.environment-panel .section-heading { flex-wrap: wrap; gap: 16px; }
+.environment-panel .host-card p { margin: 8px 0; line-height: 1.5; overflow-wrap: anywhere; }
+.environment-panel form.host-card { display: grid; gap: 16px; }
+.environment-panel .button { justify-self: start; }

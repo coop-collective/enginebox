@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "request_id": "merge-COMMIT-linux",
+  "event": "merge",
+  "sha": "0000000000000000000000000000000000000000",
+  "job": {
+    "runner": "automation",
+    "runs-on": [
+      "self-hosted",
+      "enginebox",
+      "linux",
+      "image:ubuntu-24.04-cmake",
+      "cmake"
+    ],
+    "checkout": {
+      "url": "https://github.com/your-org/your-app.git"
+    },
+    "shell": "bash",
+    "run": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release\ncmake --build build --parallel\nctest --test-dir build --output-on-failure\ncmake --install build --prefix dist\ntar -czf linux-build.tar.gz -C dist .",
+    "artifacts": [
+      "linux-build.tar.gz"
+    ],
+    "timeout-minutes": 60
+  }
+}
