@@ -284,9 +284,9 @@ pub fn commands(recipe: &Recipe, source: &Path, output: &Path) -> Result<Vec<Vec
             recipe.unity_method.clone().unwrap(),
             "-buildTarget".into(),
             if recipe.target == "web" {
-                "WebGL"
+                "webgl"
             } else {
-                "StandaloneLinux64"
+                "linux64"
             }
             .into(),
             "-logFile".into(),

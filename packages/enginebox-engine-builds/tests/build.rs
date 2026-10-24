@@ -249,7 +249,7 @@ fn canonical_hash_matches_protocol_and_engine_commands_are_argument_arrays() {
     )
     .unwrap();
     assert!(commands[0].contains(&"/project with space".into()));
-    assert!(commands[0].contains(&"WebGL".into()));
+    assert!(commands[0].contains(&"webgl".into()));
     fixture
         .recipe
         .environment
