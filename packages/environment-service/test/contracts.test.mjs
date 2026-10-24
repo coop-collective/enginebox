@@ -80,7 +80,28 @@ test('failed readiness restores the previous process and suppresses automatic re
     assert.equal(manager.states.main.revision, 'a'.repeat(40));
     assert.equal(manager.states.main.status, 'update-failed'); assert.equal(manager.states.main.healthy, true);
     await manager.reconcile(env); assert.equal(started.length, 2);
+    assert.equal(manager.states.main.status, 'update-failed');
+    assert.equal(manager.states.main.failedRevision, 'b'.repeat(40));
+    assert.equal(manager.states.main.error, 'service-exited');
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+test('a recovered source read clears transient failure for the healthy active revision', async () => {
+  const manager = new Environments(fixture()); const env = manager.config.environments[0];
+  const revision = 'a'.repeat(64); let available = false;
+  manager.states.main = { revision, desiredRevision: revision, healthy: true, status: 'ready' };
+  manager.source = async () => { if (!available) throw new Error('command-failed'); return { revision }; };
+  manager.inspect = async () => ({ State: { Running: true }, Config: { Labels: { 'enginebox.environment.revision': revision } } });
+  manager.ready = async () => {}; manager.healthy = async () => true;
+  manager.start = manager.prepare = async () => assert.fail('Healthy active process must remain running');
+  await manager.reconcile(env);
+  assert.equal(manager.states.main.status, 'update-failed');
+  assert.equal(manager.states.main.healthy, true);
+  available = true;
+  await manager.reconcile(env);
+  assert.equal(manager.states.main.status, 'ready');
+  assert.equal(manager.states.main.healthy, true);
+  assert.equal(manager.states.main.failedRevision, undefined);
+  assert.equal(manager.states.main.error, undefined);
 });
 test('container actions refuse an unrelated process even if it occupies the configured name', async () => {
   const manager = new Environments(fixture()); const env = manager.config.environments[0];
