@@ -59,8 +59,8 @@ so tests can simulate an agent without paid inference or real repository writes.
 
 ## Distributed ownership
 
-The in-progress distributed storage design in PR #14 remains authoritative for
-fleet ownership: Cloudflare's accepted revision and fencing lease gate exports.
+The merged [distributed storage design](STORE-DISTRIBUTION.md) remains
+authoritative for fleet ownership: Cloudflare's accepted revision and fencing lease gate exports.
 An integration worker consumes an accepted immutable manifest; an arbitrary
 worker's local Store head cannot authorize a push. Store distribution and GitHub
 sync use separate queues. Project promotion must first satisfy the configured
@@ -69,7 +69,7 @@ storage durability gate; a GitHub push is not a backup of the LayerFS Store.
 The current local-node adapter uses private durable receipts and file locks.
 These are suitable for the existing single-controller owner deployment, not a
 replacement for distributed fencing. The publication/outbox interface must be
-called by the accepted-main transaction when the distributed controller lands.
+called by the accepted-main transaction when this connector is integrated with the distributed controller.
 
 ## Verification
 
@@ -123,8 +123,9 @@ Controller/MCP tests validate requests and credential boundaries; browser fixtur
 exercise the UI contract. They do not qualify a deployed GitHub push, Linux
 LayerFS SDK publication/export, or paid native-agent inference in the conflict
 container. Those require a disposable Linux environment and test repository.
-The distributed accepted-manifest/outbox hook remains part of the unmerged
-controller migration, not a claim of distributed deployment in this branch.
+The distributed accepted-manifest/outbox hook is not yet wired to this connector.
+The merged Cloudflare fleet implementation does not by itself migrate the live
+Rust controller or qualify distributed GitHub delivery.
 
 Protocol references: [Git fetch](https://git-scm.com/docs/git-fetch),
 [conditional pushes](https://git-scm.com/docs/git-push), and the pinned

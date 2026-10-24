@@ -29,6 +29,8 @@ jobs:
       - run: pnpm lint:rust
       - run: pnpm build
       - if: runner.os == 'Linux'
+        run: pnpm fleet:smoke
+      - if: runner.os == 'Linux'
         run: pnpm --filter enginebox-dashboard exec playwright install --with-deps chromium
       - if: runner.os == 'Linux'
         run: pnpm test:e2e
