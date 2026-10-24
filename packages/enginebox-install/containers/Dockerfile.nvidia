@@ -1,0 +1,17 @@
+# Build from repository root. Hardware is supplied at runtime, never emulated.
+FROM rust:1.96-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY packages/ ./packages/
+COPY LICENSE NOTICE ./
+RUN cargo build --release --locked -p enginebox-install --bin enginebox-node
+
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates ffmpeg tini && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home node
+COPY --from=build /src/target/release/enginebox-node /usr/local/bin/enginebox-node
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,video,display
+USER 10001:10001
+WORKDIR /home/node
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/enginebox-node"]
+CMD ["inspect", "--profile", "nvidia-nvenc", "--ffmpeg", "/usr/bin/ffmpeg", "--qualify"]

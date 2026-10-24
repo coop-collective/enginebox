@@ -185,9 +185,35 @@ export default {
       const parts = url.pathname.split("/").filter(Boolean);
       if (request.method === "GET" && url.pathname === "/health")
         return json({ ok: true, service: "enginebox-fleet", schema: 1 });
+      if (request.method === "POST" && url.pathname === "/v1/node/enroll") {
+        const token = bearer(request);
+        const match = /^([a-z0-9-]{1,48})\.enroll\.([a-f0-9]{64})$/.exec(token);
+        requireThat(match, "Enrollment credential required", 401);
+        identifier(match[1]);
+        const body = await jsonBody(request);
+        record(body);
+        digest(body.nodeSecretHash);
+        const spec = await env.NODES.getByName(match[1]).enroll(await sha256(token), body.nodeSecretHash);
+        await env.REGISTRY.getByName("owner").registerNode(spec);
+        return json({ node: spec });
+      }
       const p = await principal(request, env);
       const registry = env.REGISTRY.getByName("owner");
       requireThat(parts[0] === "v1", "Unknown API", 404);
+      if (!p.admin && p.node.role === "native")
+        requireThat(parts.length === 3 && parts[1] === "node" &&
+          ["hello", "heartbeat", "identity"].includes(parts[2]),
+          "Native node credentials cannot access project data or other fleet executors", 403);
+      if (request.method === "POST" && url.pathname === "/v1/node-enrollments") {
+        admin(p);
+        const spec = validateNode(await jsonBody(request), false);
+        requireThat(spec.role === "native", "This enrollment flow requires a native node");
+        for (const project of spec.projects) await requireProject(env, project);
+        const token = `${spec.id}.enroll.${crypto.randomUUID().replaceAll("-", "")}${crypto.randomUUID().replaceAll("-", "")}`;
+        const expires = Date.now() + 10 * 60_000;
+        await env.NODES.getByName(spec.id).prepareEnrollment(spec, await sha256(token), expires);
+        return json({ token, expires, node: spec }, 201);
+      }
       if (!p.admin && p.node.taskOnly === true)
         requireThat(
           (parts.length === 3 &&
