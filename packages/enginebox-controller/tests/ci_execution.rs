@@ -93,7 +93,7 @@ fn real_controller_runs_a_native_build_once_and_preserves_artifacts_across_resta
     node["target"] = json!("local");
     assert_eq!(server.request("/v1/ci/nodes", Some(&node)).0, 200);
     let script = if cfg!(windows) {
-        "New-Item -ItemType Directory dist | Out-Null\nSet-Content -NoNewline dist/build.txt built"
+        "New-Item -ItemType Directory dist | Out-Null\nSet-Content -NoNewline -Path dist/build.txt -Value built"
     } else {
         "mkdir dist\nprintf built > dist/build.txt"
     };
