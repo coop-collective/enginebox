@@ -33,6 +33,10 @@ export function validateConfig(config) {
       fields(env.source, ['kind', 'url', 'branch']);
       check(typeof env.source.url === 'string' && (isAbsolute(env.source.url) || /^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9_./-]+$/.test(env.source.url)), 'invalid-source');
       check(typeof env.source.branch === 'string' && /^[A-Za-z0-9][A-Za-z0-9_./-]{0,127}$/.test(env.source.branch) && !env.source.branch.includes('..'), 'invalid-source-branch');
+    } else if (env.source.kind === 'layerfs') {
+      fields(env.source, ['kind', 'project', 'workspace', 'command']);
+      check(id(env.source.project) && (env.source.workspace === undefined || id(env.source.workspace)), 'invalid-layerfs-project');
+      check(Array.isArray(env.source.command) && env.source.command.length > 0 && env.source.command.length <= 64 && isAbsolute(env.source.command[0]) && env.source.command.every(v => typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.includes('\0')), 'invalid-layerfs-export-command');
     } else {
       fields(env.source, ['kind', 'controller', 'tokenFile', 'project', 'exportsDir']);
       check(env.source.kind === 'accepted' && id(env.source.project) && isAbsolute(env.source.exportsDir) && isAbsolute(env.source.tokenFile), 'invalid-accepted-source');

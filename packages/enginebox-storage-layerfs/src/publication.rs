@@ -26,7 +26,7 @@ impl Runtime {
             .as_u64()
             .context("Invalid publication sequence")
     }
-    fn main_lock(&self, p: &Project) -> Result<state::StateLock> {
+    pub(super) fn main_lock(&self, p: &Project) -> Result<state::StateLock> {
         ensure!(p.status == "ready", "Project is not ready");
         state::lock(&self.project_dir(&p.name).join("publication.lock"), false)
     }
@@ -149,8 +149,9 @@ impl Runtime {
         let directory = exports.join(revision);
         if directory.join("complete.json").exists() {
             ensure!(
-                state::read_json(&directory.join("complete.json"))?["digest"]
-                    == crate::sync::snapshot_digest(&directory.join("source"))?,
+                state::read_json(&directory.join("complete.json"))?["schema"] == 2
+                    && state::read_json(&directory.join("complete.json"))?["digest"]
+                        == crate::sync::snapshot_digest(&directory.join("source"))?,
                 "Retained export integrity check failed"
             );
             return Ok(directory.join("source"));
@@ -169,18 +170,7 @@ impl Runtime {
         let w = self.workspace(&name)?;
         let source = directory.join("source");
         state::private_dir(&source)?;
-        self.docker(
-            &[
-                "cp".into(),
-                format!(
-                    "{}:/project/.",
-                    w.container.context("Export container missing")?
-                ),
-                source.to_string_lossy().into_owned(),
-            ],
-            None,
-            300,
-        )?;
+        self.export_workspace_files(&w, &source)?;
         self.operate(&name, "close", &[], 60, "")?;
         ensure!(
             self.main_revision(p)? == revision,
@@ -188,7 +178,7 @@ impl Runtime {
         );
         state::write_json(
             &directory.join("complete.json"),
-            &json!({"revision":revision,"digest":crate::sync::snapshot_digest(&source)?}),
+            &json!({"schema":2,"revision":revision,"digest":crate::sync::snapshot_digest(&source)?}),
         )?;
         Ok(source)
     }

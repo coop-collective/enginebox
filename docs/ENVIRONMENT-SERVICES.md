@@ -151,3 +151,44 @@ References: [Traefik TCP](https://doc.traefik.io/traefik/reference/routing-confi
 [Traefik UDP](https://doc.traefik.io/traefik/reference/routing-configuration/udp/routing/router/),
 [Workers VPC](https://developers.cloudflare.com/workers-vpc/api/),
 [Spectrum](https://developers.cloudflare.com/spectrum/).
+
+## Local LayerFS development previews
+
+The single-owner node adapter supports `source.kind: "layerfs"`. Its protected
+operator command calls `ebox storage layerfs dev-export PROJECT`, optionally with
+`--workspace CLOSED_WORKSPACE`. Main exports follow owned LayerFS main; workspace
+exports require a completed, closed checkpoint. A preview can therefore run before
+promotion and before any GitHub push. Starting development does not require CI/CD.
+Build/test inside the writable LayerFS workspace, checkpoint and close it, then
+start its preview. Promotion updates the main service independently of external
+GitHub availability.
+
+```json
+{"kind":"layerfs", "project":"app", "workspace":"task-one",
+ "command":["/usr/bin/sudo","-n","/opt/enginebox/export-app-preview","task-one"]}
+```
+
+The command and arguments are administrator-owned configuration, never repository
+content or API input. It must return the `dev-export` JSON with `revision`,
+`sourceRoot` and `manifest`; a node helper may copy the snapshot into a private
+service-readable directory and adjust `sourceRoot`. The service checks project,
+workspace, authority, inventory digest and copied file bytes before preparation.
+Configure only the intended project and source selector in that helper. Neither
+repository credentials nor the node's writable Store belong in the app container.
+
+This adapter identifies its authority as `local-layerfs`. It does not substitute
+for the distributed controller's accepted-generation/fencing contract. The
+`accepted` adapter remains the path for distributed integration. A closed preview
+is immutable; a subsequent task uses a new workspace/preview. Live editing/HMR of
+an open LayerFS mount and automatic project enrollment are separate capabilities.
+
+Live qualification found that Docker's archive API does not observe LayerFS mounts
+added after container creation. Both dev and GitHub exports now materialize files
+inside the sandbox mount namespace before copying them out. Retained older GitHub
+exports without the corrected schema are refused. Tests require the actual app
+files and selected version, so an empty export cannot pass as a successful demo.
+The private test repo exercised import, Git-free editing, tests/build, checkpoint,
+branch preview before promotion, an external GitHub commit after promotion, and
+main-service refresh with persistent data retained. No Actions workflow or CD job
+ran for the app. See `packages/enginebox-storage-layerfs/tests/live-github-dev.py`
+and `test/live-project-probe.mjs` for the explicit opt-in qualification helpers.

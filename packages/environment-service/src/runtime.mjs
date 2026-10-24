@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { check, gatewayConfig, validateRoutes } from './config.mjs';
 import { acceptedSource, copyAccepted } from './accepted.mjs';
+import { layerfsSource } from './layerfs.mjs';
 
 export async function atomic(file, value) {
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -82,6 +83,7 @@ export class Environments {
   async source(env) {
     const root = join(this.config.stateDir, env.id); await mkdir(root, { recursive: true, mode: 0o700 });
     if (env.source.kind === 'accepted') return acceptedSource(env, this.config.stateDir);
+    if (env.source.kind === 'layerfs') return layerfsSource(env, this.config.stateDir, this.run);
     const repo = join(root, 'repository.git');
     try { await stat(repo); } catch (error) { if (error.code !== 'ENOENT') throw error; await this.run('git', ['init', '--bare', repo]); }
     await this.run('git', ['-c', 'core.hooksPath=/dev/null', '-C', repo, 'fetch', '--no-tags', '--force', '--', env.source.url, `refs/heads/${env.source.branch}:refs/heads/tracked`]);
