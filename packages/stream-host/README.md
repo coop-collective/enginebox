@@ -66,7 +66,20 @@ The repeatable browser test creates an owned Docker network, private Coturn rela
 docker build --target test-runtime -t enginebox-stream-host:qualification packages/stream-host
 docker build -t enginebox-stream-relay:qualification -f packages/stream-host/test/relay.Dockerfile packages/stream-host/test
 docker build -t enginebox-stream-browser:qualification -f packages/stream-host/test/browser.Dockerfile .
-STREAM_EVIDENCE_DIR=/private/stream-evidence node packages/stream-host/test/run.mjs
+pnpm install --frozen-lockfile
+STREAM_EVIDENCE_DIR=/private/stream-evidence node packages/stream-host/test/start-fleet.mjs
 ```
 
-The default harness uses a bounded protocol fixture for controller authority; actual fleet integration is qualified separately. Neither fixture credentials nor its test-only native window are shipped in the runtime target. Multiarch image builds and platform-specific native scene/relay checks belong to `.github/workflows/stream-host.yml`; a successful single-architecture build is not proof of another architecture.
+`start-fleet.mjs` starts a real local Wrangler controller with unique disposable
+SQLite/R2 state, a fresh project and an owner credential confined to the test
+driver. No Cloudflare login or production token is needed. It removes its
+controller, private connection file, state, and exact Docker resources after the
+test. `--check-controller` checks local startup/authentication/cleanup without
+Docker. On Linux the temporary authenticated listener binds a host interface so
+Docker's host gateway can reach it; use an isolated development or CI machine.
+
+For an isolated media-only protocol fixture, use `node
+packages/stream-host/test/run.mjs`. Neither fixture credentials nor its test-only
+native window are shipped in the runtime target. Native amd64/arm64 image builds
+and real-controller relay checks run in `.github/workflows/stream-host.yml`; a
+successful single-architecture build is not proof of another architecture.
