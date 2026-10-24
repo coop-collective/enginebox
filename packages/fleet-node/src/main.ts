@@ -21,6 +21,7 @@ import { EngineBuilds, type EngineBuildConfig } from "./build.ts";
 import { executeMedia, type MediaConfig } from "./media.ts";
 import { Cache } from "./cache.ts";
 import { Client } from "./client.ts";
+import { deliverFinishedResult } from "./result-delivery.ts";
 import { Generations, publishSnapshot, type Published } from "./generations.ts";
 import {
   NativeAssistant,
@@ -383,8 +384,8 @@ export async function runNode(config: Config) {
         canonical({ ok, result }),
       );
     try {
-      await client.json("/v1/node/finish", { assignment, ok, result });
-      log("job_finished", { job: assignment.id, ok });
+      const delivered = await deliverFinishedResult(client, assignment, journal);
+      log("job_finished", { job: assignment.id, ok: delivered.ok });
     } catch (error) {
       log("result_pending", {
         job: assignment.id,
