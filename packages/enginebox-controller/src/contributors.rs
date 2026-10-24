@@ -109,7 +109,9 @@ impl Contributors {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let expires = now() + 600;
+        // Allow the preinstalled WSL image to download and qualify on a home
+        // connection. The invitation still binds exactly one node identity.
+        let expires = now() + 3600;
         let node = Node {
             id: id.clone(),
             budget: invitation.budget.clone(),
@@ -192,7 +194,7 @@ impl Contributors {
             "budget":n.budget,"workloads":n.invitation.workloads,"os":n.os,"architecture":n.architecture,
             "enrolled":n.secret_hash.is_some(),"revoked":n.revoked,"blocked":n.blocked,"active_job":n.active,
             "online":n.last_seen+LEASE_SECONDS>now(),"last_seen":n.last_seen,"tools":n.tools,
-            "disk_enforcement":"workspace usage watchdog","cpu_memory_enforcement":if n.os == "linux" { "WSL runtime cgroup" } else { "Windows Job Object (legacy)" }})).collect::<Vec<_>>();
+            "disk_enforcement":if n.os == "linux" { "WSL virtual disk maximum" } else { "workspace usage watchdog" },"cpu_memory_enforcement":if n.os == "linux" { "WSL runtime cgroup" } else { "Windows Job Object (legacy)" }})).collect::<Vec<_>>();
         json!({"nodes":rows})
     }
     pub fn revoke(&self, key: &str) -> Result<Value> {

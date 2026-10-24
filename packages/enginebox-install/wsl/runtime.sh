@@ -7,6 +7,7 @@ export DOCKER_HOST=unix:///run/enginebox-docker.sock
 case "${1:-}" in
   claim)
     read -r owner
+    owner=${owner%$'\r'}
     [[ "$owner" =~ ^S-1-[0-9-]+$ && ! -e /etc/enginebox/installation-owner ]] || exit 1
     printf '%s\n' "$owner" > /etc/enginebox/installation-owner
     ;;

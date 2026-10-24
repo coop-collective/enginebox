@@ -47,7 +47,7 @@ it cannot increase the owner's allowance.
 
 ## Identity and lifecycle
 
-Registration codes expire after ten minutes and bind one machine-generated
+Registration codes expire after one hour and bind one machine-generated
 identity. An interrupted registration can retry with that same identity before
 expiry. The controller stores hashes, not reusable raw codes or machine tokens.
 The copied command contains the one-time code; treat it as private until consumed

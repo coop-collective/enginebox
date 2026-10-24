@@ -22,7 +22,7 @@ The installer asks for:
   minimum 20 GiB. This includes Linux, templates and workspace storage.
 
 Resources are selected on the PC, not in the dashboard. A registration code
-still authorizes exactly one node; that node registers its chosen resource
+expires after one hour and authorizes exactly one node; that node registers its chosen resource
 allowance. Older API clients may supply an explicit owner ceiling.
 
 The installer updates WSL to at least 2.5.7 when needed. Enabling WSL can trigger
