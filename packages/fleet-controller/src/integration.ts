@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { canonical, digest, identifier, requireThat, validateIntegration, type ChangeSubmission, type IntegrationJob, type CheckRequirement, type Generation } from '@enginebox/fleet-protocol';
 import { Tasks } from './tasks.ts';
 type Store = { get<T>(key:string): T|undefined; put(key:string,value:unknown):void };
@@ -48,5 +49,9 @@ export class Integrations {
     const candidate={spec:{id:job.id,project:job.project,base:job.generation,generation:report.generation,changes:job.integration.changes.map(({id,generation})=>({id,generation}))},checks:frozen.checks,fullJobs:{},taskRequirements:job.integration.taskRequirements};
     requireThat(!this.store.get(`candidate:${job.id}`),'Candidate ID already exists',409);
     this.store.put(`candidate:${job.id}`,candidate);
+    for(const change of candidate.spec.changes) {
+      const task=this.tasks.get(change.id);if(!task)continue;
+      this.tasks.move(task.id,{operationId:`integrate-${createHash("sha256").update(job.id).digest("hex").slice(0,32)}`,expectedRevision:task.revision,status:"testing",generation:change.generation,candidate:job.id},{id:"controller:integration",owner:false});
+    }
   }
 }

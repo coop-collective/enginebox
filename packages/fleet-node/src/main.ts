@@ -16,6 +16,8 @@ import {
   type Assignment,
   type NodeSpec,
 } from "@enginebox/fleet-protocol";
+import { executeIntegration, type IntegrationConfig } from "./integration.ts";
+import { EngineBuilds, type EngineBuildConfig } from "./build.ts";
 import { executeMedia, type MediaConfig } from "./media.ts";
 import { Cache } from "./cache.ts";
 import { Client } from "./client.ts";
@@ -35,6 +37,8 @@ export type Config = NodeSpec & {
   warmDelayMs?: number;
   nativeAssistant?: NativeAssistantConfig;
   media?: MediaConfig;
+  integration?:IntegrationConfig;
+  engineBuilds?:EngineBuildConfig;
   layerfs?: {
     ebox: string;
     config: string;
@@ -152,6 +156,12 @@ export async function runNode(config: Config) {
       canonical(Object.keys(config.nativeAssistant?.bindings ?? {}).sort()),
     "Enrolled assistant projects must match configured native bindings",
   );
+  for(const [capabilities,bindings,kind] of [
+    [config.integrationProjects??[],Object.keys(config.integration?.projects??{}),"integration"],
+    [config.buildProjects??[],Object.keys(config.engineBuilds?.bindings??{}),"build"],
+    [config.mediaProjects??[],config.media?.projects??[],"media"],
+  ] as [string[],string[],string][]) requireThat(canonical([...capabilities].sort())===canonical([...bindings].sort()),`Enrolled ${kind} projects must match configured bindings`);
+  const engineBuilds=config.engineBuilds?new EngineBuilds(config.engineBuilds,client):null;
   let blockedNative = false;
   let stopping = false;
   let connected = false;
@@ -274,6 +284,12 @@ export async function runNode(config: Config) {
             409,
           );
           result = await nativeAssistant.execute(assignment, signal);
+        } else if(assignment.kind === "integration") {
+          requireThat(config.integration,"Integration runtime is not configured",409);
+          result=await executeIntegration(config.integration,assignment,client,config.state,signal);
+        } else if(assignment.kind === "engine-build") {
+          requireThat(engineBuilds,"Protected engine builds are not configured",409);
+          result=await engineBuilds.execute(assignment,signal);
         } else if(assignment.kind === "media-finalize") {
           requireThat(config.media,"Media validation is not configured",409);
           result=await executeMedia(config.media,assignment,client,config.state,signal);

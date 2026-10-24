@@ -1350,6 +1350,16 @@ it("freezes exact-base integration submissions, fences capabilities and stages o
   expect((await ok("/v1/projects/demo/candidates/batch-merge")).spec).toEqual({id:"batch-merge",project:"demo",base:base.id,generation:output.id,changes:[{id:"feature",generation:change.id}]});
   expect((await ok("/v1/projects/demo")).head).toBe(base.id);
   expect((await request("/v1/projects/demo/accept",{generation:output.id,expected:base.id,candidate:"batch-merge"})).status).toBe(409);
+  const task=await ok("/v1/projects/demo/tasks/feature");
+  expect(task).toMatchObject({status:"testing",candidate:"batch-merge",resultGeneration:change.id});
+  const inventory=await ok("/v1/projects/demo");
+  expect(inventory.jobs.filter((job:any)=>job.spec.check?.candidate==="batch-merge")).toHaveLength(1);
+  const check=(await ok("/v1/node/poll",{},ordinary)).assignment;
+  expect(check).toMatchObject({kind:"verify",generation:output.id,check:{candidate:"batch-merge",scope:"full"}});
+  await ok("/v1/node/finish",{assignment:check,ok:true,result:{check:check.check}},ordinary);
+  expect((await ok("/v1/projects/demo")).head).toBe(base.id);
+  expect((await ok("/v1/projects/demo/tasks/feature/approve",{operationId:"review-integrated",expectedRevision:task.revision})).status).toBe("shipped");
+  expect((await ok("/v1/projects/demo")).head).toBe(output.id);
 });
 it("task-only credentials cannot submit or execute integration and arbitrary jobs cannot invent a frozen batch",async()=>{
   const {spec}=await integrationFixture();

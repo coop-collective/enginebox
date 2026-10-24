@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
 import {
   canonical,
@@ -756,18 +757,37 @@ export class Project extends State {
     this.put(`job:${spec.id}`, job);
     return job;
   }
+  private async queueIntegrationChecks(id:string) {
+    const candidate=this.get<CandidateRecord>(`candidate:${id}`);if(!candidate)return;
+    const generation=this.get<GenerationRecord>(`generation:${candidate.spec.generation}`)!;
+    for(const requirement of candidate.checks) {
+      if(candidate.fullJobs[requirement.name] || requirement.kind==="layerfs-exec")continue;
+      const check={candidate:id,name:requirement.name,recipe:requirement.recipe,scope:"full" as const};
+      const jobId=`check-${createHash("sha256").update(canonical({candidate:id,name:requirement.name})).digest("hex").slice(0,40)}`;
+      const common={id:jobId,project:candidate.spec.project,generation:candidate.spec.generation,check};
+      if(requirement.kind==="verify")await this.enqueue({...common,kind:"verify"});
+      else await this.enqueue({...common,kind:"engine-build",timeoutSeconds:requirement.timeoutSeconds!,build:{candidate:id,integration:id,sourceTree:generation.manifest.metadata.treeHash!,recipe:requirement.recipe}});
+    }
+  }
   async next(capabilities: {assistant?:boolean;integration?:boolean;media?:boolean;buildNode?:string} = {}) {
-    const row = this.ctx.storage.sql
-      .exec<{
-        value: string;
-      }>(
-        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.status')='queued' AND (?=1 OR json_extract(value,'$.spec.kind')!='assistant') AND (?=1 OR json_extract(value,'$.spec.kind')!='media-finalize') AND (?=1 OR json_extract(value,'$.spec.kind')!='integration') ORDER BY rowid LIMIT 1",
-        capabilities.assistant ? 1 : 0,
-        capabilities.media ? 1 : 0,
-        capabilities.integration ? 1 : 0,
-      )
-      .toArray()[0];
-    return row ? (JSON.parse(row.value) as JobRecord).spec : null;
+    const row=this.ctx.storage.sql.exec<{value:string}>(
+      `SELECT queued.value FROM records queued WHERE queued.key LIKE 'job:%'
+       AND json_extract(queued.value,'$.status')='queued'
+       AND (?=1 OR json_extract(queued.value,'$.spec.kind')!='assistant')
+       AND (?=1 OR json_extract(queued.value,'$.spec.kind')!='integration')
+       AND (?=1 OR json_extract(queued.value,'$.spec.kind')!='media-finalize')
+       AND (json_extract(queued.value,'$.spec.kind')!='engine-build' OR
+         (? IS NOT NULL AND EXISTS (SELECT 1 FROM records source WHERE
+           source.key='job:' || json_extract(queued.value,'$.spec.build.integration')
+           AND json_extract(source.value,'$.assignment.node')=?)))
+       ORDER BY queued.rowid LIMIT 1`,
+      capabilities.assistant?1:0, capabilities.integration?1:0, capabilities.media?1:0,
+      capabilities.buildNode??null, capabilities.buildNode??null,
+    ).toArray()[0];
+    if(!row)return null;
+    const spec=(JSON.parse(row.value) as JobRecord).spec;
+    requireThat(new Builds(this).eligible(spec,capabilities.buildNode),"Build source is no longer eligible",409);
+    return spec;
   }
   async assign(assignment: Assignment) {
     const key = `job:${assignment.id}`;
@@ -841,6 +861,7 @@ export class Project extends State {
         "Result differs from recorded outcome",
         409,
       );
+      if(ok&&job.spec.kind==="integration")await this.queueIntegrationChecks(job.spec.id);
       if(ok&&job.spec.check)await this.promoteReviewed(job.spec.check.candidate);
       if(ok&&job.spec.kind==="media-finalize") {const recording=this.recordingState().get(job.spec.recording);if(recording)await this.promoteReviewed(recording.candidate);}
       return job;
@@ -864,6 +885,7 @@ export class Project extends State {
     job.status = ok ? "completed" : "failed";
     job.result = result;
     this.put(key, job);
+    if(ok&&job.spec.kind==="integration")await this.queueIntegrationChecks(job.spec.id);
     if(ok&&job.spec.check)await this.promoteReviewed(job.spec.check.candidate);
     if(ok&&job.spec.kind==="media-finalize") {await this.ctx.storage.setAlarm(Date.now()+60_000);const recording=this.recordingState().get(job.spec.recording);if(recording)await this.promoteReviewed(recording.candidate);}
     return job;

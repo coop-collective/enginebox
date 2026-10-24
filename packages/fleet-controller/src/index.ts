@@ -426,6 +426,7 @@ export default {
               assistant: n.assistantProjects?.includes(project) ?? false,
               media: n.mediaProjects?.includes(project) ?? false,
               integration: n.integrationProjects?.includes(project) ?? false,
+              buildNode: n.buildProjects?.includes(project) ? n.id : undefined,
             });
             if (!next) continue;
             const reserved = await stub.reserve(next, s.epoch, s.session);
