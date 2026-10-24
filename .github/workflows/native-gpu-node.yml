@@ -9,6 +9,34 @@ on:
 permissions:
   contents: read
 jobs:
+  windows-bootstrap:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Reproduce unsigned-script failure and verify bootstrap on Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/tests/native-bootstrap.ps1
+          if ($LASTEXITCODE) { throw 'Windows bootstrap regression failed' }
+      - name: Download the previously qualified native binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: 40049328764
+          name: enginebox-node-windows-nvidia-e87c70c91bf98085a5e57b022aeaf14851ff0a70
+          path: .state/bootstrap-package
+      - name: Package the one-command installer
+        shell: pwsh
+        run: |
+          $binary='.state/bootstrap-package/enginebox-node.exe'
+          if ((Get-FileHash -Algorithm SHA256 $binary).Hash -ne 'f6f0b2c0bc7fa65b134981736ec44d7c2a25ac55219d6bd36e6ea767f3eb711c') { throw 'Qualified binary hash mismatch' }
+          Copy-Item packages/enginebox-install/assets/install-native-node.ps1 .state/bootstrap-package/ -Force
+          Copy-Item docs/NATIVE-GPU-NODES.md .state/bootstrap-package/README.md -Force
+          & packages/enginebox-install/assets/package-native-node.ps1 -PackageDirectory .state/bootstrap-package -OutputDirectory .state/bootstrap-release -Tag native-node-preview-20261024.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: native-node-bootstrap-${{ github.sha }}
+          path: .state/bootstrap-release/
   linux-image:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

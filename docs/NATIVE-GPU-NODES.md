@@ -6,6 +6,26 @@ The Windows package runs a background user service through Task Scheduler at sig
 
 ## Inspect and install Windows
 
+The native-node preview release supplies `install-command.txt`: one PowerShell
+command that downloads and verifies `install.ps1`, which in turn verifies a pinned
+package archive and executable. It launches with `-NoProfile -ExecutionPolicy
+Bypass` scoped to that process, so a downloaded unsigned script can run without
+changing the user's or machine's persistent execution policy. An organization
+enforcing signed scripts through Group Policy still requires its approved signed
+installer. This does not add an Authenticode signature to our preview.
+
+The bootstrap finds FFmpeg or offers to install `Gyan.FFmpeg` through WinGet for
+the current user, then prompts for the controller origin. Leave the origin blank
+to run only the real GPU qualification. Enrollment is still prompted privately
+by the installer. A matching deployed controller and valid enrollment invitation
+are required to register a node. No GitHub login is needed for release downloads.
+
+For a package already extracted locally, prefix the command with
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File` and keep its existing
+arguments. Running the bare unsigned `.ps1` can produce PowerShell's
+`UnauthorizedAccess` / "not digitally signed" error before our installer starts.
+See [Microsoft's execution-policy scopes](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-5.1).
+
 Download the `enginebox-node-windows-nvidia-<commit>` artifact from the **Build native GPU node installers** workflow. It includes the executable, PowerShell installer, license and checksums. Use the checksum from that trusted workflow/release. These prerelease artifacts are not Authenticode-signed and have not been tested on the owner's RTX machine.
 
 Install an NVIDIA graphics driver and an FFmpeg build containing `h264_nvenc`. Then run from the extracted artifact:

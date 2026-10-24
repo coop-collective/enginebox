@@ -1,0 +1,81 @@
+# Generated release bootstrap. The archive and executable hashes are pinned at packaging time.
+[CmdletBinding()]
+param(
+  [ValidateSet('Install','Inspect')][string]$Mode='Install',
+  [string]$Controller,
+  [string]$FfmpegPath,
+  [string]$WorkerConfig
+)
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+
+function Get-VerifiedNodePackage([string]$Uri,[string]$Sha256,[string]$Destination) {
+  $parsed=[Uri]$Uri
+  if ($parsed.Scheme -ne 'https' -or $parsed.UserInfo -or $Sha256 -notmatch '^[a-fA-F0-9]{64}$') { throw 'Invalid package URL or checksum.' }
+  $archive=Join-Path $Destination 'package.zip'
+  Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $archive
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash -ne $Sha256) { throw 'Package checksum mismatch; nothing will be executed.' }
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip=[IO.Compression.ZipFile]::OpenRead($archive)
+  try {
+    $allowed=@('enginebox-node.exe','install-native-node.ps1','README.md','LICENSE','NOTICE','SHA256SUMS')
+    $seen=@{}
+    foreach ($entry in $zip.Entries) {
+      if ($entry.FullName -cnotin $allowed -or $seen.ContainsKey($entry.FullName) -or $entry.Length -gt 100MB) { throw 'Unexpected package entry.' }
+      $seen[$entry.FullName]=$true
+    }
+    if ($seen.Count -ne $allowed.Count) { throw 'Incomplete node package.' }
+    foreach ($entry in $zip.Entries) {
+      [IO.Compression.ZipFileExtensions]::ExtractToFile($entry,(Join-Path $Destination $entry.FullName),$false)
+    }
+  } finally { $zip.Dispose() }
+}
+
+function Find-NodeFfmpeg {
+  $command=Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
+  $link=Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\ffmpeg.exe'
+  if (Test-Path -LiteralPath $link) { return $link }
+  $packages=Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  if (Test-Path -LiteralPath $packages) {
+    $found=Get-ChildItem -LiteralPath $packages -Directory -Filter 'Gyan.FFmpeg_*' |
+      Get-ChildItem -Recurse -File -Filter ffmpeg.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($found) { return $found.FullName }
+  }
+  return $null
+}
+
+# Dot-sourcing exposes only the download helpers for isolated tests.
+if ($MyInvocation.InvocationName -eq '.') { return }
+if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { throw 'Windows x64 is required.' }
+if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { throw 'This package requires Windows x64.' }
+[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$scratch=Join-Path ([IO.Path]::GetTempPath()) ('enginebox-node-'+[Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $scratch | Out-Null
+try {
+  Write-Host 'Downloading and verifying the Windows node package...'
+  Get-VerifiedNodePackage -Uri '@@ARCHIVE_URL@@' -Sha256 '@@ARCHIVE_SHA256@@' -Destination $scratch
+  if (-not $FfmpegPath) { $FfmpegPath=Find-NodeFfmpeg }
+  if (-not $FfmpegPath) {
+    $winget=Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) { throw 'FFmpeg is missing. Install Microsoft App Installer (WinGet), or rerun with -FfmpegPath pointing to ffmpeg.exe.' }
+    $answer=Read-Host 'FFmpeg is missing. Install Gyan.FFmpeg for your user with WinGet? [y/N]'
+    if ($answer -notmatch '^(y|yes)$') { throw 'FFmpeg installation skipped. Rerun with -FfmpegPath pointing to an existing ffmpeg.exe.' }
+    & $winget.Source install --id Gyan.FFmpeg --exact --source winget --scope user --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) { throw 'WinGet could not install FFmpeg.' }
+    $FfmpegPath=Find-NodeFfmpeg
+    if (-not $FfmpegPath) { throw 'FFmpeg was not located after installation. Rerun with its absolute -FfmpegPath.' }
+  }
+  if ($Mode -eq 'Install' -and -not $Controller) {
+    $Controller=Read-Host 'Controller HTTPS origin (leave blank to check the GPU only)'
+    if (-not $Controller) { $Mode='Inspect' }
+  }
+  $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $scratch 'install-native-node.ps1'),'-Mode',$Mode,
+    '-ExpectedBinarySha256','@@BINARY_SHA256@@','-FfmpegPath',$FfmpegPath)
+  if ($Controller) { $arguments+=@('-Controller',$Controller) }
+  if ($WorkerConfig) { $arguments+=@('-WorkerConfig',$WorkerConfig) }
+  & powershell.exe @arguments
+  if ($LASTEXITCODE -ne 0) { throw 'Node setup failed; see the preceding error. Organization-enforced signing policies require an approved signed installer.' }
+} finally {
+  Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+}
