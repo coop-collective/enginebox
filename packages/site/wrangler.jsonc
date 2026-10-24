@@ -1,0 +1,8 @@
+// Static marketing site and docs. Deploy with `pnpm --filter enginebox-site deploy`.
+{
+  "name": "enginebox-site",
+  "account_id": "e40385e6d96d5cad8df33b1ef3e3694a",
+  "compatibility_date": "2026-09-01",
+  "assets": { "directory": "./dist", "not_found_handling": "404-page" },
+  "routes": [{ "pattern": "enginebox.coopcollective.dev", "custom_domain": true }]
+}
