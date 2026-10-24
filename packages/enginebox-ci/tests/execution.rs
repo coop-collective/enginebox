@@ -143,3 +143,22 @@ fn successful_compiler_stderr_above_transport_limit_is_supported() {
     .unwrap();
     assert_eq!(result["stdout"], "built");
 }
+
+#[cfg(windows)]
+#[test]
+fn powershell_build_uses_a_canonical_worker_path_and_retains_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The CLI canonicalizes its private root before invoking the executor.
+    let root = tmp.path().canonicalize().unwrap();
+    let mut n = node();
+    n.capabilities.push("pwsh".into());
+    let mut r = serde_json::to_value(request("New-Item -ItemType Directory dist | Out-Null\nSet-Content -NoNewline -Path dist/build.txt -Value built")).unwrap();
+    r["job"]["shell"] = json!("pwsh");
+    r["job"]["artifacts"] = json!(["dist"]);
+    let result = executor::execute_at(&n, &serde_json::from_value(r).unwrap(), &root);
+    assert!(result.is_ok(), "PowerShell execution failed: {result:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("artifacts/merge-test/dist/build.txt")).unwrap(),
+        "built"
+    );
+}
