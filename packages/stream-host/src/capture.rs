@@ -18,12 +18,49 @@ use tokio::{
 };
 
 pub struct Capture {
-    children: Vec<Child>,
+    children: Vec<OwnedChild>,
     tasks: Vec<JoinHandle<()>>,
     pub frames: broadcast::Sender<Bytes>,
     pub input: Arc<Mutex<Input>>,
     pub failed: Arc<AtomicBool>,
     directory: PathBuf,
+}
+struct OwnedChild {
+    child: Child,
+    group: Option<i32>,
+}
+impl OwnedChild {
+    fn new(child: Child) -> Self {
+        let group = child.id().map(|id| id as i32);
+        Self { child, group }
+    }
+    fn signal(&self, signal: i32) {
+        if let Some(group) = self.group {
+            unsafe {
+                libc::kill(-group, signal);
+            }
+        }
+    }
+    fn group_exists(&self) -> bool {
+        self.group
+            .is_some_and(|group| unsafe { libc::kill(-group, 0) == 0 })
+    }
+}
+impl std::ops::Deref for OwnedChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.signal(libc::SIGKILL);
+    }
 }
 fn command(program: &str, directory: &std::path::Path, display: &str) -> Command {
     let mut c = Command::new(program);
@@ -61,7 +98,7 @@ impl Capture {
         }
         let mut children = Vec::new();
         let start = async {
-            children.push(
+            children.push(OwnedChild::new(
                 command("/usr/bin/Xvfb", &directory, &display)
                     .args([
                         &display,
@@ -75,7 +112,7 @@ impl Capture {
                     ])
                     .spawn()
                     .context("start owned Xvfb")?,
-            );
+            ));
             let input = tokio::time::timeout(Duration::from_secs(8), async {
                 loop {
                     if children[0].try_wait()?.is_some() {
@@ -104,7 +141,9 @@ impl Capture {
                 .args(&config.command.args)
                 .current_dir(&config.command.directory)
                 .envs(&config.command.env);
-            children.push(engine.spawn().context("start configured engine command")?);
+            children.push(OwnedChild::new(
+                engine.spawn().context("start configured engine command")?,
+            ));
             let mut encoder = command("/usr/bin/ffmpeg", &directory, &display)
                 .args([
                     "-hide_banner",
@@ -145,7 +184,7 @@ impl Capture {
                 .spawn()
                 .context("start VP8 encoder")?;
             let stdout = encoder.stdout.take().context("encoder output missing")?;
-            children.push(encoder);
+            children.push(OwnedChild::new(encoder));
             Ok::<_, anyhow::Error>((input, stdout))
         }
         .await;
@@ -195,37 +234,34 @@ impl Drop for Capture {
         for task in &self.tasks {
             task.abort();
         }
-        for child in &mut self.children {
-            if let Some(pid) = child.id() {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
+        for child in &self.children {
+            child.signal(libc::SIGKILL);
         }
     }
 }
-async fn stop_children(children: &mut [Child]) {
-    for child in children.iter_mut().rev() {
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
+async fn stop_children(children: &mut [OwnedChild]) {
+    for child in children.iter().rev() {
+        child.signal(libc::SIGTERM);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        for child in children.iter_mut() {
+            let _ = child.try_wait();
         }
+        if !children.iter().any(OwnedChild::group_exists) || tokio::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Retain the original PGID even after try_wait reaps its leader. Descendants
+    // can still occupy that owned group and may have ignored TERM.
+    for child in children.iter().rev() {
+        child.signal(libc::SIGKILL);
     }
     for child in children.iter_mut().rev() {
-        let pid = child.id();
-        if tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .is_err()
-        {
-            if let Some(pid) = pid {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        child.group = None;
     }
 }
 async fn read_frames(
@@ -249,5 +285,49 @@ async fn read_frames(
         out.read_exact(&mut b).await?;
         let _ = frames.send(Bytes::from(b));
         count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cleanup_kills_descendant_after_its_direct_parent_exits() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pidfile = dir.path().join("descendant.pid");
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; sleep 30 & echo $! > \"$1\"; exit 0",
+                "fixture",
+            ])
+            .arg(&pidfile)
+            .process_group(0)
+            .spawn()?;
+        let mut children = vec![OwnedChild::new(child)];
+        children[0].wait().await?;
+        assert!(children[0].id().is_none());
+        let pid: i32 = std::fs::read_to_string(pidfile)?.trim().parse()?;
+        assert!(children[0].group_exists());
+        stop_children(&mut children).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // In the container test the harness is PID1 and adopts this child.
+                let mut status = 0;
+                unsafe {
+                    libc::waitpid(pid, &mut status, libc::WNOHANG);
+                }
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "owned descendant survived process-group cleanup"
+        );
+        Ok(())
     }
 }

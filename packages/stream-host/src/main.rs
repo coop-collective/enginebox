@@ -131,7 +131,7 @@ async fn run(config: Config, controller: Controller, node: String, epoch: u64) -
             _=tokio::signal::ctrl_c()=>break Ok(()),_=term.recv()=>break Ok(()),
             _=watchdog.tick()=>{let bad=capture.as_mut().is_some_and(|c|!c.healthy());let dead:Vec<_>=peers.iter().filter(|(_,p)|bad||!p.permit.valid()).map(|(id,_)|id.clone()).collect();for id in dead{if let Some(p)=peers.remove(&id){let session=p.session.clone();p.stop().await;let _=controller.end(&session).await;}}Ok(())},
             _=heartbeat.tick()=>controller.heartbeat(peers.len(),frames.load(Ordering::Relaxed),inputs.load(Ordering::Relaxed)).await,
-            _=poll.tick()=>{match controller.poll().await {Ok(update)=>reconcile(&config,&controller,&node,epoch,&api,update,&mut capture,&mut peers,frames.clone(),inputs.clone()).await,Err(e)=>Err(e)}},
+            _=poll.tick()=>{let requested=std::time::Instant::now();match controller.poll().await {Ok(update)=>reconcile(&config,&controller,&node,epoch,&api,update,requested,&mut capture,&mut peers,frames.clone(),inputs.clone()).await,Err(e)=>Err(e)}},
         };
         if let Err(error) = update {
             for (_, p) in peers.drain() {
@@ -167,6 +167,7 @@ async fn reconcile(
     epoch: u64,
     api: &webrtc::api::API,
     update: Poll,
+    requested: std::time::Instant,
     capture: &mut Option<capture::Capture>,
     peers: &mut HashMap<String, peer::Peer>,
     frames: Arc<AtomicU64>,
@@ -183,7 +184,6 @@ async fn reconcile(
     {
         bail!("invalid authority session envelope")
     }
-    let received = std::time::Instant::now();
     let active: std::collections::HashSet<_> = update
         .sessions
         .iter()
@@ -207,14 +207,8 @@ async fn reconcile(
         {
             bail!("TURN credentials expired")
         }
-        let ttl = Duration::from_millis(
-            session
-                .expires
-                .min(session.ice_expires.unwrap_or(u64::MAX))
-                .saturating_sub(update.now)
-                .min(60_000),
-        )
-        .saturating_sub(received.elapsed());
+        let deadline = lease_deadline(requested, update.now, session.expires, session.ice_expires);
+        let ttl = deadline.saturating_duration_since(std::time::Instant::now());
         if ttl.is_zero() {
             continue;
         }
@@ -237,7 +231,10 @@ async fn reconcile(
             let p = peer::Peer::start(
                 api,
                 session.clone(),
-                input::Permit::new(session.mode == "control", ttl),
+                input::Permit::new(
+                    session.mode == "control",
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                ),
                 &session.ice_servers,
                 session
                     .ice_transport_policy
@@ -271,6 +268,43 @@ async fn reconcile(
         }
     }
     Ok(())
+}
+fn lease_deadline(
+    requested: std::time::Instant,
+    server_now: u64,
+    expires: u64,
+    ice_expires: Option<u64>,
+) -> std::time::Instant {
+    // Request start, not response receipt: subtract network delay and engine
+    // startup conservatively without trusting synchronization of wall clocks.
+    requested
+        + Duration::from_millis(
+            expires
+                .min(ice_expires.unwrap_or(u64::MAX))
+                .saturating_sub(server_now)
+                .min(60_000),
+        )
+}
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn delayed_poll_cannot_extend_authoritative_expiry() {
+        let now = std::time::Instant::now();
+        let request = now - Duration::from_secs(10);
+        assert_eq!(
+            lease_deadline(request, 1000, 6000, None).saturating_duration_since(now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            lease_deadline(request, 1000, 61000, None).duration_since(now),
+            Duration::from_secs(50)
+        );
+        assert_eq!(
+            lease_deadline(request, 1000, 61000, Some(2000)).saturating_duration_since(now),
+            Duration::ZERO
+        );
+    }
 }
 #[derive(Debug)]
 struct PeerFault;

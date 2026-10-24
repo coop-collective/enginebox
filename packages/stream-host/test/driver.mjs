@@ -83,4 +83,4 @@ try{
   const receipt={passed:true,fixture:process.env.STREAM_SCENE_KIND||'actual native X11 + FFmpeg VP8',controller:fleet?'real isolated Wrangler fleet':'protocol fixture',transport:'relay-only TURN; no host inbound ports',before,samples,identityRestartEpoch:epoch,inputMessages:2,watchInputRejected:true,invalidCoordinatesRejected:true,leaseReclaimed:true,revocationClosed:true,...(gamejamReceipt?{gamejam:gamejamReceipt}:{})};
   await writeFile('/evidence/result.json',JSON.stringify(receipt,null,2));console.log('STREAM_TEST_PASSED');
 }catch(e){console.error(e.stack);await writeFile('/evidence/result.json',JSON.stringify({passed:false,error:e.message}));process.exitCode=1;}
-finally{clearInterval(renew);await browser?.close();server.close();}
+finally{clearInterval(renew);await browser?.close();server.closeAllConnections();server.close();setTimeout(()=>process.exit(process.exitCode||0),100);}

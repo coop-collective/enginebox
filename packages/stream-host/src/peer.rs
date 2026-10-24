@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -151,6 +151,9 @@ impl Peer {
             while active.valid() {
                 match frames.recv().await {
                     Ok(data) => {
+                        if !active.valid() {
+                            break;
+                        }
                         if !matches!(
                             tokio::time::timeout(
                                 Duration::from_millis(250),
@@ -191,14 +194,45 @@ impl Peer {
             }
         });
         let accepted = Arc::new(AtomicBool::new(false));
+        let channel_count = Arc::new(AtomicUsize::new(0));
         pc.on_data_channel(Box::new(move |channel| {
-            let (p, i, accepted) = (p.clone(), i.clone(), accepted.clone());
+            let (p, i, accepted, channel_count) = (
+                p.clone(),
+                i.clone(),
+                accepted.clone(),
+                channel_count.clone(),
+            );
             Box::pin(async move {
-                if channel.label() != "input" || !p.control || accepted.swap(true, Ordering::SeqCst)
+                if channel_count.fetch_add(1, Ordering::SeqCst) >= 4 {
+                    p.revoke();
+                }
+                if channel.label() != "input"
+                    || !p.control
+                    || accepted.swap(true, Ordering::SeqCst)
+                    || !p.valid()
                 {
+                    // on_data_channel precedes handle_open in webrtc-rs. Closing
+                    // only here can miss the later SCTP stream; close on_open too.
+                    let rejected = Arc::downgrade(&channel);
+                    channel.on_open(Box::new(move || {
+                        let rejected = rejected.clone();
+                        Box::pin(async move {
+                            if let Some(channel) = rejected.upgrade() {
+                                let _ = channel.close().await;
+                            }
+                        })
+                    }));
                     let _ = channel.close().await;
                     return;
                 }
+                let (close_permit, close_input) = (p.clone(), i.clone());
+                channel.on_close(Box::new(move || {
+                    let (p, i) = (close_permit.clone(), close_input.clone());
+                    Box::pin(async move {
+                        p.revoke();
+                        i.lock().unwrap().release_all();
+                    })
+                }));
                 channel.on_message(Box::new(move |message| {
                     let (p, i) = (p.clone(), i.clone());
                     Box::pin(async move {
