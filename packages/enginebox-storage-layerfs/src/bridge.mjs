@@ -2,6 +2,7 @@
 // leases, resource admission and receipts stay in Rust. No agent loop here.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { mergeFrozen, inspectFrozen } from './integration.mjs';
 const request = JSON.parse(readFileSync(0, 'utf8'));
 process.env.LAYERFS_HOME = request.home;
 process.env.LAYERFS_VOLUME = request.volume;
@@ -18,6 +19,14 @@ let answer;
 try {
   let result;
   switch (request.operation) {
+    case 'inspect': result = await inspectFrozen(client, request.reference, request.inspectPrefix); break;
+    case 'integrate': result = await mergeFrozen(client, request.integration); break;
+    case 'snapshot': {
+      const { DatabaseSync, backup } = await import('node:sqlite');
+      const db = new DatabaseSync(process.env.LAYERFS_STORE_PATH, {readOnly:true});
+      try { await backup(db, request.output); } finally { db.close(); }
+      result = {snapshot:request.output}; break;
+    }
     case 'import': result = await client.project.init(request.source); break;
     case 'create': {
       const volumes = request.cache ? [
@@ -41,8 +50,8 @@ try {
   }
   answer = { ok: true, result };
 } catch (error) {
-  answer = { ok: false, error: { code: error.code ?? 'Unknown', message: error.message } };
+  answer = { ok: false, error: { code: error.code ?? 'Unknown', message: error.message, detail: error.detail } };
 } finally {
-  try { await client.close(); } catch (error) { answer = { ok: false, error: { code: 'Unknown', message: error.message } }; }
+  try { await client.close(); } catch (error) { answer = { ok: false, error: { code: 'Unknown', message: error.message, detail: error.detail } }; }
 }
 console.log(JSON.stringify(answer, (_, value) => typeof value === 'bigint' ? String(value) : value));

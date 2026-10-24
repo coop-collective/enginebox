@@ -23,6 +23,18 @@ enum Backend {
 enum Command {
     /// Inspect prerequisites and immutable artifacts without changing Docker.
     Doctor,
+    /// Freeze main or an immutable reference and back up its Store for publication.
+    Snapshot {
+        project: String,
+        name: String,
+        #[arg(long, default_value = "main")]
+        reference: String,
+    },
+    /// Merge a frozen exact-base batch using immutable LayerFS references.
+    Integrate {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Review committed paths and obtain the import approval digest.
     Preview {
         #[arg(long)]
@@ -42,6 +54,9 @@ enum Command {
         /// Assert that the reviewed tracked content is suitable for reuse.
         #[arg(long, required = true)]
         credential_free: bool,
+        /// Import the reviewed tree without Git metadata for logical integration.
+        #[arg(long)]
+        source_only: bool,
     },
     /// Fork a project's base into a separately limited writable sandbox.
     Fork {
@@ -121,13 +136,20 @@ pub fn run(args: Storage) -> Result<Value> {
     let runtime = Runtime::new(config)?;
     match command {
         Command::Doctor => runtime.doctor(),
+        Command::Snapshot {
+            project,
+            name,
+            reference,
+        } => runtime.snapshot(&project, &name, &reference),
+        Command::Integrate { request } => runtime.integrate(&request),
         Command::Import {
             name,
             repo,
             revision,
             approval,
             credential_free: _,
-        } => runtime.import(&name, &repo, &revision, &approval),
+            source_only,
+        } => runtime.import(&name, &repo, &revision, &approval, source_only),
         Command::Fork {
             project,
             name,

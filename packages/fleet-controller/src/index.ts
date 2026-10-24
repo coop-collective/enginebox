@@ -14,6 +14,7 @@ import {
   requireThat,
   readOnlyJob,
   sha256,
+  validateSubmission,
   validateChunks,
   validateGeneration,
   validateJob,
@@ -421,10 +422,11 @@ export default {
             });
           for (const project of n.projects) {
             const authority = env.PROJECTS.getByName(project);
-            const next = await authority.next(
-              n.assistantProjects?.includes(project) ?? false,
-              n.mediaProjects?.includes(project) ?? false,
-            );
+            const next = await authority.next({
+              assistant: n.assistantProjects?.includes(project) ?? false,
+              media: n.mediaProjects?.includes(project) ?? false,
+              integration: n.integrationProjects?.includes(project) ?? false,
+            });
             if (!next) continue;
             const reserved = await stub.reserve(next, s.epoch, s.session);
             try {
@@ -618,6 +620,16 @@ export default {
           return json(
             await authority.configureChecks(validateChecks(body.checks)),
           );
+        }
+        if (parts.length === 4 && parts[3] === "submissions" && request.method === "POST") {
+          admin(p); const spec=validateSubmission(await jsonBody(request));
+          requireThat(spec.project===project,"Project mismatch");
+          return json(await authority.submitChange(spec),201);
+        }
+        if (parts.length === 4 && parts[3] === "integrations" && request.method === "POST") {
+          admin(p); const body=await jsonBody(request); record(body);
+          identifier(body.id); requireThat(Array.isArray(body.changes),"Submission IDs required");
+          return json(await authority.integrate(body.id,body.changes as string[]),201);
         }
         if (
           parts.length === 4 &&
