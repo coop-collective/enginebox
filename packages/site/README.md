@@ -24,7 +24,7 @@ Edit the landing page in `src/home.mjs`, the pricing page in `src/pricing.mjs`, 
 
 The interactive environment diagram is a browser-only concept demo. Its private edits, pinned revisions and sleep/wake controls explain the planned persistent core workflow; they do not operate a real fleet. Keep planned capabilities clearly labeled and verify command examples against the runtime before publishing.
 
-Browser tests cover desktop and mobile interactions, documentation search, copying commands, theme persistence, navigation and missing pages. Tests use the installed Playwright Chromium browser.
+Browser tests cover desktop and mobile interactions, documentation search, copying commands, theme persistence, navigation and missing pages. They run the site in local Wrangler with a fixture dashboard service, including the dashboard entry link, JavaScript assets and API forwarding. No production controller connection is used. Tests use the installed Playwright Chromium browser.
 
 ## Pricing page and checkout
 
@@ -41,10 +41,16 @@ CHECKOUT_URL=https://example.com/checkout pnpm --filter enginebox-site build
 
 ## Deploy
 
-The site is a static-assets Cloudflare Worker served at `https://enginebox.coopcollective.dev` (see `wrangler.jsonc`). With Wrangler signed in to the account:
+The site is a Cloudflare Worker with static assets at `https://enginebox.coopcollective.dev` (see `wrangler.jsonc`). **Get started**, **Start building**, and the **Dashboard** navigation link open `https://enginebox.coopcollective.dev/dashboard/`.
+
+The `DASHBOARD` service binding connects to the existing `enginebox-dashboard-edge` Worker, which owns the private VPC connection to the native dashboard. `/dashboard/` maps to its root page; `/api/*`, `/_next/*`, and `/healthz` retain their paths. The public controller origin stays unchanged, including Windows node enrollment. The existing dashboard owns login, session cookies and node authentication; this site has no controller credential. Requests and responses stream through the fixed binding without following redirects.
+
+Keep the Worker entrypoint, `run_worker_first`, and `DASHBOARD` binding when deploying. Replacing this with a static-only custom domain hides both the dashboard and node API. Provision the dashboard edge before deploying to another account. The static `dev:site` preview only serves the website; `test:e2e` exercises the combined routing with its local fixture.
+
+With Wrangler signed in to the account:
 
 ```sh
 pnpm --filter enginebox-site run deploy
 ```
 
-This builds `dist/` and runs `wrangler deploy`, which also attaches the custom domain. Set `CHECKOUT_URL` in the same shell once license checkout opens.
+This builds `dist/` and runs `wrangler deploy`, which also attaches the custom domain and service binding. Set `CHECKOUT_URL` in the same shell once license checkout opens. Verify the homepage and docs, then click through to `/dashboard/` and verify login and `/api/node/*` before considering a deployment healthy.
