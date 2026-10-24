@@ -20,7 +20,7 @@ pub struct Preview {
 pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     git_input(repo, args, None)
 }
-fn git_input(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+pub(crate) fn git_input(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
     let repository = fs::canonicalize(repo)?;
     let mut argv = vec![
         "env".into(),
@@ -118,6 +118,12 @@ pub fn safe_link(path: &str, target: &str) -> Result<()> {
     allowed_path(&parts.join("/"))
 }
 pub fn preview(repo: &Path, revision: &str) -> Result<Preview> {
+    preview_tree(repo, revision, false)
+}
+pub fn preview_for_export(repo: &Path, revision: &str) -> Result<Preview> {
+    preview_tree(repo, revision, true)
+}
+fn preview_tree(repo: &Path, revision: &str, allow_empty: bool) -> Result<Preview> {
     ensure!(
         !revision.is_empty() && revision.len() < 512 && !revision.contains(['\0', '\n', '\r']),
         "Invalid revision"
@@ -140,6 +146,7 @@ pub fn preview(repo: &Path, revision: &str) -> Result<Preview> {
     let tree = git(repo, &["ls-tree", "-rlz", "--full-tree", &commit])?;
     let mut files = vec![];
     let mut links = BTreeMap::new();
+    let mut small_blobs = Vec::new();
     let mut bytes = 0u64;
     for record in tree.split(|b| *b == 0).filter(|b| !b.is_empty()) {
         let record = std::str::from_utf8(record)?;
@@ -155,6 +162,9 @@ pub fn preview(repo: &Path, revision: &str) -> Result<Preview> {
         bytes = bytes
             .checked_add(fields[3].parse::<u64>()?)
             .context("Tree size overflow")?;
+        if fields[0] != "120000" && fields[3].parse::<usize>()? <= 1024 {
+            small_blobs.push(fields[2]);
+        }
         if fields[0] == "120000" {
             ensure!(fields[3].parse::<usize>()? <= 4096, "Oversized symlink");
             let target = String::from_utf8(git(repo, &["cat-file", "blob", fields[2]])?)?;
@@ -163,7 +173,36 @@ pub fn preview(repo: &Path, revision: &str) -> Result<Preview> {
         }
         files.push(path.to_owned());
     }
-    ensure!(!files.is_empty(), "Empty source tree");
+    ensure!(allow_empty || !files.is_empty(), "Empty source tree");
+    // Git LFS stores pointers in Git, not the asset bytes. Refuse to publish a
+    // deceptively complete base until an explicit LFS ingestion path exists.
+    // Batch in small chunks so the process output bound does not cap tree size.
+    for objects in small_blobs.chunks(1024) {
+        let input = format!("{}\n", objects.join("\n"));
+        let output = git_input(repo, &["cat-file", "--batch"], Some(input.as_bytes()))?;
+        let mut remaining = output.as_slice();
+        for _ in objects {
+            let end = remaining
+                .iter()
+                .position(|b| *b == b'\n')
+                .context("Invalid blob header")?;
+            let header = std::str::from_utf8(&remaining[..end])?;
+            let size: usize = header
+                .split_whitespace()
+                .last()
+                .context("Blob size missing")?
+                .parse()?;
+            remaining = &remaining[end + 1..];
+            ensure!(remaining.len() > size, "Truncated blob response");
+            ensure!(
+                !remaining[..size].starts_with(b"version https://git-lfs.github.com/spec/v1\n")
+                    && !remaining[..size]
+                        .starts_with(b"version https://git-lfs.github.com/spec/v1\r\n"),
+                "Git LFS assets require separate hydration; refusing to import pointer files as complete assets"
+            );
+            remaining = &remaining[size + 1..];
+        }
+    }
     for (path, target) in &links {
         let mut resolved: Vec<String> = path.split('/').map(str::to_owned).collect();
         resolved.pop();
@@ -254,5 +293,12 @@ pub fn stage(repo: &Path, preview: &Preview, directory: &Path) -> Result<()> {
     fs::write(source.join(".git/shallow"), format!("{}\n", preview.commit))?;
     git(&source, &["update-ref", "refs/heads/main", &preview.commit])?;
     git(&source, &["reset", "--hard", &preview.commit])?;
+    Ok(())
+}
+
+/// Materialize source bytes for LayerFS. Git exists only in connector staging.
+pub fn stage_files(repo: &Path, preview: &Preview, directory: &Path) -> Result<()> {
+    stage(repo, preview, directory)?;
+    fs::remove_dir_all(directory.join("source/.git"))?;
     Ok(())
 }

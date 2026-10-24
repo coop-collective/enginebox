@@ -5,6 +5,8 @@ import { api, RequestError } from "@/lib/client";
 import type { Job } from "@/lib/types";
 import { checkoutRows, pending, sourcePreview, workspaceBusy, type Checkout, type StorageCatalog, type StorageNode, type StorageTask } from "@/lib/storage";
 
+import { GitHubStorage, githubProjects, type GitHubProject } from "./github-storage";
+
 const base = "/api/control/v1";
 const blocked = (task?: StorageTask) => !!task && (task.busy || !!task.uncertain);
 const label = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
@@ -86,6 +88,7 @@ function TaskStatus({ task, check }: { task?: StorageTask; check?: () => void })
 
 function NodeStorage({ node }: { node: StorageNode }) {
   const { tasks, run } = useStorageJobs(node.host_id);
+  const [github, setGithub] = useState<GitHubProject[]>([]);
   const [rows, setRows] = useState<Checkout[] | null>(null);
   const [project, setProject] = useState(node.projects[0]?.id ?? "");
   const [revision, setRevision] = useState("HEAD");
@@ -109,6 +112,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
         const rows = checkoutRows(result);
         if (!rows) { setListError("The node returned invalid workspace receipts."); continue; }
         setRows(rows);
+        setGithub(githubProjects(result));
         setListError("");
       }
     } finally { refreshing.current = false; }
@@ -160,6 +164,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
     {tasks.inspect?.result && <p className="catalog-notice" role="status">Node prerequisites passed. Admission checks run again for each operation.</p>}
     <TaskStatus task={tasks.list?.error ? tasks.list : undefined} check={() => void check("list")} />
     {listError && <p className="account-error" role="alert">{listError}</p>}
+    {node.github?.enabled && <GitHubStorage projects={github} rows={rows ?? []} tasks={tasks} run={run} refresh={refresh} />}
     {node.projects.length ? <>
       <label className="storage-project-select">Project
         <select value={project} onChange={(event) => { setProject(event.target.value); setReviewed(false); setFrom(""); setPreviewContext(""); }}>
@@ -201,7 +206,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
         const ready = row.status === "ready";
         const recoverable = !["ready", "closed"].includes(row.status);
         return <section className="storage-checkout" key={row.name} aria-label={`Checkout ${row.name}`}>
-          <div className="storage-checkout-heading"><div><strong>{row.name}</strong><span className="table-detail">Project {row.project}</span></div><span className="storage-receipt-status">{label(row.status)}</span></div>
+          <div className="storage-checkout-heading"><div><strong>{row.name}</strong><span className="table-detail">Project {row.github_project ?? row.project}</span></div><span className="storage-receipt-status">{label(row.status)}</span></div>
           <div className="action-buttons">
             {ready && ["deps", "checkpoint", "remount", "close"].map((operation) => <button className="button small" key={operation} disabled={busy} onClick={() => void action(row, operation)}>{operation === "deps" ? "Install cached dependencies" : label(operation)}</button>)}
             {recoverable && <button className="button small" disabled={busy} onClick={() => void action(row, "recover")}>Inspect recovery</button>}

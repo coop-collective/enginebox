@@ -4,12 +4,15 @@ export type StorageNode = {
   host_id: string;
   status: "registered";
   projects: { id: string }[];
+  github?: { enabled: boolean; private_auth_configured: boolean };
 };
 export type StorageCatalog = { configured: boolean; nodes: StorageNode[] };
 export type Checkout = {
   name: string;
   project: string;
   status: string;
+  github_project?: string;
+  source_commit?: string;
   last_error?: string | null;
   last_checkpoint?: unknown;
 };

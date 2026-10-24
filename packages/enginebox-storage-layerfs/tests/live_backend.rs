@@ -138,27 +138,18 @@ fn real_checkout_lifecycle() -> Result<()> {
         ])?;
         h.call(&["fork", "fixture", "a"])?;
         h.call(&["fork", "fixture", "b"])?;
-        let git_head = h.call(&["exec", "a", "--", "git", "rev-parse", "HEAD"])?;
-        ensure!(
-            git_head["result"]["stdout"].as_str().unwrap_or("").trim() == sha,
-            "Imported Git identity changed"
-        );
+        h.call(&["exec", "a", "--", "sh", "-c", "test ! -e /project/.git"])?;
         ensure!(
             h.call(&["fork", "fixture", "over-budget"]).is_err(),
             "Capacity exceeded"
         );
-        let content=h.call(&["exec","a","--","sh","-c","set -eu; test \"$(pwd -P)\" = /project; test ! -e .env; ! grep -q canary .git/config; test ! -r /layerfs-store/global/store.sqlite; test ! -S /var/run/docker.sock; cat hello.txt; printf 'agent-a\\n' > only-a.txt"])?;
+        let content=h.call(&["exec","a","--","sh","-c","set -eu; test \"$(pwd -P)\" = /project; test ! -e .env; test ! -e .git; test ! -r /layerfs-store/global/store.sqlite; test ! -S /var/run/docker.sock; cat hello.txt; printf 'agent-a\\n' > only-a.txt"])?;
         ensure!(
             content["result"]["stdout"]
                 .as_str()
                 .unwrap_or("")
                 .contains("base"),
             "Fixture content mismatch"
-        );
-        let commit=h.call(&["exec","a","--","sh","-c","set -eu; git add only-a.txt; git -c user.name='Engine Box fixture' -c user.email=fixture@example.invalid commit -qm agent-change; git rev-parse HEAD^"])?;
-        ensure!(
-            commit["result"]["stdout"].as_str().unwrap_or("").trim() == sha,
-            "Agent Git commit lost original ancestry"
         );
         h.call(&[
             "exec",
@@ -248,6 +239,44 @@ fn real_checkout_lifecycle() -> Result<()> {
             "Prepared dependency files were not reused"
         );
         h.call(&["close", "cached"])?;
+        let before = h.call(&["main", "fixture"])?;
+        let expected = before["revision"].as_str().context("Main revision")?;
+        let published = h.call(&[
+            "promote",
+            "fixture",
+            "a",
+            "--expected-main",
+            expected,
+            "--merge",
+        ])?;
+        ensure!(
+            published["status"] == "published",
+            "LayerFS promotion did not complete"
+        );
+        ensure!(
+            h.call(&[
+                "promote",
+                "fixture",
+                "b",
+                "--expected-main",
+                expected,
+                "--merge"
+            ])
+            .is_err(),
+            "Stale main promotion was accepted"
+        );
+        h.call(&["fork", "fixture", "promoted"])?;
+        let view = h.call(&[
+            "exec",
+            "promoted",
+            "--",
+            "sh",
+            "-c",
+            "set -eu; test -f only-a.txt; test -d node_modules; test ! -e .git; cat only-a.txt",
+        ])?;
+        ensure!(view["ok"] == true, "New fork did not inherit LayerFS main");
+        h.call(&["close", "promoted"])?;
+
         // A real operator-process interruption must not turn into an automatic
         // replay, even after the original command finishes independently.
         h.call(&["fork", "fixture", "interrupted", "--from", "a"])?;

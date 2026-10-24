@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::Duration};
 
 const BRIDGE: &str = include_str!("bridge.mjs");
+#[path = "github_runtime.rs"]
+mod github_runtime;
+#[path = "publication.rs"]
+mod publication;
 #[path = "recovery.rs"]
 mod recovery;
 #[derive(Clone, Serialize, Deserialize)]
@@ -191,13 +195,23 @@ impl Runtime {
         Ok(())
     }
     fn active_count(&self) -> Result<usize> {
-        Ok(state::json_files(&self.config.root.join("workspaces"))?
+        let sync = self.docker(
+            &[
+                "ps".into(),
+                "--filter=label=enginebox.sync.attempt".into(),
+                "--format={{.ID}}".into(),
+            ],
+            None,
+            30,
+        )?;
+        let workspaces = state::json_files(&self.config.root.join("workspaces"))?
             .into_iter()
             .map(|p| state::read_json(&p))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|v| v["status"] != "closed")
-            .count())
+            .count();
+        Ok(workspaces + String::from_utf8(sync)?.lines().count())
     }
     fn project_dir(&self, name: &str) -> PathBuf {
         self.config.root.join("projects").join(name)
@@ -349,6 +363,28 @@ impl Runtime {
     }
     fn bridge(&self, p: &Project, operation: &str, extra: Value, timeout: u64) -> Result<Value> {
         self.owned_volume(p)?;
+        let bridge_path = if operation.starts_with("project-") {
+            let content = include_str!("publication-bridge.mjs");
+            let path = self.config.root.join("publication-v1.mjs");
+            if path.exists() {
+                real_path(&path)?;
+                ensure!(
+                    fs::read_to_string(&path)? == content,
+                    "Publication adapter differs; install a compatible version"
+                );
+            } else {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                file.write_all(content.as_bytes())?;
+                file.sync_all()?;
+            }
+            path
+        } else {
+            self.config.root.join("bridge.mjs")
+        };
         let home = self.project_dir(&p.name).join("home");
         let mut request = json!({"operation":operation,"project":p.name,"home":home,"volume":p.volume,
             "prefix":format!("ebox-lfs-{}-",p.owner),"sdk":self.config.sdk,"image":self.config.image});
@@ -403,11 +439,7 @@ impl Runtime {
             "--kill-after=5s".into(),
             format!("{timeout}s"),
             "node".into(),
-            self.config
-                .root
-                .join("bridge.mjs")
-                .to_string_lossy()
-                .into_owned(),
+            bridge_path.to_string_lossy().into_owned(),
         ];
         if extra["_call"].is_string() {
             let calls = self.project_dir(&p.name).join("calls");
@@ -576,7 +608,7 @@ impl Runtime {
         let path = directory.join("project.json");
         state::write_json(&path, &json!(p))?;
         let outcome = (|| {
-            source::stage(repo, &preview, &directory)?;
+            source::stage_files(repo, &preview, &directory)?;
             // Docker volume create otherwise silently adopts an existing name.
             let found = self.docker(
                 &[
@@ -640,13 +672,7 @@ impl Runtime {
             !self.workspace_path(name).exists(),
             "Workspace name already has a receipt; names are not recycled"
         );
-        let active = state::json_files(&self.config.root.join("workspaces"))?
-            .into_iter()
-            .map(|p| state::read_json(&p))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|v| v["status"] != "closed")
-            .count();
+        let active = self.active_count()?;
         ensure!(
             active < self.config.max_workspaces,
             "Workspace budget exhausted (uncertain workspaces also count)"
@@ -973,14 +999,30 @@ impl Runtime {
         )
     }
     pub fn list(&self) -> Result<Value> {
+        let github = if self.config.root.join("github").exists() {
+            crate::github::Repositories::new(&self.config.root)?.list()?
+        } else {
+            vec![]
+        };
         let path = self.config.root.join("workspaces");
         if !path.exists() {
-            return Ok(json!({"workspaces":[]}));
+            return Ok(json!({"workspaces":[],"github_projects":github}));
         }
-        let values = state::json_files(&path)?
+        let mut values = state::json_files(&path)?
             .into_iter()
             .map(|p| state::read_json(&p))
             .collect::<Result<Vec<_>>>()?;
-        Ok(json!({"workspaces":values}))
+        for workspace in &mut values {
+            for project in &github {
+                if let Some(generation) = project["generations"]
+                    .as_array()
+                    .and_then(|gs| gs.iter().find(|g| g["project"] == workspace["project"]))
+                {
+                    workspace["github_project"] = project["id"].clone();
+                    workspace["source_commit"] = generation["commit"].clone();
+                }
+            }
+        }
+        Ok(json!({"workspaces":values,"github_projects":github}))
     }
 }
