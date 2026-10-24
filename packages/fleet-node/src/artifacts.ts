@@ -1,10 +1,15 @@
-import { open, lstat, realpath, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, lstat, realpath } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, resolve, sep } from "node:path";
 import {
   ARTIFACT_PAGE_FILES,
   canonical,
   MAX_ARTIFACT_JSON,
+  MAX_JSON_BYTES,
+  MAX_CHUNK_BYTES,
+  MAX_PAGES,
+  readBounded,
   CHUNK_BYTES,
   PAGE_CHUNKS,
   relativeFile,
@@ -18,6 +23,26 @@ import {
 } from "@enginebox/fleet-protocol";
 import { Client } from "./client.ts";
 
+async function postJSON<T>(client:Client,path:string,value:unknown,signal?:AbortSignal):Promise<T> {
+  requireThat(!signal?.aborted,"Artifact publication cancelled",409);
+  const response=await client.request(path,{method:"POST",headers:{"content-type":"application/json"},body:canonical(value),signal});
+  const bytes=await readBounded(response.body,MAX_JSON_BYTES);
+  requireThat(!signal?.aborted,"Artifact publication cancelled",409);
+  return JSON.parse(new TextDecoder().decode(bytes)) as T;
+}
+async function readManifest(path:string) {
+  const before=await lstat(path);
+  requireThat(before.isFile() && !before.isSymbolicLink() && before.size<=MAX_ARTIFACT_JSON,"Build manifest must be a bounded regular file");
+  const handle=await open(path,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+  try {
+    const info=await handle.stat();requireThat(info.isFile() && info.ino===before.ino && info.dev===before.dev && info.size<=MAX_ARTIFACT_JSON,"Build manifest changed while opening",409);
+    const buffer=Buffer.alloc(MAX_ARTIFACT_JSON+1);let size=0;
+    while(size<buffer.length){const part=await handle.read(buffer,size,buffer.length-size,null);if(!part.bytesRead)break;size+=part.bytesRead;}
+    const after=await handle.stat();requireThat(size<=MAX_ARTIFACT_JSON && after.size===before.size && after.mtimeMs===before.mtimeMs,"Build manifest changed or exceeds metadata limit",409);
+    return validateBuild(JSON.parse(buffer.subarray(0,size).toString('utf8')));
+  }finally{await handle.close();}
+}
+
 export async function publishFile(
   client: Client,
   project: string,
@@ -30,7 +55,8 @@ export async function publishFile(
     before.isFile() && !before.isSymbolicLink(),
     "Artifact output must be a regular file",
   );
-  const file = await open(path, "r"),
+  requireThat(before.size<=MAX_CHUNK_BYTES*PAGE_CHUNKS*MAX_PAGES && (!expected || before.size===expected.bytes),"Artifact file size differs or exceeds limit",409);
+  const file = await open(path, constants.O_RDONLY|(constants.O_NOFOLLOW??0)),
     hash = createHash("sha256");
   const pages: IndexPage[] = [];
   let chunks: Chunk[] = [],
@@ -116,10 +142,7 @@ export async function publishFile(
     409,
   );
   alive();
-  await client.json(
-    `/v1/projects/${project}/artifact-files/${descriptor.sha256}`,
-    descriptor,
-  );
+  await postJSON(client,`/v1/projects/${project}/artifact-files/${descriptor.sha256}`,descriptor,signal);
   return descriptor;
 }
 export async function publishBuild(
@@ -129,13 +152,7 @@ export async function publishBuild(
   filesRoot: string,
   signal?: AbortSignal,
 ): Promise<BuildRecord> {
-  requireThat(
-    (await lstat(manifestPath)).size <= MAX_ARTIFACT_JSON,
-    "Build manifest exceeds metadata limit",
-  );
-  const manifest = validateBuild(
-    JSON.parse(await readFile(manifestPath, "utf8")),
-  );
+  const manifest=await readManifest(manifestPath);
   const root = await realpath(filesRoot);
   for (const file of manifest.files) {
     relativeFile(file.path);
@@ -154,16 +171,10 @@ export async function publishBuild(
   for (let i = 0; i < manifest.files.length; i += ARTIFACT_PAGE_FILES) {
     requireThat(!signal?.aborted, "Build publication cancelled", 409);
     const page = manifest.files.slice(i, i + ARTIFACT_PAGE_FILES);
-    await client.json(
-      `/v1/projects/${manifest.project}/artifact-file-pages/${await sha256(canonical(page))}`,
-      page,
-    );
+    await postJSON(client,`/v1/projects/${manifest.project}/artifact-file-pages/${await sha256(canonical(page))}`,page,signal);
   }
   requireThat(!signal?.aborted, "Build publication cancelled", 409);
-  const result = await client.json<BuildRecord>(
-    `/v1/projects/${manifest.project}/artifacts`,
-    { candidate, manifest },
-  );
+  const result = await postJSON<BuildRecord>(client,`/v1/projects/${manifest.project}/artifacts`,{candidate,manifest},signal);
   requireThat(
     result.id === (await sha256(canonical(manifest))),
     "Published build identity differs",

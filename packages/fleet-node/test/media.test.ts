@@ -92,6 +92,7 @@ test(
           return structuredClone(recording) as T;
         }
         override async request(path: string, init: RequestInit = {}) {
+          if(path===`/v1/projects/demo/recordings/${recording.id}`)return Response.json(structuredClone(recording));
           const sequence = Number(path.split("/").at(-1));
           if (init.method === "PUT") {
             const bytes = Buffer.from(init.body as Uint8Array);
