@@ -49,12 +49,13 @@ struct Runtime {
     jobs: jobs::Jobs,
     ci_jobs: jobs::Jobs,
     storage: storage::Storage,
+    github: enginebox_github::GitHub,
     ci: ci::Ci,
     contributors: contributors::Contributors,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
-        self.jobs.pending() + self.ci_jobs.pending()
+        self.jobs.pending() + self.ci_jobs.pending() + self.github.pending()
     }
 }
 struct Gate {
@@ -144,13 +145,16 @@ impl Controller {
         }
         // Reload under exclusive ownership on every activation, including rollback.
         // A standby process must never recover another process's active jobs.
+        let github = enginebox_github::GitHub::open(&self.root)?;
         let runtime = Runtime {
             agents: AgentService::new(&self.root, self.fleet.clone())?,
             jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
             // Older controller releases prune their ordinary job history. Keep
             // CI deduplication records outside that directory across rollback.
             ci_jobs: jobs::Jobs::open(&self.root.join("ci-jobs"))?,
-            storage: storage::Storage::open(&self.root, self.fleet.clone())?,
+            storage: storage::Storage::open(&self.root, self.fleet.clone())?
+                .with_github(github.clone()),
+            github,
             contributors: contributors::Contributors::open(&self.root)?,
             ci: ci::Ci::open(
                 &self.root,
@@ -249,6 +253,11 @@ impl Controller {
                 let _ = tokio::task::spawn_blocking(move || {
                     let mut errors = Vec::new();
                     if let Some(r) = &runtime
+                        && let Err(e) = r.github.tick()
+                    {
+                        errors.push(format!("github: {e:#}"));
+                    }
+                    if let Some(r) = &runtime
                         && let Err(e) = r.ci.reconcile(&r.ci_jobs)
                     {
                         // Installers run in the CI pool; report queue/state failures.
@@ -343,6 +352,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     if path.starts_with("/v1/node/") {
         return node_request(controller, request).await;
     }
+    // Only this narrow route accepts a GitHub signature instead of owner bearer auth.
+    if method == Method::POST && path.starts_with("/v1/github/webhook/") {
+        return github_webhook(controller, request).await;
+    }
     if !controller.authorized(&request) {
         return error(StatusCode::UNAUTHORIZED, "Authentication required.");
     }
@@ -391,8 +404,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     if method == Method::GET {
         // Native auth/status programs may refresh their own home. Keep them in
         // the ownership barrier; serve the last observation during handoff.
-        let native_observation =
-            path == "/v1/agents" || path.ends_with("/usage") || path.ends_with("/accounts");
+        let native_observation = path == "/v1/agents"
+            || path.ends_with("/usage")
+            || path.ends_with("/accounts")
+            || path.starts_with("/v1/github");
         let admission = if native_observation {
             match controller.admit() {
                 Ok(a) => Some(a),
@@ -577,6 +592,11 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
 fn read(c: &Controller, p: &[String]) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
+        ["v1", "github"] => Ok(c.runtime()?.github.status()),
+        ["v1", "github", kind, "installations"] => c.runtime()?.github.list_installations(kind),
+        ["v1", "github", "installations", id, "repositories"] => {
+            c.runtime()?.github.repositories(id.parse()?)
+        }
         ["v1", "fleet"] => c.fleet.summary(),
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
@@ -629,6 +649,54 @@ fn string<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(StatusCode, Value)> {
+    if parts.get(1).is_some_and(|p| p == "github") {
+        let github = c.runtime()?.github;
+        let value = blocking(move || -> Result<Value> {
+            let p: Vec<_> = parts.iter().map(String::as_str).collect();
+            match p.as_slice() {
+                ["v1", "github", kind, "connect"] => {
+                    empty(&body)?;
+                    github.connect(kind)
+                }
+                ["v1", "github", kind, "disconnect"] => {
+                    empty(&body)?;
+                    github.disconnect(kind)
+                }
+                ["v1", "github", "callback"] => {
+                    keys(&body, &["state", "code"], &["state", "code"])?;
+                    github.callback(string(&body, "state")?, string(&body, "code")?)
+                }
+                ["v1", "github", "select"] => {
+                    keys(
+                        &body,
+                        &["installation_id", "repository_id", "branch"],
+                        &["installation_id", "repository_id", "branch"],
+                    )?;
+                    github.select(
+                        enginebox_github::number(&body, "installation_id")?,
+                        enginebox_github::number(&body, "repository_id")?,
+                        string(&body, "branch")?,
+                    )
+                }
+                ["v1", "github", "remove"] => {
+                    keys(&body, &["repository_id"], &["repository_id"])?;
+                    github.remove(enginebox_github::number(&body, "repository_id")?)
+                }
+                ["v1", "github", "drain"] => {
+                    keys(&body, &["draining"], &["draining"])?;
+                    github.set_draining(
+                        body["draining"]
+                            .as_bool()
+                            .context("draining must be boolean")?,
+                    )
+                }
+                _ => anyhow::bail!("Unknown GitHub operation"),
+            }
+        })
+        .await?;
+        return Ok((StatusCode::OK, value));
+    }
+
     let p: Vec<_> = parts.iter().map(String::as_str).collect();
     let runtime = c.runtime()?;
     let mut code = StatusCode::OK;
@@ -850,6 +918,58 @@ fn submit(
     })
 }
 
+async fn github_webhook(c: Arc<Controller>, request: Request<Body>) -> Response {
+    let kind = request
+        .uri()
+        .path()
+        .trim_start_matches("/v1/github/webhook/")
+        .to_owned();
+    if !["repos", "runners"].contains(&kind.as_str()) || request.uri().query().is_some() {
+        return error(StatusCode::NOT_FOUND, "Unknown webhook.");
+    }
+    let event = request
+        .headers()
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let signature = request
+        .headers()
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let body = match to_bytes(request.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "Webhook too large."),
+    };
+    let admission = match c.admit() {
+        Ok(a) => a,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Controller is draining; redeliver this event.",
+            );
+        }
+    };
+    let result = admitted(admission, async move {
+        blocking(move || {
+            c.runtime()?
+                .github
+                .webhook(&kind, &event, &signature, &body)
+        })
+        .await
+    })
+    .await;
+    match result {
+        Ok(value) => reply(StatusCode::ACCEPTED, value),
+        Err(_) => error(
+            StatusCode::BAD_REQUEST,
+            "Webhook rejected; check signature, installation, payload and inbox capacity.",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +1022,77 @@ mod tests {
         assert_eq!(
             app.oneshot(browser).await.unwrap().status(),
             StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn github_is_optional_and_webhook_exception_cannot_bypass_owner_auth() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v1/github", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/github/repos/connect",
+                    "{}",
+                    true
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        c.activate().unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/v1/github", "", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["configured"], false);
+        assert!(!c.root.join("github").exists());
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::POST,
+                    "/v1/github/webhook/runners",
+                    "{}",
+                    false
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::POST, "/v1/github/select", "{}", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        c.drain();
+        assert_eq!(
+            app.oneshot(request(
+                Method::POST,
+                "/v1/github/webhook/runners",
+                "{}",
+                false
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
     #[tokio::test]
@@ -1060,7 +1251,7 @@ mod tests {
                 runtime
                     .storage
                     .clone()
-                    .with_runner(Arc::new(move |host, argv, _| {
+                    .with_runner(Arc::new(move |host, argv, _, _| {
                         assert_eq!(host.id, "worker");
                         assert!(argv.windows(3).any(|v| v == ["fork", "game", "agent-a"]));
                         started_send.send(()).unwrap();

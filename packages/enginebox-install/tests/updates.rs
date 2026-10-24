@@ -699,6 +699,7 @@ fn native_release_builder_and_installer_round_trip_with_deterministic_archives()
     for binary in [
         "ebox",
         "enginebox-controller",
+        "enginebox-ci-worker",
         "enginebox-api",
         "enginebox-fleet-mcp",
         "enginebox-host",

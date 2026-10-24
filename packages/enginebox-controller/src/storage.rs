@@ -38,12 +38,14 @@ struct Project {
     repository: String,
 }
 
-type Runner = Arc<dyn Fn(&Host, &[String], Duration) -> Result<Value> + Send + Sync>;
+type Runner = Arc<dyn Fn(&Host, &[String], Option<&[u8]>, Duration) -> Result<Value> + Send + Sync>;
+type Credential = Arc<dyn Fn(&str, Option<&str>, bool) -> Result<Value> + Send + Sync>;
 #[derive(Clone)]
 pub struct Storage {
     registry: Registry,
     fleet: Fleet,
     runner: Runner,
+    credential: Option<Credential>,
 }
 pub struct Plan {
     host: Host,
@@ -52,6 +54,7 @@ pub struct Plan {
     argv: Vec<String>,
     timeout: Duration,
     runner: Runner,
+    credential: Option<Credential>,
     action: Action,
     dev_service: Option<DevService>,
 }
@@ -78,7 +81,41 @@ impl Plan {
         } else if let Action::Allocation { fleet } = &self.action {
             enginebox_core::preparation::inspect(fleet, &self.host.id, &self.name)?
         } else {
-            (self.runner)(&self.host, &self.argv, self.timeout)?
+            let mut argv = self.argv.clone();
+            let credential = if let Some(provider) = &self.credential {
+                let (repository, branch, write) = if self.operation == "storage_github-preview" {
+                    let repo = argv
+                        .windows(2)
+                        .find(|p| p[0] == "--repository")
+                        .context("Missing repository")?[1]
+                        .clone();
+                    let branch = argv
+                        .windows(2)
+                        .find(|p| p[0] == "--branch")
+                        .map(|p| p[1].clone());
+                    (repo, branch, false)
+                } else {
+                    // The node's retained project binding selects credentials, never a browser-supplied repository on export.
+                    let mut inspect = argv[..10].to_vec();
+                    inspect.extend(["github-settings".into(), self.name.clone()]);
+                    let binding =
+                        (self.runner)(&self.host, &inspect, None, Duration::from_secs(60))?;
+                    (
+                        text(&binding, "repository")?.to_owned(),
+                        Some(text(&binding, "branch")?.to_owned()),
+                        true,
+                    )
+                };
+                let value = provider(&repository, branch.as_deref(), write)?;
+                if !write && branch.is_none() {
+                    argv.extend(["--branch".into(), text(&value, "branch")?.to_owned()]);
+                }
+                argv.push("--token-stdin".into());
+                Some(serde_json::to_vec(&value)?)
+            } else {
+                None
+            };
+            (self.runner)(&self.host, &argv, credential.as_deref(), self.timeout)?
         };
         ensure!(
             result.is_object(),
@@ -261,15 +298,24 @@ impl Storage {
         Ok(Self {
             registry,
             fleet,
-            runner: Arc::new(|host, argv, timeout| {
+            credential: None,
+            runner: Arc::new(|host, argv, input, timeout| {
                 Ok(serde_json::from_slice(&host_run(
-                    host, argv, None, timeout,
+                    host, argv, input, timeout,
                 )?)?)
             }),
         })
     }
+    pub fn with_github(mut self, github: enginebox_github::GitHub) -> Self {
+        if github.configured() {
+            self.credential = Some(Arc::new(move |repo, branch, write| {
+                github.transfer_credential(repo, branch, write)
+            }));
+        }
+        self
+    }
     pub fn catalog(&self) -> Value {
-        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","github":{"enabled":true,"private_auth_configured":node.github_token_file.is_some()},"projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["dev-start","dev-status","github-settings","github-promote","github-delivery","github-preview","github-import","github-fork","compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
+        json!({"backend":"layerfs","configured":!self.registry.nodes.is_empty(),"nodes":self.registry.nodes.iter().map(|node|json!({"host_id":node.host_id,"status":"registered","github":{"enabled":true,"private_auth_configured":node.github_token_file.is_some() || self.credential.is_some(),"oauth":self.credential.is_some()},"projects":node.projects.iter().map(|project|json!({"id":project.id})).collect::<Vec<_>>()})).collect::<Vec<_>>(),"operations":["dev-start","dev-status","github-settings","github-promote","github-delivery","github-preview","github-import","github-fork","compatibility","prepare","allocation","inspect","list","preview","import","fork","deps","checkpoint","remount","close","recover"],"incus_attachment":false,"automatic_replay":false,"preparation":{"stopped_only":true,"automatic_finalize":false,"reuses_warm_pool":false}})
     }
     pub fn plan(&self, host_id: &str, operation: &str, body: &Value) -> Result<Plan> {
         let node = self
@@ -372,6 +418,7 @@ impl Storage {
                     }
                 }
                 if operation != "github-settings"
+                    && self.credential.is_none()
                     && let Some(path) = &node.github_token_file
                 {
                     argv.extend(["--token-file".into(), path.clone()]);
@@ -400,7 +447,9 @@ impl Storage {
                     enginebox_storage_layerfs::github::branch(branch)?;
                     argv.extend(["--branch".into(), branch.into()]);
                 }
-                if let Some(path) = &node.github_token_file {
+                if self.credential.is_none()
+                    && let Some(path) = &node.github_token_file
+                {
                     argv.extend(["--token-file".into(), path.clone()]);
                 }
                 780
@@ -588,6 +637,14 @@ impl Storage {
             argv,
             timeout: Duration::from_secs(timeout),
             runner: self.runner.clone(),
+            credential: if matches!(
+                operation,
+                "github-preview" | "github-promote" | "github-delivery"
+            ) {
+                self.credential.clone()
+            } else {
+                None
+            },
             action,
             dev_service: node.dev_service.clone(),
         })
@@ -602,6 +659,62 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oauth_transfers_use_private_stdin_and_the_nodes_retained_binding() {
+        let (_root, mut storage) = configured();
+        storage.credential = Some(Arc::new(|repo, branch, write| {
+            assert_eq!(repo, "owner/private");
+            assert!(branch.is_none() || branch == Some("main"));
+            Ok(
+                json!({"schema":1,"repository":repo,"branch":"main","token":"fixture-private-token","write":write}),
+            )
+        }));
+        storage.runner = Arc::new(|_, argv, input, _| {
+            assert!(!argv.join(" ").contains("fixture-private-token"));
+            assert!(!argv.iter().any(|arg| arg == "--token-file"));
+            if argv.contains(&"github-settings".into()) {
+                assert!(input.is_none());
+                return Ok(json!({"repository":"owner/private","branch":"main"}));
+            }
+            assert!(argv.contains(&"--token-stdin".into()));
+            let credential: Value = serde_json::from_slice(input.unwrap()).unwrap();
+            assert_eq!(credential["token"], "fixture-private-token");
+            if argv.contains(&"github-preview".into()) {
+                assert!(argv.windows(2).any(|p| p == ["--branch", "main"]));
+                assert_eq!(credential["write"], false);
+            } else {
+                assert_eq!(credential["write"], true);
+            }
+            Ok(json!({"ok":true}))
+        });
+        for (op, body) in [
+            (
+                "github-preview",
+                json!({"project":"app","repository":"owner/private"}),
+            ),
+            (
+                "github-delivery",
+                json!({"project":"app","action":"export"}),
+            ),
+        ] {
+            let result = storage.plan("node", op, &body).unwrap().execute().unwrap();
+            assert!(!result.to_string().contains("fixture-private-token"));
+        }
+        storage.credential = Some(Arc::new(|_, _, _| anyhow::bail!("Access revoked")));
+        storage.runner = Arc::new(|_, _, _, _| panic!("Revoked access must not reach a transfer"));
+        assert!(
+            storage
+                .plan(
+                    "node",
+                    "github-preview",
+                    &json!({"project":"app","repository":"owner/private"})
+                )
+                .unwrap()
+                .execute()
+                .is_err()
+        );
+    }
+
     fn configured() -> (tempfile::TempDir, Storage) {
         let root = tempfile::tempdir().unwrap();
         let state_root = root.path().join("state");
@@ -636,7 +749,9 @@ mod tests {
         std::fs::write(&token_file, "t".repeat(32)).unwrap();
         storage.registry.nodes[0].dev_service =
             Some(serde_json::from_value(json!({"url":url,"token_file":token_file})).unwrap());
-        storage = storage.with_runner(Arc::new(|_, _, _| Ok(json!({"ok":true,"imported":true}))));
+        storage = storage.with_runner(Arc::new(|_, _, _, _| {
+            Ok(json!({"ok":true,"imported":true}))
+        }));
         let server = std::thread::spawn(move || {
             for retry in [false, true] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -826,7 +941,7 @@ mod tests {
     #[test]
     fn node_failure_is_not_reported_as_success() {
         let (_root, storage) = configured();
-        let storage = storage.with_runner(Arc::new(|_, _, _| Ok(json!({"ok":false}))));
+        let storage = storage.with_runner(Arc::new(|_, _, _, _| Ok(json!({"ok":false}))));
         assert!(
             storage
                 .plan("node", "deps", &json!({"name":"worker"}))
@@ -838,7 +953,7 @@ mod tests {
     #[test]
     fn oversized_storage_results_cannot_poison_durable_job_records() {
         let (_root, storage) = configured();
-        let storage = storage.with_runner(Arc::new(|_, _, _| {
+        let storage = storage.with_runner(Arc::new(|_, _, _, _| {
             Ok(json!({"files":["a".repeat(3 * 1024 * 1024)]}))
         }));
         let error = storage
@@ -865,7 +980,7 @@ mod tests {
         }
         let plan = storage.plan("node", "prepare", &request).unwrap();
         assert_eq!(&plan.argv[4..], &["--host", "local", "node-protocol"]);
-        let incompatible = storage.with_runner(Arc::new(|_, _, _| {
+        let incompatible = storage.with_runner(Arc::new(|_, _, _, _| {
             Ok(json!({"version":"0.3.0","protocol":1}))
         }));
         assert!(
@@ -898,7 +1013,7 @@ mod tests {
             bad["layerfs"] = replacement;
             assert!(require_storage_protocol(&bad).is_err());
         }
-        let storage = storage.with_runner(Arc::new(move |_, _, _| Ok(valid.clone())));
+        let storage = storage.with_runner(Arc::new(move |_, _, _, _| Ok(valid.clone())));
         assert!(
             storage
                 .plan("node", "compatibility", &json!({}))

@@ -168,3 +168,5 @@ Engine Box is source-available under the [Business Source License 1.1](LICENSE).
 - Each version converts to Apache-2.0 four years after its first public release.
 
 Earlier versions keep the licenses they were published under (Apache-2.0 through commit `19f834a`, then a prior source-available license). See [docs/LICENSING.md](docs/LICENSING.md) and [NOTICE](NOTICE). Reusable optional modules, including CI integration, will live here as they are implemented. Managed hosting is planned and not available. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
+
+GitHub account connections, private repository selection and the optional native Actions runner service are described in [GitHub Actions](docs/GITHUB-ACTIONS.md), with [Kitbash secret setup](docs/GITHUB-SECRETS.md).

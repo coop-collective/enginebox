@@ -134,13 +134,13 @@ impl Runtime {
     }
     pub fn github_settings(&self, project: &str, enabled: Option<bool>) -> Result<Value> {
         self.verify_binding()?;
-        let (_, p, outbox, _) = self.github_binding(project)?;
+        let (_, p, outbox, binding) = self.github_binding(project)?;
         let _lease = self.main_lock(&p)?;
         if let Some(enabled) = enabled {
             outbox.configure(enabled)?;
         }
         Ok(
-            json!({"project":project,"main":{"revision":self.main_revision(&p)?,"sequence":self.publication_sequence(&p)?},"sync":outbox.status()?}),
+            json!({"project":project,"repository":binding["repository"],"branch":binding["branch"],"main":{"revision":self.main_revision(&p)?,"sequence":self.publication_sequence(&p)?},"sync":outbox.status()?}),
         )
     }
     fn export_main(&self, p: &Project, revision: &str) -> Result<PathBuf> {

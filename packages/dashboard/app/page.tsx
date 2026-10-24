@@ -12,6 +12,7 @@ import type {
 import { api, errorMessage, RequestError } from "@/lib/client";
 import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
+import { GitHubPanel } from "@/components/github-panel";
 import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
@@ -35,6 +36,7 @@ const sections = {
     description: "Register Windows workers; choose resources in the installer.",
     icon: "server",
   },
+  github: { title: "GitHub", description: "Connect repositories and run GitHub Actions on your infrastructure.", icon: "terminal" },
   environments: {
     title: "Environments",
     description: "Run persistent development services and manage their endpoints.",
@@ -696,6 +698,8 @@ export default function Dashboard() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const loading = useRef(false);
   useEffect(() => {
+    const panel = new URLSearchParams(window.location.search).get("panel");
+    if (panel === "github" || panel === "storage") setSection(panel);
     api<{ authenticated: boolean }>("/api/session")
       .then((data) => setSession(data.authenticated ? "ready" : "login"))
       .catch((err) => {
@@ -896,7 +900,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "machines", "agents", "templates", "storage", "environments"] as const)
+          {(["fleet", "machines", "agents", "templates", "storage", "environments", "github"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1045,6 +1049,7 @@ export default function Dashboard() {
                   </button>
                 </div>
               )}
+              {section === "github" && <GitHubPanel />}
               {section === "agents" && (
                 <AgentsPanel close={() => navigate("fleet")} />
               )}
