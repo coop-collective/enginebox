@@ -26,6 +26,9 @@ jobs:
       - run: pnpm exec cargo fmt --all --check
       - run: pnpm check
       - run: pnpm test
+      - name: Verify protected dependency handoff in disposable Linux
+        if: runner.os == 'Linux'
+        run: pnpm test:preparation:linux
       - name: Qualify pinned CI toolchain installation on the native worker
         run: pnpm test:ci-templates
       - run: pnpm lint:rust

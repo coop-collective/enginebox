@@ -1,10 +1,11 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/client";
+import { preparationWorkflow } from "@/lib/github-preparation";
 
 type Repository = { id: number; installation_id: number; full_name: string; private: boolean; branch: string; default_branch?: string; permissions?: { push?: boolean } };
 type Installation = { id: number; account: string; permissions: Record<string, string>; suspended: boolean };
-type Status = { configured: boolean; runner_app_configured: boolean; accounts: { kind: string; login: string }[]; repositories: Repository[]; draining: boolean; pools: { id: string; organization: string; labels: string[]; runner_group_id: number; max_runners: number }[]; jobs: { id: number; repository: string; status: string; github_status: string; error?: string }[] };
+type Status = { configured: boolean; runner_app_configured: boolean; accounts: { kind: string; login: string }[]; repositories: Repository[]; draining: boolean; pools: { id: string; organization: string; labels: string[]; runner_group_id: number; max_runners: number; preparation?: { repository_id: number; workflows: string[] } | null }[]; jobs: { id: number; repository: string; status: string; github_status: string; error?: string }[] };
 const base = "/api/control/v1/github";
 export function GitHubPanel() {
   const [status, setStatus] = useState<Status>();
@@ -13,6 +14,9 @@ export function GitHubPanel() {
   const [installUrl, setInstallUrl] = useState(""); const [runnerInstallUrl, setRunnerInstallUrl] = useState("");
   const [runnerInstallations, setRunnerInstallations] = useState<Installation[]>([]);
   const [installation, setInstallation] = useState(""); const [repos, setRepos] = useState<Repository[]>([]);
+  const [profile, setProfile] = useState(""); const [groupName, setGroupName] = useState("");
+  const [actionRef, setActionRef] = useState(""); const [checkoutRef, setCheckoutRef] = useState("");
+  const [workflow, setWorkflow] = useState("");
   const [repoId, setRepoId] = useState(""); const [branch, setBranch] = useState("");
   const refresh = useCallback(async () => { setStatus(await api<Status>(base)); }, []);
   useEffect(() => { void refresh().catch(e => setError(e.message)); }, [refresh]);
@@ -45,7 +49,15 @@ export function GitHubPanel() {
         {!status.runner_app_configured ? <p>Configure the runner App and a disposable CI worker to enable this connection.</p> : <div className="github-actions"><button className="button primary" disabled={busy} onClick={() => void work(() => connect("runners"))}>Connect runner administration</button><button className="button" disabled={busy || !status.accounts.some(a => a.kind === "runners")} onClick={() => void work(() => loadInstallations("runners"))}>Review runner permissions</button></div>}
         {runnerInstallUrl && <p><a href={runnerInstallUrl} target="_blank" rel="noreferrer">Install runner App or approve organization permissions</a></p>}
         {runnerInstallations.map(i => <p key={i.id}>{i.account}: {i.permissions.organization_self_hosted_runners === "write" && !i.suspended ? "Runner administration approved" : "Organization approval required"}</p>)}
-        {status.pools.map(p => <div className="github-repo" key={p.id}><strong>{p.organization} / {p.id}</strong><p>Group {p.runner_group_id} · up to {p.max_runners} runners</p><code>{p.labels.join(", ")}</code></div>)}
+        {status.pools.map(p => <div className="github-repo" key={p.id}><strong>{p.organization} / {p.id}</strong><p>Group {p.runner_group_id} · up to {p.max_runners} runners</p><code>{p.labels.join(", ")}</code><p>{p.preparation ? "LayerFS preparation required" : "Standard disposable runner"}</p>{p.preparation && <p>Repository {p.preparation.repository_id} · {p.preparation.workflows.length} approved workflows</p>}</div>)}
+        {status.pools.some(p => p.preparation) && <div className="github-fields">
+          <label>Prepared runner profile<select value={profile} onChange={e => { setProfile(e.target.value); setWorkflow(""); }}><option value="">Select a profile</option>{status.pools.filter(p => p.preparation).map(p => <option key={p.id} value={p.id}>{p.organization} / {p.id} · repository {p.preparation!.repository_id}</option>)}</select></label>
+          <label>Runner group name<input value={groupName} onChange={e => setGroupName(e.target.value)} /></label>
+          <label>Enginebox action at commit SHA<input placeholder="owner/repo/packages/enginebox-actions@40-character-sha" value={actionRef} onChange={e => setActionRef(e.target.value)} /></label>
+          <label>Checkout action at commit SHA<input placeholder="actions/checkout@40-character-sha" value={checkoutRef} onChange={e => setCheckoutRef(e.target.value)} /></label>
+          <button className="button" disabled={!profile} onClick={() => { try { const pool = status.pools.find(p => p.id === profile)!; setWorkflow(preparationWorkflow({ group: groupName, label: `enginebox-${pool.id}`, action: actionRef, checkout: checkoutRef })); setError(""); } catch (e) { setError((e as Error).message); } }}>Preview prepared workflow</button>
+          {workflow && <><p>Review this fragment in a workflow PR. Preserve required checkout options, replace the dependency install step, and review redundant package cache restores. The selected group must approve the destination workflow. This recipe explicitly disables install scripts.</p><label>Prepared workflow fragment<textarea rows={22} readOnly value={workflow} /></label><a className="button" download="enginebox-workflow-fragment.yml" href={`data:text/yaml;charset=utf-8,${encodeURIComponent(workflow)}`}>Download workflow fragment</a></>}
+        </div>}
         <div className="github-actions"><button className="button" disabled={busy} onClick={() => void work(async () => { await post("drain", { draining: !status.draining }); })}>{status.draining ? "Resume runner provisioning" : "Drain runners"}</button><button className="button" disabled={busy} onClick={() => void work(refresh)}>Refresh GitHub status</button></div>
         <p>{status.draining ? "Provisioning paused; active runners finish their jobs." : "Provisioning enabled for configured pools."}</p>
         {status.jobs.map(j => <div className="github-repo" key={j.id}><strong>{j.repository} · job {j.id}</strong><p>{j.status} · GitHub: {j.github_status}</p>{j.error && <p role="alert">{j.error}</p>}</div>)}

@@ -15,6 +15,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+mod preparation;
 
 #[derive(Parser)]
 #[command(
@@ -40,12 +41,17 @@ struct Config {
     layerfs: Option<PathBuf>,
     #[serde(default)]
     projects: BTreeMap<String, PreparedProject>,
+    #[serde(default)]
+    acceleration: Option<preparation::Profile>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedProject {
     project: String,
     from: Option<String>,
+    /// Optional administrator-owned fleet resolver. Credentials remain on the node.
+    #[serde(default)]
+    resolve: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +62,8 @@ struct Request {
     repository: String,
     jitconfig: String,
     timeout_seconds: u64,
+    #[serde(default)]
+    preparation: Option<preparation::Admission>,
 }
 fn validate(request: &Request, config: &Config) -> Result<()> {
     ensure!(
@@ -85,6 +93,20 @@ fn validate(request: &Request, config: &Config) -> Result<()> {
         "Pin an official runner version"
     );
     config.resources.validate(None)?;
+    match (&config.acceleration, &request.preparation) {
+        (Some(profile), Some(admission)) => {
+            ensure!(
+                config.layerfs.is_some(),
+                "Accelerated runners require LayerFS storage"
+            );
+            preparation::validate(profile, admission)?;
+        }
+        (None, None) => ensure!(
+            config.layerfs.is_none(),
+            "LayerFS runners require repository-bound acceleration admission"
+        ),
+        _ => anyhow::bail!("Controller and worker preparation profiles must agree"),
+    }
     Ok(())
 }
 fn run(config: Config, request: Request) -> Result<Value> {
@@ -113,6 +135,12 @@ fn run(config: Config, request: Request) -> Result<Value> {
     let mut receipt = json!({"schema":1,"name":request.name,"job_id":request.job_id,"repository":request.repository,"status":"preparing","runner_version":config.runner_version,"cleaned":false});
     state::write_json(&receipt_path, &receipt)?;
     let outcome = (|| -> Result<()> {
+        if let Some(profile) = &config.acceleration {
+            ensure!(
+                fleet.template(&host, &config.template)?["manifest_digest"] == profile.image,
+                "Preparation image must match the installed registered template manifest"
+            );
+        }
         let prepared = enginebox_core::preparation::prepare(
             &fleet,
             &host.id,
@@ -133,6 +161,41 @@ fn run(config: Config, request: Request) -> Result<Value> {
                 .get(&request.repository)
                 .context("No approved LayerFS base for this repository")?;
             let runtime = LayerRuntime::new(LayerConfig::load(path)?)?;
+            if let Some(command) = &project.resolve {
+                ensure!(
+                    !command.is_empty()
+                        && PathBuf::from(&command[0]).is_absolute()
+                        && project.from.is_none(),
+                    "Use an absolute preparation resolver and immutable main"
+                );
+                let output = enginebox_core::transport::run_process(
+                    command,
+                    None,
+                    Duration::from_secs(1200),
+                )?;
+                let resolved: Value = serde_json::from_slice(&output)?;
+                let profile = config
+                    .acceleration
+                    .as_ref()
+                    .context("Missing acceleration profile")?;
+                ensure!(
+                    resolved["schema"] == 1
+                        && resolved["project"] == project.project
+                        && resolved["from"].is_null()
+                        && resolved["preparation"]["repository"]
+                            .as_str()
+                            .and_then(|id| id.parse::<u64>().ok())
+                            == Some(profile.repository_id)
+                        && resolved["preparation"]["namespace"]
+                            == format!("github-installation-{}", profile.installation_id)
+                        && resolved["preparation"]["trust"] == "repository-read"
+                        && resolved["preparation"]["image"] == profile.image
+                        && resolved["preparation"]["pnpm"] == profile.pnpm
+                        && resolved["preparation"]["scripts"] == profile.scripts,
+                    "Resolved preparation differs from worker admission"
+                );
+                receipt["preparation_key"] = resolved["preparation"]["key"].clone();
+            }
             receipt["checkout"] = json!(checkout);
             state::write_json(&receipt_path, &receipt)?;
             runtime.fork(&project.project, &checkout, project.from.as_deref())?;
@@ -163,6 +226,16 @@ fn run(config: Config, request: Request) -> Result<Value> {
             bx.call(&["start", &request.name])?;
         }
         enginebox_core::fleet::wait_ready_unlocked(&bx, &request.name)?;
+        if let (Some(profile), Some(admission)) = (&config.acceleration, &request.preparation) {
+            preparation::bootstrap(
+                &bx,
+                &request.name,
+                &request.repository,
+                admission,
+                profile,
+                request.timeout_seconds,
+            )?;
+        }
         receipt["status"] = json!("running");
         state::write_json(&receipt_path, &receipt)?;
         // Tokens never enter host command arguments, environment, logs or a reusable image.
@@ -171,30 +244,65 @@ fn run(config: Config, request: Request) -> Result<Value> {
             r#"set -eu
 umask 077
 cd "$HOME"
-test ! -e ci-runner
-for file in /opt/actions-runner/.runner /opt/actions-runner/.credentials /opt/actions-runner/.credentials_rsaparams; do
-  test ! -e "$file"
-done
-cp -a /opt/actions-runner ci-runner
+{setup}
 cd ci-runner
 test "$(./bin/Runner.Listener --version)" = {version}
 IFS= read -r jit
 set +e
-timeout --signal=TERM --kill-after=30s {seconds}s ./run.sh --jitconfig "$jit" > runner.log 2>&1
+{guard}timeout --signal=TERM --kill-after=30s {seconds}s ./run.sh --jitconfig "$jit" > runner.log 2>&1
 code=$?
 unset jit
 printf '%s\n' "$code" > exit-code
 exit 0
 "#,
             version = shell_quote(&config.runner_version),
+            setup = if config.acceleration.is_some() {
+                preparation::launch_setup()
+            } else {
+                "test ! -e ci-runner\nfor file in /opt/actions-runner/.runner /opt/actions-runner/.credentials /opt/actions-runner/.credentials_rsaparams; do test ! -e \"$file\"; done\ncp -a /opt/actions-runner ci-runner\n".into()
+            },
+            guard = if config.acceleration.is_some() {
+                "setpriv --no-new-privs "
+            } else {
+                ""
+            },
             seconds = request.timeout_seconds
         );
         let command = bx.exec_args(&request.name, &["bash".into(), "-c".into(), script])?;
-        bx.run_input(
-            &command,
-            format!("{}\n", request.jitconfig).as_bytes(),
-            Duration::from_secs(request.timeout_seconds + 90),
-        )?;
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let assignment: Result<Option<Value>> = std::thread::scope(|verify_scope| {
+            // Verification runs while the synchronous native runner is alive, with no App credential in the guest.
+            let verifier = request.preparation.as_ref().map(|admission| {
+                verify_scope.spawn(|| {
+                    preparation::verify(
+                        &bx,
+                        &request.name,
+                        &request.repository,
+                        admission,
+                        &stopped,
+                    )
+                })
+            });
+            let outcome = bx.run_input(
+                &command,
+                format!("{}\n", request.jitconfig).as_bytes(),
+                Duration::from_secs(request.timeout_seconds + 90),
+            );
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            let verified = verifier
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Assignment verifier stopped"))
+                })
+                .transpose()?;
+            outcome?;
+            verified.transpose()
+        });
+        // Cleanup still runs for a failed preparation; its error is reported after exact owned deletion.
+        if let Ok(Some(value)) = &assignment {
+            receipt["assignment"] = value.clone();
+        }
         owned(&bx.instance(&request.name)?, &receipt)?;
         // Export private diagnostics before deleting the disposable VM. Never return logs to the API.
         let logs = receipts.join(format!("{}-logs.tar", request.name));
@@ -246,6 +354,7 @@ exit 0
         );
         bx.call(&["delete", &request.name])?;
         receipt["cleaned"] = json!(true);
+        assignment?;
         Ok(())
     })();
     receipt["duration_seconds"] = json!(started.elapsed().as_secs_f64());

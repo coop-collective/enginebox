@@ -24,6 +24,42 @@ pub struct Pool {
     pub timeout_seconds: u64,
     /// Administrator-provisioned worker; opaque JIT configuration goes via stdin.
     pub worker: Vec<String>,
+    #[serde(default)]
+    pub preparation: Option<Preparation>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preparation {
+    pub repository_id: u64,
+    /// Every allowed workflow may read the preloaded repository cache. No stronger trust is implied.
+    pub workflows: Vec<String>,
+}
+
+fn check_group(group: &Value, repositories: &[Value], preparation: &Preparation) -> Result<()> {
+    ensure!(
+        group["visibility"] == "selected"
+            && group["allows_public_repositories"] == false
+            && group["restricted_to_workflows"] == true
+            && repositories.len() == 1
+            && repositories[0]["id"] == preparation.repository_id,
+        "Prepared runners require a private single-repository group with workflow restrictions"
+    );
+    let actual = group["selected_workflows"]
+        .as_array()
+        .context("Missing workflow restrictions")?
+        .iter()
+        .map(|v| v.as_str().context("Invalid workflow restriction"))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let expected = preparation
+        .workflows
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        actual == expected,
+        "Runner group workflow restrictions differ from preparation policy"
+    );
+    Ok(())
 }
 pub fn validate_pools(pools: &[Pool]) -> Result<()> {
     let mut ids = BTreeSet::new();
@@ -48,6 +84,24 @@ pub fn validate_pools(pools: &[Pool]) -> Result<()> {
                 && p.labels.iter().all(|s| name(s).is_ok()),
             "Each pool needs its own enginebox-<id> label"
         );
+        if let Some(preparation) = &p.preparation {
+            ensure!(
+                preparation.repository_id > 0 && (1..=16).contains(&preparation.workflows.len()),
+                "Bind preparation to a repository and protected workflows"
+            );
+            let mut workflows = BTreeSet::new();
+            for workflow in &preparation.workflows {
+                ensure!(
+                    workflow.len() <= 512
+                        && !workflow.chars().any(char::is_whitespace)
+                        && workflow.starts_with(&format!("{}/", p.organization))
+                        && workflow.contains("/.github/workflows/")
+                        && workflow.contains("@refs/heads/")
+                        && workflows.insert(workflow),
+                    "Use unique protected-branch workflow references"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -72,6 +126,10 @@ pub fn signature(secret: &str, supplied: &str, body: &[u8]) -> Result<()> {
 }
 fn matches(pool: &Pool, payload: &Value) -> bool {
     payload["installation"]["id"] == pool.installation_id
+        && pool
+            .preparation
+            .as_ref()
+            .is_none_or(|p| payload["repository"]["id"] == p.repository_id)
         && payload["repository"]["owner"]["login"]
             .as_str()
             .is_some_and(|s| s.eq_ignore_ascii_case(&pool.organization))
@@ -257,9 +315,35 @@ impl GitHub {
             current["run_id"] == job["run_id"],
             "Workflow job identity changed"
         );
+        let verification_token = if let Some(preparation) = &pool.preparation {
+            ensure!(
+                selected.private && selected.id == preparation.repository_id,
+                "Prepared repository changed"
+            );
+            let group_path = format!(
+                "/orgs/{}/actions/runner-groups/{}",
+                pool.organization, pool.runner_group_id
+            );
+            let group = self.api.call("GET", &group_path, &token, None)?;
+            let repositories = self.api.pages(
+                &format!("{group_path}/repositories"),
+                "repositories",
+                &token,
+            )?;
+            check_group(&group, &repositories, preparation)?;
+            let credential = self.api.call(
+                "POST",
+                &format!("/app/installations/{}/access_tokens", pool.installation_id),
+                &api::jwt(self.app("runners")?)?,
+                Some(json!({"repository_ids":[selected.id],"permissions":{"actions":"read"}})),
+            )?;
+            Some(text(&credential, "token")?.to_owned())
+        } else {
+            None
+        };
         let runner_name = format!("ebox-ci-{}", uuid::Uuid::new_v4().simple());
         // JIT is single-use; a lost response is never retried automatically.
-        let generated=self.api.call("POST",&format!("/orgs/{}/actions/runners/generate-jitconfig",pool.organization),&token,Some(json!({"name":runner_name,"runner_group_id":pool.runner_group_id,"labels":pool.labels,"work_folder":"_work"})))?;
+        let generated=self.api.call("POST",&format!("/orgs/{}/actions/runners/generate-jitconfig",pool.organization),&token,Some(json!({"name":runner_name,"runner_group_id":pool.runner_group_id,"labels":pool.labels,"work_folder":if pool.preparation.is_some() {"/project/work"} else {"_work"}})))?;
         let runner_id = number(&generated["runner"], "id")?;
         {
             let mut data = self.data.lock().unwrap();
@@ -268,7 +352,10 @@ impl GitHub {
             job["runner_name"] = json!(runner_name);
             self.save(&data)?;
         }
-        let request = json!({"schema":1,"name":runner_name,"job_id":job["id"],"repository":repo,"jitconfig":text(&generated,"encoded_jit_config")?,"timeout_seconds":pool.timeout_seconds});
+        let mut request = json!({"schema":1,"name":runner_name,"job_id":job["id"],"repository":repo,"jitconfig":text(&generated,"encoded_jit_config")?,"timeout_seconds":pool.timeout_seconds});
+        if let Some(preparation) = &pool.preparation {
+            request["preparation"] = json!({"repository_id":selected.id,"installation_id":pool.installation_id,"runner_id":runner_id,"workflows":preparation.workflows,"verification_token":verification_token});
+        }
         let mut command = std::process::Command::new(&pool.worker[0]);
         command.args(&pool.worker[1..]).env_clear();
         for key in [
@@ -289,7 +376,15 @@ impl GitHub {
         let output = run_command(
             command,
             Some(&serde_json::to_vec(&request)?),
-            Duration::from_secs(pool.timeout_seconds + 600),
+            // Cold generation resolution has its own 20-minute bound before VM execution.
+            Duration::from_secs(
+                pool.timeout_seconds
+                    + if pool.preparation.is_some() {
+                        1800
+                    } else {
+                        600
+                    },
+            ),
         )?;
         let result: Value = serde_json::from_slice(&output)?;
         ensure!(
@@ -307,6 +402,18 @@ impl GitHub {
                     .is_some_and(|v| v.is_finite() && v >= 0.0),
             "Worker did not prove cleanup"
         );
+        if pool.preparation.is_some() {
+            let actual = &result["assignment"];
+            ensure!(
+                actual["verified"] == true
+                    && actual["repository_id"] == selected.id
+                    && actual["runner_id"] == runner_id
+                    && actual["job_id"].as_u64().is_some_and(|id| id > 0)
+                    && actual["run_id"].as_u64().is_some_and(|id| id > 0)
+                    && actual["run_attempt"].as_u64().is_some_and(|id| id > 0),
+                "Worker did not verify actual assignment"
+            );
+        }
         let cleanup_token = self.api.call(
             "POST",
             &format!("/app/installations/{}/access_tokens", pool.installation_id),
@@ -332,7 +439,7 @@ impl GitHub {
         );
         // Do not publish arbitrary worker stdout (could include JIT or workflow secrets).
         Ok(
-            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued"}),
+            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued", "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64()}),
         )
     }
 }
@@ -354,9 +461,27 @@ fn job_persistence_failure(data: &mut crate::Data, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_groups_enforce_repo_and_workflow_scope() {
+        let preparation = Preparation {
+            repository_id: 10,
+            workflows: vec!["fixture/repo/.github/workflows/ci.yml@refs/heads/main".into()],
+        };
+        let mut group = json!({"visibility":"selected","allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":preparation.workflows});
+        check_group(&group, &[json!({"id":10})], &preparation).unwrap();
+        assert!(check_group(&group, &[json!({"id":10}), json!({"id":11})], &preparation).is_err());
+        assert!(check_group(&group, &[json!({"id":11})], &preparation).is_err());
+        group["restricted_to_workflows"] = json!(false);
+        assert!(check_group(&group, &[json!({"id":10})], &preparation).is_err());
+    }
     #[cfg(unix)]
     #[test]
     fn jit_worker_cleanup_is_owned_and_worker_output_is_filtered() {
+        jit_fixture(false);
+        jit_fixture(true);
+    }
+    #[cfg(unix)]
+    fn jit_fixture(prepared: bool) {
         use crate::tests::{account, api_fixture, service};
         use std::{
             fs,
@@ -383,8 +508,12 @@ mod tests {
 import json,sys
 r=json.load(sys.stdin)
 assert r['jitconfig']=='fixture-jit-config'
-assert set(r)=={'schema','name','job_id','repository','jitconfig','timeout_seconds'}
-print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':True,'runner_version':'2.337.0','duration_seconds':1,'private_extra':'must-not-expose'}))
+assert set(r)=={'schema','name','job_id','repository','jitconfig','timeout_seconds'} | ({'preparation'} if 'preparation' in r else set())
+a={}
+if 'preparation' in r:
+ assert r['preparation']['verification_token']=='fixture-verification-token'
+ a={'verified':True,'job_id':1000,'run_id':55,'run_attempt':2,'runner_id':501,'repository_id':101}
+print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':True,'runner_version':'2.337.0','duration_seconds':1,'private_extra':'must-not-expose','assignment':a}))
 "#).unwrap();
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
         g.config.as_mut().unwrap().pools[0].worker = vec![worker.to_str().unwrap().into()];
@@ -404,7 +533,7 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
             );
             data.jobs.insert("2-99".into(),json!({"id":99,"repository":"fixture/private","repository_id":101,"run_id":44,"status":"running"}));
         }
-        let (api, server) = api_fixture(vec![
+        let mut responses = vec![
             (
                 "/user/installations?",
                 json!({"installations":[{"id":2,"account":{"login":"fixture"},"permissions":{"organization_self_hosted_runners":"write"},"suspended_at":null}]}),
@@ -423,7 +552,7 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
             ),
             (
                 "generate-jitconfig",
-                json!({"runner":{"id":501},"encoded_jit_config":"fixture-jit-config"}),
+                json!({"runner":{"id":501},"encoded_jit_config":"fixture-jit-config","expected_work_folder":if prepared {"/project/work"} else {"_work"}}),
             ),
             (
                 "/app/installations/2/access_tokens",
@@ -438,7 +567,17 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
                 "/repos/fixture/private/actions/jobs/99",
                 json!({"id":99,"run_id":44,"status":"queued"}),
             ),
-        ]);
+        ];
+        if prepared {
+            let workflows =
+                vec!["fixture/private/.github/workflows/ci.yml@refs/heads/main".to_owned()];
+            g.config.as_mut().unwrap().pools[0].preparation = Some(Preparation {
+                repository_id: 101,
+                workflows: workflows.clone(),
+            });
+            responses.splice(4..4, vec![("GET /orgs/fixture/actions/runner-groups/1 ", json!({"visibility":"selected","allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":workflows})), ("/runner-groups/1/repositories?",json!({"repositories":[{"id":101}]})), ("/app/installations/2/access_tokens",json!({"token":"fixture-verification-token"}))]);
+        }
+        let (api, server) = api_fixture(responses);
         g.api = api;
         let result = g
             .run_job("2-99", &g.config.as_ref().unwrap().pools[0])
@@ -447,6 +586,10 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         assert_eq!(result["cleaned"], true);
         assert_eq!(result["runner_id"], 501);
         assert_eq!(result["demand_pending"], true);
+        assert_eq!(result["prepared"], prepared);
+        if prepared {
+            assert_eq!(result["actual_job_id"], 1000);
+        }
         let mut demand = json!({"status":"running","github_status":"queued"});
         finish_capacity(&mut demand, result.clone());
         assert_eq!(demand["status"], "queued");
@@ -456,6 +599,7 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         for secret in [
             "fixture-jit-config",
             "fixture-installation-token",
+            "fixture-verification-token",
             "must-not-expose",
         ] {
             assert!(!result.to_string().contains(secret));
@@ -503,6 +647,7 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
                     .to_string_lossy()
                     .into_owned(),
             ],
+            preparation: None,
         };
         validate_pools(std::slice::from_ref(&pool)).unwrap();
         let mut payload = json!({"installation":{"id":1},"repository":{"owner":{"login":"fixture"}},"workflow_job":{"labels":["self-hosted","linux","enginebox-linux"]}});

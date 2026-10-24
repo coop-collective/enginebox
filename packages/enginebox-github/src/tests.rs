@@ -69,6 +69,12 @@ pub(crate) fn api_fixture(
                 let value: Value = serde_json::from_slice(&input).unwrap();
                 runner_name = value["name"].clone();
                 assert_eq!(value["runner_group_id"], 1);
+                assert_eq!(value["work_folder"], response["expected_work_folder"]);
+            }
+            if response["token"] == "fixture-verification-token" {
+                let value: Value = serde_json::from_slice(&input).unwrap();
+                assert_eq!(value["repository_ids"], json!([101]));
+                assert_eq!(value["permissions"], json!({"actions":"read"}));
             }
             if response["name"] == "fixture-created-runner" {
                 response["name"] = runner_name.clone();

@@ -41,6 +41,10 @@ impl Runtime {
         message: &str,
     ) -> Result<Value> {
         ensure!(
+            !self.project_dir(&p.name).join("preparation.json").exists(),
+            "Imported preparation main is immutable; activate a new generation instead"
+        );
+        ensure!(
             crate::config::digest(expected),
             "Exact main revision required"
         );

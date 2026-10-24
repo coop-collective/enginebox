@@ -1,0 +1,10 @@
+{
+  "name": "@enginebox/actions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/hook.mjs && node --check src/action.mjs && node --check src/broker.mjs"
+  }
+}

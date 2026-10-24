@@ -97,6 +97,23 @@ afterEach(async () => {
   await reset();
 });
 
+it('preparation catalog requires owner approval, matching published data, and retains revocation across eviction', async () => {
+  const node = await setup();
+  const key = '1'.repeat(64);
+  const generation = await publish('prepared-store-fixture', null, { preparationKey: key, preparationRecipe: 'pnpm-installed-v1', projectRecordHash: await sha256('fixture-record') });
+  const value = { schema: 1, project: 'demo', key, generation: generation.id, recipe: 'pnpm-installed-v1', namespace: 'owner-fixture', repository: '101', trust: 'repository-read', image: '2'.repeat(64), pnpm: '12.15.0', scripts: 'deny', credentialFree: true, projectRecord: btoa('fixture-record') };
+  expect((await request('/v1/projects/demo/preparations', value, node)).status).toBe(403);
+  expect((await request('/v1/projects/demo/preparations', { ...value, key: '3'.repeat(64) })).status).toBe(409);
+  expect(await ok('/v1/projects/demo/preparations', value)).toEqual(value);
+  expect(await ok(`/v1/projects/demo/preparations/${key}`, undefined, node)).toEqual(value);
+  expect((await request('/v1/projects/demo/preparations', { ...value, repository: '102' })).status).toBe(409);
+  expect((await request(`/v1/projects/demo/preparations/${key}`, undefined, node, 'DELETE')).status).toBe(403);
+  await ok(`/v1/projects/demo/preparations/${key}`, undefined, token, 'DELETE');
+  await evictDurableObject(env.PROJECTS.getByName('demo'));
+  expect((await request(`/v1/projects/demo/preparations/${key}`)).status).toBe(404);
+  expect((await request('/v1/projects/demo/preparations', value)).status).toBe(409);
+});
+
 it("keeps assistant prompts and results out of storage inventory, catalog and raw job reads", async () => {
   const native = await setup("native-node", "agent", ["demo"]);
   const storage = await setup("storage-node", "storage");

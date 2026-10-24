@@ -24,6 +24,45 @@ enum Backend {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Verify an already activated immutable preparation without reading a transported snapshot.
+    PreparationReady {
+        project: String,
+        #[arg(long)]
+        snapshot_hash: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        record_hash: String,
+    },
+    /// Explicitly activate an approved immutable dependency Store on a new node.
+    PreparationRestore {
+        project: String,
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        snapshot_hash: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        record: PathBuf,
+        #[arg(long)]
+        record_hash: String,
+        #[arg(long, required = true)]
+        credential_free: bool,
+    },
+    /// Back up a dedicated credential-free preparation Store, never a job Store.
+    PreparationSnapshot {
+        project: String,
+        name: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long, required = true)]
+        credential_free: bool,
+    },
     /// Export owned main or a closed branch as verified source for a dev preview.
     DevExport {
         project: String,
@@ -223,6 +262,36 @@ pub fn run(args: Storage) -> Result<Value> {
     }
     let runtime = Runtime::new(config)?;
     match command {
+        Command::PreparationReady {
+            project,
+            snapshot_hash,
+            key,
+            revision,
+            record_hash,
+        } => runtime.preparation_ready(&project, &snapshot_hash, &key, &revision, &record_hash),
+        Command::PreparationRestore {
+            project,
+            snapshot,
+            snapshot_hash,
+            key,
+            revision,
+            record,
+            record_hash,
+            credential_free: _,
+        } => runtime.preparation_restore(
+            &project,
+            &snapshot,
+            &snapshot_hash,
+            &key,
+            &revision,
+            (&record, &record_hash),
+        ),
+        Command::PreparationSnapshot {
+            project,
+            name,
+            key,
+            credential_free: _,
+        } => runtime.preparation_snapshot(&project, &name, &key),
         Command::DevExport { project, workspace } => {
             runtime.dev_export(&project, workspace.as_deref())
         }

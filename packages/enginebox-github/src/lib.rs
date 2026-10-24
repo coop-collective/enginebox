@@ -199,7 +199,7 @@ impl GitHub {
         json!({"configured": self.config.is_some(), "runner_app_configured":self.config.as_ref().is_some_and(|c|c.runners.is_some()),
             "accounts":data.accounts.iter().map(|(kind, a)|json!({"kind":kind,"login":a["login"]})).collect::<Vec<_>>(),
             "repositories":data.repositories.values().collect::<Vec<_>>(), "jobs":data.jobs.values().collect::<Vec<_>>(), "draining":data.draining,
-            "pools":self.config.as_ref().map(|c|c.pools.iter().map(|p|json!({"id":p.id,"organization":p.organization,"labels":p.labels,"runner_group_id":p.runner_group_id,"max_runners":p.max_runners})).collect::<Vec<_>>()).unwrap_or_default()})
+            "pools":self.config.as_ref().map(|c|c.pools.iter().map(|p|json!({"id":p.id,"organization":p.organization,"labels":p.labels,"runner_group_id":p.runner_group_id,"max_runners":p.max_runners,"preparation":p.preparation.as_ref().map(|v|json!({"repository_id":v.repository_id,"workflows":v.workflows}))})).collect::<Vec<_>>()).unwrap_or_default()})
     }
     pub fn connect(&self, kind: &str) -> Result<Value> {
         let app = self.app(kind)?;
