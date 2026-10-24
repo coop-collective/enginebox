@@ -1,5 +1,7 @@
 import { validateIntegration, type IntegrationJob } from "./integration.ts";
 export * from "./integration.ts";
+export * from "./engine-build.ts";
+import { validateEngineBuild, type EngineBuildJob } from "./engine-build.ts";
 export const SCHEMA = 1;
 export * from "./artifacts.ts";
 export * from "./recordings.ts";
@@ -49,6 +51,7 @@ export type NodeSpec = {
   cacheBytes: number;
   assistantProjects?: string[];
   integrationProjects?: string[];
+  buildProjects?: string[];
   taskOnly?: true;
   mediaProjects?: string[];
 };
@@ -84,14 +87,14 @@ export type AssistantJob = {
   argv?: never;
   check?: never;
 };
-export type JobSpec = StoreJob | AssistantJob | MediaFinalizeJob | IntegrationJob;
+export type JobSpec = StoreJob | AssistantJob | MediaFinalizeJob | IntegrationJob | EngineBuildJob;
 export function readOnlyJob(job: { kind: string }) {
   return job.kind === "hydrate" || job.kind === "verify";
 }
 export type CheckRequirement = {
   name: string;
   recipe: string;
-  kind: "verify" | "layerfs-exec";
+  kind: "verify" | "layerfs-exec" | "engine-build";
   argv?: string[];
   timeoutSeconds?: number;
 };
@@ -252,6 +255,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "assistantProjects",
     "mediaProjects",
     "integrationProjects",
+    "buildProjects",
     "taskOnly",
   ]);
   identifier(value.id);
@@ -270,7 +274,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     requireThat(
       value.taskOnly === true && value.role === "agent" &&
         value.projects.length === 1 && value.origin === null &&
-        value.assistantProjects === undefined && value.mediaProjects === undefined && value.integrationProjects === undefined,
+        value.assistantProjects === undefined && value.mediaProjects === undefined && value.integrationProjects === undefined && value.buildProjects === undefined,
       "Task-only credentials require one project, agent role and no executor capability",
     );
   if (value.assistantProjects !== undefined) {
@@ -297,6 +301,10 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
   if (value.integrationProjects !== undefined) {
     requireThat(value.role === "agent" && Array.isArray(value.integrationProjects) && value.integrationProjects.length <= 128, "Invalid integration projects");
     for (const project of value.integrationProjects) { identifier(project); requireThat(value.projects.includes(project), "Integration project must be enrolled"); }
+  }
+  if(value.buildProjects!==undefined){
+    requireThat(value.role==='agent' && !value.taskOnly && Array.isArray(value.buildProjects) && value.buildProjects.length<=128,'Invalid build projects');
+    for(const project of value.buildProjects){identifier(project);requireThat(value.projects.includes(project),'Build project must be enrolled');}
   }
   integer(value.slots, 1, 64);
   integer(value.cacheBytes, MAX_CHUNK_BYTES * 2, Number.MAX_SAFE_INTEGER);
@@ -334,6 +342,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     ...(value.mediaProjects === undefined ? {} : {mediaProjects: [...new Set(value.mediaProjects as string[])]}),
     ...(value.taskOnly === true ? { taskOnly: true as const } : {}),
     ...(value.integrationProjects === undefined ? {} : { integrationProjects: [...new Set(value.integrationProjects as string[])] }),
+    ...(value.buildProjects === undefined ? {} : {buildProjects:[...new Set(value.buildProjects as string[])]}),
     ...(value.assistantProjects === undefined
       ? {}
       : {
@@ -343,6 +352,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
 }
 export function validateJob(value: unknown): JobSpec {
   record(value);
+  if(value.kind === "engine-build") return validateEngineBuild(value);
   exactKeys(value, [
     "id",
     "project",
@@ -456,9 +466,13 @@ export function validateChecks(value: unknown): CheckRequirement[] {
     identifier(v.name);
     digest(v.recipe);
     requireThat(
-      v.kind === "verify" || v.kind === "layerfs-exec",
+      v.kind === "verify" || v.kind === "layerfs-exec" || v.kind === "engine-build",
       "Invalid check executor",
     );
+    if(v.kind === 'engine-build') {
+      requireThat(v.argv===undefined,'Build checks only accept a protected recipe hash');integer(v.timeoutSeconds,1,7200);
+      return {name:v.name,recipe:v.recipe,kind:'engine-build',timeoutSeconds:v.timeoutSeconds} as CheckRequirement;
+    }
     const executor = validateJob({
       id: "recipe",
       project: "recipe",

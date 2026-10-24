@@ -90,3 +90,57 @@ The proof directory must not exist. The fixture exports Web and Linux, verifies 
 Use the release binary for timing; Rust debug SHA256 loops materially distort cold/cached latency. These small fixtures do not qualify large Unreal project cold starts.
 
 Command references: [Godot CLI](https://docs.godotengine.org/en/stable/tutorials/editor/command_line_tutorial.html), [Godot Web export](https://docs.godotengine.org/en/stable/classes/class_editorexportplatformweb.html), [Unity editor CLI](https://docs.unity3d.com/6000.0/Documentation/Manual/EditorCommandLineArguments.html), [Unreal BuildCookRun](https://dev.epicgames.com/documentation/en-us/unreal-engine/build-operations-cooking-packaging-deploying-and-running-projects-in-unreal-engine).
+
+## Fleet build jobs
+
+The trusted worker can opt into `buildProjects:["demo"]` at enrollment. Its private node configuration adds:
+
+```json
+{
+  "buildProjects": ["demo"],
+  "engineBuilds": {
+    "localTrusted": true,
+    "binary": "/opt/enginebox/enginebox-build",
+    "binarySha256": "<release binary SHA256>",
+    "bindings": {
+      "demo": {
+        "integrationRoot": "/private/layerfs/integrations/demo",
+        "state": "/private/builds/demo",
+        "recipes": {"<recipe SHA from fingerprint>":"/private/recipes/godot-web.json"}
+      }
+    }
+  }
+}
+```
+
+`localTrusted:true` is an explicit private qualification mode, not multi-tenant native isolation. Imported project code runs with the worker's OS identity and can inspect same-UID files despite the cleared environment. Keep fleet owner credentials out of this machine/process boundary and use it only for authorized private projects. A separately isolated native build binding is still required before offering hostile shared-tenant execution. Neither a browser nor an agent can submit executable paths, environment or arbitrary argv in a build job.
+
+Configure an owner-controlled required check `{name:"playable",kind:"engine-build",recipe:"<SHA>",timeoutSeconds:300}` before freezing integration. Once the integration job completes and publishes its exact generation, an owner queues `POST /v1/projects/demo/jobs`:
+
+```json
+{
+  "id":"build-attempt-1",
+  "project":"demo",
+  "kind":"engine-build",
+  "generation":"<integrated generation SHA>",
+  "timeoutSeconds":300,
+  "build":{
+    "candidate":"integration-1",
+    "integration":"integration-1",
+    "sourceTree":"<treeHash from integration>",
+    "recipe":"<protected recipe SHA>"
+  },
+  "check":{
+    "candidate":"integration-1",
+    "name":"playable",
+    "recipe":"<same protected recipe SHA>",
+    "scope":"full"
+  }
+}
+```
+
+Enqueue verifies the completed integration job, candidate, immutable generation metadata, current task requirements and required-check policy. Assignment is pinned to that integration's executor because remote logical Store/source import is not yet qualified. The worker derives `integrationRoot/<integration>/source` and `source.json` from its protected binding; it ignores paths returned in a remote job report. It verifies manifest provenance, protected recipe identity/timeout and the enginebox-build executable SHA before launching the CLI.
+
+Lease renewal uses an atomic private file. Cancellation waits for the CLI to confirm exit. An unconfirmed supervisor after ten seconds produces `UncertainNativeRun`, retaining the native reservation for owner reconciliation rather than reporting a failed, free slot. Private attempt metadata identifies the CLI PID; a restarted node's existing operation journal prevents replay of an interrupted build. A local cache artifact produced before publication failure can be reverified on a new authorized attempt.
+
+The worker streams the actual manifest/files through `publishBuild` to the controller's immutable chunk storage. Successful result is `{generation,sourceTree,recipe,artifact,cacheHit}` plus the existing protected check identity. Controller completion and acceptance require that exact registered artifact, candidate, generation, tree hash, recipe and executor identity. The accepted candidate references this existing artifact; neither acceptance nor playtest playback invokes the engine again.

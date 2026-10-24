@@ -23,6 +23,7 @@ import { Recordings } from "./recordings.ts";
 import type { PlaytestPolicy, RecordingChunk } from "@enginebox/fleet-protocol";
 import { Integrations } from "./integration.ts";
 import { Tasks } from "./tasks.ts";
+import { Builds } from "./builds.ts";
 import { Artifacts } from "./artifacts.ts";
 import type { BuildManifest } from "@enginebox/fleet-protocol";
 
@@ -206,6 +207,7 @@ export class FleetNode extends State {
       "Node has no free slots",
       409,
     );
+    requireThat(job.kind !== 'engine-build' || node.buildProjects?.includes(job.project), 'Node is not enrolled for builds', 403);
     const reservation: Reservation = {
       ...job,
       node: node.id,
@@ -367,6 +369,7 @@ type CandidateRecord = {
   taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
+  async buildEligible(job:JobSpec,node:string|undefined) { return new Builds(this).eligible(job,node); }
   private recordingState() { return new Recordings(this,this.ctx.storage.sql); }
   async playtestPolicy() { return this.recordingState().policy(); }
   async configurePlaytests(policy:PlaytestPolicy) { return this.recordingState().configure(policy); }
@@ -638,6 +641,10 @@ export class Project extends State {
           409,
         );
       }
+      for(const check of checks) {
+        const job=this.get<JobRecord>(`job:${candidate.fullJobs[check.name]}`)!;
+        if(job.spec.kind==='engine-build')new Builds(this).complete(job.spec,job.result!,job.assignment!.node);
+      }
       validation = {
         candidate: candidate.spec,
         checks,
@@ -714,6 +721,11 @@ export class Project extends State {
       );
       return prior;
     }
+    if(spec.kind === 'engine-build') {
+      new Builds(this).source(spec);
+      const candidate=this.get<CandidateRecord>(`candidate:${spec.build.candidate}`);
+      this.tasks().validateRequirements(candidate?.taskRequirements);
+    }
     const job: JobRecord = { spec, status: "queued" };
     if (spec.check) {
       const candidate = this.get<CandidateRecord>(
@@ -768,6 +780,7 @@ export class Project extends State {
             project: assignment.project,
             generation: assignment.generation,
             kind: assignment.kind,
+            ...(assignment.kind === "engine-build" ? {build:assignment.build,timeoutSeconds:assignment.timeoutSeconds} : {}),
             ...(assignment.kind === "assistant"
               ? {
                   prompt: assignment.prompt,
@@ -787,6 +800,7 @@ export class Project extends State {
       "Job specification changed",
       409,
     );
+    if(job.spec.kind==='engine-build')new Builds(this).assigned(job.spec,assignment);
     if (job.assignment?.attempt === assignment.attempt) return job;
     requireThat(
       job.status === "queued" && assignment.expires > Date.now(),
@@ -836,6 +850,7 @@ export class Project extends State {
       "Expired result cannot claim success",
       409,
     );
+    if(ok && job.spec.kind==='engine-build')new Builds(this).complete(job.spec,result,assignment.node);
     if (ok && job.spec.check) {
       const report = JSON.parse(result);
       requireThat(
