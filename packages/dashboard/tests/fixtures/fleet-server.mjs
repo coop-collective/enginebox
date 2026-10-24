@@ -4,6 +4,7 @@ const GiB = 1024 ** 3;
 const token = "fixture-api-token-server-only-12345";
 const minimum = { cpu: 2, memory_gib: 2, disk_gib: 30 };
 const recommended = { cpu: 4, memory_gib: 4, disk_gib: 40 };
+let contributors = [];
 let mode,
   jobs,
   instances,
@@ -51,6 +52,7 @@ function manifest(id = "native", revision = 1) {
 }
 function reset() {
   mode = "normal";
+  contributors = [];
   jobs = new Map();
   authSessions = new Map();
   connectedAccounts = new Set();
@@ -137,6 +139,7 @@ createServer(async (req, res) => {
     environmentRoutes = [];
     return send(200, { ok: true });
   }
+  if (req.url === "/__test/contributor-online") { contributors = contributors.map(n => ({...n,enrolled:true,online:true,tools:{ci:true,codex:false}})); return send(200,{ok:true}); }
   if (req.url === "/__test/storage-requests") return send(200, storageRequests);
   if (req.url === "/__test/mode") {
     mode = data.mode;
@@ -201,6 +204,13 @@ createServer(async (req, res) => {
     return send(200, { schema_version: 1, templates: ciTemplates });
   }
   if (req.url === '/v1/environments' && req.method === 'GET') return send(200, environmentCatalog());
+  if (req.url === '/__enginebox/status') return send(200,{node_protocol:1});
+  if (req.url === '/v1/contributors' && req.method === 'GET') return send(200,{nodes:contributors});
+  if (req.url === '/v1/contributors/enrollments' && req.method === 'POST') {
+    const id='a'.repeat(32); contributors.push({...data,id,enrolled:false,revoked:false,blocked:false,online:false,tools:{}});
+    return send(200,{id,code:`${id}.${'b'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+600});
+  }
+  if (/^\/v1\/contributors\/[a-f0-9]{32}\/revoke$/.test(req.url)) { contributors=contributors.map(n=>({...n,revoked:true}));return send(200,{revoked:true}); }
   if (req.url === '/v1/environments/routes' && req.method === 'POST') {
     environmentRoutes = environmentRoutes.filter(r => r.id !== (data.remove ?? data.id));
     if (!data.remove) environmentRoutes.push(data);

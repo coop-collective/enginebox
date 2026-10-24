@@ -6,6 +6,9 @@ license-file = "../../LICENSE"
 publish = false
 
 [dependencies]
+enginebox-node-protocol = { path = "../enginebox-node-protocol" }
+enginebox-ci = { path = "../enginebox-ci" }
+enginebox-agents = { path = "../enginebox-agents" }
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
@@ -25,12 +28,13 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Security_Authorization", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+enginebox-controller = { path = "../enginebox-controller" }
 tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
@@ -44,3 +48,7 @@ path = "src/bin/supervisor.rs"
 [[bin]]
 name = "enginebox-release"
 path = "src/bin/release.rs"
+
+[[bin]]
+name = "enginebox-node"
+path = "src/bin/node.rs"

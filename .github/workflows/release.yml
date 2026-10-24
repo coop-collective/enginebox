@@ -46,7 +46,7 @@ jobs:
             --version "$version" --target '${{ matrix.target }}' --bin-dir target/release \
             --license LICENSE --notice NOTICE \
             --binary enginebox-api --binary enginebox-fleet-mcp --binary enginebox-guest \
-            --binary enginebox-mcp --binary enginebox-browser --binary enginebox-agent-clients \
+            --binary enginebox-mcp --binary enginebox-browser --binary enginebox-agent-clients --binary enginebox-node \
             --dashboard packages/dashboard/dist/standalone \
             --dashboard-start packages/dashboard/scripts/start.mjs \
             --output '.state/release/${{ matrix.target }}'
@@ -72,7 +72,7 @@ jobs:
           mkdir -p .state/publish
           find .state/artifacts -type f -name '*.sha256' -exec cat {} + > .state/publish/SHA256SUMS
           find .state/artifacts -type f \( -name '*.tar.gz' -o -name '*.json' -o -name '*.sha256' \) -exec cp {} .state/publish/ \;
-          cp packages/enginebox-install/assets/install.sh packages/enginebox-install/assets/install.ps1 .state/publish/
+          cp packages/enginebox-install/assets/install.sh packages/enginebox-install/assets/install.ps1 packages/enginebox-install/assets/install-native-node.ps1 .state/publish/
       - name: Publish a reviewable prerelease
         env:
           GH_TOKEN: ${{ github.token }}

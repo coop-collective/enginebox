@@ -15,6 +15,7 @@ import { TemplateCatalog } from "@/components/template-catalog";
 import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
+import { ContributorsPanel } from "@/components/contributors-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
@@ -29,6 +30,11 @@ const bytes = (value?: number) =>
     : "—";
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
+  machines: {
+    title: "Worker machines",
+    description: "Register CI and agent workers and choose their resource allowance.",
+    icon: "server",
+  },
   environments: {
     title: "Environments",
     description: "Run persistent development services and manage their endpoints.",
@@ -890,7 +896,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates", "storage", "environments"] as const)
+          {(["fleet", "machines", "agents", "templates", "storage", "environments"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1056,6 +1062,7 @@ export default function Dashboard() {
                 <StoragePanel refreshToken={updated?.getTime() ?? 0} />
               )}
               {section === "environments" && <EnvironmentsPanel />}
+              {section === "machines" && <ContributorsPanel />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

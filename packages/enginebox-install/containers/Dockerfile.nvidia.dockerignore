@@ -1,0 +1,11 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!NOTICE
+!packages/
+!packages/enginebox-*/
+!packages/enginebox-*/Cargo.toml
+!packages/enginebox-*/src/**
+!packages/enginebox-*/build.rs

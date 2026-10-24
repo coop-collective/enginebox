@@ -402,6 +402,8 @@ async fn mock_server(state: Mock) -> (String, tokio::task::JoinHandle<()>) {
             .route("/internal/undrain", post(mock_activate))
             .route("/value", get(mock_get).post(mock_mutation))
             .route("/v1/agents", get(mock_observation))
+            .route("/v1/node/heartbeat", post(mock_node_heartbeat))
+            .route("/v1/node/result", post(mock_node_result))
             .with_state(state),
     )
     .await
@@ -885,4 +887,64 @@ fn windows_private_directory_replaces_explicit_everyone_permissions() {
         fs::read_to_string(directory.join("child/secret.txt")).unwrap(),
         "retained private state"
     );
+}
+
+async fn mock_node_heartbeat(
+    State(s): State<Mock>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, String) {
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some("Bearer fixture-node-token")
+    {
+        return (StatusCode::UNAUTHORIZED, "node auth".into());
+    }
+    (StatusCode::OK, s.version)
+}
+async fn mock_node_result(
+    State(s): State<Mock>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, String) {
+    let result = mock_node_heartbeat(State(s.clone()), headers).await;
+    if result.0 == StatusCode::OK {
+        s.jobs.store(0, Ordering::SeqCst);
+    }
+    result
+}
+#[tokio::test]
+async fn scoped_node_results_pass_drain_gate_without_authorizing_operator_writes() {
+    let f = fixture().await;
+    let client = reqwest::Client::new();
+    for path in ["/value", "/v1/node/arbitrary", "/v1/node/heartbeat"] {
+        let response = client
+            .post(format!("{}{path}", f.url))
+            .bearer_auth("invalid-node-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    f.old.jobs.store(1, Ordering::SeqCst);
+    let supervisor = f.supervisor.clone();
+    let next = candidate(&f);
+    let upgrade = tokio::spawn(async move { supervisor.handoff(next).await });
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while f.old.drain_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for action in ["heartbeat", "result"] {
+        let response = client
+            .post(format!("{}/v1/node/{action}", f.url))
+            .bearer_auth("fixture-node-token")
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "0.3.0");
+    }
+    upgrade.await.unwrap().unwrap();
+    assert_eq!(f.supervisor.current_version().await, Version::new(0, 4, 0));
 }

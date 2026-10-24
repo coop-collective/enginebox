@@ -406,6 +406,7 @@ dependencies = [
  "enginebox-agents",
  "enginebox-ci",
  "enginebox-core",
+ "enginebox-node-protocol",
  "enginebox-storage-layerfs",
  "fs2",
  "http-body-util",
@@ -465,6 +466,10 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "enginebox-agents",
+ "enginebox-ci",
+ "enginebox-controller",
+ "enginebox-node-protocol",
  "flate2",
  "fs2",
  "futures-util",
@@ -482,6 +487,15 @@ dependencies = [
  "tower",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "enginebox-node-protocol"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

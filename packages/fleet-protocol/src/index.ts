@@ -13,7 +13,7 @@ export const MAX_PAGES = 256;
 export const MAX_JSON_BYTES = 256 * 1024;
 export const LEASE_MS = 30_000;
 export const NODE_STALE_MS = 20_000;
-export type Role = "agent" | "storage";
+export type Role = "agent" | "storage" | "native";
 export type JsonValue =
   | null
   | boolean
@@ -265,7 +265,7 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
   ]);
   identifier(value.id);
   requireThat(
-    value.role === "agent" || value.role === "storage",
+    value.role === "agent" || value.role === "storage" || value.role === "native",
     "Invalid node role",
   );
   requireThat(
@@ -275,6 +275,9 @@ export function validateNode(value: unknown, allowHttp: boolean): NodeSpec {
     "Projects required",
   );
   for (const project of value.projects) identifier(project);
+  if (value.role === "native")
+    requireThat(value.origin === null && value.assistantProjects === undefined && value.taskOnly === undefined,
+      "Native nodes use outbound control and cannot impersonate storage or agent executors");
   if (value.taskOnly !== undefined)
     requireThat(
       value.taskOnly === true &&
