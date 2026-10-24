@@ -97,7 +97,25 @@ function Backup-AndRemoveRuntime([string]$Name,[string]$Directory) {
   Invoke-Wsl -Arguments @('--distribution',$Name,'--user','root','--exec','sync') | Out-Host
   Invoke-Wsl -Arguments @('--terminate',$Name) | Out-Host
   $disk=Join-Path $backup 'enginebox.vhdx'
-  Invoke-Wsl -Arguments @('--export',$Name,$disk,'--vhd') | Out-Host
+  if (Test-Path -LiteralPath $disk) { throw 'The new backup path already exists; no state was removed.' }
+  # Terminate can return before Windows releases the VHD handle. Retry only
+  # that explicit transient error; never shut down other WSL distributions.
+  for ($attempt=1; $attempt -le 15; $attempt++) {
+    $preference=$ErrorActionPreference
+    try {
+      $ErrorActionPreference='Continue'
+      $exportOutput=@(& wsl.exe --export $Name $disk --vhd 2>&1)
+      $exportExit=$LASTEXITCODE
+    } finally { $ErrorActionPreference=$preference }
+    $exportDetail=(($exportOutput | Out-String) -replace "`0",'').Trim()
+    if ($exportExit -eq 0) { break }
+    if ($exportDetail -notmatch 'ERROR_SHARING_VIOLATION' -or $attempt -eq 15) { throw "Backup export failed (exit $exportExit): $exportDetail`nThe existing distribution was retained. Backup directory: $backup" }
+    if ($attempt -eq 1) { Write-Host 'Waiting for Windows to release the Enginebox virtual disk...' }
+    # Only this attempt's incomplete export can be removed. The source runtime
+    # and every previous backup remain intact.
+    if (Test-Path -LiteralPath $disk) { Remove-Item -LiteralPath $disk -Force }
+    Start-Sleep -Seconds 2
+  }
   if (-not (Test-Path -LiteralPath $disk) -or (Get-Item -LiteralPath $disk).Length -lt 1MB) { throw "Backup is incomplete. The existing distribution was retained. Backup directory: $backup" }
   $stream=[IO.File]::OpenRead($disk)
   try { $magic=New-Object byte[] 8; $read=$stream.Read($magic,0,8) } finally { $stream.Dispose() }

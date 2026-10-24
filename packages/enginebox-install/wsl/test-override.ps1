@@ -34,6 +34,9 @@ assert not (root/'override-workspace-proof.txt').exists()
 '@
   $clean | & wsl.exe -d $name -u root --exec python3 -
   if ($LASTEXITCODE) { throw 'Replacement did not start with fresh state' }
+  Invoke-Wsl -Arguments @('--unregister',$name)
+  # The runner needs space for the exported disk and its independent restore;
+  # the clean replacement has already been checked and is no longer needed.
   # Import copies the backup. Never boot/import-in-place the original archive.
   Invoke-Wsl -Arguments @('--import',$restored,(Join-Path $root 'restored'),$disk,'--vhd')
   $verify=@'

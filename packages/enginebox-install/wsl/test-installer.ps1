@@ -31,7 +31,8 @@ $fixtureImage=Join-Path $testRoot 'image-fixture'
 [IO.File]::WriteAllText($fixtureImage,'fixture-rootfs')
 $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 (Get-Content -Raw -LiteralPath $path).Replace('@@ROOTFS_URL@@','https://fixture.invalid/enginebox.wsl').Replace('@@ROOTFS_SHA256@@',$fixtureHash) | Set-Content -LiteralPath $flowScript -Encoding UTF8
-$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false; overrideChoice='n'; pendingId=$null; exportFailure=$false; exportInvalid=$false; enrollmentError=$null; stopped=0 }
+$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false; overrideChoice='n'; pendingId=$null; exportFailure=$false; exportInvalid=$false; exportSharing=0; delays=0; enrollmentError=$null; stopped=0 }
+function global:Start-Sleep { param($Seconds) if ($Seconds -ne 2) { throw 'Unexpected retry delay' }; $global:EngineboxWslFixture.delays++ }
 function global:Get-CimInstance { [pscustomobject]@{NumberOfLogicalProcessors=16;TotalPhysicalMemory=32GB} }
 function global:Get-ScheduledTask { return $null }
 function global:Register-ScheduledTask {
@@ -78,6 +79,7 @@ function global:wsl.exe {
     '--terminate' { if ($args[1] -ne 'Enginebox') { throw 'Unrelated distribution stopped' } }
     '--export' {
       if ($args[1] -ne 'Enginebox' -or $args[3] -ne '--vhd') { throw 'Unexpected export' }
+      if ($global:EngineboxWslFixture.exportSharing -gt 0) { $global:EngineboxWslFixture.exportSharing--; $global:LASTEXITCODE=1; 'Wsl/Service/ERROR_SHARING_VIOLATION'; return }
       if ($global:EngineboxWslFixture.exportFailure) { $global:LASTEXITCODE=1; return }
       $stream=[IO.File]::Create($args[2])
       try {
@@ -170,12 +172,12 @@ try {
   $f.linuxMemory=16GB; $f.linuxCpu=16
   # Enter accepts Override existing by default. A complete private backup must
   # precede unregistering, and the new runtime must take the fresh invitation.
-  $f.overrideChoice=''; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@()
+  $f.overrideChoice=''; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@(); $f.exportSharing=2
   $replacement=Join-Path $testRoot 'replacement'
   $newCode=('e'*32)+'.'+('f'*64)
   & $flowScript -InstallDirectory $replacement -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode
   $backups=@(Get-ChildItem -LiteralPath (Join-Path $replacement 'backups') -Directory)
-  if ($backups.Count -ne 1 -or $f.code -ne $newCode -or -not $f.enrolled -or $f.stopped -ne 1) { throw 'Default override must back up and register a fresh runtime' }
+  if ($backups.Count -ne 1 -or $f.code -ne $newCode -or -not $f.enrolled -or $f.stopped -ne 1 -or $f.delays -ne 2) { throw 'Default override must wait for disk release, back up and register a fresh runtime' }
   $backup=Join-Path $backups[0].FullName 'enginebox.vhdx'
   $receipt=Get-Content -Raw -LiteralPath (Join-Path $backups[0].FullName 'backup.json') | ConvertFrom-Json
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backup).Hash -ne $receipt.sha256) { throw 'Missing verified backup receipt' }
@@ -214,6 +216,6 @@ try {
   Write-Output 'Fresh import and stdin registration, defaults, custom controller/resources, WSL upgrade/reboot, constrained-memory recovery, immutable registered budgets, minimum capacity and WSL-only startup passed.'
 } finally {
   Remove-Item -LiteralPath $testRoot -Recurse -Force
-  foreach ($name in @('Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
+  foreach ($name in @('Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Start-Sleep','Read-Host','Start-Process','Invoke-WebRequest','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
   Remove-Variable EngineboxWslFixture -Scope Global
 }
