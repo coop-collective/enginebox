@@ -8,7 +8,7 @@ import { home } from './src/home.mjs';
 const root = fileURLToPath(new URL('.', import.meta.url));
 const out = join(root, 'dist');
 // Canonical origin for canonical/og:url links and the sitemap. Override with SITE_URL when deploying elsewhere.
-const siteUrl = (process.env.SITE_URL || 'https://xavalabs.com').replace(/\/+$/, '');
+const siteUrl = (process.env.SITE_URL || 'https://enginebox.coopcollective.dev').replace(/\/+$/, '');
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const logo = '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="m16 3 12 7-12 7-12-7Z M4 16l12 7 12-7 M4 22l12 7 12-7"/></svg>';
 // Published path of each content-hashed asset, keyed by its source path (filled in below).
