@@ -1,6 +1,0 @@
-target
-**/node_modules
-**/__pycache__
-**/.godot
-.cargo
-.state
