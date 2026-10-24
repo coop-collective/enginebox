@@ -102,7 +102,6 @@ $identity=Get-Content -Raw -LiteralPath $config | ConvertFrom-Json
 if (-not $SkipDependencies) {
   $required=@()
   if ($identity.workloads.ci) { $required+=@(@{name='git';id='Git.Git'},@{name='pwsh';id='Microsoft.PowerShell'}) }
-  if ($identity.workloads.agents) { $required+=@(@{name='codex';id='OpenAI.Codex'}) }
   foreach ($tool in $required) {
     if (Find-Tool $tool.name) { continue }
     $winget=Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -111,13 +110,6 @@ if (-not $SkipDependencies) {
     if ($LASTEXITCODE -ne 0) { Write-Warning "Registered, but $($tool.id) installation failed. The dashboard will report the missing tool." }
   }
 }
-if ($identity.workloads.agents -and (Find-Tool 'codex')) {
-  $answer=Read-Host 'Sign in to native Codex for this worker now? [Y/n]'
-  if ($answer -notmatch '^(n|no)$') {
-    $providerRoot=Join-Path $root 'work\providers\codex'; New-Item -ItemType Directory -Force -Path $providerRoot | Out-Null
-    $previousCodexConfig=$env:CODEX_HOME
-    try { $env:CODEX_HOME=$providerRoot; & (Find-Tool 'codex') login } finally { $env:CODEX_HOME=$previousCodexConfig }
-  }
-}
+if ($identity.workloads.agents) { Write-Warning 'Host agent execution is disabled. Use the Enginebox WSL2 installer for template workspaces.' }
 Write-Output "Registered this machine for its selected CI/agent workloads. It starts at sign-in. Status: $root\private\status.json"
 Write-Output "Shared limits: $Cpu CPUs, $MemoryGiB GiB RAM; workspace disk watchdog: $DiskGiB GiB. Check readiness in the dashboard."

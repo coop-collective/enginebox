@@ -11,6 +11,10 @@ def call(*args):
     if r.get('ok') is False: raise RuntimeError('LayerFS operation reported failure: '+json.dumps(r)[-2000:])
     return r
 call('doctor')
+settings=json.loads(pathlib.Path('/etc/enginebox/settings.json').read_text())
+cpu=pathlib.Path('/sys/fs/cgroup/enginebox.slice/cpu.max').read_text().split()
+assert int(cpu[0]) <= settings['cpu']*int(cpu[1])
+assert int(pathlib.Path('/sys/fs/cgroup/enginebox.slice/memory.max').read_text()) <= settings['memory_gib']*1024**3
 if receipt.exists():
     proof=json.loads(receipt.read_text())
     assert proof['layerfs'] and proof['isolation']
@@ -31,6 +35,12 @@ if not (root/'layerfs/projects/welcome/project.json').exists():
 suffix=uuid.uuid4().hex[:12]
 a,b='proof-a-'+suffix,'proof-b-'+suffix
 call('fork','welcome',a); call('fork','welcome',b)
+for workspace in [a,b]:
+    w=json.loads((root/'layerfs/workspaces'/f'{workspace}.json').read_text())
+    inspected=json.loads(subprocess.check_output(['docker','--host','unix:///run/enginebox-docker.sock','inspect',w['container']],text=True))[0]
+    assert inspected['HostConfig']['CgroupParent']=='enginebox.slice'
+    assert inspected['HostConfig']['Memory'] > 0
+    assert not inspected['HostConfig'].get('Privileged')
 canary=root/'private-canary';canary.write_text(uuid.uuid4().hex);canary.chmod(0o600)
 try:
     script='set -eu; test "$(id -u)" != 0; test ! -e /mnt/c; test ! -r /var/lib/enginebox/private-canary; test ! -S /run/enginebox-docker.sock; test ! -S /var/run/docker.sock; test ! -r /layerfs-store/global/store.sqlite; test ! -e /project/.git; codex --version; claude --version; printf private-a > proof.txt; mkdir -p "$HOME/.codex"; printf private-credential > "$HOME/.codex/proof"'

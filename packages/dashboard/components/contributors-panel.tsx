@@ -3,7 +3,7 @@ import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/client';
 type Budget = { cpu: number; memory_gib: number; disk_gib: number };
 type Node = { id: string; label: string; budget: Budget; workloads: { ci: boolean; agents: boolean }; online: boolean; enrolled: boolean; revoked: boolean; blocked: boolean; tools: { ci?: boolean; workspace?: boolean; backend?: string; worker_running?: boolean } };
-type Enrollment = { id: string; expires: number; command: string };
+type Enrollment = { id: string; expires: number; code: string; command: string };
 export function ContributorsPanel() {
   const [nodes, setNodes] = useState<Node[]>([]), [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [label, setLabel] = useState('Windows workstation');
@@ -41,6 +41,7 @@ export function ContributorsPanel() {
     </form>
     {invitation && <article className="host-card" aria-label="Install this machine">
       <h3>Run once in PowerShell</h3><p>This code expires at {new Date(invitation.expires * 1000).toLocaleTimeString()} and registers one machine. Choose resources in the installer. If WSL setup requires a restart or the code expires, finish setup and generate a fresh registration code.</p>
+      <label>Registration code for an installer already open<input readOnly aria-label="Registration code" value={invitation.code} /></label>
       <textarea readOnly aria-label="PowerShell install command" value={invitation.command} rows={5} spellCheck={false} />
       <button className="button primary" onClick={async () => { try { await navigator.clipboard.writeText(invitation.command); setCopied(true); } catch { setError('Clipboard access was denied. Select and copy the command above.'); } }}>{copied ? 'Copied' : 'Copy install command'}</button>
     </article>}

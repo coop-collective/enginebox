@@ -47,7 +47,7 @@ export async function contributors(request: Request, segments: string[]) {
   const result = await forward(`/v1/contributors${suffix ? `/${suffix}` : ''}`, request.method, config().apiToken, body);
   if (suffix === 'enrollments') {
     const command = installCommand(String(result.code), Number(result.expires));
-    return json({ id: result.id, expires: result.expires, command });
+    return json({ id: result.id, expires: result.expires, code: result.code, command });
   }
   return json(result);
 }

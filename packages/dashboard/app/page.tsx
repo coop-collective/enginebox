@@ -32,7 +32,7 @@ const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
   machines: {
     title: "Worker machines",
-    description: "Register CI and agent workers and choose their resource allowance.",
+    description: "Register Windows workers; choose resources in the installer.",
     icon: "server",
   },
   environments: {

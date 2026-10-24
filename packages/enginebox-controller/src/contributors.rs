@@ -385,16 +385,7 @@ impl Contributors {
                     timeout_minutes * 60
                 }
                 "agent" => {
-                    ensure!(
-                        n.invitation.workloads.agents && n.tools["codex"] == true,
-                        "Native Codex is not installed or signed in"
-                    );
-                    let r = enginebox_agents::native::RunRequest::parse(run.request.clone())?;
-                    ensure!(
-                        r.provider == "codex" && r.resume_id.is_none() && r.workdir == ".",
-                        "This native worker uses new Codex runs"
-                    );
-                    r.timeout_seconds
+                    anyhow::bail!("Host agent execution is disabled. Use a WSL template workspace.")
                 }
                 _ => anyhow::bail!("Unknown workload"),
             }

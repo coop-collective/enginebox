@@ -252,7 +252,7 @@ fn worker_environment(command: &mut Command) -> Result<()> {
     }
     let mut paths =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
-    for name in ["pwsh", "git", "codex"] {
+    for name in ["pwsh", "git"] {
         if let Some(exe) = executable(name)
             && let Some(parent) = exe.parent()
         {
@@ -279,26 +279,9 @@ async fn tool_ready(name: &str, args: &[&str]) -> bool {
     .await
     .is_ok_and(|r| r.is_ok_and(|s| s.success()))
 }
-async fn tools(root: &Path, c: &Config, running: bool) -> Value {
+async fn tools(_root: &Path, c: &Config, running: bool) -> Value {
     if cfg!(target_os = "linux") {
         return crate::wsl::inventory(running);
-    }
-    let codex = executable("codex");
-    let mut signed_in = false;
-    if let Some(exe) = codex.as_ref() {
-        let status = tokio::time::timeout(
-            Duration::from_secs(5),
-            Command::new(exe)
-                .args(["login", "status"])
-                .env("CODEX_HOME", root.join("providers/codex"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await;
-        signed_in = status.is_ok_and(|r| r.is_ok_and(|s| s.success()));
     }
     let ci = c.workloads.ci
         && tool_ready(
@@ -313,7 +296,7 @@ async fn tools(root: &Path, c: &Config, running: bool) -> Value {
         .await
         && tool_ready("git", &["--version"]).await;
     json!({"ci":ci,
-        "codex":c.workloads.agents && signed_in,"codex_installed":codex.is_some(),"worker_running":running,
+        "codex":false,"workspace":false,"backend":"legacy-windows-ci","worker_running":running,
         "cpu_memory_limits":"windows-job-object","disk_limit":"workspace-watchdog","streaming_qualified":false})
 }
 pub async fn run(path: &Path, test: bool) -> Result<()> {
@@ -459,63 +442,5 @@ pub fn execute(input: Value) -> Result<Value> {
         };
         return enginebox_ci::executor::execute_at(&node, &request, &root.join("ci"));
     }
-    ensure!(run.kind == "agent", "Unknown worker kind");
-    let r = enginebox_agents::native::RunRequest::parse(run.request)?;
-    ensure!(
-        r.provider == "codex" && r.resume_id.is_none(),
-        "Only new native Codex runs are enabled"
-    );
-    let home = root.join("providers/codex");
-    private_dir(&home)?;
-    ensure!(
-        enginebox_node_protocol::id(&run.request_id),
-        "Invalid workspace identity"
-    );
-    let workspace = root.join("agents");
-    private_dir(&workspace)?;
-    let cwd = workspace.join(&run.request_id);
-    ensure!(
-        !cwd.exists() && r.workdir == ".",
-        "A fresh worker run requires a new workspace at its root"
-    );
-    private_dir(&cwd)?;
-    let exe = executable("codex").context("Native Codex executable not installed")?;
-    let mut env = std::collections::BTreeMap::new();
-    for key in [
-        "PATH",
-        "SystemRoot",
-        "WINDIR",
-        "COMSPEC",
-        "PATHEXT",
-        "USERPROFILE",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "SystemDrive",
-        "TEMP",
-        "TMP",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.to_owned(), value);
-        }
-    }
-    env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
-    enginebox_agents::native::verify_client(
-        exe.to_str().context("Invalid Codex path")?,
-        "codex",
-        &env,
-        &cwd,
-    )?;
-    let argv = enginebox_agents::native::native_command(&r, exe.to_str().unwrap());
-    let output = enginebox_agents::process::bounded(
-        &argv,
-        Some(&env),
-        Some(&cwd),
-        r.prompt.as_bytes(),
-        Duration::from_secs(r.timeout_seconds),
-        32 * 1024,
-        None,
-    )?;
-    Ok(
-        json!({"ok":output.exit_code==0 && !output.timed_out,"provider":"codex","output":output.output,"output_truncated":output.output_truncated,"timed_out":output.timed_out,"workspace":format!("agents/{}",run.request_id)}),
-    )
+    anyhow::bail!("Host agent execution is disabled. Use a WSL template workspace.")
 }

@@ -65,6 +65,15 @@ PY
     exec enginebox-node register-worker --controller "$controller" --cpu "$cpu" --memory-gib "$memory" --disk-gib "$disk" --config /var/lib/enginebox/private/worker.json
     ;;
   supervise)
+    # This watchdog is outside enginebox.slice so even an OOM-killed daemon
+    # cannot leave detached container scopes running after the worker exits.
+    cleanup_runtime() {
+      if [[ -w /sys/fs/cgroup/enginebox.slice/cgroup.kill ]]; then
+        echo 1 > /sys/fs/cgroup/enginebox.slice/cgroup.kill
+      fi
+      systemctl stop enginebox.slice || true
+    }
+    trap cleanup_runtime EXIT HUP INT TERM
     systemctl start enginebox-worker.service
     while systemctl is-active --quiet enginebox-worker.service; do sleep 5; done
     echo 'Worker stopped. Check dashboard status and the private WSL service journal.' >&2

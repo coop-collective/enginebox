@@ -1,5 +1,4 @@
-//! Real Windows supervisor, HTTP registration, native CI and CLI process wiring.
-//! The fake Codex tests native process plumbing, not provider inference/eligibility.
+//! Legacy Windows CI remains scoped; host agent execution must be refused.
 #![cfg(windows)]
 use enginebox_controller::{Controller, router};
 use serde_json::{Value, json};
@@ -61,7 +60,7 @@ fn main(){
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
+async fn windows_enrollment_runs_legacy_ci_refuses_host_agents_then_revokes() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     fake_codex(root);
@@ -175,7 +174,7 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
     loop {
         let catalog = api(&client, &url, "/v1/contributors", None).await;
         if catalog["nodes"][0]["tools"]["ci"] == true
-            && catalog["nodes"][0]["tools"]["codex"] == true
+            && catalog["nodes"][0]["tools"]["codex"] == false
         {
             break;
         }
@@ -207,14 +206,9 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
         "built"
     );
     assert_eq!(api(&client, &url, &path, Some(run)).await["job"]["id"], id);
-    let agent=api(&client,&url,&path,Some(json!({"request_id":"agent-proof","kind":"agent","request":{"provider":"codex","prompt":"fixture-native-prompt","timeout_seconds":30}}))).await;
-    let result = done(&client, &url, agent["job"]["id"].as_str().unwrap()).await;
-    assert_eq!(result["result"]["provider"], "codex");
-    assert_eq!(
-        std::fs::read_to_string(root.join("installation/work/agents/agent-proof/agent-result.txt"))
-            .unwrap(),
-        "fixture-native-prompt"
-    );
+    let denied = client.post(format!("{url}{path}")).bearer_auth(OWNER).json(&json!({"request_id":"agent-proof","kind":"agent","request":{"provider":"codex","prompt":"fixture-native-prompt","timeout_seconds":30}})).send().await.unwrap();
+    assert!(!denied.status().is_success());
+    assert!(!root.join("installation/work/agents/agent-proof").exists());
     // Revocation must terminate a running native job and its detached descendant.
     let pid_file = root.join("descendant.pid");
     let script = format!(

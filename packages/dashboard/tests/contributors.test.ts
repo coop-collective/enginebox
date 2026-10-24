@@ -26,7 +26,8 @@ test('one-copy installer pins release, checksum, host without imposing local res
   const response=await contributors(ownerRequest({budget}),['enrollments']);
   assert.equal(response.headers.get('cache-control'),'no-store');
   const value=await response.json();assert.doesNotMatch(value.command,/-Cpu|-MemoryGiB|-DiskGiB/);assert.ok(value.command.includes(code));assert.ok(!value.command.includes(owner));assert.ok(value.command.includes('Get-FileHash'));
-  assert.equal(value.code,undefined);
+  assert.equal(value.code,code);
+  assert.match(value.command,/-EnrollmentExpires \d+/);
 });
 test('node proxy forwards only caller token and rejects browsers and administrative paths',async t=>{
   const fetch=t.mock.method(globalThis,'fetch',async (url:string,options:RequestInit)=>{
