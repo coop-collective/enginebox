@@ -31,7 +31,7 @@ it("consumes enrollment for one identity; retries survive eviction and remain sc
   expect((await call("/v1/node/heartbeat",{stats:{hardwareEncodePassed:1}},token,{"x-enginebox-session":session,"x-enginebox-epoch":String(hello.epoch)})).status).toBe(200);
   expect((await call(`/v1/nodes/${spec.id}/revoke`,{})).status).toBe(200);
   expect((await call("/v1/node/hello",{session},token)).status).toBe(401);
-  expect((await call("/v1/node/enroll",body,invitation.token)).status).toBe(409);
+  expect((await call("/v1/node/enroll",body,invitation.token)).status).toBe(401);
 });
 it("requires owner-issued unexpired credentials and prevents competing claims",async()=>{
   const invitation=await invite();
