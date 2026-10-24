@@ -28,7 +28,10 @@ Incus attachment of an installed SDK sandbox. Reported results:
 {"passed":true,"nativeStoreReopened":true,"productionPreparationBridge":true,"missingRecordRefused":true,"independentBranches":true,"incusAttachment":false,"liveGitHubJob":false}
 ```
 
-The same pnpm/hook fixtures also run inside a separate Linux container with
+Run `pnpm test:preparation:linux` for the nine recipe/hook/root-handoff checks;
+the Linux verification workflow runs this command too. It builds a pinned Node
+image, mounts only these two product packages read-only, and removes only resources
+with its unique ownership label. The fixtures run inside a separate container with
 `--network=none`, after installing exact pnpm 12.15.0 in disposable tool state.
 This proves their offline recipe behavior; their filesystem is the container's
 private filesystem, not an Incus LayerFS mount. The recipe and native Store tests

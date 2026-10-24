@@ -42,7 +42,7 @@ test('root handoff protects approved bytes, refuses escaping/symlink targets and
   await request({ key, inputs: { ...inputs, policy: { scripts: 'run' } }, source }, false);
   await mkdir(join(source, 'node_modules'));
   await request({ key, inputs, source }, false);
-  await rm(join(source, 'node_modules'));
+  await rm(join(source, 'node_modules'), { recursive: true });
   const before = await stat(join(root, 'prepared', key, 'node_modules/fixture'));
   await request({ key, inputs, source }, true);
   const after = await stat(join(source, 'node_modules/fixture'));

@@ -30,6 +30,7 @@
     "test:fleet": "pnpm --filter @enginebox/fleet-controller test && pnpm --filter @enginebox/fleet-node test",
     "build:fleet": "pnpm --filter @enginebox/fleet-controller build && pnpm --filter @enginebox/fleet-node build",
     "fleet:verify": "node packages/fleet-dev/src/cli.mjs verify",
-    "fleet:accept": "node packages/fleet-dev/src/cli.mjs accept"
+    "fleet:accept": "node packages/fleet-dev/src/cli.mjs accept",
+    "test:preparation:linux": "node packages/enginebox-actions/test/linux.mjs"
   }
 }
