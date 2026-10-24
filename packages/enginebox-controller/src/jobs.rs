@@ -13,6 +13,13 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+struct PendingGuard(Arc<AtomicUsize>);
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub fn private_dir(path: &Path) -> Result<()> {
     enginebox_core::state::private_dir(path)
 }
@@ -213,15 +220,20 @@ impl Jobs {
         }
         write_private(&self.root.join(format!("{id}.json")), &record)?;
         records.insert(id.clone(), record.clone());
-        if is_ci {
-            self.ci_pending.fetch_add(1, Ordering::SeqCst);
+        let counter = if is_ci {
+            &self.ci_pending
         } else {
-            self.pending.fetch_add(1, Ordering::SeqCst);
-        }
+            &self.pending
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
         drop(records);
         let this = self.clone();
+        // Released on every exit, including a panic, so drain() cannot see a
+        // phantom active job.
+        let pending = PendingGuard(counter.clone());
         tokio::spawn(async move {
-            let _permit = if is_ci {
+            let _pending = pending;
+            let Ok(_permit) = if is_ci {
                 &this.ci_workers
             } else {
                 &this.workers
@@ -229,9 +241,15 @@ impl Jobs {
             .clone()
             .acquire_owned()
             .await
-            .expect("Job semaphore never closed");
+            else {
+                eprintln!("Fleet job {id} abandoned: worker semaphore closed");
+                return;
+            };
             let started = std::time::Instant::now();
-            let mut v = this.get(&id).expect("Admitted job exists");
+            let Ok(mut v) = this.get(&id) else {
+                eprintln!("Fleet job {id} abandoned: admitted record is missing");
+                return;
+            };
             v["status"] = json!("running");
             let persisted = this.save(&id, v);
             let result = if persisted.is_ok() {
@@ -242,7 +260,10 @@ impl Jobs {
             } else {
                 Err(anyhow::anyhow!("Unable to journal job start"))
             };
-            let mut v = this.get(&id).expect("Admitted job exists");
+            let Ok(mut v) = this.get(&id) else {
+                eprintln!("Fleet job {id} finished but its record is missing");
+                return;
+            };
             match result {
                 Ok(r) => {
                     v["status"] = json!("succeeded");
@@ -260,11 +281,6 @@ impl Jobs {
             // the durable running record recovers as uncertain after restart.
             if this.save(&id, v.clone()).is_err() {
                 this.records.lock().unwrap().insert(id.clone(), v);
-            }
-            if is_ci {
-                this.ci_pending.fetch_sub(1, Ordering::SeqCst);
-            } else {
-                this.pending.fetch_sub(1, Ordering::SeqCst);
             }
         });
         Ok(record)
@@ -469,6 +485,56 @@ mod tests {
         let recovered = Jobs::open(&root).unwrap();
         assert_eq!(recovered.get(&id).unwrap()["status"], "failed");
         assert!(recovered.get("../secret").is_err());
+    }
+    async fn wait_idle(jobs: &Jobs) {
+        for _ in 0..200 {
+            if jobs.pending() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("pending stayed at {}", jobs.pending());
+    }
+    #[tokio::test]
+    async fn pending_returns_to_zero_when_the_record_goes_missing() {
+        for (operation, ci) in [("create", false), ("ci_run", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let jobs = Jobs::open(&tmp.path().join("jobs")).unwrap();
+            let pool = if ci { &jobs.ci_workers } else { &jobs.workers };
+            // Hold every worker so the job is queued while its record is removed.
+            let held = pool.clone().acquire_many_owned(4).await.unwrap();
+            let job = jobs
+                .submit("test", operation, "ebox-test", || Ok(json!({})))
+                .unwrap();
+            assert_eq!(jobs.pending(), 1);
+            jobs.records
+                .lock()
+                .unwrap()
+                .remove(job["id"].as_str().unwrap());
+            drop(held);
+            wait_idle(&jobs).await;
+        }
+    }
+    #[tokio::test]
+    async fn pending_returns_to_zero_when_the_job_task_panics() {
+        for (operation, ci) in [("create", false), ("ci_run", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let jobs = Jobs::open(&tmp.path().join("jobs")).unwrap();
+            let pool = if ci { &jobs.ci_workers } else { &jobs.workers };
+            let held = pool.clone().acquire_many_owned(4).await.unwrap();
+            jobs.submit("test", operation, "ebox-test", || Ok(json!({})))
+                .unwrap();
+            assert_eq!(jobs.pending(), 1);
+            // A poisoned record lock makes the queued task panic.
+            let records = jobs.records.clone();
+            let _ = std::thread::spawn(move || {
+                let _lock = records.lock().unwrap();
+                panic!("poison");
+            })
+            .join();
+            drop(held);
+            wait_idle(&jobs).await;
+        }
     }
     #[cfg(unix)]
     #[test]

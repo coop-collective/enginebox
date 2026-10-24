@@ -152,6 +152,9 @@ export class Environments {
         const matches = container?.Config.Labels['enginebox.environment.revision'] === state.revision;
         if ((!matches || !container?.State.Running) && state.revision) await this.start(env, state.revision);
         state.healthy = !!state.revision && await this.healthy(env);
+        if (state.healthy && state.revision === source.revision) {
+          delete state.failedRevision; delete state.error;
+        }
         state.status = state.healthy ? (state.failedRevision ? 'update-failed' : 'ready') : 'unhealthy';
         return;
       }
