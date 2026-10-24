@@ -6,7 +6,7 @@ The deployed Rust controller, provider connections, Incus workspaces and Gamejam
 
 ## Start and iterate
 
-Install Node **24+**, pnpm **12.14.0**, and Docker with Compose v2. Docker Desktop must use **Linux containers** on macOS and Windows; WSL2 is the Windows path. Linux can use Docker Engine with the Compose plugin. The pinned image supports both Linux amd64 and arm64. No Cloudflare account, login or API token is required for local development.
+Install Node **24+**, pnpm **12.15.0**, and Docker with Compose v2. Docker Desktop must use **Linux containers** on macOS and Windows; WSL2 is the Windows path. Linux can use Docker Engine with the Compose plugin. The pinned image supports both Linux amd64 and arm64. No Cloudflare account, login or API token is required for local development.
 
 ```sh
 pnpm install --frozen-lockfile

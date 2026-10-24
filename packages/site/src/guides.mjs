@@ -45,7 +45,7 @@ export const guides = [
       {
         id: 'requirements',
         title: 'Choose your operator and compute machines',
-        html: `<p>Use Node.js 22.12 or newer and the repository's pinned pnpm 12.14.0. The root workspace provisions Rust 1.96.0 through pnpm's Cargo integration. Python is not a runtime dependency.</p><p>Compute workspaces currently require a prepared Linux Incus/KVM host. A macOS or Windows operator can manage a separate Linux node; installing the controller does not contribute that laptop's CPU or GPU to the fleet. Check <a href="/docs/platform-support/">platform support</a> before provisioning.</p>`,
+        html: `<p>Use Node.js 22.12 or newer and the repository's pinned pnpm 12.15.0. The root workspace provisions Rust 1.96.0 through pnpm's Cargo integration. Python is not a runtime dependency.</p><p>Compute workspaces currently require a prepared Linux Incus/KVM host. A macOS or Windows operator can manage a separate Linux node; installing the controller does not contribute that laptop's CPU or GPU to the fleet. Check <a href="/docs/platform-support/">platform support</a> before provisioning.</p>`,
       },
       {
         id: 'build',
