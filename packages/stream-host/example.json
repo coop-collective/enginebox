@@ -1,0 +1,12 @@
+{
+  "controller": "https://fleet.example.com",
+  "project": "my-project",
+  "command": {
+    "executable": "/opt/godot/godot",
+    "args": ["--path", "/app/game", "--rendering-method", "gl_compatibility", "--resolution", "1280x720", "--position", "0,0"],
+    "directory": "/app/game"
+  },
+  "width": 1280,
+  "height": 720,
+  "maxPeers": 4
+}

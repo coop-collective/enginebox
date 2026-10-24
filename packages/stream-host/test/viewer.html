@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><title>Owned native stream qualification</title>
+<video id="video" autoplay playsinline muted style="width:640px;height:360px"></video>
+<script>
+const video=document.querySelector('video');
+window.openSession=async(mode)=>{
+  const session=await fetch('/fixture/open',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode})}).then(r=>r.json());
+  window.session=session; window.pc=new RTCPeerConnection({iceServers:session.iceServers,iceTransportPolicy:session.iceTransportPolicy});
+  pc.addTransceiver('video',{direction:'recvonly'});
+  window.input=pc.createDataChannel('input',{ordered:true});
+  pc.ontrack=e=>{video.srcObject=e.streams[0]||new MediaStream([e.track]);video.play();};
+  const offer=await pc.createOffer();await pc.setLocalDescription(offer);
+  await new Promise((resolve,reject)=>{if(pc.iceGatheringState==='complete')return resolve();const timer=setTimeout(()=>reject(Error('browser ICE timeout')),15000);pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}});});
+  await fetch('/fixture/offer/'+session.id,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(pc.localDescription)});
+  for(let i=0;i<150;i++){const answer=await fetch('/fixture/answer/'+session.id).then(r=>r.json());if(answer.sdp){await pc.setRemoteDescription(answer);return session.id;}await new Promise(r=>setTimeout(r,200));}throw Error('host answer timeout');
+};
+window.stats=async()=>{const s=await pc.getStats();const v=[...s.values()].find(v=>v.type==='inbound-rtp'&&v.kind==='video');const pair=[...s.values()].find(v=>v.type==='candidate-pair'&&v.state==='succeeded'&&v.nominated);return{frames:v?.framesDecoded||0,width:video.videoWidth,height:video.videoHeight,bytes:v?.bytesReceived||0,localType:pair?s.get(pair.localCandidateId)?.candidateType:null,remoteType:pair?s.get(pair.remoteCandidateId)?.candidateType:null,connection:pc.connectionState,input:input.readyState};};
+window.pixel=()=>{const c=document.createElement('canvas');c.width=640;c.height=360;c.getContext('2d').drawImage(video,0,0,640,360);return [...c.getContext('2d').getImageData(300,200,1,1).data].slice(0,3);};
+window.clickNative=()=>{input.send(JSON.stringify({type:'pointerdown',x:300,y:200,button:0}));input.send(JSON.stringify({type:'pointerup',x:300,y:200,button:0}));};
+window.closeSession=async()=>{pc.close();await fetch('/fixture/end/'+session.id,{method:'POST'});};
+</script>
