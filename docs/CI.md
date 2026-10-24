@@ -333,7 +333,7 @@ four workflows. The native verification matrix runs worker/controller tests on
 Linux, macOS and Windows, and explicitly downloads the matching pinned Node
 recipe into a disposable worker to verify installation, reuse and an actual build
 artifact. Run that network qualification locally with
-`pnpm exec cargo test --workspace --locked --test template_download -- --ignored`.
+`pnpm test:ci-templates` (opts into network downloads).
 Signed mobile builds, official runner registration, OS image provisioning and
 cache benchmarks remain separate qualification; toolchain installation tests do
 not establish those capabilities or a successful mobile store release.
