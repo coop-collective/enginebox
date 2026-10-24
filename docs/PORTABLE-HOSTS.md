@@ -69,3 +69,16 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 Release checks must also install the exact built artifact on each advertised operating system and execute its supported commands. The Rust release builder checks artifact shape and integrity; a successful archive build is not evidence that a Windows service, a new Linux machine or a GPU workload works. No package is automatically published by the installer or the build tool.
+
+## Isolated container contribution
+
+The personal-machine WebRTC contribution path is documented in the
+[stream-host guide](../packages/stream-host/README.md) and
+[machine authority contract](../packages/fleet-controller/MACHINES.md). Its Linux
+container runs an isolated workload/display and joins one project with a
+restricted native identity. Docker Desktop can run that Linux container on macOS
+or Windows; this does not change the native Windows/macOS workspace and GPU
+qualification statuses above. Invitations, grants and signaling are implemented
+in the Cloudflare fleet controller; media and exact image/platform qualification
+must be reported independently, without treating successful image compilation
+as proof of desktop or GPU support.

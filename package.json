@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "private": true,
   "license": "BUSL-1.1",
-  "packageManager": "pnpm@12.14.0",
+  "packageManager": "pnpm@12.15.0",
   "engines": {
     "node": ">=24"
   },

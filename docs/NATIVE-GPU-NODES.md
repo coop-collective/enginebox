@@ -69,14 +69,14 @@ It retains private identity/evidence. Revoke the machine at the controller to re
 Deploy the matching controller revision before using this installer. On the owner/controller side, use its existing administrator-authenticated API to create the project (if needed), then:
 
 ```http
-POST /v1/node-enrollments
+POST /v1/projects/demo/machine-invitations
 Authorization: Bearer <controller-owner-credential>
 Content-Type: application/json
 
-{"id":"windows-gpu-1","role":"native","projects":["demo"],"origin":null,"slots":1,"cacheBytes":16777216}
+{"id":"windows-gpu-1","label":"Windows GPU test host","ownerAccountId":"owner-account","allowControl":false}
 ```
 
-The response contains a ten-minute enrollment credential. Send only that credential to the machine. The installer generates and privately persists the long-term node identity before exchange. The controller stores only hashes and consumes the invitation for one identity; retrying that identity after a lost response is safe. A competing identity is rejected. Reissuing a pending invitation invalidates the previous one. Enrollment cannot resurrect a revoked node.
+The response contains a ten-minute enrollment credential. Send only that credential to the machine. The installer generates and privately persists the long-term node identity before exchange. The controller retains the private pending invitation for idempotent owner retries, stores a hash of the claimed node credential, and binds the invitation to one identity; retrying that identity after a lost response is safe. A competing identity is rejected. An identical pending invitation request returns the same credential and expiry. Changed or expired invitations require a fresh ID. Enrollment cannot resurrect a revoked node.
 
 `POST /v1/nodes/windows-gpu-1/revoke` uses owner authorization. Native credentials are restricted to their own identity/session/heartbeat endpoints; they cannot read project storage, claim existing agent jobs, create nodes or access owner operations. HTTPS certificate validation is required, redirects are rejected and a URL cannot contain credentials, query, fragment or a path. Loopback HTTP exists only behind an explicit test flag, never in the installer.
 

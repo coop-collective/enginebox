@@ -61,7 +61,7 @@ New workspaces use LayerFS checkpoints and branches, without a native Git checko
 
 ## Immutable dependency reuse
 
-Configure both `pnpm_store` and `pnpm_metadata` to existing local Docker volumes containing one published cache generation. Seed that generation separately using pnpm 12.14.0, then stop all writers before readers use it. The backend mounts both volumes read-only and copies metadata to each sandbox's private writable cache.
+Configure both `pnpm_store` and `pnpm_metadata` to existing local Docker volumes containing one published cache generation. Seed that generation separately using pnpm 12.15.0, then stop all writers before readers use it. The backend mounts both volumes read-only and copies metadata to each sandbox's private writable cache.
 
 ```sh
 sudo ebox --host local storage layerfs --config /etc/enginebox/layerfs.json deps worker-a

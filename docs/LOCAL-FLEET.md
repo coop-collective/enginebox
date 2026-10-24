@@ -6,7 +6,7 @@ The deployed Rust controller, provider connections, Incus workspaces and Gamejam
 
 ## Start and iterate
 
-Install Node **24+**, pnpm **12.14.0**, and Docker with Compose v2. Docker Desktop must use **Linux containers** on macOS and Windows; WSL2 is the Windows path. Linux can use Docker Engine with the Compose plugin. The pinned image supports both Linux amd64 and arm64. No Cloudflare account, login or API token is required for local development.
+Install Node **24+**, pnpm **12.15.0**, and Docker with Compose v2. Docker Desktop must use **Linux containers** on macOS and Windows; WSL2 is the Windows path. Linux can use Docker Engine with the Compose plugin. The pinned image supports both Linux amd64 and arm64. No Cloudflare account, login or API token is required for local development.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -138,3 +138,27 @@ For the optional CPU media validator, frozen build playback and batch review API
 Dashboard browser tests use disposable fixture ports. If port 18765 or 3007 is already used by a native preview, set `EBOX_TEST_FLEET_PORT` and `EBOX_TEST_DASHBOARD_PORT` to free loopback ports before `pnpm test:e2e`. The test launcher refuses to reuse or reset an existing server.
 
 The shared browser fixture also supports `ENGINEBOX_TEST_FLEET_PORT` and `ENGINEBOX_TEST_DASHBOARD_PORT`; those names take precedence over their `EBOX_TEST_*` aliases.
+
+## Personal machine and WebRTC development
+
+The [machine controller contract](../packages/fleet-controller/MACHINES.md) and
+[stream-host container guide](../packages/stream-host/README.md) describe the
+separate personal-computer contribution path. Enginebox owns invitation claims,
+process fencing, Account-issued viewer grants and exclusive control leases;
+Gamejam consumes those APIs. A machine token cannot access Store data, jobs,
+provider credentials or task shipping evidence.
+
+Use a fresh local Wrangler configuration and persistence directory for this
+flow. Its optional local TURN configuration must explicitly enable local mode;
+never copy hosted owner or TURN credentials into a test container. Run controller
+checks with `pnpm --filter @enginebox/fleet-controller check` and
+`pnpm --filter @enginebox/fleet-controller test`, then the container/browser proof
+from the stream-host guide. Existing fleet namespaces, previews, node journals
+and native workspaces must remain untouched.
+
+The container contribution targets Linux Docker and Docker Desktop's Linux VM on
+macOS/Windows. It captures the workload inside its own Linux display and uses
+WebRTC video/input with bounded controller signaling. This does not qualify
+capture of the person's native desktop, Windows Unreal, Apple toolchains,
+hardware encoding, or a new native resource/VM backend. Runtime media, relay and
+operating-system qualification receipts are separate from controller unit tests.

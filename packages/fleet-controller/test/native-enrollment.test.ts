@@ -5,13 +5,13 @@ import worker from "../src/index.ts";
 import { sha256 } from "@enginebox/fleet-protocol";
 
 const admin="local-tests-only-0123456789abcdef0123456789";
-const spec={id:"native-fixture",role:"native",projects:["demo"],origin:null,slots:1,cacheBytes:16777216};
+const spec={id:"native-fixture",label:"GPU test host",ownerAccountId:"test-owner",allowControl:false};
 async function call(path:string, body:unknown, token=admin, extra:Record<string,string>={}) {
   return worker.fetch(new Request(`https://fleet.test${path}`,{method:"POST",headers:{authorization:`Bearer ${token}`,...extra},body:JSON.stringify(body)}),env as Env);
 }
 async function invite() {
   expect((await call("/v1/projects",{id:"demo"})).status).toBe(201);
-  const response=await call("/v1/node-enrollments",spec);
+  const response=await call("/v1/projects/demo/machine-invitations",spec);
   expect(response.status).toBe(201);
   return await response.json() as {token:string;expires:number};
 }
@@ -42,10 +42,10 @@ it("requires owner-issued unexpired credentials and prevents competing claims",a
 it("expires pending credentials and rejects executor privilege escalation",async()=>{
   const invitation=await invite();
   await runInDurableObject(env.NODES.getByName(spec.id),async(instance)=>{
-    const pending=instance.get<{expires:number}>("enrollment")!;
-    pending.expires=Date.now()-1; instance.put("enrollment",pending);
+    const pending=instance.get<{expires:number}>("invitation")!;
+    pending.expires=Date.now()-1; instance.put("invitation",pending);
   });
   expect((await call("/v1/node/enroll",{nodeSecretHash:"a".repeat(64)},invitation.token)).status).toBe(401);
-  expect((await call("/v1/node-enrollments",{...spec,id:"wrong",role:"agent"})).status).toBe(400);
-  expect((await call("/v1/node-enrollments",{...spec,id:"wrong",assistantProjects:["demo"]})).status).toBe(400);
+  expect((await call("/v1/projects/demo/machine-invitations",{...spec,id:"wrong",role:"agent"})).status).toBe(400);
+  expect((await call("/v1/projects/demo/machine-invitations",{...spec,id:"wrong",assistantProjects:["demo"]})).status).toBe(400);
 });

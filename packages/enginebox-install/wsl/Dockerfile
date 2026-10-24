@@ -2,7 +2,7 @@
 FROM node:24.21.0-bookworm@sha256:3d27e5c11e5786e309ec3e03f93ae536eb36e6e5eb3714d5eb3300a36157add0 AS template
 RUN apt-get update && apt-get install -y --no-install-recommends git fuse3 bindfs inotify-tools ca-certificates python3 ripgrep \
  && rm -rf /var/lib/apt/lists/* \
- && npm install --global pnpm@12.14.0 @openai/codex@0.163.0 @anthropic-ai/claude-code@2.1.302 \
+ && npm install --global pnpm@12.15.0 @openai/codex@0.163.0 @anthropic-ai/claude-code@2.1.302 \
  && mkdir -p /home/agent && chown 501:20 /home/agent
 ENV HOME=/home/agent CODEX_HOME=/home/agent/.codex CI=1
 RUN codex --version && claude --version
