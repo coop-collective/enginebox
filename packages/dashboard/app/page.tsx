@@ -12,6 +12,7 @@ import type {
 import { api, errorMessage, RequestError } from "@/lib/client";
 import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
+import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
@@ -1042,11 +1043,14 @@ export default function Dashboard() {
                 <AgentsPanel close={() => navigate("fleet")} />
               )}
               {section === "templates" && (
+                <>
                 <TemplateCatalog
                   refreshToken={updated?.getTime() ?? 0}
                   registered={refresh}
                   close={() => navigate("fleet")}
                 />
+                <CiTemplates />
+                </>
               )}
               {section === "storage" && (
                 <StoragePanel refreshToken={updated?.getTime() ?? 0} />

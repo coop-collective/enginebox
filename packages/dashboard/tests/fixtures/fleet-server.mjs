@@ -8,6 +8,7 @@ let mode,
   jobs,
   instances,
   templates,
+  ciTemplates,
   authSessions,
   connectedAccounts,
   syncProgress,
@@ -77,6 +78,7 @@ function reset() {
   });
   native.sync.nodes[0].status = "ready";
   templates = [native];
+  ciTemplates = [];
   instances = [
     {
       name: "ebox-editor",
@@ -172,6 +174,32 @@ createServer(async (req, res) => {
   }
   if (req.headers.authorization !== `Bearer ${token}`)
     return send(401, { error: "Wrong backend token" });
+  if (req.url === "/v1/ci/templates") {
+    if (req.method === "POST") {
+      ciTemplates = ciTemplates.filter((item) => item.manifest.id !== data.manifest.id);
+      ciTemplates.push({ manifest: data.manifest, enabled: false, nodes: [{ node_id: "ci-linux", status: "disabled", verified_at: null, error: null }] });
+    }
+    for (const recipe of ciTemplates) for (const node of recipe.nodes) {
+      if (node.status === "installing" && Date.now() > node.finish) {
+        node.status = node.retried ? "ready" : "failed";
+        node.error = node.retried ? null : "verification-failed";
+        node.verified_at = node.retried ? Math.floor(Date.now() / 1000) : null;
+      }
+    }
+    return send(200, { schema_version: 1, templates: ciTemplates });
+  }
+  const ciAction = req.url.match(/^\/v1\/ci\/templates\/([^/]+)\/(enable|disable|retry)$/);
+  if (ciAction && req.method === "POST") {
+    const recipe = ciTemplates.find((item) => item.manifest.id === ciAction[1]);
+    if (!recipe) return send(400, { error: "Unknown CI template" });
+    if (ciAction[2] !== "retry") recipe.enabled = ciAction[2] === "enable";
+    for (const node of recipe.nodes) {
+      node.status = recipe.enabled ? "installing" : "disabled";
+      node.error = null; node.verified_at = null; node.finish = Date.now() + 250;
+      if (ciAction[2] === "retry") node.retried = true;
+    }
+    return send(200, { schema_version: 1, templates: ciTemplates });
+  }
   if (req.url === '/v1/environments' && req.method === 'GET') return send(200, environmentCatalog());
   if (req.url === '/v1/environments/routes' && req.method === 'POST') {
     environmentRoutes = environmentRoutes.filter(r => r.id !== (data.remove ?? data.id));

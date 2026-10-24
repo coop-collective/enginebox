@@ -109,6 +109,30 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 pub fn tools() -> Vec<Value> {
     vec![
         tool(
+            "ci_templates",
+            "List enabled CI toolchain recipes and per-node verification/install status.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "ci_template_register",
+            "Register an owner-authored CI toolchain recipe. New recipes start disabled; enabled revisions synchronize to compatible dedicated CI nodes.",
+            json!({"manifest":{"type":"object"}}),
+            &["manifest"],
+        ),
+        tool(
+            "ci_template_enable",
+            "Enable or disable a CI recipe. Enable installs/verifies it on compatible nodes; disable stops new placements without removing files or stopping running jobs.",
+            json!({"template":{"type":"string"},"enabled":{"type":"boolean"}}),
+            &["template", "enabled"],
+        ),
+        tool(
+            "ci_template_retry",
+            "Explicitly retry a failed toolchain installation on one dedicated CI node after inspecting its failure.",
+            json!({"template":{"type":"string"},"node":{"type":"string"}}),
+            &["template", "node"],
+        ),
+        tool(
             "ci_nodes",
             "List registered build workers and their declared OS/image/toolchain capabilities.",
             json!({}),
@@ -359,6 +383,39 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         );
     }
     let result = match name {
+        "ci_templates" => ("/v1/ci/templates".into(), None),
+        "ci_template_register" => {
+            let manifest: enginebox_ci::templates::Template =
+                serde_json::from_value(args["manifest"].clone())?;
+            manifest.validate()?;
+            (
+                "/v1/ci/templates".into(),
+                Some(json!({"manifest":manifest})),
+            )
+        }
+        "ci_template_enable" | "ci_template_retry" => {
+            let id = args["template"].as_str().context("Template required")?;
+            ensure!(enginebox_ci::model::identifier(id), "Invalid template ID");
+            if name == "ci_template_retry" {
+                let node = args["node"].as_str().context("Node required")?;
+                ensure!(enginebox_ci::model::identifier(node), "Invalid node ID");
+                (
+                    format!("/v1/ci/templates/{id}/retry"),
+                    Some(json!({"node":node})),
+                )
+            } else {
+                let enabled = args["enabled"]
+                    .as_bool()
+                    .context("Enabled must be boolean")?;
+                (
+                    format!(
+                        "/v1/ci/templates/{id}/{}",
+                        if enabled { "enable" } else { "disable" }
+                    ),
+                    Some(json!({})),
+                )
+            }
+        }
         "ci_nodes" => ("/v1/ci".into(), None),
         "ci_register" => {
             let node: enginebox_ci::Node = serde_json::from_value(args["manifest"].clone())?;
@@ -775,7 +832,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            32
+            36
         );
     }
     #[test]

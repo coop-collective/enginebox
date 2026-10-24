@@ -17,14 +17,23 @@ use std::{
 pub struct Execution {
     pub node: Node,
     pub request: Request,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<crate::templates::Binding>,
 }
 
 /// Remote transport and the executable entry point share one versioned request.
 pub fn execute_on(node: &Node, request: &Request) -> Result<Value> {
+    execute_managed_on(node, request, None)
+}
+pub fn execute_managed_on(
+    node: &Node,
+    request: &Request,
+    template: Option<&crate::templates::Binding>,
+) -> Result<Value> {
     node.validate()?;
     request.validate()?;
     if node.target == "local" {
-        return execute(node, request);
+        return execute_managed_at(node, request, &root()?, template);
     }
     let Job::Automation {
         timeout_minutes, ..
@@ -49,6 +58,7 @@ pub fn execute_on(node: &Node, request: &Request) -> Result<Value> {
         Some(&serde_json::to_vec(&Execution {
             node: node.clone(),
             request: request.clone(),
+            template: template.cloned(),
         })?),
         Duration::from_secs(timeout_minutes * 60 + 30),
     )?;
@@ -107,11 +117,20 @@ pub fn execute(node: &Node, request: &Request) -> Result<Value> {
     execute_at(node, request, &root()?)
 }
 pub fn execute_at(node: &Node, request: &Request, root: &Path) -> Result<Value> {
+    execute_managed_at(node, request, root, None)
+}
+pub fn execute_managed_at(
+    node: &Node,
+    request: &Request,
+    root: &Path,
+    template: Option<&crate::templates::Binding>,
+) -> Result<Value> {
     node.require_local()?;
     request.validate()?;
     let Job::Automation {
         runs_on,
         node: selected,
+        template: requested_template,
         checkout,
         shell,
         run,
@@ -122,7 +141,14 @@ pub fn execute_at(node: &Node, request: &Request, root: &Path) -> Result<Value> 
         anyhow::bail!("Expected automation");
     };
     ensure!(
-        selected.as_deref().is_none_or(|id| id == node.id) && node.matches(runs_on),
+        requested_template.as_deref() == template.map(|t| t.manifest.id.as_str()),
+        "Managed CI jobs require their pinned installation binding"
+    );
+    let effective = template
+        .map(|t| t.manifest.node(node))
+        .unwrap_or_else(|| node.clone());
+    ensure!(
+        selected.as_deref().is_none_or(|id| id == node.id) && effective.matches(runs_on),
         "Worker does not match all requested capabilities"
     );
     state::private_dir(root)?;
@@ -133,6 +159,15 @@ pub fn execute_at(node: &Node, request: &Request, root: &Path) -> Result<Value> 
     state::private_dir(&home)?;
     state::private_dir(&workspace)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_minutes * 60);
+    let toolchain = template
+        .map(|t| crate::provision::ready(t, node, root, deadline))
+        .transpose()?;
+    let configure = |command: &mut Command| -> Result<()> {
+        if let (Some(binding), Some(prefix)) = (template, &toolchain) {
+            crate::provision::environment(command, &binding.manifest, prefix)?;
+        }
+        Ok(())
+    };
     let remaining = || {
         deadline
             .checked_duration_since(Instant::now())
@@ -153,10 +188,12 @@ pub fn execute_at(node: &Node, request: &Request, root: &Path) -> Result<Value> 
             vec!["checkout", "--detach", "--quiet", "FETCH_HEAD"],
         ] {
             let mut cmd = command("git", &workspace, &home);
+            configure(&mut cmd)?;
             cmd.args(args);
             run_command(cmd, None, remaining()?)?;
         }
         let mut cmd = command("git", &workspace, &home);
+        configure(&mut cmd)?;
         cmd.args(["rev-parse", "HEAD"]);
         let actual = run_command(cmd, None, remaining()?)?;
         ensure!(
@@ -196,6 +233,7 @@ pub fn execute_at(node: &Node, request: &Request, root: &Path) -> Result<Value> 
         Shell::Pwsh => Path::new("..").join("job.ps1"),
         Shell::Bash => script,
     };
+    configure(&mut cmd)?;
     cmd.arg(script_argument)
         .env("ENGINEBOX_SHA", &request.sha)
         .env("ENGINEBOX_REQUEST_ID", &request.request_id)

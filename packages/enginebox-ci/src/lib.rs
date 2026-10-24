@@ -2,4 +2,6 @@
 pub mod executor;
 pub mod github;
 pub mod model;
+pub mod provision;
+pub mod templates;
 pub use model::{Job, Node, Request};

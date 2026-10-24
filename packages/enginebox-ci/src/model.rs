@@ -190,6 +190,9 @@ pub enum Job {
         runs_on: Vec<String>,
         #[serde(default)]
         node: Option<String>,
+        /// Enabled, verified controller-owned toolchain; pinned when admitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<String>,
         #[serde(default)]
         checkout: Option<Checkout>,
         shell: Shell,
@@ -229,6 +232,7 @@ impl Request {
             Job::Automation {
                 runs_on,
                 node,
+                template,
                 checkout,
                 run,
                 timeout_minutes,
@@ -240,6 +244,10 @@ impl Request {
                     "runs-on needs explicit capability labels"
                 );
                 ensure!(node.as_deref().is_none_or(identifier), "Invalid node ID");
+                ensure!(
+                    template.as_deref().is_none_or(identifier),
+                    "Invalid template ID"
+                );
                 ensure!(
                     !run.trim().is_empty()
                         && run.len() <= 8192
