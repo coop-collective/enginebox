@@ -6,7 +6,8 @@ The Windows package runs a background user service through Task Scheduler at sig
 
 ## Inspect and install Windows
 
-The native-node preview release supplies `install-command.txt`: one PowerShell
+The [Windows preview release](https://github.com/coop-collective/enginebox/releases/tag/native-node-preview-20261024.1)
+supplies [`install-command.txt`](https://github.com/coop-collective/enginebox/releases/download/native-node-preview-20261024.1/install-command.txt): one PowerShell
 command that downloads and verifies `install.ps1`, which in turn verifies a pinned
 package archive and executable. It launches with `-NoProfile -ExecutionPolicy
 Bypass` scoped to that process, so a downloaded unsigned script can run without
