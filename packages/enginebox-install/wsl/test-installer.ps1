@@ -84,7 +84,7 @@ try {
   $f=$global:EngineboxWslFixture
   if ($f.prompts.Count -ne 4 -or $f.configuration.controller -ne 'https://enginebox.coopcollective.dev' -or $f.configuration.cpu -ne 4 -or $f.configuration.memory_gib -ne 8) { throw 'Installer defaults or prompts were not applied' }
   if ($f.configuration.disk_gib -lt 20 -or $f.configuration.disk_gib -gt 50) { throw 'Disk default outside bounds' }
-  if ($f.starts -ne 1 -or $f.registrations[-1] -ne 'wsl.exe' -or $f.updates -ne 0) { throw 'Worker must start only in WSL' }
+  if ($f.starts -ne 1 -or [IO.Path]::GetFileName($f.registrations[-1]) -ne 'wsl.exe' -or $f.updates -ne 0) { throw ('Worker must start only in WSL: '+($f | ConvertTo-Json -Compress)) }
   $global:EngineboxWslFixture.version='2.3.26'
   & $flowScript -InstallDirectory (Join-Path $testRoot 'updated') -Controller 'https://custom.example' -Cpu 2 -MemoryGiB 4 -DiskGiB 20
   $f=$global:EngineboxWslFixture

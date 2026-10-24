@@ -56,6 +56,14 @@ jobs:
           if ($LASTEXITCODE) { throw 'Real WSL LayerFS/isolation qualification failed' }
           wsl.exe -d EngineboxCI -u root --exec cat /var/lib/enginebox/qualification.json
           if ($LASTEXITCODE) { throw 'Missing qualification receipt' }
+      - name: Exercise real outbound Linux node and revoked-lease cleanup
+        shell: pwsh
+        run: |
+          $source=[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/packages/enginebox-install/wsl/test-node.py"))
+          wsl.exe -d EngineboxCI -u root --exec python3 -c 'import base64,pathlib,sys; pathlib.Path("/tmp/enginebox-node-proof.py").write_bytes(base64.b64decode(sys.argv[1]))' $source
+          if ($LASTEXITCODE) { throw 'Could not stage node test in disposable distro' }
+          wsl.exe -d EngineboxCI -u root --exec python3 /tmp/enginebox-node-proof.py
+          if ($LASTEXITCODE) { throw 'Linux outbound node execution/cleanup qualification failed' }
       - name: Runtime diagnostics on failure
         if: failure()
         shell: pwsh
