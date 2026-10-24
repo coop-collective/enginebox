@@ -24,7 +24,8 @@ RUN git init && git remote add origin https://github.com/Ephemeral-AI-Lab/layerf
  && git fetch --depth=1 origin 968a5d0be0ea3e9456b06f9148b65523138e9490 \
  && git checkout --detach FETCH_HEAD && test "$(git rev-parse HEAD)" = 968a5d0be0ea3e9456b06f9148b65523138e9490 \
  && python3 -B core/tools/check_fuser_integrity.py \
- && cargo build --manifest-path core/Cargo.toml --locked --release -p layerfs-daemon --bin layerfs-daemon \
+ && cargo fetch --manifest-path core/Cargo.toml --locked \
+ && cargo build --manifest-path core/Cargo.toml --offline --locked --release -p layerfs-daemon --bin layerfs-daemon \
  && npm --prefix sdk/js run build:native
 
 FROM node:24.21.0-bookworm@sha256:3d27e5c11e5786e309ec3e03f93ae536eb36e6e5eb3714d5eb3300a36157add0 AS runtime

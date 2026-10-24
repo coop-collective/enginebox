@@ -102,3 +102,84 @@ async fn scoped_node_http_credentials_and_drain_admission() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn wsl_enrollment_uses_local_resources_and_requires_template_readiness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = tmp.path().join("fleet.toml");
+    std::fs::write(
+        &fleet,
+        "schema_version=1\n[[hosts]]\nid='metal'\ntarget='unused-fixture'\n",
+    )
+    .unwrap();
+    let owner = "w".repeat(32);
+    let controller = Controller::new(&fleet, &tmp.path().join("state"), owner.clone()).unwrap();
+    controller.activate().unwrap();
+    let app = router(controller);
+    // An invitation authorizes registration; resources are selected on the PC.
+    let (status, invitation) = call(
+        &app,
+        &owner,
+        "/v1/contributors/enrollments",
+        json!({"label":"WSL machine","workloads":{"ci":true,"agents":true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = format!("{}.{}", invitation["id"].as_str().unwrap(), "c".repeat(64));
+    let budget = json!({"cpu":3,"memory_gib":6,"disk_gib":30});
+    let enrollment = json!({"secret_hash":enginebox_core::state::digest(&json!(token)),"budget":budget,"os":"linux","architecture":"x86_64"});
+    let (status, result) = call(
+        &app,
+        invitation["code"].as_str().unwrap(),
+        "/v1/node/enroll",
+        enrollment,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["budget"], budget);
+    let session = uuid::Uuid::new_v4().to_string();
+    let (_, hello) = call(&app, &token, "/v1/node/hello", json!({"session":session})).await;
+    let mut heartbeat = json!({"session":session,"epoch":hello["epoch"],"tools":{"workspace":false,"worker_running":false}});
+    assert_eq!(
+        call(&app, &token, "/v1/node/heartbeat", heartbeat.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let path = format!(
+        "/v1/contributors/{}/runs",
+        invitation["id"].as_str().unwrap()
+    );
+    let job = json!({"request_id":"workspace-proof","kind":"workspace","request":{"operation":"fork","workspace":"proof","project":"welcome"}});
+    assert!(!call(&app, &owner, &path, job.clone()).await.0.is_success());
+    heartbeat["tools"]["workspace"] = json!(true);
+    assert_eq!(
+        call(&app, &token, "/v1/node/heartbeat", heartbeat.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mut invalid = job.clone();
+    invalid["request"]["workspace"] = json!("../../private");
+    assert!(!call(&app, &owner, &path, invalid).await.0.is_success());
+    let (status, submitted) = call(&app, &owner, &path, job).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let mut assigned = None;
+    for _ in 0..100 {
+        let (_, poll) = call(&app, &token, "/v1/node/poll", heartbeat.clone()).await;
+        if poll["job"].is_object() {
+            assigned = Some(poll["job"].clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let assigned = assigned.expect("template work was never assigned");
+    assert_eq!(assigned["run"]["kind"], "workspace");
+    assert!(submitted["job"]["id"].is_string());
+    assert_eq!(assigned["run"]["request_id"], "workspace-proof");
+    let result = json!({"session":session,"epoch":hello["epoch"],"job":assigned["id"],"result":{"ok":true,"backend":"wsl2-layerfs"}});
+    assert_eq!(
+        call(&app, &token, "/v1/node/result", result).await.0,
+        StatusCode::OK
+    );
+}

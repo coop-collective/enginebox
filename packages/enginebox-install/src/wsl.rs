@@ -21,6 +21,10 @@ pub fn enforce(budget: &Budget) -> Result<()> {
             && settings["disk_gib"] == budget.disk_gib,
         "Runtime resource settings differ from enrollment"
     );
+    ensure!(
+        fs2::total_space("/var/lib/enginebox")? <= u64::from(budget.disk_gib) * 1024 * 1024 * 1024,
+        "Runtime disk exceeds the enrolled maximum"
+    );
     let membership = std::fs::read_to_string("/proc/self/cgroup")?;
     ensure!(
         membership

@@ -18,11 +18,15 @@ case "${1:-}" in
     trap 'rm -f "$incoming"' EXIT
     cat > "$incoming"
     python3 - "$incoming" <<'PY'
-import json,pathlib,sys,urllib.parse
+import json,pathlib,sys,urllib.parse,os
 p=pathlib.Path(sys.argv[1]); s=json.loads(p.read_text(encoding='utf-8-sig'))
 assert set(s)=={'controller','cpu','memory_gib','disk_gib'}
 u=urllib.parse.urlsplit(s['controller']); assert u.scheme=='https' and u.hostname and not u.username and not u.password and not u.path and not u.query and not u.fragment
 for key,lo,hi in [('cpu',1,256),('memory_gib',4,4096),('disk_gib',20,65536)]: assert type(s[key]) is int and lo<=s[key]<=hi
+assert s['cpu'] <= len(os.sched_getaffinity(0)), 'Existing WSL CPU cap is below the selected allowance'
+mem=int(next(line.split()[1] for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:')))*1024
+assert s['memory_gib']*1024**3 <= mem+512*1024**2, 'Existing WSL memory cap is below the selected allowance'
+v=os.statvfs('/var/lib/enginebox'); assert v.f_blocks*v.f_frsize <= s['disk_gib']*1024**3, 'Virtual disk exceeds the selected maximum'
 saved=pathlib.Path('/etc/enginebox/settings.json')
 if saved.exists(): assert json.loads(saved.read_text())==s, 'Existing runtime settings differ'
 else: saved.write_text(json.dumps(s))
@@ -39,7 +43,7 @@ PY
 import hashlib,json,pathlib,sys
 s=json.loads(pathlib.Path('/etc/enginebox/settings.json').read_text())
 hashfile=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
-config={'schema':1,'root':'/var/lib/enginebox/layerfs','docker_socket':'/run/enginebox-docker.sock','sdk':'/opt/enginebox/layerfs/sdk','daemon':'/opt/enginebox/layerfs/daemon','native_sha256':hashfile('/opt/enginebox/layerfs/sdk/native/layerfs.node'),'daemon_sha256':hashfile('/opt/enginebox/layerfs/daemon'),'image':sys.argv[1],'max_workspaces':4,'cpus_per_workspace':min(s['cpu'],64),'memory_mib_per_workspace':min((s['memory_gib']-2)*1024,131072),'disk_reserve_gib':2,'import_limit_gib':1}
+config={'schema':1,'root':'/var/lib/enginebox/layerfs','docker_socket':'/run/enginebox-docker.sock','sdk':'/opt/enginebox/layerfs/sdk','daemon':'/opt/enginebox/layerfs/daemon','native_sha256':hashfile('/opt/enginebox/layerfs/sdk/native/layerfs.node'),'daemon_sha256':hashfile('/opt/enginebox/layerfs/daemon'),'image':sys.argv[1],'max_workspaces':2,'cpus_per_workspace':max(1,min(s['cpu']//2,64)),'memory_mib_per_workspace':min((s['memory_gib']-2)*512,131072),'disk_reserve_gib':2,'import_limit_gib':1}
 pathlib.Path('/etc/enginebox/layerfs.json').write_text(json.dumps(config))
 PY
     fi
@@ -47,7 +51,7 @@ PY
     systemd-run --quiet --wait --pipe --collect --slice=enginebox.slice /usr/bin/python3 /opt/enginebox/qualify.py
     ;;
   enrolled)
-    test -f /var/lib/enginebox/private/worker.json
+    test -f /var/lib/enginebox/private/worker.json && jq -e '.enrolled == true' /var/lib/enginebox/private/worker.json >/dev/null
     ;;
   enroll)
     if [[ -f /var/lib/enginebox/private/worker.json ]] && jq -e '.enrolled == true' /var/lib/enginebox/private/worker.json >/dev/null; then

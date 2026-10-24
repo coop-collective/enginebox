@@ -142,6 +142,10 @@ impl Contributors {
             ["windows", "linux"].contains(&e.os.as_str()) && e.architecture == "x86_64",
             "This worker release requires Windows x64 or its Linux x64 WSL runtime"
         );
+        ensure!(
+            e.os != "linux" || (e.budget.memory_gib >= 4 && e.budget.disk_gib >= 20),
+            "WSL runtime requires at least 4 GiB memory and 20 GiB disk"
+        );
         let mut nodes = self.nodes.lock().unwrap();
         let mut n = nodes.get(key).cloned().context("Unknown registration")?;
         ensure!(

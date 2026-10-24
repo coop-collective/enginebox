@@ -21,7 +21,7 @@ test('one-copy installer pins release, checksum, host without imposing local res
   t.mock.method(globalThis,'fetch',async (_url:string,options:RequestInit)=>{
     if (_url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
     assert.equal((options.headers as Record<string,string>).Authorization,`Bearer ${owner}`);
-    return Response.json({id:'a'.repeat(32),code,expires:Date.now()/1000+600});
+    return Response.json({id:'a'.repeat(32),code,expires:Math.floor(Date.now()/1000)+600});
   });
   const response=await contributors(ownerRequest({budget}),['enrollments']);
   assert.equal(response.headers.get('cache-control'),'no-store');

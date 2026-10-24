@@ -2,7 +2,7 @@ import { bodyJson, config, HttpError, json, requireOrigin, requireSession } from
 
 const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result']);
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
-export function installCommand(code: string) {
+export function installCommand(code: string, expires?: number) {
   const url = process.env.ENGINEBOX_NODE_INSTALLER_URL ?? '';
   const hash = process.env.ENGINEBOX_NODE_INSTALLER_SHA256 ?? '';
   const origin = process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN ?? config().origin;
@@ -13,7 +13,8 @@ export function installCommand(code: string) {
     throw new HttpError(503, 'Machine registration requires a public HTTPS controller origin.');
   if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(code))
     throw new HttpError(502, 'Invalid registration response.');
-  return `& { $p=Join-Path $env:TEMP ('enginebox-'+[guid]::NewGuid()+'.ps1'); try { Invoke-WebRequest -UseBasicParsing ${quote(url)} -OutFile $p; if ((Get-FileHash -Algorithm SHA256 $p).Hash -ne ${quote(hash)}) { throw 'Installer checksum mismatch' }; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p -Controller ${quote(origin)} -EnrollmentCode ${quote(code)} } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }`;
+  if (expires !== undefined && (!Number.isSafeInteger(expires) || expires < 1)) throw new HttpError(502, 'Invalid registration expiry.');
+  return `& { $p=Join-Path $env:TEMP ('enginebox-'+[guid]::NewGuid()+'.ps1'); try { Invoke-WebRequest -UseBasicParsing ${quote(url)} -OutFile $p; if ((Get-FileHash -Algorithm SHA256 $p).Hash -ne ${quote(hash)}) { throw 'Installer checksum mismatch' }; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p -Controller ${quote(origin)} -EnrollmentCode ${quote(code)}${expires === undefined ? '' : ` -EnrollmentExpires ${expires}`} } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }`;
 }
 async function forward(path: string, method: string, token: string, body?: unknown) {
   const response = await fetch(`${config().apiUrl}${path}`, {
@@ -45,7 +46,7 @@ export async function contributors(request: Request, segments: string[]) {
   }
   const result = await forward(`/v1/contributors${suffix ? `/${suffix}` : ''}`, request.method, config().apiToken, body);
   if (suffix === 'enrollments') {
-    const command = installCommand(String(result.code));
+    const command = installCommand(String(result.code), Number(result.expires));
     return json({ id: result.id, expires: result.expires, command });
   }
   return json(result);

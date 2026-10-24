@@ -31,3 +31,32 @@ jobs:
           path: .state/wsl-release/
           compression-level: 0
           if-no-files-found: error
+  wsl-proof:
+    needs: image
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: enginebox-wsl-${{ github.sha }}
+          path: .state/wsl-release
+      - name: Enable WSL and boot disposable template runtime
+        shell: pwsh
+        run: |
+          wsl.exe --install --no-distribution --web-download
+          if ($LASTEXITCODE) { throw 'This runner cannot enable WSL without a reboot; WSL execution is not qualified.' }
+          wsl.exe --update --web-download
+          if ($LASTEXITCODE) { throw 'WSL update failed' }
+          wsl.exe --install --from-file "$PWD/.state/wsl-release/enginebox.wsl" --name EngineboxCI --location "$PWD/.state/wsl-ci" --version 2 --vhd-size 20GB --no-launch
+          if ($LASTEXITCODE) { throw 'WSL2 import/boot failed' }
+          '{"controller":"https://fixture.invalid","cpu":2,"memory_gib":4,"disk_gib":20}' | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl configure
+          if ($LASTEXITCODE) { throw 'Real WSL LayerFS/isolation qualification failed' }
+          wsl.exe -d EngineboxCI -u root --exec cat /var/lib/enginebox/qualification.json
+          if ($LASTEXITCODE) { throw 'Missing qualification receipt' }
+      - name: Remove only the disposable CI distribution
+        if: always()
+        shell: pwsh
+        run: |
+          $names=@((wsl.exe --list --quiet) | ForEach-Object { ($_ -replace "`0",'').Trim() })
+          if ($names -contains 'EngineboxCI') { wsl.exe --unregister EngineboxCI }
