@@ -17,6 +17,7 @@ permissions:
   contents: read
 jobs:
   windows-bootstrap:
+    if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -26,6 +27,7 @@ jobs:
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/tests/native-bootstrap.ps1
           if ($LASTEXITCODE) { throw 'Windows bootstrap regression failed' }
   linux-image:
+    if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -45,6 +47,7 @@ jobs:
           test "$status" -ne 125
           [[ "$output" == *'nvidia-smi'* ]]
   package:
+    if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
     strategy:
       fail-fast: false
       matrix:
