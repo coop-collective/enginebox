@@ -19,6 +19,7 @@ beforeEach(()=>{
 function ownerRequest(body:unknown, auth=true) {return new Request(`${origin}/api/contributors/enrollments`,{method:'POST',headers:{origin,'Content-Type':'application/json',...(auth?{cookie:sessionCookie().split(';')[0]}:{})},body:JSON.stringify(body)});}
 test('one-copy installer pins release, checksum, host and resource allowance without owner credentials',async t=>{
   t.mock.method(globalThis,'fetch',async (_url:string,options:RequestInit)=>{
+    if (_url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
     assert.equal((options.headers as Record<string,string>).Authorization,`Bearer ${owner}`);
     return Response.json({id:'a'.repeat(32),code,expires:Date.now()/1000+600});
   });

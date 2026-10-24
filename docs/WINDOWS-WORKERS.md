@@ -95,7 +95,13 @@ The deployed dashboard requires:
 - Optional `ENGINEBOX_NODE_PUBLIC_ORIGIN`: HTTPS origin used by installed nodes;
   defaults to the dashboard origin. Paths, queries and URL credentials are refused.
 
-Without a configured installer, invitation creation returns a visible error and
+The supervisor must advertise `node_protocol: 1` from its authenticated status
+endpoint. Older supervisors reject scoped node writes. Upgrading this stable
+supervisor requires a drained maintenance restart; ordinary controller/dashboard
+handoffs do not replace it. Heartbeat and result traffic bypass the handoff gate
+so already admitted jobs can finish draining.
+
+Without a configured installer or compatible supervisor, invitation creation returns a visible error and
 does not consume an invitation slot. Deploy the matching native controller and
 dashboard through the normal standby/drain/activate supervisor flow.
 

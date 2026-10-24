@@ -38,7 +38,11 @@ export async function contributors(request: Request, segments: string[]) {
   if (!allowed) throw new HttpError(404, 'Unknown machine operation.');
   const body = request.method === 'POST' ? await bodyJson(request, 20000) : undefined;
   // Validate release configuration before consuming a new invitation slot.
-  if (suffix === 'enrollments') installCommand(`${'0'.repeat(32)}.${'0'.repeat(64)}`, body.budget ?? {});
+  if (suffix === 'enrollments') {
+    installCommand(`${'0'.repeat(32)}.${'0'.repeat(64)}`, body.budget ?? {});
+    const supervisor = await forward('/__enginebox/status', 'GET', config().apiToken);
+    if (supervisor.node_protocol !== 1) throw new HttpError(503, 'The controller supervisor needs the Windows worker protocol update before registration.');
+  }
   const result = await forward(`/v1/contributors${suffix ? `/${suffix}` : ''}`, request.method, config().apiToken, body);
   if (suffix === 'enrollments') {
     const command = installCommand(String(result.code), body.budget);

@@ -175,6 +175,7 @@ createServer(async (req, res) => {
   }
   if (req.headers.authorization !== `Bearer ${token}`)
     return send(401, { error: "Wrong backend token" });
+  if (req.url === '/__enginebox/status') return send(200,{node_protocol:1});
   if (req.url === '/v1/contributors' && req.method === 'GET') return send(200,{nodes:contributors});
   if (req.url === '/v1/contributors/enrollments' && req.method === 'POST') {
     const id='a'.repeat(32); contributors.push({...data,id,enrolled:false,revoked:false,blocked:false,online:false,tools:{}});

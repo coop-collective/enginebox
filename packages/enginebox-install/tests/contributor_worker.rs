@@ -77,6 +77,49 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server =
         tokio::spawn(async move { axum::serve(listener, router(controller)).await.unwrap() });
+    // Exercise the real supervisor front door: node bearer auth must survive it.
+    let install = enginebox_install::release::Installation::inspect(
+        root.canonicalize().unwrap().join("supervisor"),
+    )
+    .unwrap();
+    install.initialize().unwrap();
+    let version = semver::Version::new(0, 3, 0);
+    let dir = install.release_dir(&version);
+    std::fs::create_dir_all(&dir).unwrap();
+    enginebox_install::release::atomic_json(
+        &dir.join("manifest.json"),
+        &enginebox_install::release::Manifest {
+            version: version.clone(),
+            target: enginebox_install::release::current_target().into(),
+            archive_sha256: "0".repeat(64),
+            state_schema: 1,
+            read_schema_min: 1,
+            read_schema_max: 1,
+            dashboard: false,
+        },
+    )
+    .unwrap();
+    install.activate(&version).unwrap();
+    let supervisor = enginebox_install::supervisor::Supervisor::new(
+        enginebox_install::supervisor::SupervisorConfig {
+            install,
+            state_dir: None,
+            fleet_config: fleet,
+            api_listen: "127.0.0.1:8765".parse().unwrap(),
+            dashboard_listen: None,
+            token: OWNER.into(),
+            drain_timeout: Duration::from_secs(10),
+        },
+        enginebox_install::supervisor::Candidate::external(version, 1, url, None),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let proxy = tokio::spawn(async move {
+        axum::serve(listener, supervisor.api_router())
+            .await
+            .unwrap()
+    });
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -144,7 +187,7 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let path = format!("/v1/contributors/{}/runs", invite["id"].as_str().unwrap());
-    let run = json!({"request_id":"ci-proof","kind":"ci","request":{"schema_version":1,"request_id":"ci-proof","event":"workflow_dispatch","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["windows","pwsh"],"shell":"pwsh","run":"if ($env:OWNER_SECRET_FIXTURE) { throw 'Credential escaped' }; New-Item -ItemType Directory dist | Out-Null; Set-Content -NoNewline dist/result.txt built","artifacts":["dist"],"timeout-minutes":1}}});
+    let run = json!({"request_id":"ci-proof","kind":"ci","request":{"schema_version":1,"request_id":"ci-proof","event":"workflow_dispatch","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["windows","pwsh"],"shell":"pwsh","run":"if ($env:OWNER_SECRET_FIXTURE) { throw 'Credential escaped' }; New-Item -ItemType Directory dist | Out-Null; Set-Content -NoNewline -Path dist/result.txt -Value built","artifacts":["dist"],"timeout-minutes":1}}});
     let submitted = api(&client, &url, &path, Some(run.clone())).await;
     let id = submitted["job"]["id"].as_str().unwrap();
     let result = done(&client, &url, id).await;
@@ -153,7 +196,14 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
         std::fs::read_to_string(
             root.join("installation/work/ci/artifacts/ci-proof/dist/result.txt")
         )
-        .unwrap(),
+        .unwrap_or_else(|e| panic!(
+            "{e}; result={result}; artifacts={:?}",
+            std::fs::read_dir(root.join("installation/work/ci/artifacts/ci-proof/dist")).map(
+                |entries| entries
+                    .map(|e| e.map(|e| e.file_name()))
+                    .collect::<Vec<_>>()
+            )
+        )),
         "built"
     );
     assert_eq!(api(&client, &url, &path, Some(run)).await["job"]["id"], id);
@@ -178,4 +228,5 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
         .unwrap();
     assert!(!status.success());
     server.abort();
+    proxy.abort();
 }

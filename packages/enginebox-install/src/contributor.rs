@@ -253,10 +253,10 @@ fn worker_environment(command: &mut Command) -> Result<()> {
     let mut paths =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
     for name in ["pwsh", "git", "codex"] {
-        if let Some(exe) = executable(name) {
-            if let Some(parent) = exe.parent() {
-                paths.push(parent.to_owned());
-            }
+        if let Some(exe) = executable(name)
+            && let Some(parent) = exe.parent()
+        {
+            paths.push(parent.to_owned());
         }
     }
     command.env("PATH", std::env::join_paths(paths)?);

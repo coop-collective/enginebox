@@ -28,18 +28,18 @@ export function ContributorsPanel() {
     setBusy(true); try { await api(`/api/contributors/${id}/${action}`, { method: 'POST', body: JSON.stringify(action === 'reconcile' ? { stopped: true } : {}) }); await refresh(); }
     catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
-  return <section className="storage-panel" aria-label="Worker machines">
-    <div className="section-heading"><div><h2>Worker machines</h2><p>Connect a Windows machine to this controller for CI and native agents.</p></div><button className="button small" onClick={() => void refresh()}>Refresh machines</button></div>
+  return <section className="contributor-panel" aria-label="Worker machines">
+    <div className="contributor-heading"><div><h2>Worker machines</h2><p>Connect a Windows machine to this controller for CI and native agents.</p></div><button className="button small" onClick={() => void refresh()}>Refresh machines</button></div>
     {error && <div className="alert" role="alert">{error}</div>}
-    <form className="host-card" onSubmit={issue}>
+    <form className="host-card contributor-form" onSubmit={issue}>
       <h3>Add a machine</h3>
       <label>Machine name<input required maxLength={80} value={label} onChange={e => setLabel(e.target.value)} /></label>
       <div className="contributor-resources">
         {([['cpu', 'CPU cores', 1, 256], ['memory_gib', 'Memory (GiB)', 2, 4096], ['disk_gib', 'Disk allowance (GiB)', 10, 65536]] as const).map(([key, text, min, max]) =>
           <label key={key}>{text}<input type="number" min={min} max={max} step={1} required value={budget[key]} onChange={e => setBudget({ ...budget, [key]: Number(e.target.value) })} /></label>)}
       </div>
-      <label><input type="checkbox" checked={ci} onChange={e => setCi(e.target.checked)} /> CI builds and checks</label>
-      <label><input type="checkbox" checked={agents} onChange={e => setAgents(e.target.checked)} /> Native agents</label>
+      <label className="contributor-choice"><input type="checkbox" checked={ci} onChange={e => setCi(e.target.checked)} /> CI builds and checks</label>
+      <label className="contributor-choice"><input type="checkbox" checked={agents} onChange={e => setAgents(e.target.checked)} /> Native agents</label>
       <p>One workload runs at a time within the shared CPU and memory limit. Workspace disk use is monitored; work stops at the allowance. Native jobs run as your Windows user. Choose trusted projects.</p>
       <button className="button primary" disabled={busy || (!ci && !agents)}>Create install command</button>
     </form>
