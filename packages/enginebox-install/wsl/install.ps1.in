@@ -45,6 +45,21 @@ function Get-WslVersion {
   if ($match.Success) { return [version]$match.Value }
   return $null
 }
+function Get-RuntimeCapacity {
+  # Read the actual Linux VM limits, not Windows physical RAM. This also works
+  # with already-downloaded preview images, so failed setup can resume in place.
+  $probe=@'
+import json,os,pathlib
+mem=int(next(l.split()[1] for l in pathlib.Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemTotal:')))*1024
+committed=any(pathlib.Path(p).exists() for p in ['/etc/enginebox/settings.json','/var/lib/enginebox/private/worker.json'])
+print(json.dumps({'cpu':len(os.sched_getaffinity(0)),'memory_bytes':mem,'committed':committed}))
+'@
+  $raw=$probe | & wsl.exe --distribution $Distro --user root --exec python3 -
+  if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Enginebox Linux resources. Setup is retained; check the WSL error above and run the installer again.' }
+  $capacity=($raw | Out-String) | ConvertFrom-Json
+  if ($capacity.cpu -lt 1 -or $capacity.memory_bytes -le 0 -or $capacity.committed -isnot [bool]) { throw 'Invalid Linux resource inspection result.' }
+  return $capacity
+}
 # Tests may load validation helpers without inspecting or modifying Windows.
 if ($MyInvocation.InvocationName -eq '.') { return }
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { throw 'This release requires Windows x64.' }
@@ -88,7 +103,10 @@ $DiskGiB=Read-Number 'Linux disk maximum in GiB (includes templates)' $DiskGiB (
 if ($settings -and ($settings.controller -ne $Controller -or $settings.cpu -ne $Cpu -or $settings.memory_gib -ne $MemoryGiB -or $settings.disk_gib -ne $DiskGiB)) { throw 'Existing installation has different settings. This installer preserves its identity, resources and workspaces.' }
 New-Item -ItemType Directory -Force -Path $root | Out-Null; Protect-Directory $root
 if ($PSCommandPath -ne $resumeScript) { Copy-Item -LiteralPath $PSCommandPath -Destination $resumeScript -Force }
-@{marker=$Marker;root=$root;controller=$Controller;cpu=$Cpu;memory_gib=$MemoryGiB;disk_gib=$DiskGiB} | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+function Save-Setup {
+  @{marker=$Marker;root=$root;controller=$Controller;cpu=$Cpu;memory_gib=$MemoryGiB;disk_gib=$DiskGiB} | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+}
+Save-Setup
 # Keep resumption under the installing user. Elevation is limited to enabling
 # WSL; the distro and identity must not accidentally belong to another admin.
 $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -143,6 +161,27 @@ if ($distros -contains $Distro) {
   $sid | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl claim
   if ($LASTEXITCODE -ne 0) { throw 'Could not record distribution ownership.' }
   Remove-Item -LiteralPath $image -Force
+}
+$capacity=Get-RuntimeCapacity
+# Match the runtime's 512 MiB kernel-overhead tolerance when converting its
+# MemTotal observation back to whole-GiB allowances (e.g. a 4 GiB WSL VM).
+$linuxMemory=[int][math]::Floor(([double]$capacity.memory_bytes+512MB)/1GB)
+$linuxCpu=[int]$capacity.cpu
+$observedMemory=[math]::Round([double]$capacity.memory_bytes/1GB,2)
+Write-Host "WSL reports $linuxCpu CPU cores and $observedMemory GiB usable RAM."
+if ($linuxMemory -lt 4) {
+  throw "WSL has only $observedMemory GiB usable RAM; Enginebox requires a WSL memory limit of at least 4 GiB. Increase Memory size in WSL Settings (or the existing [wsl2] memory setting in $env:USERPROFILE\.wslconfig), save work in all WSL distributions, restart Windows, and rerun this installer. The installed image is retained. Global WSL settings were not changed."
+}
+if ($Cpu -gt $linuxCpu -or $MemoryGiB -gt $linuxMemory) {
+  if ($capacity.committed) {
+    throw "WSL capacity is below this installation's saved allowance ($Cpu CPU, $MemoryGiB GiB). Restore its WSL limits and restart Windows after saving work, then resume. Existing settings, identity and workspaces were preserved."
+  }
+  Write-Host 'The requested allowance exceeds WSL capacity. Choose a smaller allowance to finish this pending installation.'
+  if ($Cpu -gt $linuxCpu) { $Cpu=Read-Number 'CPU cores within WSL capacity' 0 $linuxCpu 1 $linuxCpu }
+  if ($MemoryGiB -gt $linuxMemory) { $MemoryGiB=Read-Number 'Memory allowance within WSL capacity in GiB' 0 $linuxMemory 4 $linuxMemory }
+  # Only an unconfigured, identity-free runtime can change its pending budget.
+  # The Linux configure command independently refuses changes to saved settings.
+  Save-Setup
 }
 $configuration=@{controller=$Controller;cpu=$Cpu;memory_gib=$MemoryGiB;disk_gib=$DiskGiB} | ConvertTo-Json -Compress
 $configuration | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl configure

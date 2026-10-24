@@ -43,8 +43,20 @@ Only the new distribution disables Windows drive automounting and Win32 interop.
 The distribution is installed with its own `--vhd-size` maximum. A cgroup v2
 `enginebox.slice` caps aggregate CPU and memory across the trusted worker,
 private Docker daemon, SDK helpers and workspace containers. Existing global WSL
-limits still constrain it; setup rejects a selected allowance larger than the
-Linux VM can supply. It does not change those global settings automatically.
+limits still constrain it. After importing or reopening its distribution, setup
+reads Linux's actual CPU and total memory. If a pending, unconfigured installation
+requested more than WSL can supply, it prompts for a smaller allowance and saves
+that choice. Re-run the current dashboard installer to recover the earlier
+"Existing WSL memory cap is below the selected allowance" failure; the image is
+reused, so there is no need to delete the distribution or download it again.
+
+Once Linux settings or a node identity exist, setup preserves their budget and
+reports how to restore sufficient WSL capacity. A WSL limit below 4 GiB cannot
+run this template. Raise Memory size in WSL Settings (or the existing `[wsl2]`
+`memory` entry in `%USERPROFILE%\.wslconfig`), save work in every WSL distribution,
+restart Windows, then resume setup. These are shared WSL settings; the installer
+does not change them or shut down other distributions automatically. See
+[Microsoft's WSL configuration documentation](https://learn.microsoft.com/en-us/windows/wsl/wsl-config).
 
 The worker's Docker daemon has a dedicated socket and data root. Workspace
 commands execute through the pinned LayerFS backend as its unprivileged user.
