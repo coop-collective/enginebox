@@ -12,7 +12,7 @@ The 0.3 development line moves the runtime, host helper, native-agent supervisio
 | `enginebox-storage-layerfs` | First-class checkout storage, approved imports, immutable dependency reuse, file checkpoints and bounded recovery |
 | `dashboard` | Owner dashboard, session authentication and server-side API proxy |
 
-The root pins pnpm 12.14.0 and Rust 1.96.0. With `cargo.enabled: true`, `pnpm install` downloads both ecosystems and provisions the Rust toolchain; Cargo performs compilation. This is one workspace/dependency entrypoint, not a replacement of npm and crates.io with a single public registry. Both `pnpm-lock.yaml` and `Cargo.lock` remain required. [pnpm's Cargo documentation](https://github.com/pnpm/pnpm/blob/main/pnpm/docs/cargo.md) labels this integration experimental.
+The root pins pnpm 12.15.0 and Rust 1.96.0. With `cargo.enabled: true`, `pnpm install` downloads both ecosystems and provisions the Rust toolchain; Cargo performs compilation. This is one workspace/dependency entrypoint, not a replacement of npm and crates.io with a single public registry. Both `pnpm-lock.yaml` and `Cargo.lock` remain required. [pnpm's Cargo documentation](https://github.com/pnpm/pnpm/blob/main/pnpm/docs/cargo.md) labels this integration experimental.
 
 ## Compatibility boundary
 

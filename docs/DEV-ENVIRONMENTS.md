@@ -2,7 +2,7 @@
 
 Engine Box's next application-environment workflow has two lifetimes: a persistent **core environment** for the project, and disposable **agent environments** for individual tasks. The core follows the project's main branch and keeps its application data as code changes. An agent starts from a published revision of that environment, makes changes against its own data, and submits code for review.
 
-The broader fork/publication workflow below remains a product contract. The optional [environment service](ENVIRONMENT-SERVICES.md) now implements a protected registry, exact-source following, bounded application containers, persistent data, readiness, recovery and dashboard-managed HTTP/WebSocket/TCP/UDP routes. Git main has executable end-to-end qualification; the accepted LayerFS export adapter has provenance/byte-integrity contract tests and still needs live qualification with the separate integration executor. Consistent online data publication and disposable data forks remain unimplemented. No template field is defined by this document.
+The broader fork/publication workflow below remains a product contract. The optional [environment service](ENVIRONMENT-SERVICES.md) now implements a protected registry, exact-source following, bounded application containers, persistent data, readiness, recovery and dashboard-managed HTTP/WebSocket/TCP/UDP routes. [Project config](PROJECT-CONFIG.md) defines repository-selected dev templates and bootstrap. Local LayerFS main and public vinext HMR have live qualification; the distributed accepted export adapter still needs live qualification with the separate integration executor. Consistent online data publication and disposable data forks remain unimplemented.
 
 ## One persistent core per project
 

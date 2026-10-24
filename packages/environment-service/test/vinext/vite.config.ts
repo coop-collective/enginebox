@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 import vinext from 'vinext';
 import { cloudflare } from '@cloudflare/vite-plugin';
 
-const publicHost = process.env.DEV_PUBLIC_HOST;
+const publicHost = (process.env.ENGINEBOX_PUBLIC_HOST || process.env.DEV_PUBLIC_HOST);
 export default defineConfig({
   plugins: [vinext(), cloudflare({
     viteEnvironment: { name: 'rsc', childEnvironments: ['ssr'] },

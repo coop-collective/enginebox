@@ -1,6 +1,7 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
 pub mod ci;
 mod ci_templates;
+mod environment;
 pub mod jobs;
 pub mod storage;
 

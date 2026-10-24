@@ -119,6 +119,7 @@ function hasMetadata() {
 }
 let environmentRoutes = [];
 const environmentCatalog = () => ({
+  projects: [{ id: 'p-demo', host: 'metal-01', project: 'demo', status: 'ready', healthy: true, urls: ['https://demo.dev.example.com'] }, { id: 'p-failed', host: 'metal-01', project: 'failed-app', status: 'failed', healthy: false, error: 'setup-failed', urls: [] }],
   baseDomains: ['dev.example.com'], transportEntrypoints: [{ name: 'game-udp', protocol: 'udp', port: 21000, public: false }], routes: environmentRoutes,
   environments: [{ id: 'main', source: { kind: 'git', branch: 'main' }, services: [{ name: 'web', protocol: 'http' }, { name: 'game', protocol: 'udp' }], status: 'ready', healthy: true, revision: 'a'.repeat(40), desiredRevision: 'a'.repeat(40), cpu: 1, memoryMiB: 256 }],
 });
@@ -210,7 +211,7 @@ createServer(async (req, res) => {
     if (mode === "storage-error") return send(503, { error: "Storage catalog unavailable." });
     return send(200, { backend: "layerfs", configured: mode !== "storage-empty", nodes: mode === "storage-empty" ? [] : [{ host_id: "metal-01", status: "registered", github: { enabled: true, private_auth_configured: false }, projects: [{ id: "game" }, { id: "demo" }] }], incus_attachment: false, automatic_replay: false });
   }
-  const storage = req.url.match(/^\/v1\/storage\/hosts\/metal-01\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover|github-preview|github-import|github-settings|github-fork|github-promote|github-delivery)$/);
+  const storage = req.url.match(/^\/v1\/storage\/hosts\/metal-01\/(inspect|list|preview|import|fork|deps|checkpoint|remount|close|recover|github-preview|github-import|github-settings|github-fork|github-promote|github-delivery|dev-start|dev-status)$/);
   if (storage && req.method === "POST") {
     storageRequests.push({ operation: storage[1], body: data });
     const id = `storage-${jobs.size + 1}`;
@@ -236,10 +237,13 @@ createServer(async (req, res) => {
       } else if (operation === "github-import") {
         if (input.revision !== "c".repeat(40) || input.approval !== "d".repeat(64) || input.credential_free !== true || !githubReviews.has(input.project)) { job.status = "failed"; job.error = "Exact source review required."; }
         else {
+          result.dev = { status: "queued" };
           const reviewed = githubReviews.get(input.project);
           githubProjects.push({ id: input.project, repository: reviewed.repository, branch: reviewed.branch || "main", current: { project: "gh-fixture", commit: input.revision } });
           githubConnections.set(input.project, { main: { revision: "e".repeat(64), sequence: 0 }, sync: { enabled: false, active: null } });
         }
+      } else if (operation === "dev-start" || operation === "dev-status") {
+        result = { host: 'metal-01', project: input.project, status: operation === 'dev-start' ? 'queued' : 'ready', urls: operation === 'dev-status' ? ['https://demo.dev.example.com'] : [] };
       } else if (operation === "github-settings") {
         const connection = githubConnections.get(input.project);
         if (!connection) { job.status = "failed"; job.error = "Unknown GitHub project."; }

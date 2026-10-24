@@ -96,6 +96,11 @@ Storage dashboard and controller/MCP expose the same workflow. Begin with
 Outbound delivery defaults off. Observe `github-settings` before publishing so
 `github-promote` carries the exact expected main revision.
 
+With the optional dev-service handoff configured, successful imports also queue
+[repository-defined dev bootstrap](PROJECT-CONFIG.md). Import remains committed
+if setup is unavailable or fails. MCP `storage_dev_start` retries setup and
+`storage_dev_status` reports readiness and URLs through the usual durable jobs.
+
 Git is confined to the connector's private fetch cache and per-attempt environment.
 The agent container receives only the reconciliation worktree, a read-only image,
 private temporary home, bounded CPU/RAM/processes and no Docker socket or push
