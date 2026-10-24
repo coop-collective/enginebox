@@ -75,13 +75,14 @@ test('source symlinks escaping the checkout are refused', async t => {
 test('explicit run policy executes lifecycle scripts instead of using an installed-tree hit', { skip: process.platform === 'win32' }, async t => {
   const f = await fixture(t);
   const file = join(f.source, 'package.json'), pkg = JSON.parse(await readFile(file, 'utf8'));
-  pkg.scripts.postinstall = `node -e "require('fs').writeFileSync('node_modules/lifecycle-ran', 'yes')"`;
+  pkg.scripts.postinstall = `node -e "require('fs').writeFileSync('node_modules/lifecycle-ran', 'yes');require('fs').writeFileSync('generated.js', 'module.exports = 42;')"`;
   await writeFile(file, JSON.stringify(pkg));
   await build(f); // deny is explicit: this generation cannot stand in for a script-enabled install.
   const receipt = await prepare({ ...f, policy: { ...policy, scripts: 'run' } });
   assert.equal(receipt.mode, 'install');
   assert.equal(receipt.reason, 'lifecycle-scripts-require-install');
   assert.equal(await readFile(join(f.source, 'node_modules/lifecycle-ran'), 'utf8'), 'yes');
+  assert.equal(await readFile(join(f.source, 'generated.js'), 'utf8'), 'module.exports = 42;');
 });
 
 test('custom package hooks cannot publish or silently reuse installed dependency trees', { skip: process.platform === 'win32' }, async t => {

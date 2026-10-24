@@ -198,10 +198,10 @@ export async function prepare({ source, root, policy, env = process.env, offline
     assert(!requireHit, `Required prepared generation unavailable: ${reason}`);
     downloadedPackages = await install(source, root, policy, env, offline);
   }
-  // A verified rename executes no dependency code and cannot change tools/configuration.
-  // Avoid probing tools twice on a hit; still compare source content after the handoff.
-  const after = mode === 'installed-tree' ? { key: before.key, sourceDigest: (await tree(source, { source: true })).digest } : await fingerprint(source, policy, env);
-  assert(before.key === after.key && before.sourceDigest === after.sourceDigest, 'Preparation changed source inputs');
+  // A verified rename executes no code and must preserve source. Ordinary install
+  // retains native lifecycle effects, including generated files outside node_modules.
+  // Its output is private job state and never automatically becomes a reusable base.
+  if (mode === 'installed-tree') assert(before.sourceDigest === (await tree(source, { source: true })).digest, 'Preparation changed source inputs');
   const receipt = { schema: 1, recipe: RECIPE, key: before.key, mode, reason, validation: mode === 'installed-tree' ? (activate ? 'protected-generation' : 'content-sha256') : 'locked-install', downloadedPackages, elapsedMs: performance.now() - started, source: before.sourceDigest };
   await save(join(root, 'receipts', `${randomUUID()}.json`), receipt);
   return receipt;
