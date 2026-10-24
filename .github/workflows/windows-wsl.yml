@@ -44,10 +44,25 @@ jobs:
       - name: Enable WSL and boot disposable template runtime
         shell: pwsh
         run: |
+          function Get-WslVersion {
+            $previous=$ErrorActionPreference
+            try { $ErrorActionPreference='Continue'; $value=(& wsl.exe --version 2>$null | Out-String) -replace "`0",'' }
+            finally { $ErrorActionPreference=$previous }
+            $match=[regex]::Match($value,'\d+\.\d+\.\d+')
+            if ($match.Success) { return [version]$match.Value }
+            return $null
+          }
           wsl.exe --install --no-distribution --web-download
           if ($LASTEXITCODE) { throw 'This runner cannot enable WSL without a reboot; WSL execution is not qualified.' }
-          wsl.exe --update --web-download
-          if ($LASTEXITCODE) { throw 'WSL update failed' }
+          # Match the installer minimum without requiring Microsoft's update
+          # endpoint to be available when the runner already meets it.
+          $version=Get-WslVersion
+          if (-not $version -or $version -lt [version]'2.5.7') {
+            wsl.exe --update --web-download
+            if ($LASTEXITCODE) { throw 'WSL update failed' }
+            $version=Get-WslVersion
+          }
+          if (-not $version -or $version -lt [version]'2.5.7') { throw 'WSL 2.5.7 or newer is required for qualification.' }
           wsl.exe --install --from-file "$PWD/.state/wsl-release/enginebox.wsl" --name EngineboxCI --location "$PWD/.state/wsl-ci" --version 2 --vhd-size 20GB --no-launch
           if ($LASTEXITCODE) { throw 'WSL2 import/boot failed' }
           [Security.Principal.WindowsIdentity]::GetCurrent().User.Value | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl claim
