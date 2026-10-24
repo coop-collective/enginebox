@@ -339,4 +339,27 @@ target/release/enginebox-fleet-mcp`) + `<p>The operator token stays on the opera
       },
     ],
   },
+  {
+    slug: 'licensing',
+    title: 'Licensing and pricing',
+    group: 'Operate',
+    summary: 'What is free, what needs a paid per-node license and how each version converts to Apache-2.0.',
+    sections: [
+      {
+        id: 'boundary',
+        title: 'Where the license boundary is',
+        html: `<table><thead><tr><th>Use</th><th>Terms</th></tr></thead><tbody><tr><td>Personal and non-commercial use</td><td>Free</td></tr><tr><td>Testing, evaluation, development and other non-production use</td><td>Free</td></tr><tr><td>Production use by or on behalf of a business</td><td>$10 per node per month</td></tr><tr><td>Offering Engine Box to third parties as a hosted or managed service</td><td>Separate agreement</td></tr></tbody></table><p>Engine Box is source-available under the Business Source License 1.1. It is not an OSI open-source license. You can copy and modify the source; modified copies are covered by the same license.</p>`,
+      },
+      {
+        id: 'nodes',
+        title: 'What counts as a node',
+        html: `<p>A node is each machine registered with an Engine Box controller to run workspaces. The controller itself does not count unless it also runs workspaces. Three Linux hosts registered to run workspaces are three nodes, or $30 per month.</p><p>The software does not currently enforce node counts. The license is the agreement. Provider subscriptions for Codex, Claude Code and Cursor stay with the provider and are not part of the price.</p>`,
+      },
+      {
+        id: 'change-date',
+        title: 'Change Date and history',
+        html: `<p>Each version converts to the Apache License, Version 2.0 four years after it is first publicly released. Earlier code keeps the license it was published under: Apache-2.0 through an early commit, then an earlier source-available license (see NOTICE).</p><p>See <a href="/pricing/">pricing</a> for plans and a worked example. The full policy is in ${source('docs/LICENSING.md', 'docs/LICENSING.md')} and the terms are in the ${source('LICENSE', 'license')}.</p>`,
+      },
+    ],
+  },
 ];
