@@ -13,9 +13,17 @@ test('installer chooses resources while owner, copies enrollment, observes readi
   await expect(page.getByRole('article',{name:'Machine Windows RTX'})).toContainText('Waiting for registration');
   await page.context().grantPermissions(['clipboard-read','clipboard-write']);await page.getByRole('button',{name:'Copy install command'}).click();await expect(page.getByRole('button',{name:'Copied',exact:true})).toBeVisible();
   expect(await page.evaluate(()=>navigator.clipboard.readText())).toContain('-Controller');
+  const pending=page.getByRole('article',{name:'Machine Windows RTX'});
+  await expect(pending).toContainText('Machine ID: '+'a'.repeat(32));
+  await pending.getByRole('button',{name:'Renew registration code'}).click();
+  await expect(page.getByLabel('Registration code',{exact:true})).toHaveValue(`${'a'.repeat(32)}.${'c'.repeat(64)}`);
+  await expect(command).toHaveValue(new RegExp('c'.repeat(64)));
+  await expect(pending).toHaveCount(1);
+  await expect(page.getByRole('button',{name:'Copy install command',exact:true})).toBeVisible();
   await page.screenshot({path:'test-results/contributors-desktop.png',fullPage:true});
   await page.setViewportSize({width:390,height:844});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);await page.screenshot({path:'test-results/contributors-mobile.png',fullPage:true});
   await request.post(`${fixtureOrigin}/__test/contributor-online`);await page.getByRole('button',{name:'Refresh machines'}).click();await expect(command).toHaveCount(0);
   const card=page.getByRole('article',{name:'Machine Windows RTX'});await expect(card).toContainText('Online');await expect(card).toContainText('Templates: Ready in WSL2');await expect(card).toContainText('2 CPU · 4 GiB memory · 20 GiB disk allowance');
+  await expect(card.getByRole('button',{name:'Renew registration code'})).toHaveCount(0);
   await card.getByRole('button',{name:'Revoke machine'}).click();await expect(card).toContainText('Revoked');
 });

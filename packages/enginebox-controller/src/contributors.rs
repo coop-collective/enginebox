@@ -133,6 +133,28 @@ impl Contributors {
         nodes.insert(id.clone(), node);
         Ok(json!({"id":id,"code":code,"expires":expires,"one_time":true}))
     }
+    /// Renew an owner's unconsumed invitation without replacing the identity
+    /// already saved by an installer before its first network request.
+    pub fn renew_enrollment(&self, key: &str) -> Result<Value> {
+        ensure!(id(key), "Invalid registration identity");
+        let mut nodes = self.nodes.lock().unwrap();
+        let mut n = nodes.get(key).cloned().context("Unknown registration")?;
+        ensure!(
+            !n.revoked && n.secret_hash.is_none(),
+            "Only an unrevoked, unenrolled registration can be renewed"
+        );
+        let code = format!(
+            "{key}.{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        n.code_hash = secret_hash(&code);
+        n.expires = now() + 3600;
+        self.save(&n)?;
+        let response = json!({"id":n.id,"code":code,"expires":n.expires,"one_time":true});
+        nodes.insert(key.to_owned(), n);
+        Ok(response)
+    }
     pub fn enroll(&self, code: &str, e: Enrollment) -> Result<Value> {
         let (key, secret) = code.split_once('.').context("Invalid registration code")?;
         ensure!(
@@ -538,6 +560,56 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+    #[test]
+    fn renewal_preserves_pending_identity_and_invalidates_old_code_durably() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = Contributors::open(tmp.path()).unwrap();
+        let issued = service.issue(invitation()).unwrap();
+        let key = issued["id"].as_str().unwrap();
+        let token = format!("{key}.{}", "c".repeat(64));
+        let enrollment = Enrollment {
+            secret_hash: secret_hash(&token),
+            budget: Budget {
+                cpu: 2,
+                memory_gib: 4,
+                disk_gib: 20,
+            },
+            os: "linux".into(),
+            architecture: "x86_64".into(),
+        };
+        service.nodes.lock().unwrap().get_mut(key).unwrap().expires = 0;
+        assert!(
+            service
+                .enroll(issued["code"].as_str().unwrap(), enrollment.clone())
+                .is_err()
+        );
+        let before = service.catalog();
+        let renewed = service.renew_enrollment(key).unwrap();
+        assert_eq!(renewed["id"], issued["id"]);
+        assert_ne!(renewed["code"], issued["code"]);
+        assert!(renewed["expires"].as_u64().unwrap() > now());
+        assert_eq!(service.catalog(), before);
+        drop(service);
+        let service = Contributors::open(tmp.path()).unwrap();
+        assert!(
+            service
+                .enroll(issued["code"].as_str().unwrap(), enrollment.clone())
+                .is_err()
+        );
+        service
+            .enroll(renewed["code"].as_str().unwrap(), enrollment)
+            .unwrap();
+        assert!(service.authenticated(&token));
+        assert!(!service.authenticated(renewed["code"].as_str().unwrap()));
+        assert!(service.renew_enrollment(key).is_err());
+        assert!(service.authenticated(&token));
+        let revoked = service.issue(invitation()).unwrap();
+        let revoked_id = revoked["id"].as_str().unwrap();
+        service.revoke(revoked_id).unwrap();
+        assert!(service.renew_enrollment(revoked_id).is_err());
+        assert!(service.renew_enrollment(&"f".repeat(32)).is_err());
+        assert!(service.renew_enrollment("../invalid").is_err());
     }
     #[test]
     fn assignments_never_replay_and_sessions_and_results_are_bound() {

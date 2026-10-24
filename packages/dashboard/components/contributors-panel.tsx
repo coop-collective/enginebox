@@ -28,6 +28,11 @@ export function ContributorsPanel() {
     setBusy(true); try { await api(`/api/contributors/${id}/${action}`, { method: 'POST', body: JSON.stringify(action === 'reconcile' ? { stopped: true } : {}) }); await refresh(); }
     catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
+  async function renew(id: string) {
+    setBusy(true); setError(''); setCopied(false); setInvitation(undefined);
+    try { setInvitation(await api<Enrollment>(`/api/contributors/${id}/renew-enrollment`, { method: 'POST', body: '{}' })); await refresh(); }
+    catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  }
   return <section className="contributor-panel" aria-label="Worker machines">
     <div className="contributor-heading"><div><h2>Worker machines</h2><p>Connect a Windows machine to this controller for template workspaces in WSL2.</p></div><button className="button small" onClick={() => void refresh()}>Refresh machines</button></div>
     {error && <div className="alert" role="alert">{error}</div>}
@@ -40,16 +45,19 @@ export function ContributorsPanel() {
       <button className="button primary" disabled={busy || (!ci && !agents)}>Create install command</button>
     </form>
     {invitation && <article className="host-card" aria-label="Install this machine">
-      <h3>Run once in PowerShell</h3><p>This code expires at {new Date(invitation.expires * 1000).toLocaleTimeString()} and registers one machine. Choose resources in the installer. If WSL setup requires a restart or the code expires, finish setup and generate a fresh registration code.</p>
+      <h3>Run once in PowerShell</h3><p>This code expires at {new Date(invitation.expires * 1000).toLocaleTimeString()} and registers one machine. Choose resources in the installer. To retry a failed registration, renew the code on the existing machine below. Match its ID to the pending identity saved by the installer.</p>
+      <p>Machine ID: <code>{invitation.id}</code></p>
       <label>Registration code for an installer already open<input readOnly aria-label="Registration code" value={invitation.code} /></label>
       <textarea readOnly aria-label="PowerShell install command" value={invitation.command} rows={5} spellCheck={false} />
       <button className="button primary" onClick={async () => { try { await navigator.clipboard.writeText(invitation.command); setCopied(true); } catch { setError('Clipboard access was denied. Select and copy the command above.'); } }}>{copied ? 'Copied' : 'Copy install command'}</button>
     </article>}
     <div className="host-grid">{nodes.map(n => <article className="host-card" key={n.id} aria-label={`Machine ${n.label}`}>
       <h3>{n.label}</h3><p>{n.revoked ? 'Revoked' : !n.enrolled ? 'Waiting for registration' : n.blocked ? 'Needs reconciliation' : n.online ? 'Online' : 'Offline'}</p>
+      <p>Machine ID: <code>{n.id}</code></p>
       <p>{n.enrolled ? `${n.budget.cpu} CPU · ${n.budget.memory_gib} GiB memory · ${n.budget.disk_gib} GiB disk allowance` : 'Resources chosen during installation'}</p>
       <p>Templates: {n.tools.workspace ? 'Ready in WSL2' : n.enrolled && n.tools.backend !== 'wsl2-layerfs' ? 'Upgrade to the WSL2 installer' : 'Waiting for WSL2 setup'}</p>
       {n.blocked && <button className="button small" disabled={busy || n.tools.worker_running !== false} onClick={() => void change(n.id, 'reconcile')}>Confirm owned worker stopped</button>}
+      {!n.revoked && !n.enrolled && <button className="button small" disabled={busy} onClick={() => void renew(n.id)}>Renew registration code</button>}
       {!n.revoked && <button className="button small" disabled={busy} onClick={() => void change(n.id, 'revoke')}>Revoke machine</button>}
     </article>)}</div>
   </section>;

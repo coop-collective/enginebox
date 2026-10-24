@@ -745,6 +745,10 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
         ["v1", "contributors", "enrollments"] => {
             runtime.contributors.issue(serde_json::from_value(body)?)?
         }
+        ["v1", "contributors", node, "renew-enrollment"] => {
+            empty(&body)?;
+            runtime.contributors.renew_enrollment(node)?
+        }
         ["v1", "contributors", node, "revoke"] => {
             empty(&body)?;
             runtime.contributors.revoke(node)?

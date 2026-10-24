@@ -35,17 +35,18 @@ export async function contributors(request: Request, segments: string[]) {
   if (new URL(request.url).search) throw new HttpError(400, 'Query parameters are not supported.');
   const suffix = segments.join('/');
   const allowed = request.method === 'GET' ? suffix === '' : request.method === 'POST' &&
-    (suffix === 'enrollments' || /^[a-f0-9]{32}\/(revoke|reconcile|runs)$/.test(suffix));
+    (suffix === 'enrollments' || /^[a-f0-9]{32}\/(renew-enrollment|revoke|reconcile|runs)$/.test(suffix));
   if (!allowed) throw new HttpError(404, 'Unknown machine operation.');
   const body = request.method === 'POST' ? await bodyJson(request, 20000) : undefined;
-  // Validate release configuration before consuming a new invitation slot.
-  if (suffix === 'enrollments') {
+  const enrollment = suffix === 'enrollments' || suffix.endsWith('/renew-enrollment');
+  // Validate release configuration before issuing or rotating an invitation.
+  if (enrollment) {
     installCommand(`${'0'.repeat(32)}.${'0'.repeat(64)}`);
     const supervisor = await forward('/__enginebox/status', 'GET', config().apiToken);
     if (supervisor.node_protocol !== 1) throw new HttpError(503, 'The controller supervisor needs the Windows worker protocol update before registration.');
   }
   const result = await forward(`/v1/contributors${suffix ? `/${suffix}` : ''}`, request.method, config().apiToken, body);
-  if (suffix === 'enrollments') {
+  if (enrollment) {
     const command = installCommand(String(result.code), Number(result.expires));
     return json({ id: result.id, expires: result.expires, code: result.code, command });
   }

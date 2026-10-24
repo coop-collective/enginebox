@@ -52,6 +52,31 @@ test('command rejects shell injection and credential-bearing controller origins'
   assert.throws(()=>installCommand("';Invoke-Expression bad"));
   process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN='https://user:password@enginebox.example';assert.throws(()=>installCommand(code));
 });
+test('renewal requires the owner and origin, keeps the identity, and returns a pinned recovery command',async t=>{
+  const id='a'.repeat(32), path=[id,'renew-enrollment'];
+  const calls:string[]=[];
+  t.mock.method(globalThis,'fetch',async (url:string,options:RequestInit)=>{
+    calls.push(url);
+    assert.equal((options.headers as Record<string,string>).Authorization,`Bearer ${owner}`);
+    if (url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
+    assert.equal(url,`http://127.0.0.1:8765/v1/contributors/${id}/renew-enrollment`);
+    assert.equal(options.body,'{}');
+    return Response.json({id,code,expires:Math.floor(Date.now()/1000)+3600});
+  });
+  await assert.rejects(contributors(ownerRequest({},false),path));
+  const cross=ownerRequest({});cross.headers.set('origin','https://attacker.example');
+  await assert.rejects(contributors(cross,path));
+  const hash=process.env.ENGINEBOX_NODE_INSTALLER_SHA256;
+  delete process.env.ENGINEBOX_NODE_INSTALLER_SHA256;
+  await assert.rejects(contributors(ownerRequest({}),path));
+  assert.equal(calls.length,0);
+  process.env.ENGINEBOX_NODE_INSTALLER_SHA256=hash;
+  const response=await contributors(ownerRequest({}),path), value=await response.json();
+  assert.equal(response.headers.get('cache-control'),'no-store');
+  assert.equal(value.id,id);assert.equal(value.code,code);
+  assert.ok(value.command.includes(code));assert.match(value.command,/Get-FileHash/);
+  assert.ok(!value.command.includes(owner));assert.equal(calls.length,2);
+});
 test('an older supervisor cannot issue an unusable worker invitation',async t=>{
   const fetch=t.mock.method(globalThis,'fetch',async (url:string)=>{assert.ok(url.endsWith('/__enginebox/status'));return Response.json({current:'old'});});
   await assert.rejects(contributors(ownerRequest({budget}),['enrollments']),(e:unknown)=>e instanceof HttpError&&e.status===503);

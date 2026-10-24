@@ -28,9 +28,25 @@ allowance. Older API clients may supply an explicit owner ceiling.
 The installer updates WSL to at least 2.5.7 when needed. Enabling WSL can trigger
 Windows UAC and require a reboot. It saves non-secret setup state and schedules
 resumption under the original Windows user. It does not force a reboot. A code
-that expires while the image downloads must be replaced with a fresh code from
-the dashboard; there is a separate registration-code field for an installer that
-is already open. The installed distribution is retained.
+that expires while the image downloads can be renewed on the existing machine
+card in the dashboard; there is a separate registration-code field for an installer
+that is already open. The installed distribution is retained.
+
+If registration fails after saving a pending identity, keep its state. Read only
+the non-secret identity fields in PowerShell:
+
+```powershell
+wsl -d Enginebox -u root -- jq '{id, enrolled, controller, budget}' /var/lib/enginebox/private/worker.json
+```
+
+In **Worker machines**, match that `id` to the existing card and select **Renew
+registration code**. Run its new install command, or paste the code into an
+installer already waiting for it. Renewal keeps the same ID and owner allowances,
+invalidates the previous code, and is available only before successful enrollment.
+Creating another machine generates a different ID and cannot recover the saved
+identity. Never remove `worker.json` or unregister the distribution to retry.
+If the controller already shows the matching machine as enrolled but local state
+does not, retain both states for reconciliation; renewal cannot replace its key.
 
 It refuses an unrelated distribution named Enginebox, unrelated scheduled tasks,
 symlink/junction installation paths and changes to an existing identity's

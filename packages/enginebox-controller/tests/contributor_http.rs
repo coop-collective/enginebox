@@ -39,6 +39,35 @@ async fn scoped_node_http_credentials_and_drain_admission() {
     let (status,invite)=call(&app,&owner,"/v1/contributors/enrollments",json!({"label":"Windows PC","budget":{"cpu":2,"memory_gib":4,"disk_gib":20},"workloads":{"ci":true,"agents":true}})).await;
     assert_eq!(status, StatusCode::OK);
     let token = format!("{}.{}", invite["id"].as_str().unwrap(), "a".repeat(64));
+    let renewal_path = format!(
+        "/v1/contributors/{}/renew-enrollment",
+        invite["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        call(
+            &app,
+            invite["code"].as_str().unwrap(),
+            &renewal_path,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, &token, &renewal_path, json!({})).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, &owner, &renewal_path, json!({"budget":{}}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, renewed) = call(&app, &owner, &renewal_path, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renewed["id"], invite["id"]);
+    assert_ne!(renewed["code"], invite["code"]);
     assert_eq!(
         call(&app, &token, "/v1/node/hello", json!({})).await.0,
         StatusCode::UNAUTHORIZED
@@ -49,11 +78,26 @@ async fn scoped_node_http_credentials_and_drain_admission() {
             &app,
             invite["code"].as_str().unwrap(),
             "/v1/node/enroll",
+            enrollment.clone()
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            &app,
+            renewed["code"].as_str().unwrap(),
+            "/v1/node/enroll",
             enrollment
         )
         .await
         .0,
         StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, &owner, &renewal_path, json!({})).await.0,
+        StatusCode::BAD_REQUEST
     );
     assert_eq!(
         call(&app, &token, "/v1/contributors/enrollments", json!({}))

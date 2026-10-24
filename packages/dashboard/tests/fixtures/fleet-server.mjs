@@ -211,6 +211,12 @@ createServer(async (req, res) => {
     const id='a'.repeat(32); contributors.push({...data,id,enrolled:false,revoked:false,blocked:false,online:false,tools:{}});
     return send(200,{id,code:`${id}.${'b'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+600});
   }
+  const renewContributor = req.url.match(/^\/v1\/contributors\/([a-f0-9]{32})\/renew-enrollment$/);
+  if (renewContributor && req.method === 'POST') {
+    const node=contributors.find(n=>n.id===renewContributor[1]);
+    if (!node || node.enrolled || node.revoked) return send(400,{error:'Only a pending registration can be renewed.'});
+    return send(200,{id:node.id,code:`${node.id}.${'c'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+3600});
+  }
   if (/^\/v1\/contributors\/[a-f0-9]{32}\/revoke$/.test(req.url)) { contributors=contributors.map(n=>({...n,revoked:true}));return send(200,{revoked:true}); }
   if (req.url === '/v1/environments/routes' && req.method === 'POST') {
     environmentRoutes = environmentRoutes.filter(r => r.id !== (data.remove ?? data.id));
