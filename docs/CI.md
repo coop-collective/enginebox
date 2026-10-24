@@ -129,8 +129,9 @@ output. Capacity, download, installer and verification failures remain visible
 per node. Bounded diagnostic details stay in private `*.error.json`/`error.json`
 files on that worker; the API exposes phase codes instead of script output.
 
-Failures are never silently replayed. Inspect the worker before explicitly
-retrying; each retry uses a fresh attempt directory. A controller restart marks
+Periodic reconciliation never retries a failure. Inspect the worker before
+explicitly retrying or changing its desired configuration; each new attempt uses
+a fresh identity. A controller restart marks
 uncertain queued/installing attempts failed and re-verifies earlier ready
 installations without replaying their installers. Disabling a template stops
 new placements and queued starts, and lets running jobs finish. Disabling,
@@ -328,9 +329,14 @@ Tests cover matching, dedicated-host fencing, CI queue isolation, native shell s
 artifact retention/escapes, request deduplication/restart, HTTP authentication and
 draining, pinned toolchain install/probe/build/retry/restart, later-node
 synchronization, dashboard controls, and mock GitHub dispatch/status/cancel responses. `actionlint` checks the
-four workflows. Live signed mobile builds, Windows worker execution, official
-runner registration, image provisioning, cache benchmarks and real GitHub
-dispatch remain separate qualification; local tests do not establish them.
+four workflows. The native verification matrix runs worker/controller tests on
+Linux, macOS and Windows, and explicitly downloads the matching pinned Node
+recipe into a disposable worker to verify installation, reuse and an actual build
+artifact. Run that network qualification locally with
+`pnpm exec cargo test --workspace --locked --test template_download -- --ignored`.
+Signed mobile builds, official runner registration, OS image provisioning and
+cache benchmarks remain separate qualification; toolchain installation tests do
+not establish those capabilities or a successful mobile store release.
 
 Protocol references: [GitHub workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event),
 [self-hosted runner routing and ephemeral lifecycle](https://docs.github.com/en/actions/reference/runners/self-hosted-runners),
