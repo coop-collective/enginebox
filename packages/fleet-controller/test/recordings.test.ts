@@ -70,7 +70,7 @@ async function node(
     origin: null,
     slots: 1,
     cacheBytes: 16777216,
-    ...(media ? { mediaProjects: ["demo"] } : {}),
+    ...(media ? { mediaProjects: ["demo"], buildProjects: ["demo"] } : {}),
     ...(taskOnly ? { taskOnly: true } : {}),
   });
   const session = crypto.randomUUID();
@@ -110,10 +110,13 @@ async function fixture(batch = false) {
     snapshotHash: source.sha256,
     snapshotBytes: source.bytes,
     pages: source.pages,
-    metadata: { treeHash: tree },
+    metadata: { treeHash: tree, integration: "candidate-one" },
   });
   await ok("projects/demo/checks", {
-    checks: [{ name: "verify", kind: "verify", recipe }],
+    checks: [
+      { name: "verify", kind: "verify", recipe },
+      { name: "playable", kind: "engine-build", recipe, timeoutSeconds: 30 },
+    ],
   });
   await ok("projects/demo/tasks", {
     id: "task-one",
@@ -188,13 +191,54 @@ async function fixture(batch = false) {
     files,
     totalBytes: file.bytes,
   };
-  const build = await ok("projects/demo/artifacts", {
-    candidate: candidate.id,
-    manifest,
-  });
   const app = await node("app", false, true),
     executor = await node("media-worker", true),
     ordinary = await node("ordinary");
+  const build = await ok(
+    "projects/demo/artifacts",
+    { candidate: candidate.id, manifest },
+    executor,
+  );
+  // The native integration is a fixture input; this test exercises real
+  // controller build-result validation, not an engine execution claim.
+  await runInDurableObject(env.PROJECTS.getByName("demo"), (instance) =>
+    instance.put("job:candidate-one", {
+      spec: { id: "candidate-one", kind: "integration", project: "demo" },
+      status: "completed",
+      assignment: { node: "media-worker" },
+      result: canonical({ generation: generation.id, treeHash: tree }),
+    }),
+  );
+  await ok("projects/demo/jobs", {
+    id: "build-web",
+    project: "demo",
+    generation: generation.id,
+    kind: "engine-build",
+    timeoutSeconds: 30,
+    build: {
+      candidate: candidate.id,
+      integration: candidate.id,
+      sourceTree: tree,
+      recipe,
+    },
+    check: { candidate: candidate.id, name: "playable", recipe, scope: "full" },
+  });
+  const buildAssignment = (await ok("node/poll", {}, executor)).assignment;
+  await ok(
+    "node/finish",
+    {
+      assignment: buildAssignment,
+      ok: true,
+      result: {
+        artifact: build.id,
+        generation: generation.id,
+        sourceTree: tree,
+        recipe,
+        check: buildAssignment.check,
+      },
+    },
+    executor,
+  );
   await ok(
     "projects/demo/test-sessions",
     {
@@ -478,4 +522,31 @@ it("Enginebox collects batch reviews before promotion and ships after the final 
       })
     ).status,
   ).toBe("shipped");
+});
+
+it("refuses a published alternate recipe as evidence for the protected release artifact", async () => {
+  const f = await fixture();
+  const alternate = await ok("projects/demo/artifacts", {
+    candidate: f.candidate.id,
+    manifest: { ...f.manifest, recipe: "e".repeat(64) },
+  });
+  expect(
+    (
+      await request(
+        "projects/demo/test-sessions",
+        {
+          id: "alternate",
+          taskId: f.task.id,
+          expectedRevision: f.task.revision,
+          tester: "account-one",
+          artifact: alternate.id,
+        },
+        f.app,
+      )
+    ).status,
+  ).toBe(409);
+  const contexts = await ok("projects/demo/test-contexts", undefined, f.app);
+  expect(contexts.contexts.map((context: any) => context.artifact)).toEqual([
+    f.build.id,
+  ]);
 });

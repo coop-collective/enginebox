@@ -12,6 +12,8 @@ import {
   requireThat,
   validateRecordingFinish,
   type BuildRecord,
+  type CheckRequirement,
+  type JobSpec,
   type CandidateSpec,
   type MediaFinalizeJob,
   type PlaytestPolicy,
@@ -30,6 +32,8 @@ type Store = {
 };
 type Candidate = {
   spec: CandidateSpec;
+  checks: CheckRequirement[];
+  fullJobs: Record<string, string>;
   taskRequirements?: Record<string, string>;
 };
 const day = 86_400_000;
@@ -72,6 +76,25 @@ export class Recordings {
     this.store.put("playtest-policy", policy);
     return policy;
   }
+  private protectedBuild(candidate: Candidate, artifact: string) {
+    return candidate.checks.some((check) => {
+      if (check.kind !== "engine-build") return false;
+      const job = this.store.get<{
+        spec: JobSpec;
+        status: string;
+        result?: string;
+      }>(`job:${candidate.fullJobs[check.name]}`);
+      return (
+        job?.status === "completed" &&
+        job.spec.kind === "engine-build" &&
+        job.spec.generation === candidate.spec.generation &&
+        job.spec.check.scope === "full" &&
+        job.spec.check.recipe === check.recipe &&
+        !!job.result &&
+        JSON.parse(job.result).artifact === artifact
+      );
+    });
+  }
   contexts() {
     const rows = this.sql
       .exec<{
@@ -98,7 +121,8 @@ export class Recordings {
       const build = builds.find(
         (build) =>
           build.toolchain.target === "web" &&
-          build.generation === candidate.spec.generation,
+          build.generation === candidate.spec.generation &&
+          this.protectedBuild(candidate, build.id),
       );
       return build
         ? [
@@ -177,8 +201,9 @@ export class Recordings {
     requireThat(
       build?.candidate === task.candidate &&
         build.generation === candidate.spec.generation &&
-        build.toolchain.target === "web",
-      "This task needs a published Web build",
+        build.toolchain.target === "web" &&
+        this.protectedBuild(candidate, build.id),
+      "This task needs a completed protected Web build",
       409,
     );
     const session: TestSession = {
@@ -556,6 +581,10 @@ export class Recordings {
     return value;
   }
   private evidence(task: Task) {
+    const candidate = task.candidate
+      ? this.store.get<Candidate>(`candidate:${task.candidate}`)
+      : undefined;
+    if (!candidate) return undefined;
     const policy = this.policy();
     const rows = this.sql
       .exec<{
@@ -571,6 +600,7 @@ export class Recordings {
         (value) =>
           value.expiresAt > Date.now() &&
           value.candidate === task.candidate &&
+          this.protectedBuild(candidate, value.artifact) &&
           value.taskGeneration === task.resultGeneration &&
           value.requirements === requirements(task) &&
           value.finish?.outcome === "pass" &&

@@ -12,7 +12,7 @@ async function openStorage(page: Page) {
   await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Storage", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Shared checkout storage" })).toBeVisible();
 }
-test.beforeEach(async ({ request }) => { await request.post("http://127.0.0.1:18765/__test/reset"); });
+test.beforeEach(async ({ request }) => { await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/reset`); });
 
 test("storage source review binds import to the approved commit and supports prepared forks", async ({ page, request }) => {
   const errors: string[] = [];
@@ -37,7 +37,7 @@ test("storage source review binds import to the approved commit and supports pre
   await page.getByLabel("Checkout name").fill("cached-agent");
   await page.getByRole("button", { name: "Create checkout" }).click();
   await expect(page.getByRole("region", { name: "Checkout cached-agent", exact: true })).toBeVisible();
-  const requests = await (await request.get("http://127.0.0.1:18765/__test/storage-requests")).json();
+  const requests = await (await request.get(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/storage-requests`)).json();
   expect(requests.find((r: { operation: string }) => r.operation === "import").body).toEqual({ project: "demo", revision: "a".repeat(40), approval: "b".repeat(64), credential_free: true });
   expect(requests.filter((r: { operation: string }) => r.operation === "fork").at(-1).body.from).toBe("prepared");
   expect(JSON.stringify(requests)).not.toContain("/srv/");
@@ -49,7 +49,7 @@ test("storage source review binds import to the approved commit and supports pre
 });
 
 test("storage actions disable only their own checkout and show refusals and recovery", async ({ page, request }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", { data: { mode: "storage-slow" } });
+  await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/mode`, { data: { mode: "storage-slow" } });
   await openStorage(page);
   const a = page.getByRole("region", { name: "Checkout worker-a", exact: true });
   const b = page.getByRole("region", { name: "Checkout worker-b", exact: true });
@@ -80,16 +80,16 @@ for (const status of [404, 503]) test(`lost job observation (${status}) never re
   await expect(a.getByRole("button", { name: "Remount", exact: true })).toBeDisabled();
   await a.getByRole("button", { name: "Check job status" }).click();
   await expect(a.getByText("Remount completed.")).toBeVisible();
-  const requests = await (await request.get("http://127.0.0.1:18765/__test/storage-requests")).json();
+  const requests = await (await request.get(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/storage-requests`)).json();
   expect(requests.filter((r: { operation: string }) => r.operation === "remount")).toHaveLength(1);
 });
 
 test("empty and unavailable storage are explicit and proxy rejects arbitrary commands", async ({ page, request }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", { data: { mode: "storage-empty" } });
+  await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/mode`, { data: { mode: "storage-empty" } });
   await openStorage(page);
   await expect(page.getByRole("heading", { name: "Storage setup required" })).toBeVisible();
   expect((await page.request.post("/api/control/v1/storage/hosts/metal-01/exec", { headers: { origin: "http://127.0.0.1:3007" }, data: { argv: ["id"] } })).status()).toBe(404);
-  await request.post("http://127.0.0.1:18765/__test/mode", { data: { mode: "storage-error" } });
+  await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/mode`, { data: { mode: "storage-error" } });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("Storage catalog unavailable");
 });
@@ -128,7 +128,7 @@ test("GitHub import, LayerFS promotion and conflict-agent handoff use exact revi
   await expect(page.getByRole("button", { name: "Accept agent resolution" })).toBeEnabled();
   await page.getByRole("button", { name: "Accept agent resolution" }).click();
   await expect(page.getByLabel("GitHub sync status")).toContainText("delivered");
-  const requests=await (await request.get("http://127.0.0.1:18765/__test/storage-requests")).json();
+  const requests=await (await request.get(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/storage-requests`)).json();
   expect(requests.find((r:{operation:string})=>r.operation==="github-import").body).toEqual({ project:"web-app",revision:"c".repeat(40),approval:"d".repeat(64),credential_free:true });
   expect(requests.find((r:{operation:string})=>r.operation==="github-promote").body).toEqual({ project:"web-app",name:"github-agent",expected_main:"e".repeat(64),merge:true });
   expect(requests.find((r:{operation:string,body:{action?:string}})=>r.operation==="github-delivery"&&r.body.action==="resolve").body).toEqual({ project:"web-app",action:"resolve",attempt:"sync-fixture" });
@@ -145,7 +145,7 @@ test("GitHub source edits invalidate review and fetch failures never enable impo
   await expect(page.getByLabel("GitHub tracked files")).toBeVisible();
   await page.getByLabel("GitHub branch",{exact:true}).fill("different");
   await expect(page.getByRole("button",{name:"Import into LayerFS"})).not.toBeVisible();
-  await request.post("http://127.0.0.1:18765/__test/mode",{data:{mode:"github-fetch-failed"}});
+  await request.post(`http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}/__test/mode`,{data:{mode:"github-fetch-failed"}});
   await page.getByRole("button",{name:"Fetch and review",exact:true}).click();
   await expect(page.getByRole("alert")).toContainText("GitHub transfer failed");
   await expect(page.getByRole("button",{name:"Import into LayerFS"})).not.toBeVisible();

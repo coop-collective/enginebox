@@ -446,7 +446,10 @@ export class Project extends State {
     const rows = this.ctx.storage.sql
       .exec<{
         value: string;
-      }>("SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.spec.kind')='media-finalize' AND json_extract(value,'$.spec.recording')=? AND json_extract(value,'$.status')='assigned' LIMIT 1", id)
+      }>(
+        "SELECT value FROM records WHERE key LIKE 'job:%' AND json_extract(value,'$.spec.kind')='media-finalize' AND json_extract(value,'$.spec.recording')=? AND json_extract(value,'$.status')='assigned' LIMIT 1",
+        id,
+      )
       .toArray();
     const job = rows[0] ? (JSON.parse(rows[0].value) as JobRecord) : null;
     requireThat(
@@ -462,7 +465,9 @@ export class Project extends State {
       .exec<{
         key: string;
         value: string;
-      }>("SELECT key,value FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.state') IN ('ready','partial') AND json_extract(value,'$.media') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-input-cleaned:' || substr(records.key,11)) LIMIT 8")
+      }>(
+        "SELECT key,value FROM records WHERE key LIKE 'recording:%' AND json_extract(value,'$.state') IN ('ready','partial') AND json_extract(value,'$.media') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-input-cleaned:' || substr(records.key,11)) LIMIT 8",
+      )
       .toArray();
     for (const row of completed) {
       const value = JSON.parse(
@@ -497,7 +502,9 @@ export class Project extends State {
     const next = this.ctx.storage.sql
       .exec<{
         at: number | null;
-      }>("SELECT MIN(CASE WHEN json_extract(value,'$.state') IN ('recording','uploading') THEN MIN(json_extract(value,'$.expiresAt'),json_extract(value,'$.uploadExpiresAt')) ELSE json_extract(value,'$.expiresAt') END) AS at FROM records WHERE key LIKE 'recording:%' AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-cleaned:' || substr(records.key,11))")
+      }>(
+        "SELECT MIN(CASE WHEN json_extract(value,'$.state') IN ('recording','uploading') THEN MIN(json_extract(value,'$.expiresAt'),json_extract(value,'$.uploadExpiresAt')) ELSE json_extract(value,'$.expiresAt') END) AS at FROM records WHERE key LIKE 'recording:%' AND NOT EXISTS (SELECT 1 FROM records cleaned WHERE cleaned.key='recording-cleaned:' || substr(records.key,11))",
+      )
       .one().at;
     if (expired.length === 20 || completed.length === 8)
       await this.ctx.storage.setAlarm(Date.now() + 1000);
@@ -562,12 +569,15 @@ export class Project extends State {
     if (
       current.status === "testing" &&
       candidate &&
+      current.reviewReceipt &&
+      canonical(current.reviewReceipt) === canonical(reviewed.reviewReceipt) &&
+      this.tasks().reviewReady(current, candidate) &&
       this.get(`acceptance:${candidate.spec.generation}`)
     )
       return this.tasks().move(
         id,
         {
-          operationId: `ship-${input.operationId}`.slice(0, 48),
+          operationId: `ship-${createHash("sha256").update(input.operationId).digest("hex").slice(0, 40)}`,
           expectedRevision: current.revision,
           status: "shipped",
         },
@@ -1145,6 +1155,18 @@ export class Project extends State {
     job.result = canonical({
       error: "Interrupted attempt reconciled; submit a new job ID to retry",
     });
+    if (
+      job.spec.kind === "media-finalize" &&
+      this.recordingState().get(job.spec.recording)?.state === "finalizing"
+    )
+      this.recordingState().complete(
+        job.spec.recording,
+        {
+          error:
+            "Media attempt was reconciled after interruption; start a new recording",
+        },
+        false,
+      );
     this.put(key, job);
   }
 }

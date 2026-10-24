@@ -1,6 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 
-const fixture = "http://127.0.0.1:18765";
+const fixture = `http://127.0.0.1:${process.env.EBOX_TEST_FLEET_PORT ?? "18765"}`;
 async function signIn(page: Page) {
   await page.goto("/");
   await page.getByLabel("Operator password").fill("fixture-dashboard-password");
