@@ -21,6 +21,12 @@ enum Backend {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Export owned main or a closed branch as verified source for a dev preview.
+    DevExport {
+        project: String,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Observe the current accepted LayerFS main revision.
     Main { project: String },
     /// Promote or merge a closed checkpointed branch to LayerFS main.
@@ -190,6 +196,9 @@ pub fn run(args: Storage) -> Result<Value> {
     }
     let runtime = Runtime::new(config)?;
     match command {
+        Command::DevExport { project, workspace } => {
+            runtime.dev_export(&project, workspace.as_deref())
+        }
         Command::Main { project } => runtime.project_main(&project),
         Command::Promote {
             project,

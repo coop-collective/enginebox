@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "windows-builder",
+  "target": "builder@windows-node.example.invalid",
+  "os": "windows",
+  "architecture": "x64",
+  "image": "windows-2025-msvc",
+  "capabilities": [
+    "cmake",
+    "msvc",
+    "pwsh"
+  ]
+}

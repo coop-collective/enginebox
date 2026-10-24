@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "android-builder",
+  "target": "builder@android-node.example.invalid",
+  "os": "linux",
+  "architecture": "x64",
+  "image": "ubuntu-24.04-android",
+  "capabilities": [
+    "android-sdk",
+    "jdk-17"
+  ]
+}

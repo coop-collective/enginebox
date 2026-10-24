@@ -1,7 +1,8 @@
+import { fixtureOrigin, dashboardOrigin } from "./urls";
 import { test, expect, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 
-const origin = "http://127.0.0.1:3007";
+const origin = `${dashboardOrigin}`;
 async function signIn(page: Page) {
   await page.goto("/");
   await page.getByLabel("Operator password").fill("fixture-dashboard-password");
@@ -11,7 +12,7 @@ async function signIn(page: Page) {
   ).toBeVisible();
 }
 test.beforeEach(async ({ request }) => {
-  await request.post("http://127.0.0.1:18765/__test/reset");
+  await request.post(`${fixtureOrigin}/__test/reset`);
 });
 
 test("login protects fleet data, rejects wrong passwords and keeps API token server-side", async ({
@@ -105,14 +106,14 @@ test("failed jobs, empty fleet and API errors are visible", async ({
   await expect(
     page.getByText("The selected host does not have enough free storage."),
   ).toBeVisible();
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "empty" },
   });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Add your first host" }),
   ).toBeVisible();
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "error" },
   });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
@@ -125,7 +126,7 @@ test("pending lifecycle operations only change controls on their target workspac
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "slow-actions" },
   });
   await signIn(page);
@@ -205,7 +206,7 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "warm" },
   });
   await signIn(page);
@@ -292,7 +293,7 @@ test("template minimum and custom resources validate before a cold allocation", 
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "typed" },
   });
   await signIn(page);
@@ -354,7 +355,7 @@ test("preparing reserves remain unavailable and refill errors are visible", asyn
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "pool-preparing" },
   });
   await signIn(page);
@@ -376,7 +377,7 @@ test("canonical templates import once and automatically sync revisions and futur
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "catalog" },
   });
   await signIn(page);
@@ -430,7 +431,7 @@ test("canonical templates import once and automatically sync revisions and futur
   page.on("request", (req) => {
     if (req.method() === "POST") requests.push(req.url());
   });
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "catalog-new-node" },
   });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
@@ -468,7 +469,7 @@ test("template node failures stay explicit and fleet-wide retry recovers capacit
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "catalog-sync-error" },
   });
   await signIn(page);
@@ -502,7 +503,7 @@ test("exported templates download as portable manifests and can be reimported", 
   page,
   request,
 }) => {
-  await request.post("http://127.0.0.1:18765/__test/mode", {
+  await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "catalog" },
   });
   await signIn(page);
