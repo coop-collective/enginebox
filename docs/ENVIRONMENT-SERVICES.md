@@ -55,6 +55,21 @@ Enginebox build, process replacement or CD deployment runs for that source updat
 The dev server owns rebuilding, request handling and browser HMR/reload. HTTP and
 WebSocket traffic use the same generic port route.
 
+The environment runs the project's configured dev command. For a vinext project,
+use `"dev": "vinext dev"` in `package.json` and start `pnpm dev` (or the configured
+package-manager equivalent). Vinext/Vite owns browser HMR; the Cloudflare Vite
+plugin can keep server execution and bindings locally simulated in workerd. Do
+not substitute a standalone `wrangler dev` command for the framework's dev script.
+The supervisor has no framework selection or custom reload protocol.
+
+The importable `test/vinext` fixture demonstrates this setup with a pinned pnpm
+lockfile, local KV under `/data`, an explicit allowed public host and Vite's HMR
+client pointed at the public HTTPS port. Its cache mounts are documented in its
+README. `test/live-vinext-browser.mjs` checks the public WebSocket, a source update
+without page navigation and retained simulated KV state. It records React state
+preservation separately: framework HMR can remount components and reset their
+in-memory state while the dev process and persisted application data stay intact.
+
 ```json
 {
   "updateMode":"files", "writableDirs":[".wrangler","node_modules/.mf"],
@@ -105,6 +120,9 @@ cannot transparently carry that particular connection. A direct port connection
 preserves that path, or a project dev server with a configurable HMR endpoint.
 Do not claim public Wrangler reload merely because ordinary WebSockets work.
 See Cloudflare's [reserved endpoint documentation](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/).
+This restriction is specific to that Wrangler reload endpoint, not vinext/Vite's
+HMR transport. Keep the framework's own dev command and configure its public host
+and WebSocket client port for the proxy.
 
 ## Networking
 

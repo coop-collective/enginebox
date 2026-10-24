@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.vinext/
+.corepack/
+.pnpm-store/
+dist/
+.next/

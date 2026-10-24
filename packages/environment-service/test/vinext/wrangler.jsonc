@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "enginebox-vinext-dev-fixture",
+  "main": "vinext/server/app-router-entry",
+  "compatibility_date": "2026-10-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "not_found_handling": "none" },
+  "kv_namespaces": [{ "binding": "STATE", "id": "00000000000000000000000000000001", "remote": false }]
+}
