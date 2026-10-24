@@ -30,7 +30,7 @@ The software does not currently enforce node counts. The license is the agreemen
 
 ## How to buy
 
-Licenses are bought from the [pricing page](https://xavalabs.com/pricing/). Checkout is not open yet; the page says so until it is. Provider subscriptions (Codex, Claude, Cursor) are separate and stay with the provider.
+Licenses are bought from the [pricing page](https://enginebox.coopcollective.dev/pricing/). Checkout is not open yet; the page says so until it is. Provider subscriptions (Codex, Claude, Cursor) are separate and stay with the provider.
 
 ## Change Date
 

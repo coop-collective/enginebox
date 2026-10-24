@@ -37,4 +37,4 @@ CHECKOUT_URL=https://example.com/checkout pnpm --filter enginebox-site build
 - Set, it must be an `https://` URL; the plan shows a "Get a license" link to it.
 - Unset, the plan shows a disabled "Checkout opening soon" button with no link, and the build prints a warning. No checkout exists yet.
 
-`SITE_URL` sets the canonical origin (default `https://xavalabs.com`) and `OUT_DIR` overrides the `dist/` output directory (used by the build tests).
+`SITE_URL` sets the canonical origin (default `https://enginebox.coopcollective.dev`) and `OUT_DIR` overrides the `dist/` output directory (used by the build tests).

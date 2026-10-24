@@ -20,14 +20,14 @@ test('pricing page builds with the price, nav, sitemap and canonical link', () =
     assert.match(site.result.stderr, /CHECKOUT_URL is not set/);
     const html = site.read('pricing/index.html');
     assert.match(html, /\$10/);
-    assert.match(html, /<link rel="canonical" href="https:\/\/xavalabs\.com\/pricing\/">/);
+    assert.match(html, /<link rel="canonical" href="https:\/\/enginebox\.coopcollective\.dev\/pricing\/">/);
     assert.match(html, /<a href="\/pricing\/" aria-current="page">Pricing<\/a>/);
     assert.match(html, /Checkout opening soon/);
     assert.doesNotMatch(html, /data-checkout[^>]*href=/);
     assert.match(html, /\$30/);
     assert.match(site.read('index.html'), /<nav id="main-nav"[^]*href="\/pricing\/"[^]*<\/nav>/);
     assert.match(site.read('index.html'), /site-footer[^]*href="\/pricing\/"/);
-    assert.match(site.read('sitemap.xml'), /<loc>https:\/\/xavalabs\.com\/pricing\/<\/loc>/);
+    assert.match(site.read('sitemap.xml'), /<loc>https:\/\/enginebox\.coopcollective\.dev\/pricing\/<\/loc>/);
     assert.match(site.read('docs/licensing/index.html'), /\$10 per node per month/);
     assert.doesNotMatch(site.read('index.html'), /Sustainable Use/);
   } finally { rmSync(site.dir, { recursive: true, force: true }); }

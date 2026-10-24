@@ -163,7 +163,7 @@ Personal computers are an optional resource-contribution track. Owners choose ho
 Engine Box is source-available under the [Business Source License 1.1](LICENSE). It is not OSI open source.
 
 - **Free:** personal, non-commercial and non-production use (testing, evaluation, development).
-- **$10 per node per month:** production use by or on behalf of a business. A node is each machine registered with a controller to run workspaces; the controller itself does not count unless it also runs workspaces. Buy a license on the [pricing page](https://xavalabs.com/pricing/).
+- **$10 per node per month:** production use by or on behalf of a business. A node is each machine registered with a controller to run workspaces; the controller itself does not count unless it also runs workspaces. Buy a license on the [pricing page](https://enginebox.coopcollective.dev/pricing/).
 - **Separate agreement:** offering Engine Box to third parties as a hosted or managed service.
 - Each version converts to Apache-2.0 four years after its first public release.
 

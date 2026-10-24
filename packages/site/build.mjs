@@ -9,7 +9,7 @@ import { pricing, pricingTitle, pricingDescription } from './src/pricing.mjs';
 const root = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.OUT_DIR ? resolve(process.env.OUT_DIR) : join(root, 'dist');
 // Canonical origin for canonical/og:url links and the sitemap. Override with SITE_URL when deploying elsewhere.
-const siteUrl = (process.env.SITE_URL || 'https://xavalabs.com').replace(/\/+$/, '');
+const siteUrl = (process.env.SITE_URL || 'https://enginebox.coopcollective.dev').replace(/\/+$/, '');
 // Where the "Get a license" button points. No checkout exists yet: when unset, the pricing page shows a disabled button.
 const checkoutUrl = (process.env.CHECKOUT_URL || '').trim();
 if (checkoutUrl && !/^https:\/\/[^\s"<>]+$/.test(checkoutUrl)) throw new Error('CHECKOUT_URL must be an https:// URL');
