@@ -31,13 +31,14 @@ $fixtureImage=Join-Path $testRoot 'image-fixture'
 [IO.File]::WriteAllText($fixtureImage,'fixture-rootfs')
 $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 (Get-Content -Raw -LiteralPath $path).Replace('@@ROOTFS_URL@@','https://fixture.invalid/enginebox.wsl').Replace('@@ROOTFS_SHA256@@',$fixtureHash) | Set-Content -LiteralPath $flowScript -Encoding UTF8
-$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false }
+$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false; overrideChoice='n'; pendingId=$null; exportFailure=$false; exportInvalid=$false; enrollmentError=$null; stopped=0 }
 function global:Get-CimInstance { [pscustomobject]@{NumberOfLogicalProcessors=16;TotalPhysicalMemory=32GB} }
 function global:Get-ScheduledTask { return $null }
 function global:Register-ScheduledTask {
   param($TaskName,$Action,$Trigger,$Principal,$Description,$Settings,[switch]$Force)
   $global:EngineboxWslFixture.registrations+=@($Action.Execute)
 }
+function global:Stop-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.stopped++ }
 function global:Start-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.starts++ }
 function global:Read-Host {
   param($Prompt,[switch]$AsSecureString)
@@ -46,6 +47,7 @@ function global:Read-Host {
     return ConvertTo-SecureString $global:EngineboxWslFixture.secret -AsPlainText -Force
   }
   $global:EngineboxWslFixture.prompts+=@($Prompt)
+  if ($Prompt -eq 'Override existing? [Y/n]') { return $global:EngineboxWslFixture.overrideChoice }
   if ($Prompt -like 'Controller address*' -and $global:EngineboxWslFixture.controllerChoice) { return $global:EngineboxWslFixture.controllerChoice }
   return ''
 }
@@ -66,6 +68,12 @@ function global:Invoke-WebRequest {
   $global:EngineboxWslFixture.downloads++
   [IO.File]::WriteAllText($OutFile,'fixture-rootfs')
 }
+function global:tar.exe {
+  $global:LASTEXITCODE=0
+  if ($args[0] -ne '-tf' -or -not (Test-Path -LiteralPath $args[1])) { throw 'Unexpected archive validation' }
+  if ($global:EngineboxWslFixture.exportInvalid) { $global:LASTEXITCODE=1; return }
+  './etc/enginebox/installation-owner'; './etc/enginebox/wsl-runtime'; './usr/local/bin/enginebox-node'; './var/lib/enginebox/'
+}
 function global:wsl.exe {
   $global:LASTEXITCODE=0
   $global:EngineboxWslFixture.calls+=@(($args -join ' '))
@@ -73,6 +81,20 @@ function global:wsl.exe {
     '--version' { 'WSL version: '+$global:EngineboxWslFixture.version }
     '--list' { if ($global:EngineboxWslFixture.installed) { 'Enginebox' }; 'Ubuntu' }
     '--status' { return }
+    '--terminate' { if ($args[1] -ne 'Enginebox') { throw 'Unrelated distribution stopped' } }
+    '--export' {
+      if ($args[1] -ne 'Enginebox' -or $args.Count -ne 3) { throw 'Expected filesystem export without a VHD lock' }
+      if ($global:EngineboxWslFixture.exportFailure) { $global:LASTEXITCODE=1; return }
+      $stream=[IO.File]::Create($args[2])
+      try {
+        $magic='archive-fixture'
+        $bytes=[Text.Encoding]::ASCII.GetBytes($magic);$stream.Write($bytes,0,$bytes.Length);$stream.SetLength(1MB)
+      } finally { $stream.Dispose() }
+    }
+    '--unregister' {
+      if ($args[1] -ne 'Enginebox') { throw 'Unrelated distribution removed' }
+      $global:EngineboxWslFixture.installed=$false; $global:EngineboxWslFixture.enrolled=$false; $global:EngineboxWslFixture.pendingId=$null
+    }
     '--install' {
       if ($args.Count -ne 12 -or $args[1] -ne '--from-file' -or $args[3] -ne '--name' -or $args[4] -ne 'Enginebox' -or $args[7] -ne '--version' -or $args[8] -ne '2' -or $args[9] -ne '--vhd-size' -or $args[10] -ne '20GB' -or $args[11] -ne '--no-launch') { throw ('Incorrect import argv: '+($args -join ' ')) }
       $global:EngineboxWslFixture.installed=$true
@@ -80,14 +102,27 @@ function global:wsl.exe {
     '--distribution' {
       switch ($args[-1]) {
         '-' {
-          if ($args[-2] -ne 'python3' -or -not (($input | Out-String).Contains('/proc/meminfo'))) { throw 'Unexpected capacity probe' }
-          @{cpu=$global:EngineboxWslFixture.linuxCpu;memory_bytes=$global:EngineboxWslFixture.linuxMemory;committed=$global:EngineboxWslFixture.committed} | ConvertTo-Json -Compress
+          if ($args[-2] -ne 'python3') { throw 'Unexpected probe' }
+          $probe=$input | Out-String
+          if ($probe.Contains('/proc/meminfo')) {
+            @{cpu=$global:EngineboxWslFixture.linuxCpu;memory_bytes=$global:EngineboxWslFixture.linuxMemory;committed=$global:EngineboxWslFixture.committed} | ConvertTo-Json -Compress
+          } elseif ($probe.Contains('/var/lib/enginebox/private/worker.json')) {
+            @{id=$global:EngineboxWslFixture.pendingId;enrolled=$global:EngineboxWslFixture.enrolled} | ConvertTo-Json -Compress
+          } else { throw 'Unexpected probe body' }
         }
         '/etc/enginebox/installation-owner' { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
         'configure' { $global:EngineboxWslFixture.configuration=($input | Out-String | ConvertFrom-Json) }
         'enrolled' { if (-not $global:EngineboxWslFixture.enrolled) { $global:LASTEXITCODE=1 }; return }
         'claim' { $global:EngineboxWslFixture.claim=($input | Out-String).Trim() }
-        'enroll' { $global:EngineboxWslFixture.code=($input | Out-String).Trim(); $global:EngineboxWslFixture.enrolled=$true }
+        'enginebox-docker.service' { return }
+        'sync' { return }
+        'enroll' {
+          $global:EngineboxWslFixture.code=($input | Out-String).Trim()
+          if ($global:EngineboxWslFixture.enrollmentError) {
+            $global:LASTEXITCODE=1;Write-Error $global:EngineboxWslFixture.enrollmentError; return
+          }
+          $global:EngineboxWslFixture.enrolled=$true
+        }
         default { throw 'Unexpected WSL mutation' }
       }
     }
@@ -97,7 +132,7 @@ function global:wsl.exe {
 try {
   & $flowScript -InstallDirectory (Join-Path $testRoot 'ready')
   $f=$global:EngineboxWslFixture
-  if ($f.prompts.Count -ne 4 -or $f.configuration.controller -ne 'https://enginebox.coopcollective.dev' -or $f.configuration.cpu -ne 4 -or $f.configuration.memory_gib -ne 8) { throw 'Installer defaults or prompts were not applied' }
+  if ($f.prompts.Count -ne 5 -or $f.configuration.controller -ne 'https://enginebox.coopcollective.dev' -or $f.configuration.cpu -ne 4 -or $f.configuration.memory_gib -ne 8) { throw 'Installer defaults or prompts were not applied' }
   if ($f.configuration.disk_gib -lt 20 -or $f.configuration.disk_gib -gt 50) { throw 'Disk default outside bounds' }
   if ($f.starts -ne 1 -or [IO.Path]::GetFileName($f.registrations[-1]) -ne 'wsl.exe' -or $f.updates -ne 0) { throw ('Worker must start only in WSL: '+($f | ConvertTo-Json -Compress)) }
   $global:EngineboxWslFixture.version='2.3.26'
@@ -139,6 +174,42 @@ try {
   if (-not $failed -or $f.starts -ne $beforeStarts -or $null -ne $f.configuration) { throw 'Insufficient WSL memory must report actionable guidance before configuration' }
   if ($f.calls | Where-Object { $_ -match '--shutdown|--terminate|--unregister' }) { throw 'Capacity recovery must not interrupt other WSL distributions' }
   $f.linuxMemory=16GB; $f.linuxCpu=16
+  # Enter accepts Override existing by default. A complete private backup must
+  # precede unregistering, and the new runtime must take the fresh invitation.
+  $f.overrideChoice=''; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@()
+  $replacement=Join-Path $testRoot 'replacement'
+  $newCode=('e'*32)+'.'+('f'*64)
+  & $flowScript -InstallDirectory $replacement -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode
+  $backups=@(Get-ChildItem -LiteralPath (Join-Path $replacement 'backups') -Directory)
+  if ($backups.Count -ne 1 -or $f.code -ne $newCode -or -not $f.enrolled -or $f.stopped -ne 1) { throw 'Default override must back up and register a fresh runtime' }
+  $backup=Join-Path $backups[0].FullName 'enginebox.tar'
+  $receipt=Get-Content -Raw -LiteralPath (Join-Path $backups[0].FullName 'backup.json') | ConvertFrom-Json
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backup).Hash -ne $receipt.sha256) { throw 'Missing verified backup receipt' }
+  $exportIndex=[array]::IndexOf($f.calls,($f.calls | Where-Object { $_ -like '--export *' } | Select-Object -First 1))
+  $removeIndex=[array]::IndexOf($f.calls,'--unregister Enginebox')
+  if ($exportIndex -lt 0 -or $removeIndex -le $exportIndex) { throw 'Replacement removed state before export' }
+  # Startup resumption never repeats override, even with the default Yes answer.
+  $f.calls=@(); $beforeStops=$f.stopped
+  & $flowScript -InstallDirectory $replacement -Resume
+  if ($f.stopped -ne $beforeStops -or ($f.calls | Where-Object { $_ -like '--export*' -or $_ -like '--unregister*' })) { throw 'Resume must not repeat replacement' }
+  foreach ($failure in @('exportFailure','exportInvalid')) {
+    $f[$failure]=$true; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@(); $beforeStarts=$f.starts
+    $failed=$false
+    try { & $flowScript -InstallDirectory (Join-Path $testRoot $failure) -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode } catch { $failed=$true }
+    if (-not $failed -or -not $f.installed -or $f.pendingId -ne ('a'*32) -or $f.starts -ne $beforeStarts -or ($f.calls | Where-Object { $_ -like '--unregister*' })) { throw 'An incomplete backup must retain the existing distribution' }
+    $f[$failure]=$false
+  }
+  # Choosing No retains the old identity and explains a mismatched code locally.
+  $f.overrideChoice='n'; $f.calls=@(); $failed=$false
+  try { & $flowScript -InstallDirectory (Join-Path $testRoot 'retain') -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode } catch { $failed=$_.Exception.Message -like '*Saved machine ID*' }
+  if (-not $failed -or $f.pendingId -ne ('a'*32) -or ($f.calls | Where-Object { $_ -like '--unregister*' })) { throw 'Declining override must retain the pending identity' }
+  # Show and save the underlying native error, with credentials removed.
+  $f.enrollmentError='Controller returned HTTP 409; credential '+$code
+  $failed=$false; $errorsRoot=Join-Path $testRoot 'error-detail'
+  try { & $flowScript -InstallDirectory $errorsRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code } catch { $failed=$_.Exception.Message -like '*HTTP 409*' -and -not $_.Exception.Message.Contains($code) }
+  $detail=Get-Content -Raw -LiteralPath (Join-Path $errorsRoot 'registration-error.txt')
+  if (-not $failed -or $detail.Contains($code) -or -not $detail.Contains('[redacted credential]') -or $f.enrolled) { throw 'Registration failure detail must be useful and exclude credentials' }
+  $f.enrollmentError=$null; $f.pendingId=$null; $f.enrolled=$true
   $f.version=''; $f.calls=@(); $beforeStarts=$f.starts
   $rebootRoot=Join-Path $testRoot 'reboot'
   & $flowScript -InstallDirectory $rebootRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
@@ -149,6 +220,6 @@ try {
   Write-Output 'Fresh import and stdin registration, defaults, custom controller/resources, WSL upgrade/reboot, constrained-memory recovery, immutable registered budgets, minimum capacity and WSL-only startup passed.'
 } finally {
   Remove-Item -LiteralPath $testRoot -Recurse -Force
-  foreach ($name in @('Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
+  foreach ($name in @('Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','tar.exe','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
   Remove-Variable EngineboxWslFixture -Scope Global
 }
