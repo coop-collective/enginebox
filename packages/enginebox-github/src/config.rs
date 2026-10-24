@@ -59,6 +59,11 @@ mod tests {
     #[test]
     fn private_file_references_load_without_values_in_config() {
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let secret = temp.path().join("secret");
         fs::write(&secret, "fixture-private-secret\n").unwrap();
         #[cfg(unix)]

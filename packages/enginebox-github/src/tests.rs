@@ -11,7 +11,7 @@ fn config() -> Value {
     runners["slug"] = json!("fixture-runners");
     json!({"schema":1,"callback_url":"https://example.invalid/api/github/callback","repos":app,"runners":runners,"pools":[{"id":"linux","installation_id":2,"organization":"fixture","runner_group_id":1,"labels":["self-hosted","Linux","X64","enginebox-linux"],"max_runners":1,"timeout_seconds":300,"worker":["/fixture/worker"]}]})
 }
-fn service() -> (tempfile::TempDir, GitHub) {
+pub(crate) fn service() -> (tempfile::TempDir, GitHub) {
     let root = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     {
@@ -22,11 +22,14 @@ fn service() -> (tempfile::TempDir, GitHub) {
     let service = GitHub::open(root.path()).unwrap();
     (root, service)
 }
-fn api_fixture(responses: Vec<(&'static str, Value)>) -> (api::Api, std::thread::JoinHandle<()>) {
+pub(crate) fn api_fixture(
+    responses: Vec<(&'static str, Value)>,
+) -> (api::Api, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let thread = std::thread::spawn(move || {
-        for (expected, response) in responses {
+        let mut runner_name = Value::Null;
+        for (expected, mut response) in responses {
             let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -62,6 +65,14 @@ fn api_fixture(responses: Vec<(&'static str, Value)>) -> (api::Api, std::thread:
                 assert_eq!(value["repository_ids"], json!([101]));
                 assert_eq!(value["permissions"], json!({"contents":"read"}));
             }
+            if expected.contains("generate-jitconfig") {
+                let value: Value = serde_json::from_slice(&input).unwrap();
+                runner_name = value["name"].clone();
+                assert_eq!(value["runner_group_id"], 1);
+            }
+            if response["name"] == "fixture-created-runner" {
+                response["name"] = runner_name.clone();
+            }
             let bytes = response.to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",bytes.len(),bytes).unwrap();
         }
@@ -71,7 +82,7 @@ fn api_fixture(responses: Vec<(&'static str, Value)>) -> (api::Api, std::thread:
 fn token() -> Value {
     json!({"access_token":"fixture-user-access","refresh_token":"fixture-user-refresh","expires_in":28800})
 }
-fn account(g: &GitHub) {
+pub(crate) fn account(g: &GitHub) {
     let mut data = g.data.lock().unwrap();
     let mut value = normalize_token(token()).unwrap();
     value["id"] = json!(1);

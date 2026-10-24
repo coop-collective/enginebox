@@ -332,6 +332,107 @@ fn job_persistence_failure(data: &mut crate::Data, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn jit_worker_cleanup_is_owned_and_worker_output_is_filtered() {
+        use crate::tests::{account, api_fixture, service};
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            process::{Command, Stdio},
+        };
+        let (root, mut g) = service();
+        account(&g);
+        let key = Command::new("openssl")
+            .args(["genrsa", "2048"])
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(key.status.success());
+        g.config
+            .as_mut()
+            .unwrap()
+            .runners
+            .as_mut()
+            .unwrap()
+            .private_key = String::from_utf8(key.stdout).unwrap();
+        let worker = root.path().join("fixture-worker");
+        fs::write(&worker,r#"#!/usr/bin/env python3
+import json,sys
+r=json.load(sys.stdin)
+assert r['jitconfig']=='fixture-jit-config'
+assert set(r)=={'schema','name','job_id','repository','jitconfig','timeout_seconds'}
+print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':True,'runner_version':'2.337.0','duration_seconds':1,'private_extra':'must-not-expose'}))
+"#).unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+        g.config.as_mut().unwrap().pools[0].worker = vec![worker.to_str().unwrap().into()];
+        {
+            let mut data = g.data.lock().unwrap();
+            let repo_account = data.accounts["repos"].clone();
+            data.accounts.insert("runners".into(), repo_account);
+            data.repositories.insert(
+                101,
+                crate::Repository {
+                    id: 101,
+                    installation_id: 4,
+                    full_name: "fixture/private".into(),
+                    private: true,
+                    branch: "main".into(),
+                },
+            );
+            data.jobs.insert("2-99".into(),json!({"id":99,"repository":"fixture/private","repository_id":101,"run_id":44,"status":"running"}));
+        }
+        let (api, server) = api_fixture(vec![
+            (
+                "/user/installations?",
+                json!({"installations":[{"id":2,"account":{"login":"fixture"},"permissions":{"organization_self_hosted_runners":"write"},"suspended_at":null}]}),
+            ),
+            (
+                "/app/installations/2/access_tokens",
+                json!({"token":"fixture-installation-token"}),
+            ),
+            (
+                "/user/installations/4/repositories?",
+                json!({"repositories":[{"id":101}]}),
+            ),
+            (
+                "/repos/fixture/private/actions/jobs/99",
+                json!({"id":99,"run_id":44,"status":"queued"}),
+            ),
+            (
+                "generate-jitconfig",
+                json!({"runner":{"id":501},"encoded_jit_config":"fixture-jit-config"}),
+            ),
+            (
+                "/app/installations/2/access_tokens",
+                json!({"token":"fixture-cleanup-token"}),
+            ),
+            (
+                "GET /orgs/fixture/actions/runners/501",
+                json!({"name":"fixture-created-runner","busy":false}),
+            ),
+            ("DELETE /orgs/fixture/actions/runners/501", json!({})),
+        ]);
+        g.api = api;
+        let result = g
+            .run_job("2-99", &g.config.as_ref().unwrap().pools[0])
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result["cleaned"], true);
+        assert_eq!(result["runner_id"], 501);
+        for secret in [
+            "fixture-jit-config",
+            "fixture-installation-token",
+            "must-not-expose",
+        ] {
+            assert!(!result.to_string().contains(secret));
+            assert!(
+                !fs::read_to_string(g.root.join("state.json"))
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+    }
     #[test]
     fn signature_is_raw_body_bound() {
         let key = hmac::Key::new(hmac::HMAC_SHA256, b"fixture");
