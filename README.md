@@ -2,7 +2,7 @@
 
 Prepared environments for native coding agents, on hardware you control.
 
-Engine Box is a source-available (not open-source; see [License](#source-available-and-commercial-boundary)) toolkit that manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Native clients keep their planning loops; Engine Box owns the reusable task, workspace, integration and validation workflow that apps such as Gamejam consume.
+Engine Box is a source-available (not open-source; see [License](#license-and-pricing)) toolkit that manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Native clients keep their planning loops; Engine Box owns the reusable task, workspace, integration and validation workflow that apps such as Gamejam consume.
 
 The goal is less repeated setup and faster, trustworthy feedback from builds and tests. Self-hosted CI optimization is an optional module on the same foundation.
 
@@ -143,7 +143,7 @@ Full index: [docs/README.md](docs/README.md).
 - [Persistent private agent state and native session launching](docs/TENANT-AGENT-STATE.md)
 - [Portable host capabilities and platform qualification](docs/PORTABLE-HOSTS.md)
 - [Provider allowance and billing visibility](docs/AGENT-USAGE.md)
-- [License and commercial boundary](docs/LICENSING.md)
+- [License, pricing and nodes](docs/LICENSING.md)
 - [Server bootstrap](docs/BOOTSTRAP.md)
 - [Fleet API and MCP](docs/FLEET.md)
 - [Template catalog and resource requirements](docs/TEMPLATES.md)
@@ -158,8 +158,13 @@ The first host target is Linux x86_64 with KVM; the reference prototype used Ubu
 
 Personal computers are an optional resource-contribution track. Owners choose how much CPU and memory to contribute. The current Linux fleet enforces configured contribution ceilings in admission in addition to physical reserves and per-VM limits. macOS/Windows Docker and native workers are not yet enrollment targets; `enginebox-host` reports hardware and planning budgets without installing a worker or allocating resources. See the [platform matrix and installation gates](docs/PORTABLE-HOSTS.md).
 
-## Source-available and commercial boundary
+## License and pricing
 
-This repository contains the source-available environment foundation. Personal and internal company self-hosting are permitted under the community license. Commercial hosting, selling access and commercial redistribution require a separate agreement. Reusable optional modules, including CI integration, will live here as they are implemented. Managed hosting and proprietary workspace recipes can be separate offerings. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.
+Engine Box is source-available under the [Business Source License 1.1](LICENSE). It is not OSI open source.
 
-New versions use the [Sustainable Use License 1.0](LICENSE), originally published by n8n. This is not OSI open source. Previously published Apache-2.0 code retains its existing rights; see the [licensing boundary](docs/LICENSING.md).
+- **Free:** personal, non-commercial and non-production use (testing, evaluation, development).
+- **$10 per node per month:** production use by or on behalf of a business. A node is each machine registered with a controller to run workspaces; the controller itself does not count unless it also runs workspaces. Buy a license on the [pricing page](https://enginebox.coopcollective.dev/pricing/).
+- **Separate agreement:** offering Engine Box to third parties as a hosted or managed service.
+- Each version converts to Apache-2.0 four years after its first public release.
+
+Earlier versions keep the licenses they were published under (Apache-2.0 through commit `19f834a`, then a prior source-available license). See [docs/LICENSING.md](docs/LICENSING.md) and [NOTICE](NOTICE). Reusable optional modules, including CI integration, will live here as they are implemented. Managed hosting is planned and not available. Third-party clients and engines retain their own licenses; they are not bundled or relicensed here.

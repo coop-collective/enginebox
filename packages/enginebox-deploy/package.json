@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "private": true,
   "type": "module",
-  "license": "SEE LICENSE IN ../../LICENSE",
+  "license": "BUSL-1.1",
   "engines": { "node": ">=22.12" },
   "scripts": { "test": "node --test test/*.test.mjs" }
 }
