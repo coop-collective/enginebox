@@ -94,7 +94,6 @@ impl Peer {
                 urls: server.urls.clone(),
                 username: server.username.clone(),
                 credential: server.credential.clone(),
-                ..Default::default()
             });
         }
         if policy == "relay"
@@ -174,6 +173,23 @@ impl Peer {
             }
         });
         let (p, i) = (permit.clone(), input.clone());
+        // Independent of controller HTTP: expiry releases held keys even while
+        // the main poll is waiting for a network timeout.
+        let (watch_permit, watch_input, watch_pc) = (permit.clone(), input.clone(), pc.clone());
+        let watchdog = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tick.tick().await;
+                if !watch_permit.valid() {
+                    watch_permit.revoke();
+                    if watch_permit.control {
+                        watch_input.lock().unwrap().release_all();
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(2), watch_pc.close()).await;
+                    break;
+                }
+            }
+        });
         let accepted = Arc::new(AtomicBool::new(false));
         pc.on_data_channel(Box::new(move |channel| {
             let (p, i, accepted) = (p.clone(), i.clone(), accepted.clone());
@@ -202,7 +218,7 @@ impl Peer {
             answer: None,
             negotiation: None,
             offered: false,
-            tasks: vec![rtcp, send],
+            tasks: vec![rtcp, send, watchdog],
             input,
         })
     }
@@ -276,5 +292,67 @@ impl Drop for Peer {
         if self.permit.control {
             self.input.lock().unwrap().release_all();
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires the owned Linux test-runtime image with Xvfb/native fixture"]
+    async fn lease_watchdog_releases_held_key_while_controller_http_is_blocked() -> Result<()> {
+        use crate::{capture::Capture, config::Config};
+        use std::sync::atomic::AtomicU64;
+        let config: Config = serde_json::from_value(
+            serde_json::json!({"controller":"https://fixture.example","project":"fixture","width":640,"height":360,"command":{"executable":"/usr/local/bin/enginebox-test-window","directory":"/app"}}),
+        )?;
+        let capture = Capture::start(
+            &config,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await?;
+        let session: Session = serde_json::from_value(
+            serde_json::json!({"id":"lease-test","project":"fixture","nodeId":"native-fixture","nodeEpoch":1,"mode":"control","state":"open","expires":60000}),
+        )?;
+        let permit = Permit::new(true, Duration::from_secs(5));
+        let peer = Peer::start(
+            &api()?,
+            session,
+            permit.clone(),
+            &[],
+            "all",
+            capture.input.clone(),
+            capture.frames.subscribe(),
+        )
+        .await?;
+        permit.renew(Duration::from_millis(250));
+        capture
+            .input
+            .lock()
+            .unwrap()
+            .apply(br#"{"type":"keydown","key":"KeyA"}"#, &permit)?;
+        assert!(capture.input.lock().unwrap().server_has_pressed_keys()?);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let blocked = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/poll"))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await;
+        assert!(response.is_err());
+        assert!(!permit.valid());
+        assert!(
+            !capture.input.lock().unwrap().server_has_pressed_keys()?,
+            "independent deadline must release the native key during HTTP await"
+        );
+        peer.stop().await;
+        capture.stop().await;
+        blocked.abort();
+        Ok(())
     }
 }

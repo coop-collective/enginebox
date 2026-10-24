@@ -1,3 +1,4 @@
 /target/
 /.state/
+/.cargo/
 **/.godot/

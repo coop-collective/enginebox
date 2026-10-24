@@ -112,7 +112,11 @@ impl Controller {
             return Err(AuthorityLost.into());
         }
         if !response.status().is_success() {
-            bail!("controller returned HTTP{}", response.status().as_u16())
+            bail!(
+                "controller returned HTTP{} for {}",
+                response.status().as_u16(),
+                path.split('?').next().unwrap_or(path)
+            )
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {

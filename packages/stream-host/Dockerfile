@@ -28,8 +28,16 @@ RUN apt-get update && apt-get install --no-install-recommends -y gcc libc6-dev l
     && rm -rf /var/lib/apt/lists/*
 COPY test/window.c /window.c
 RUN gcc -O2 -Wall -Wextra /window.c -lX11 -o /window
+FROM build AS test-build
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo test --release --locked --no-run --message-format=json -j 4 > /tmp/test-artifacts.json \
+    && test_binary=$(sed -n '/"test":true/s/.*"executable":"\([^"]*\)".*/\1/p' /tmp/test-artifacts.json | tail -n 1) \
+    && test -n "$test_binary" && cp "$test_binary" /usr/local/bin/stream-host-tests
 FROM runtime AS test-runtime
 COPY --from=fixture-build /window /usr/local/bin/enginebox-test-window
+COPY --from=test-build /usr/local/bin/stream-host-tests /usr/local/bin/stream-host-tests
 
 # An unqualified `docker build` must never include the test application.
 FROM runtime AS default

@@ -145,10 +145,10 @@ async fn run(config: Config, controller: Controller, node: String, epoch: u64) -
             }
             eprintln!("Stream authority unavailable; streams stopped: {error}");
         }
-        if peers.is_empty() {
-            if let Some(c) = capture.take() {
-                c.stop().await;
-            }
+        if peers.is_empty()
+            && let Some(c) = capture.take()
+        {
+            c.stop().await;
         }
     };
     for (_, p) in peers.drain() {

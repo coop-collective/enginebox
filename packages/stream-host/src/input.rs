@@ -31,10 +31,18 @@ impl Permit {
         })
     }
     pub fn renew(&self, ttl: Duration) {
-        *self.deadline.lock().unwrap() = Instant::now() + ttl;
+        let mut deadline = self.deadline.lock().unwrap();
+        if Instant::now() >= *deadline {
+            self.revoke();
+            return;
+        }
+        *deadline = Instant::now() + ttl;
     }
     pub fn valid(&self) -> bool {
-        self.active.load(Ordering::SeqCst) && Instant::now() < *self.deadline.lock().unwrap()
+        if Instant::now() >= *self.deadline.lock().unwrap() {
+            self.revoke();
+        }
+        self.active.load(Ordering::SeqCst)
     }
     pub fn revoke(&self) {
         self.active.store(false, Ordering::SeqCst);
@@ -175,6 +183,16 @@ impl Input {
         }
         let _ = self.conn.flush();
     }
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn server_has_pressed_keys(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_keymap()?
+            .reply()?
+            .keys
+            .iter()
+            .any(|b| *b != 0))
+    }
 }
 impl Drop for Input {
     fn drop(&mut self) {
@@ -216,6 +234,8 @@ mod tests {
         p.revoke();
         assert!(!p.valid());
         let p = Permit::new(true, Duration::ZERO);
+        assert!(!p.valid());
+        p.renew(Duration::from_secs(60));
         assert!(!p.valid());
     }
     #[test]
