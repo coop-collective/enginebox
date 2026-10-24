@@ -27,6 +27,12 @@ import { Tasks } from "./tasks.ts";
 import { Builds } from "./builds.ts";
 import { Artifacts } from "./artifacts.ts";
 import type { BuildManifest } from "@enginebox/fleet-protocol";
+import { Machines, type MachineAuthority } from "./machines.ts";
+import type {
+  MachineGrantRequest,
+  MachineSignalRequest,
+} from "@enginebox/fleet-protocol";
+import type { MachineIceConfiguration } from "./machine-turn.ts";
 
 export class State extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -84,6 +90,12 @@ export class Registry extends State {
   async assistants(project: string) {
     return this.rows<string>(`assistant:${project}:`);
   }
+  async registerMachine(project: string, id: string) {
+    this.put(`machine:${project}:${id}`, id);
+  }
+  async machines(project: string) {
+    return this.rows<string>(`machine:${project}:`);
+  }
 }
 
 type NodeRecord = NodeView & { secretHash: string };
@@ -92,8 +104,100 @@ type Reservation = Assignment & {
   outcome?: string;
 };
 export class FleetNode extends State {
+  async invite(
+    spec: NodeSpec,
+    token: string,
+    tokenHash: string,
+    expires: number,
+  ) {
+    const prior = this.get<{
+      spec: NodeSpec;
+      token: string;
+      tokenHash: string;
+      expires: number;
+      revoked?: boolean;
+    }>("invitation");
+    requireThat(!this.get("node"), "Machine invitation already consumed", 409);
+    if (prior) {
+      requireThat(
+        !prior.revoked && prior.expires > Date.now(),
+        "Machine invitation expired or revoked; use a new ID",
+        409,
+      );
+      requireThat(
+        canonical(prior.spec) === canonical(spec),
+        "Machine invitation ID already has different settings",
+        409,
+      );
+      return { node: prior.spec, token: prior.token, expires: prior.expires };
+    }
+    this.put("invitation", { spec, token, tokenHash, expires });
+    return { node: spec, token, expires };
+  }
+  async enroll(tokenHash: string, secretHash: string) {
+    const invite = this.get<{
+      spec: NodeSpec;
+      tokenHash: string;
+      expires: number;
+      revoked?: boolean;
+    }>("invitation");
+    requireThat(
+      invite &&
+        !invite.revoked &&
+        invite.tokenHash === tokenHash &&
+        invite.expires > Date.now(),
+      "Invalid or expired machine invitation",
+      401,
+    );
+    const prior = this.get<NodeRecord>("node");
+    if (prior) {
+      requireThat(
+        !prior.revoked && prior.secretHash === secretHash,
+        "Invitation already claimed by another identity",
+        409,
+      );
+    } else {
+      this.put("node", {
+        ...invite.spec,
+        secretHash,
+        epoch: 0,
+        session: null,
+        lastSeen: 0,
+        revoked: false,
+        ready: {},
+        stats: {},
+      } satisfies NodeRecord);
+    }
+    return invite.spec;
+  }
+  async machineView() {
+    const node = await this.view();
+    if (node) return node;
+    const invite = this.get<{
+      spec: NodeSpec;
+      expires: number;
+      revoked?: boolean;
+    }>("invitation");
+    return invite
+      ? {
+          ...invite.spec,
+          epoch: 0,
+          session: null,
+          lastSeen: 0,
+          ready: {},
+          stats: {} as Record<string, number>,
+          revoked: !!invite.revoked,
+          pending: true,
+          invitationExpires: invite.expires,
+        }
+      : null;
+  }
   async create(spec: NodeSpec, secretHash: string) {
-    requireThat(!this.get("node"), "Node already exists", 409);
+    requireThat(
+      !this.get("node") && !this.get("invitation"),
+      "Node already exists",
+      409,
+    );
     this.put("node", {
       ...spec,
       secretHash,
@@ -125,6 +229,20 @@ export class FleetNode extends State {
     const node = this.get<NodeRecord>("node")!;
     requireThat(!node.revoked, "Node revoked", 401);
     if (node.session !== session) {
+      if (node.role === "native") {
+        requireThat(
+          !this.get(`native-boot:${session}`),
+          "Native process was already fenced",
+          409,
+        );
+        requireThat(
+          node.epoch < 4096,
+          "Native boot history full; enroll a new identity",
+          409,
+        );
+        this.put(`native-boot:${session}`, true);
+        node.stats = {};
+      }
       node.epoch++;
       node.session = session;
       node.ready = {};
@@ -152,6 +270,10 @@ export class FleetNode extends State {
       409,
     );
     return node;
+  }
+  async checkSession(epoch: number, session: string) {
+    this.current(epoch, session);
+    return true;
   }
   private hasUncertainNative(epoch: number) {
     return this.rows<Reservation>("lease:").some(
@@ -315,11 +437,16 @@ export class FleetNode extends State {
     this.put("node", node);
   }
   async revoke() {
-    const node = this.get<NodeRecord>("node")!;
-    node.revoked = true;
-    node.epoch++;
-    node.ready = {};
-    this.put("node", node);
+    const node = this.get<NodeRecord>("node");
+    const invite = this.get<{ revoked?: boolean }>("invitation");
+    requireThat(node || invite, "Unknown node", 404);
+    if (invite) this.put("invitation", { ...invite, revoked: true });
+    if (node && !node.revoked) {
+      node.revoked = true;
+      node.epoch++;
+      node.ready = {};
+      this.put("node", node);
+    }
   }
   async grant(project: string, generation: string, reader: string) {
     const node = this.get<NodeRecord>("node")!;
@@ -385,6 +512,62 @@ type CandidateRecord = {
   taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
+  private machines() {
+    return new Machines(this, this.ctx.storage.sql);
+  }
+  async syncMachine(id: string, epoch: number, revoked: boolean) {
+    return this.machines().sync(id, epoch, revoked);
+  }
+  async machineGrantExisting(input: MachineGrantRequest, epoch: number) {
+    return this.machines().existingGrant(input, epoch);
+  }
+  async machineGrantIce(input: MachineGrantRequest, epoch: number) {
+    return this.machines().grantIce(input, epoch);
+  }
+  async machineGrant(
+    input: MachineGrantRequest,
+    epoch: number,
+    token: string,
+    tokenHash: string,
+    ice: MachineIceConfiguration,
+  ) {
+    return this.machines().grant(input, epoch, token, tokenHash, ice);
+  }
+  async machineOpen(
+    id: string,
+    grantId: string,
+    grantHash: string,
+    clientHash: string,
+  ) {
+    return this.machines().open(id, grantId, grantHash, clientHash);
+  }
+  async machineSession(id: string, auth: MachineAuthority) {
+    return this.machines().view(id, auth);
+  }
+  async machineSignals(id: string, auth: MachineAuthority, after: number) {
+    return this.machines().signals(id, auth, after);
+  }
+  async machineSignal(
+    id: string,
+    auth: MachineAuthority,
+    input: MachineSignalRequest,
+  ) {
+    return this.machines().signal(id, auth, input);
+  }
+  async machineRenew(
+    id: string,
+    auth: MachineAuthority,
+    grantId: string,
+    grantHash: string,
+  ) {
+    return this.machines().renew(id, auth, grantId, grantHash);
+  }
+  async machineEnd(id: string, auth: MachineAuthority, operationId: string) {
+    return this.machines().end(id, auth, operationId);
+  }
+  async machinePoll(nodeId: string, epoch: number) {
+    return this.machines().poll(nodeId, epoch);
+  }
   async buildEligible(job: JobSpec, node: string | undefined) {
     return new Builds(this).eligible(job, node);
   }
