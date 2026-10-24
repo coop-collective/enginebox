@@ -25,6 +25,23 @@ Resources are selected on the PC, not in the dashboard. A registration code
 expires after one hour and authorizes exactly one node; that node registers its chosen resource
 allowance. Older API clients may supply an explicit owner ceiling.
 
+When the normal installer finds an owned Enginebox distribution, it asks
+**Override existing? [Y/n]**. Pressing Enter chooses Yes: the installer downloads
+and verifies the replacement, stops only Enginebox, exports its complete stopped
+VHDX into `%LOCALAPPDATA%\Enginebox\wsl-node\backups\<timestamp-id>`, checks the
+export and records its SHA-256, then removes the old WSL registration and installs
+a fresh runtime. The backup retains the previous identity, credentials, settings
+and LayerFS workspace data. Keep it private. A failed export prevents removal.
+Other WSL distributions are untouched.
+
+Use a newly generated dashboard install command for a replacement. Choose **N**
+to continue the existing runtime and identity instead. Automatic startup uses
+`-Resume`, which never asks to replace an existing distribution. The installer
+holds a local file lock so two copies cannot replace the same installation at
+once. Backup archives can be restored as a separate WSL2 distribution using
+[Microsoft's export/import commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands#export-a-distribution);
+import a copy rather than booting the original backup in place.
+
 The installer updates WSL to at least 2.5.7 when needed. Enabling WSL can trigger
 Windows UAC and require a reboot. It saves non-secret setup state and schedules
 resumption under the original Windows user. It does not force a reboot. A code
@@ -40,13 +57,20 @@ wsl -d Enginebox -u root -- jq '{id, enrolled, controller, budget}' /var/lib/eng
 ```
 
 In **Worker machines**, match that `id` to the existing card and select **Renew
-registration code**. Run its new install command, or paste the code into an
+registration code**. Run its new install command and choose **N** at **Override
+existing?**, or paste the code into an
 installer already waiting for it. Renewal keeps the same ID and owner allowances,
 invalidates the previous code, and is available only before successful enrollment.
 Creating another machine generates a different ID and cannot recover the saved
-identity. Never remove `worker.json` or unregister the distribution to retry.
+identity. For an ordinary retry, retain `worker.json` and the distribution; use
+the installer's backup-and-replace flow when a fresh installation is intended.
 If the controller already shows the matching machine as enrolled but local state
 does not, retain both states for reconciliation; renewal cannot replace its key.
+
+Registration errors include the underlying WSL/native error and save a bounded,
+credential-redacted copy to `registration-error.txt` beside the Windows setup
+receipt. A mismatched code reports the saved machine ID before attempting
+registration.
 
 It refuses an unrelated distribution named Enginebox, unrelated scheduled tasks,
 symlink/junction installation paths and changes to an existing identity's

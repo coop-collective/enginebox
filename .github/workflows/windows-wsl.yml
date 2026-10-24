@@ -79,6 +79,11 @@ jobs:
           if ($LASTEXITCODE) { throw 'Could not stage node test in disposable distro' }
           wsl.exe -d EngineboxCI -u root --exec python3 /tmp/enginebox-node-proof.py
           if ($LASTEXITCODE) { throw 'Linux outbound node execution/cleanup qualification failed' }
+      - name: Replace the disposable runtime and restore its preserved state
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-override.ps1 -Image "$PWD/.state/wsl-release/enginebox.wsl"
+          if ($LASTEXITCODE) { throw 'WSL override/backup/restore qualification failed' }
       - name: Runtime diagnostics on failure
         if: failure()
         shell: pwsh
@@ -93,4 +98,4 @@ jobs:
         shell: pwsh
         run: |
           $names=@((wsl.exe --list --quiet) | ForEach-Object { ($_ -replace "`0",'').Trim() })
-          if ($names -contains 'EngineboxCI') { wsl.exe --unregister EngineboxCI }
+          foreach ($name in @('EngineboxCI','EngineboxCIBackup')) { if ($names -contains $name) { wsl.exe --unregister $name } }

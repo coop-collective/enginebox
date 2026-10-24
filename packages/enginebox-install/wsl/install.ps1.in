@@ -60,6 +60,60 @@ print(json.dumps({'cpu':len(os.sched_getaffinity(0)),'memory_bytes':mem,'committ
   if ($capacity.cpu -lt 1 -or $capacity.memory_bytes -le 0 -or $capacity.committed -isnot [bool]) { throw 'Invalid Linux resource inspection result.' }
   return $capacity
 }
+function Get-RuntimeIdentity {
+  $probe=@'
+import json,pathlib
+p=pathlib.Path('/var/lib/enginebox/private/worker.json')
+s=json.loads(p.read_text()) if p.exists() else {}
+print(json.dumps({'id':s.get('id'),'enrolled':s.get('enrolled',False)}))
+'@
+  $raw=$probe | & wsl.exe --distribution $Distro --user root --exec python3 -
+  if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the saved registration. Its state was retained.' }
+  return (($raw | Out-String) | ConvertFrom-Json)
+}
+function Get-RuntimeImage([string]$Directory) {
+  $image=Join-Path $Directory 'enginebox.wsl'
+  [Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  if (-not (Test-Path -LiteralPath $image) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash -ne '@@ROOTFS_SHA256@@') {
+    Write-Host 'Downloading the preinstalled Linux runtime and templates...'
+    Invoke-WebRequest -UseBasicParsing -Uri '@@ROOTFS_URL@@' -OutFile $image
+  }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash -ne '@@ROOTFS_SHA256@@') { throw 'Linux image checksum mismatch.' }
+  return $image
+}
+function Backup-AndRemoveRuntime([string]$Name,[string]$Directory) {
+  # The caller must establish ownership and obtain the override choice first.
+  # Export a stopped VHD before unregistering, so credentials and LayerFS data
+  # remain together in a private, recoverable backup.
+  $owner=(& wsl.exe --distribution $Name --user root --exec cat /etc/enginebox/installation-owner 2>$null | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or $owner -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'Cannot replace a distribution without matching Enginebox ownership.' }
+  $backupRoot=Join-Path $Directory 'backups'
+  if ((Test-Path -LiteralPath $backupRoot) -and ((Get-Item -LiteralPath $backupRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Backup directory must not be a junction or symlink.' }
+  $backup=Join-Path $backupRoot (([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))+'-'+[guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $backup -Force | Out-Null
+  Protect-Directory $backup
+  Write-Host "Backing up the existing Enginebox runtime to $backup"
+  Invoke-Wsl -Arguments @('--distribution',$Name,'--user','root','--exec','systemctl','stop','enginebox-worker.service','enginebox-docker.service') | Out-Host
+  Invoke-Wsl -Arguments @('--distribution',$Name,'--user','root','--exec','sync') | Out-Host
+  Invoke-Wsl -Arguments @('--terminate',$Name) | Out-Host
+  $disk=Join-Path $backup 'enginebox.vhdx'
+  Invoke-Wsl -Arguments @('--export',$Name,$disk,'--vhd') | Out-Host
+  if (-not (Test-Path -LiteralPath $disk) -or (Get-Item -LiteralPath $disk).Length -lt 1MB) { throw "Backup is incomplete. The existing distribution was retained. Backup directory: $backup" }
+  $stream=[IO.File]::OpenRead($disk)
+  try { $magic=New-Object byte[] 8; $read=$stream.Read($magic,0,8) } finally { $stream.Dispose() }
+  if ($read -ne 8 -or [Text.Encoding]::ASCII.GetString($magic) -ne 'vhdxfile') { throw "Backup is not a VHDX. The existing distribution was retained. Backup directory: $backup" }
+  $hash=(Get-FileHash -Algorithm SHA256 -LiteralPath $disk).Hash.ToLowerInvariant()
+  @{schema=1;distribution=$Name;sha256=$hash;bytes=(Get-Item -LiteralPath $disk).Length;created=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'backup.json') -Encoding UTF8
+  $setup=Join-Path $Directory 'setup.json'
+  if (Test-Path -LiteralPath $setup) { Copy-Item -LiteralPath $setup -Destination (Join-Path $backup 'setup.json') }
+  Invoke-Wsl -Arguments @('--unregister',$Name) | Out-Host
+  # WSL can retain an empty installation directory after unregistering. Move
+  # any remainder into the backup rather than deleting files recursively.
+  $oldDirectory=Join-Path $Directory 'distro'
+  if (Test-Path -LiteralPath $oldDirectory) { Move-Item -LiteralPath $oldDirectory -Destination (Join-Path $backup 'installation-directory') }
+  Write-Host "Previous identity and workspaces are preserved in $disk"
+  return $backup
+}
 # Tests may load validation helpers without inspecting or modifying Windows.
 if ($MyInvocation.InvocationName -eq '.') { return }
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { throw 'This release requires Windows x64.' }
@@ -102,6 +156,8 @@ $diskMaximum=if ($settings) { [int]$settings.disk_gib } else { [math]::Min(65536
 $DiskGiB=Read-Number 'Linux disk maximum in GiB (includes templates)' $DiskGiB ([math]::Max(20,[math]::Min(50,[math]::Floor($free/2)))) 20 $diskMaximum
 if ($settings -and ($settings.controller -ne $Controller -or $settings.cpu -ne $Cpu -or $settings.memory_gib -ne $MemoryGiB -or $settings.disk_gib -ne $DiskGiB)) { throw 'Existing installation has different settings. This installer preserves its identity, resources and workspaces.' }
 New-Item -ItemType Directory -Force -Path $root | Out-Null; Protect-Directory $root
+$installationLock=[IO.File]::Open((Join-Path $root 'install.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+try {
 if ($PSCommandPath -ne $resumeScript) { Copy-Item -LiteralPath $PSCommandPath -Destination $resumeScript -Force }
 function Save-Setup {
   @{marker=$Marker;root=$root;controller=$Controller;cpu=$Cpu;memory_gib=$MemoryGiB;disk_gib=$DiskGiB} | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding UTF8
@@ -146,17 +202,28 @@ if ($LASTEXITCODE -ne 0) {
   exit 3010
 }
 $distros=@((& wsl.exe --list --quiet) | ForEach-Object { ($_ -replace "`0",'').Trim() })
-if ($distros -contains $Distro) {
+$hasDistro=$distros -contains $Distro
+if ($hasDistro) {
   $owned=(& wsl.exe --distribution $Distro --user root --exec cat /etc/enginebox/installation-owner 2>$null | Out-String).Trim()
   if ($owned -ne $sid) { throw 'An existing Enginebox distribution belongs to another installation. It will not be changed.' }
-} else {
-  $image=Join-Path $root 'enginebox.wsl'
-  [Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-  if (-not (Test-Path -LiteralPath $image) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash -ne '@@ROOTFS_SHA256@@') {
-    Write-Host 'Downloading the preinstalled Linux runtime and templates...'
-    Invoke-WebRequest -UseBasicParsing -Uri '@@ROOTFS_URL@@' -OutFile $image
+  if (-not $Resume) {
+    Write-Host 'An Enginebox installation already exists. Override stops this runtime, saves its complete state in a private backup, and installs a fresh runtime for registration.'
+    $choice=Read-Host 'Override existing? [Y/n]'
+    if ($choice -and $choice -notmatch '^(?i:y|yes|n|no)$') { throw 'Enter Y to override or N to continue the existing installation.' }
+    if (-not $choice -or $choice -match '^(?i:y|yes)$') {
+      if ($EnrollmentCode -and $EnrollmentCode.Trim() -cnotmatch '^[a-f0-9]{32}\.[a-f0-9]{64}$') { throw 'Invalid registration code. Copy a fresh install command from the dashboard. The existing runtime was retained.' }
+      $identity=Get-RuntimeIdentity
+      if ($identity.enrolled -and $EnrollmentCode -and $EnrollmentCode.Split('.')[0] -eq $identity.id) { throw 'This code belongs to the enrolled runtime. Create an install command for a new machine before overriding. The existing runtime was retained.' }
+      # Download and verify the replacement before stopping the old runtime.
+      $null=Get-RuntimeImage $root
+      Stop-ScheduledTask -TaskName $TaskName
+      $null=Backup-AndRemoveRuntime $Distro $root
+      $hasDistro=$false
+    }
   }
-  if ((Get-FileHash -Algorithm SHA256 -LiteralPath $image).Hash -ne '@@ROOTFS_SHA256@@') { throw 'Linux image checksum mismatch.' }
+}
+if (-not $hasDistro) {
+  $image=Get-RuntimeImage $root
   Invoke-Wsl -Arguments @('--install','--from-file',$image,'--name',$Distro,'--location',(Join-Path $root 'distro'),'--version','2','--vhd-size',($DiskGiB.ToString()+'GB'),'--no-launch')
   $sid | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl claim
   if ($LASTEXITCODE -ne 0) { throw 'Could not record distribution ownership.' }
@@ -191,14 +258,27 @@ $registered=$LASTEXITCODE -eq 0
 if (-not $registered) {
   if ($EnrollmentExpires -gt 0 -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge $EnrollmentExpires) { $EnrollmentCode=$null; Write-Host 'The original registration code expired during setup. Generate a fresh code; installed components are retained.' }
   if (-not $EnrollmentCode) {
-    Write-Host "Open $Controller/dashboard/ and create a fresh machine registration code."
+    Write-Host "Open $Controller/dashboard/ and copy a machine registration code. For a saved pending identity, renew the code on its matching machine card."
     $secret=Read-Host 'One-time registration code' -AsSecureString
     $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
     try { $EnrollmentCode=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secret.Dispose() }
   }
-  $EnrollmentCode | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl enroll
-  $EnrollmentCode=$null
-  if ($LASTEXITCODE -ne 0) { throw 'Registration failed. Keep the pending identity and inspect the preceding error; do not delete its state.' }
+  $identity=Get-RuntimeIdentity
+  if ($identity.id) { Write-Host "Saved machine ID: $($identity.id)" }
+  if ($identity.id -and $EnrollmentCode.Split('.')[0] -ne $identity.id) { throw "The registration code is for a different machine. Saved machine ID: $($identity.id). Rerun this installer and choose Override existing, or renew the code for that exact ID in the dashboard. State was retained." }
+  $previous=$ErrorActionPreference
+  try {
+    $ErrorActionPreference='Continue'
+    $output=@($EnrollmentCode | & wsl.exe --distribution $Distro --user root --exec /usr/local/sbin/enginebox-wsl enroll 2>&1)
+    $registrationExit=$LASTEXITCODE
+  } finally { $EnrollmentCode=$null; $ErrorActionPreference=$previous }
+  if ($registrationExit -ne 0) {
+    $detail=(($output | Out-String) -replace '[a-fA-F0-9]{32}\.[a-fA-F0-9]{64}','[redacted credential]').Trim()
+    if ($detail.Length -gt 4000) { $detail=$detail.Substring(0,4000) }
+    if (-not $detail) { $detail="WSL registration exited with code $registrationExit without error output." }
+    $detail | Set-Content -LiteralPath (Join-Path $root 'registration-error.txt') -Encoding UTF8
+    throw "Registration failed: $detail`nState is retained. Error details: $(Join-Path $root 'registration-error.txt')"
+  }
 }
 $action=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '--distribution Enginebox --user root --exec /usr/local/sbin/enginebox-wsl supervise'
 $taskSettings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -206,3 +286,4 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Pr
 Start-ScheduledTask -TaskName $TaskName
 Write-Host "Registered. WSL2 owns the Linux runtime and template workspaces: $Cpu CPU, $MemoryGiB GiB memory, $DiskGiB GiB virtual disk maximum."
 Write-Host "Agent tools are inside templates; sign in through an authorized workspace. Dashboard: $Controller/dashboard/"
+} finally { $installationLock.Dispose() }
