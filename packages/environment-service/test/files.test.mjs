@@ -83,7 +83,9 @@ test('destination parent symlinks cannot redirect a source update', { skip: proc
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('a dev process survives source changes, source failures and controller recovery', async () => {
+// The Linux supervisor requires Unix private-directory permissions. Keep the
+// portable file-update tests above running on Windows as well.
+test('a dev process survives source changes, source failures and controller recovery', { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'ebox-watch-process-'));
   try {
     const env = { id: 'main', updateMode: 'files', writableDirs: ['.wrangler'], source: { kind: 'layerfs', project: 'test', command: ['/bin/export'] }, image: `node@sha256:${'a'.repeat(64)}`, command: ['dev-server'], prepare: ['install-dependencies'], ports: [{ name: 'web', protocol: 'http', container: 8787, host: 18787 }], health: { port: 'web', path: '/' }, cpu: 1, memoryMiB: 256, timeoutSeconds: 5 };
