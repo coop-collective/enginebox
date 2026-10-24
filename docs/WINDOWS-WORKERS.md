@@ -3,7 +3,10 @@
 The replacement installer uses a dedicated WSL2 distribution and template-created
 LayerFS workspaces. See [Windows WSL setup](WINDOWS-WSL.md). This page records the
 older direct-host preview; its Codex installation/sign-in flow is not the new
-Windows setup and does not establish workspace isolation.
+Windows setup and does not establish workspace isolation. The controller now
+rejects direct-host `agent` jobs, and the retained legacy installer no longer
+installs or signs in Codex. The setup and agent API examples below describe the
+historical preview, not the current dashboard or installer.
 
 An installed Windows x64 worker connects outbound to the **same native controller
 and HTTPS dashboard** as an existing bare-metal host. It needs no inbound port,

@@ -73,7 +73,7 @@ workspace containers within the aggregate allowance. The owner API queues:
 
 ```json
 {
-  "request_id": "unique-operation-id",
+  "request_id": "00d3dcda15644dc093c4418acb74ec96",
   "kind": "workspace",
   "request": {
     "operation": "fork",
@@ -84,12 +84,14 @@ workspace containers within the aggregate allowance. The owner API queues:
 ```
 
 Send this to `POST /v1/contributors/{node}/runs` using owner authentication.
+Generate a fresh 32-character lowercase hexadecimal request ID for each operation
+(for example, a UUID without hyphens); reuse it only when retrying identical input.
 `exec`, `checkpoint`, `remount` and `close` operate on the named workspace. `exec`
 requires an argument array and may specify `timeout_seconds` (1–3600):
 
 ```json
 {
-  "request_id": "another-unique-operation-id",
+  "request_id": "3508946aca0842e588163cd77d239957",
   "kind": "workspace",
   "request": {
     "operation": "exec",
