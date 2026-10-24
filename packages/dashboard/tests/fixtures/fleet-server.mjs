@@ -139,7 +139,7 @@ createServer(async (req, res) => {
     environmentRoutes = [];
     return send(200, { ok: true });
   }
-  if (req.url === "/__test/contributor-online") { contributors = contributors.map(n => ({...n,enrolled:true,online:true,tools:{ci:true,codex:false}})); return send(200,{ok:true}); }
+  if (req.url === "/__test/contributor-online") { contributors = contributors.map(n => ({...n,enrolled:true,online:true,budget:{cpu:2,memory_gib:4,disk_gib:20},tools:{workspace:true,backend:'wsl2-layerfs'}})); return send(200,{ok:true}); }
   if (req.url === "/__test/storage-requests") return send(200, storageRequests);
   if (req.url === "/__test/mode") {
     mode = data.mode;

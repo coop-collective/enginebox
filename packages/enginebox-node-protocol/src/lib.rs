@@ -36,8 +36,18 @@ pub struct Workloads {
 #[serde(deny_unknown_fields)]
 pub struct Invitation {
     pub label: String,
+    #[serde(default = "installer_ceiling")]
     pub budget: Budget,
     pub workloads: Workloads,
+}
+// New registrations choose their actual allowance locally. Retain an optional
+// owner ceiling for older API clients; it is never the installed allocation.
+pub fn installer_ceiling() -> Budget {
+    Budget {
+        cpu: 256,
+        memory_gib: 4096,
+        disk_gib: 65536,
+    }
 }
 impl Invitation {
     pub fn validate(&self) -> Result<()> {
@@ -69,6 +79,63 @@ pub struct Run {
     pub request_id: String,
     pub kind: String,
     pub request: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRequest {
+    pub operation: String,
+    pub workspace: String,
+    #[serde(default = "default_project")]
+    pub project: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+}
+fn default_project() -> String {
+    "welcome".into()
+}
+fn default_timeout() -> u64 {
+    120
+}
+impl WorkspaceRequest {
+    pub fn validate(&self) -> Result<()> {
+        let identifier = |v: &str| {
+            !v.is_empty()
+                && v.len() <= 48
+                && v.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !v.starts_with('-')
+                && !v.ends_with('-')
+        };
+        ensure!(
+            identifier(&self.workspace) && identifier(&self.project),
+            "Invalid workspace or project"
+        );
+        ensure!(
+            ["fork", "exec", "checkpoint", "remount", "close"].contains(&self.operation.as_str()),
+            "Unknown workspace operation"
+        );
+        ensure!(
+            (1..=3600).contains(&self.timeout_seconds),
+            "Invalid workspace timeout"
+        );
+        ensure!(
+            self.argv.len() <= 128
+                && self
+                    .argv
+                    .iter()
+                    .all(|a| a.len() <= 16384 && !a.contains('\0'))
+                && self.argv.iter().map(String::len).sum::<usize>() <= 24000,
+            "Invalid workspace command"
+        );
+        ensure!(
+            (self.operation == "exec") != self.argv.is_empty(),
+            "Only exec accepts a nonempty command"
+        );
+        Ok(())
+    }
 }
 pub fn id(value: &str) -> bool {
     !value.is_empty()

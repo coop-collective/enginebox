@@ -139,8 +139,8 @@ impl Contributors {
         );
         e.budget.validate()?;
         ensure!(
-            e.os == "windows" && e.architecture == "x86_64",
-            "This worker release requires Windows x64"
+            ["windows", "linux"].contains(&e.os.as_str()) && e.architecture == "x86_64",
+            "This worker release requires Windows x64 or its Linux x64 WSL runtime"
         );
         let mut nodes = self.nodes.lock().unwrap();
         let mut n = nodes.get(key).cloned().context("Unknown registration")?;
@@ -188,7 +188,7 @@ impl Contributors {
             "budget":n.budget,"workloads":n.invitation.workloads,"os":n.os,"architecture":n.architecture,
             "enrolled":n.secret_hash.is_some(),"revoked":n.revoked,"blocked":n.blocked,"active_job":n.active,
             "online":n.last_seen+LEASE_SECONDS>now(),"last_seen":n.last_seen,"tools":n.tools,
-            "disk_enforcement":"workspace usage watchdog","cpu_memory_enforcement":"Windows Job Object"})).collect::<Vec<_>>();
+            "disk_enforcement":"workspace usage watchdog","cpu_memory_enforcement":if n.os == "linux" { "WSL runtime cgroup" } else { "Windows Job Object (legacy)" }})).collect::<Vec<_>>();
         json!({"nodes":rows})
     }
     pub fn revoke(&self, key: &str) -> Result<Value> {
@@ -329,6 +329,18 @@ impl Contributors {
                 "Node is offline or needs reconciliation"
             );
             match run.kind.as_str() {
+                "workspace" => {
+                    ensure!(
+                        n.os == "linux"
+                            && (n.invitation.workloads.ci || n.invitation.workloads.agents)
+                            && n.tools["workspace"] == true,
+                        "The WSL template runtime is not ready"
+                    );
+                    let r: enginebox_node_protocol::WorkspaceRequest =
+                        serde_json::from_value(run.request.clone())?;
+                    r.validate()?;
+                    r.timeout_seconds + 180
+                }
                 "ci" => {
                     ensure!(
                         n.invitation.workloads.ci && n.tools["ci"] == true,

@@ -17,7 +17,7 @@ beforeEach(()=>{
   delete process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN;
 });
 function ownerRequest(body:unknown, auth=true) {return new Request(`${origin}/api/contributors/enrollments`,{method:'POST',headers:{origin,'Content-Type':'application/json',...(auth?{cookie:sessionCookie().split(';')[0]}:{})},body:JSON.stringify(body)});}
-test('one-copy installer pins release, checksum, host and resource allowance without owner credentials',async t=>{
+test('one-copy installer pins release, checksum, host without imposing local resources without owner credentials',async t=>{
   t.mock.method(globalThis,'fetch',async (_url:string,options:RequestInit)=>{
     if (_url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
     assert.equal((options.headers as Record<string,string>).Authorization,`Bearer ${owner}`);
@@ -25,7 +25,7 @@ test('one-copy installer pins release, checksum, host and resource allowance wit
   });
   const response=await contributors(ownerRequest({budget}),['enrollments']);
   assert.equal(response.headers.get('cache-control'),'no-store');
-  const value=await response.json();assert.match(value.command,/-Cpu 2 -MemoryGiB 4 -DiskGiB 20/);assert.ok(value.command.includes(code));assert.ok(!value.command.includes(owner));assert.ok(value.command.includes('Get-FileHash'));
+  const value=await response.json();assert.doesNotMatch(value.command,/-Cpu|-MemoryGiB|-DiskGiB/);assert.ok(value.command.includes(code));assert.ok(!value.command.includes(owner));assert.ok(value.command.includes('Get-FileHash'));
   assert.equal(value.code,undefined);
 });
 test('node proxy forwards only caller token and rejects browsers and administrative paths',async t=>{
@@ -48,9 +48,8 @@ test('invitation issuance requires owner session, same origin, and a configured 
   delete process.env.ENGINEBOX_NODE_INSTALLER_SHA256;await assert.rejects(contributors(ownerRequest({budget}),['enrollments']));assert.equal(fetch.mock.callCount(),0);
 });
 test('command rejects shell injection and credential-bearing controller origins',()=>{
-  assert.throws(()=>installCommand("';Invoke-Expression bad",budget));
-  assert.throws(()=>installCommand(code,{...budget,cpu:NaN}));
-  process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN='https://user:password@enginebox.example';assert.throws(()=>installCommand(code,budget));
+  assert.throws(()=>installCommand("';Invoke-Expression bad"));
+  process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN='https://user:password@enginebox.example';assert.throws(()=>installCommand(code));
 });
 test('an older supervisor cannot issue an unusable worker invitation',async t=>{
   const fetch=t.mock.method(globalThis,'fetch',async (url:string)=>{assert.ok(url.endsWith('/__enginebox/status'));return Response.json({current:'old'});});

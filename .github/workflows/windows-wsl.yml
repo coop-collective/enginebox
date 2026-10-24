@@ -1,0 +1,33 @@
+name: Windows WSL template runtime
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'packages/enginebox-install/**'
+      - 'packages/enginebox-node-protocol/**'
+      - '.github/workflows/windows-wsl.yml'
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate PowerShell 5.1 installer and input policy
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-installer.ps1
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Build preinstalled Linux rootfs and template
+        run: packages/enginebox-install/wsl/build.sh .state/wsl-release
+      - name: Package immutable installer
+        run: python3 packages/enginebox-install/wsl/package.py .state/wsl-release wsl-node-preview-${{ github.run_id }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: enginebox-wsl-${{ github.sha }}
+          path: .state/wsl-release/
+          compression-level: 0
+          if-no-files-found: error

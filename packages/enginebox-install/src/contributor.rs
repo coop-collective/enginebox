@@ -221,8 +221,8 @@ fn enforce_budget(b: &Budget) -> Result<()> {
     Ok(())
 }
 #[cfg(not(windows))]
-fn enforce_budget(_: &Budget) -> Result<()> {
-    anyhow::bail!("This contributor backend requires Windows Job Objects")
+fn enforce_budget(b: &Budget) -> Result<()> {
+    crate::wsl::enforce(b)
 }
 
 fn worker_environment(command: &mut Command) -> Result<()> {
@@ -280,6 +280,9 @@ async fn tool_ready(name: &str, args: &[&str]) -> bool {
     .is_ok_and(|r| r.is_ok_and(|s| s.success()))
 }
 async fn tools(root: &Path, c: &Config, running: bool) -> Value {
+    if cfg!(target_os = "linux") {
+        return crate::wsl::inventory(running);
+    }
     let codex = executable("codex");
     let mut signed_in = false;
     if let Some(exe) = codex.as_ref() {
@@ -326,7 +329,7 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
         .context("Missing installation root")?
         .join("work");
     private_dir(&root)?;
-    private_dir(&root.join("providers/codex"))?;
+    // Provider state belongs to individual template sandboxes.
     private_dir(&private.join("receipts"))?;
     let lock = std::fs::OpenOptions::new()
         .write(true)
@@ -393,6 +396,9 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
         }
     }.await;
+    if cfg!(target_os = "linux") {
+        crate::wsl::stop_runtime()?;
+    }
     atomic_json(
         &private.join("status.json"),
         &json!({"online":false,"id":c.id,"error":"Worker stopped; check controller status and local resource availability"}),
@@ -401,6 +407,9 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
 }
 
 pub fn execute(input: Value) -> Result<Value> {
+    if cfg!(target_os = "linux") {
+        return crate::wsl::execute(input);
+    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::{

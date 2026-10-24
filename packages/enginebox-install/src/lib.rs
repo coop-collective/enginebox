@@ -6,3 +6,5 @@ pub mod release;
 pub mod supervisor;
 #[cfg(windows)]
 mod windows_acl;
+
+pub mod wsl;

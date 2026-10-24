@@ -1,0 +1,15 @@
+[Unit]
+Description=Enginebox outbound WSL template worker
+Requires=enginebox-docker.service
+After=enginebox-docker.service network-online.target
+ConditionPathExists=/var/lib/enginebox/private/worker.json
+[Service]
+Slice=enginebox.slice
+UMask=0077
+ExecStart=/usr/local/bin/enginebox-node run-worker --config /var/lib/enginebox/private/worker.json
+ExecStopPost=/usr/bin/systemctl --no-block stop enginebox-docker.service
+KillMode=control-group
+TimeoutStopSec=30
+Restart=no
+[Install]
+WantedBy=multi-user.target
