@@ -6,12 +6,12 @@ import { pathToFileURL } from 'node:url';
 import { validateConfig, check, fields, id } from './config.mjs';
 import { Environments } from './runtime.mjs';
 
-export async function serve(config) {
+export async function serve(config, run) {
   validateConfig(config);
   const token = (await readFile(config.tokenFile, 'utf8')).trim();
   check(token.length >= 32, 'private-api-token-required');
   const hash = value => createHash('sha256').update(value).digest();
-  const manager = new Environments(config);
+  const manager = new Environments(config, run);
   let ready = false; let mutations = Promise.resolve();
   const server = createServer(async (request, response) => {
     const reply = (status, body) => { response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); response.end(JSON.stringify(body)); };
@@ -19,6 +19,11 @@ export async function serve(config) {
       if (!timingSafeEqual(hash(request.headers.authorization ?? ''), hash(`Bearer ${token}`))) return reply(401, { error: 'unauthorized' });
       if (!ready) return reply(503, { error: 'initializing' });
       if (request.url === '/v1/environments' && request.method === 'GET') return reply(200, manager.catalog());
+      if (request.url === '/v1/environments/projects' && request.method === 'GET') return reply(200, { projects: manager.projects.catalog() });
+      if (request.url === '/v1/environments/projects' && request.method === 'POST') {
+        let body = ''; for await (const chunk of request) { body += chunk; check(Buffer.byteLength(body) <= 8192, 'body-too-large'); }
+        return reply(202, await manager.projects.register(JSON.parse(body)));
+      }
       if (request.url === '/v1/environments/routes' && request.method === 'POST') {
         let body = ''; for await (const chunk of request) { body += chunk; check(Buffer.byteLength(body) <= 8192, 'body-too-large'); }
         const value = JSON.parse(body);

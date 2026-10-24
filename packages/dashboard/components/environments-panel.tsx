@@ -6,6 +6,7 @@ type Catalog = {
   baseDomains: string[];
   transportEntrypoints: { name: string; protocol: string; port: number; public: boolean }[];
   routes: Route[];
+  projects?: { id: string; host: string; project: string; status: string; healthy: boolean; error?: string; urls: string[] }[];
   environments: { id: string; source: { kind: string; branch?: string }; services: { name: string; protocol: string }[]; status: string; healthy: boolean; revision?: string; desiredRevision?: string; error?: string; cpu: number; memoryMiB: number }[];
 };
 export function EnvironmentsPanel() {
@@ -32,6 +33,11 @@ export function EnvironmentsPanel() {
     <div className="section-heading"><div><h2>Live environments</h2><p>Follow accepted code, preserve service data, and manage network routes.</p></div><button className="button small" onClick={() => void refresh()}>Refresh services</button></div>
     {error && <div role="alert" className="alert">{error}</div>}
     {catalog && <>
+      {!!catalog.projects?.length && <div className="host-grid">{catalog.projects.map(project => <article key={project.id} className="host-card" aria-label={`Project dev ${project.project}`}>
+        <h3>{project.project}</h3><p>{project.healthy ? 'Serving' : 'Not serving'} · {project.status}</p>
+        {project.error && <p role="status">{project.error}</p>}
+        {project.urls.filter(url => /^https?:\/\//.test(url)).map(url => <p key={url}><a href={url} target="_blank" rel="noopener noreferrer">Open {project.project}</a></p>)}
+      </article>)}</div>}
       {catalog.environments.length === 0 && <p>No persistent environments have been provisioned.</p>}
       <div className="host-grid">{catalog.environments.map(env => <article key={env.id} className="host-card" aria-label={`Environment ${env.id}`}>
         <h3>{env.id}</h3><p>{env.healthy ? 'Serving' : 'Not serving'} · {env.status}</p>

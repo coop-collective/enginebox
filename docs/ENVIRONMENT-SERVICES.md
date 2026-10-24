@@ -8,11 +8,16 @@ Traefik routes. The dashboard's
 **Environments** section shows running/desired revisions and manages routes. Its
 private API token never reaches the browser. CI and agent execution remain separate.
 
+[Repository config and dev templates](PROJECT-CONFIG.md) can now bootstrap these
+services from accepted LayerFS source. When the optional controller handoff is
+configured, UI/MCP imports queue setup automatically and return separate dev status.
+
 ## Source and data ownership
 
-An operator provisions each source, digest-pinned image, preparation/start argument
-vectors, ports and resource limits. Agents cannot alter these through submitted
-code. Application containers receive no Docker socket, provider home, GitHub write
+An operator provisions static recipes, or enables repository bootstrap with
+protected source providers, resource bounds, port ranges and route policy. Repo
+templates can then select a pinned image and container commands within that policy.
+Application containers receive no Docker socket, provider home, GitHub write
 token or fleet owner credential. Prepared code is read-only; `/data` is a separate
 persistent directory, also named by `ENGINEBOX_DATA_DIR`. Writable application
 state must use that directory or `/tmp`.
@@ -101,8 +106,10 @@ The app cannot write its source bind mount. `writableDirs` grants bounded, ephem
 tmpfs directories for framework caches (for example `.wrangler` or
 `node_modules/.mf` or `node_modules/.vite`); they cannot overlap managed source. Put durable simulated
 databases in `/data`, not these caches. Dependencies are prepared once. Changes to
-dependencies, runtime image, command or writable mount configuration may require a
-new environment; there is no automatic in-process dependency installation.
+dependencies, runtime image, command or writable mount configuration require a
+new environment. Repo bootstrap prepares and switches that replacement using its
+declared install inputs; static recipes still require an operator-managed change.
+There is no in-process dependency installation.
 Choose an image with the runtime prerequisites (including system CA certificates
 for workerd). npm's cache belongs in `/tmp`; the private home has a small quota.
 `ENGINEBOX_REVISION` is the startup revision, while the API's revision identifies

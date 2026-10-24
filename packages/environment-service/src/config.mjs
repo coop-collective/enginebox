@@ -2,6 +2,7 @@ import { isAbsolute } from 'node:path';
 
 export function check(value, code) { if (!value) throw new Error(code); }
 export const id = value => typeof value === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(value);
+const storageId = value => typeof value === 'string' && /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(value);
 export const port = value => Number.isInteger(value) && value >= 1024 && value <= 65535;
 export const hostname = value => typeof value === 'string' && value.length <= 253 && value.split('.').length >= 2 && value.split('.').every(x => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(x));
 export const sourcePath = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !value.includes('\\') && !value.includes('\0') && value.split('/').every(p => p && !['.', '..', '.git', '.enginebox-prepared'].includes(p));
@@ -9,7 +10,7 @@ export function fields(value, allowed) {
   check(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => allowed.includes(k)), 'unknown-field');
 }
 export function validateConfig(config) {
-  fields(config, ['schema', 'stateDir', 'listenPort', 'tokenFile', 'docker', 'baseDomains', 'httpEntrypoint', 'httpTls', 'basicAuthUsers', 'transportEntrypoints', 'environments', 'pollSeconds']);
+  fields(config, ['schema', 'stateDir', 'listenPort', 'tokenFile', 'docker', 'baseDomains', 'httpEntrypoint', 'httpTls', 'basicAuthUsers', 'transportEntrypoints', 'environments', 'pollSeconds', 'bootstrap']);
   check(config.schema === 1 && isAbsolute(config.stateDir) && isAbsolute(config.tokenFile) && port(config.listenPort), 'invalid-config');
   check(Array.isArray(config.baseDomains) && config.baseDomains.length > 0 && config.baseDomains.every(hostname), 'base-domains-required');
   check(id(config.httpEntrypoint), 'http-entrypoint-required');
@@ -25,13 +26,38 @@ export function validateConfig(config) {
     endpoints.add(ep.name); sockets.add(`${ep.protocol}:${ep.port}`);
   }
   check(Number.isInteger(config.pollSeconds) && config.pollSeconds >= 2 && config.pollSeconds <= 300, 'invalid-poll-interval');
+  if (config.bootstrap !== undefined) {
+    const b = config.bootstrap;
+    fields(b, ['hosts', 'templates', 'portRange', 'domain', 'urlScheme', 'access', 'maxCpu', 'maxMemoryMiB', 'maxProjects']);
+    check(Array.isArray(b.hosts) && b.hosts.length > 0 && b.hosts.length <= 256, 'invalid-bootstrap-hosts');
+    const hosts = new Set();
+    for (const host of b.hosts) {
+      fields(host, ['id', 'command']);
+      check(typeof host.id === 'string' && /^[a-z0-9][a-z0-9-]{0,47}$/.test(host.id) && !hosts.has(host.id), 'invalid-bootstrap-host'); hosts.add(host.id);
+      check(Array.isArray(host.command) && host.command.length > 0 && host.command.length <= 63 && isAbsolute(host.command[0]) && host.command.every(v => typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.includes('\0')), 'invalid-bootstrap-export-command');
+    }
+    check(Array.isArray(b.templates) && b.templates.length <= 256, 'invalid-dev-template-catalog');
+    check(Array.isArray(b.portRange) && b.portRange.length === 2 && b.portRange.every(port) && b.portRange[0] <= b.portRange[1], 'invalid-bootstrap-port-range');
+    check(hostname(b.domain) && config.baseDomains.some(d => b.domain === d || b.domain.endsWith(`.${d}`)), 'invalid-bootstrap-domain');
+    check(b.urlScheme === undefined || ['http', 'https'].includes(b.urlScheme), 'invalid-public-url-scheme');
+    check(['public', 'authenticated'].includes(b.access) && (b.access !== 'authenticated' || config.basicAuthUsers.length > 0), 'invalid-bootstrap-access');
+    check(Number.isFinite(b.maxCpu) && b.maxCpu >= 0.1 && b.maxCpu <= 8 && Number.isInteger(b.maxMemoryMiB) && b.maxMemoryMiB >= 64 && b.maxMemoryMiB <= 16384 && Number.isInteger(b.maxProjects) && b.maxProjects >= 1 && b.maxProjects <= 24, 'invalid-bootstrap-limits');
+  }
   check(Array.isArray(config.environments) && config.environments.length <= 64, 'invalid-environments');
   const names = new Set(); const bindings = new Set();
   for (const env of config.environments) {
-    fields(env, ['id', 'source', 'image', 'command', 'prepare', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds', 'updateMode', 'writableDirs']);
+    fields(env, ['id', 'source', 'image', 'command', 'prepare', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds', 'updateMode', 'writableDirs', 'cwd', 'env', 'dataId', 'sourceInputs', 'publicHost', 'publicScheme']);
     check(id(env.id) && !names.has(env.id), 'duplicate-or-invalid-environment'); names.add(env.id);
     check(env.updateMode === undefined || ['restart', 'files'].includes(env.updateMode), 'invalid-update-mode');
     check(env.updateMode !== 'files' || ['layerfs', 'accepted'].includes(env.source.kind), 'files-update-requires-layerfs');
+    check(env.cwd === undefined || env.cwd === '.' || sourcePath(env.cwd), 'invalid-working-directory');
+    check(env.dataId === undefined || id(env.dataId), 'invalid-data-id');
+    check(env.publicHost === undefined || (hostname(env.publicHost) && ['http', 'https'].includes(env.publicScheme)), 'invalid-public-host');
+    if (env.env !== undefined) {
+      check(env.env && typeof env.env === 'object' && !Array.isArray(env.env) && Object.keys(env.env).length <= 64, 'invalid-environment-values');
+      for (const [key, value] of Object.entries(env.env)) check(/^[A-Z_][A-Z0-9_]{0,63}$/.test(key) && key !== 'HOME' && !key.startsWith('ENGINEBOX_') && typeof value === 'string' && value.length <= 4096 && !value.includes('\0'), 'invalid-environment-value');
+    }
+    if (env.sourceInputs !== undefined) check(env.updateMode === 'files' && env.sourceInputs && typeof env.sourceInputs === 'object' && !Array.isArray(env.sourceInputs) && Object.entries(env.sourceInputs).length <= 66 && Object.entries(env.sourceInputs).every(([p, h]) => sourcePath(p) && typeof h === 'string' && /^[a-f0-9]{64}$/.test(h)), 'invalid-source-inputs');
     const dirs = env.writableDirs ?? [];
     check(Array.isArray(dirs) && dirs.length <= 16 && dirs.every(p => sourcePath(p) && /^[A-Za-z0-9_./-]+$/.test(p)), 'invalid-writable-directories');
     check(dirs.length === 0 || env.updateMode === 'files', 'writable-directories-require-files-mode');
@@ -42,7 +68,7 @@ export function validateConfig(config) {
       check(typeof env.source.branch === 'string' && /^[A-Za-z0-9][A-Za-z0-9_./-]{0,127}$/.test(env.source.branch) && !env.source.branch.includes('..'), 'invalid-source-branch');
     } else if (env.source.kind === 'layerfs') {
       fields(env.source, ['kind', 'project', 'workspace', 'command']);
-      check(id(env.source.project) && (env.source.workspace === undefined || id(env.source.workspace)), 'invalid-layerfs-project');
+      check(storageId(env.source.project) && (env.source.workspace === undefined || storageId(env.source.workspace)), 'invalid-layerfs-project');
       check(Array.isArray(env.source.command) && env.source.command.length > 0 && env.source.command.length <= 64 && isAbsolute(env.source.command[0]) && env.source.command.every(v => typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.includes('\0')), 'invalid-layerfs-export-command');
     } else {
       fields(env.source, ['kind', 'controller', 'tokenFile', 'project', 'exportsDir']);

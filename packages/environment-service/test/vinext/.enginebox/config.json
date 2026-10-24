@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "dev": {
+    "template": "./templates/web-dev.json"
+  }
+}

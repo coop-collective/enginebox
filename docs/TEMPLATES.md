@@ -1,5 +1,10 @@
 # Portable workspace templates
 
+This document describes native agent VM templates. Repository-defined app dev
+templates use the separate [project config](PROJECT-CONFIG.md) schema; CI jobs
+select [CI toolchain templates](CI.md). Each adapter validates its own template
+kind and lifecycle.
+
 A template describes a supported workspace recipe, its resource requirements and its revision. Register it once on the controller. Its reconciler installs that desired revision on every registered node and reports each node's capacity or installation failures. Existing workspaces keep their current environment.
 
 The registry and installer live in `packages/enginebox-core/src/templates.rs`. They are independent of the dashboard and can be called by the API or another operator application. The installer reuses the existing bootstrap library for guest preparation; it does not reinstall the host or require editing its original bootstrap configuration.

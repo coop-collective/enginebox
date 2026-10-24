@@ -30,6 +30,9 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
   const key = `github:${selected}`;
   const settingsKey = `${key}:settings`;
   const operationKey = `${key}:operation`;
+  const devKey = `${key}:dev`;
+  const dev = tasks[devKey]?.result as { status?: string; error?: string; urls?: string[] } | undefined;
+  const importedDev = tasks["github:import"]?.result?.dev as { status?: string; error?: string } | undefined;
   const settings = tasks[settingsKey]?.result as { main?: { revision: string }; sync?: { enabled: boolean; last_synced_commit?: string; active?: { id: string; status: string; conflicts: string[] } } } | undefined;
   const busy = (k: string) => !!tasks[k] && (tasks[k].busy || !!tasks[k].uncertain);
   const preview = context === `${project}\0${repository}\0${branch}` ? sourcePreview(tasks["github:preview"]?.result) : null;
@@ -75,12 +78,20 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
         <button className="button primary" disabled={!reviewed || busy("github:import")} onClick={() => void importSource()}>Import into LayerFS</button>
       </div>}
       <Status task={tasks["github:import"]} taskKey="github:import" run={run} />
+      {importedDev?.status && <p role="status">Dev setup: {importedDev.status}. {importedDev.error}</p>}
     </details>
     {!!linked.length && <>
       <label className="storage-project-select">Connected project<select value={selected} onChange={(e) => setSelected(e.target.value)}>{linked.map((p) => <option key={p.id} value={p.id}>{p.id} · {p.repository}</option>)}</select></label>
       {current && <p className="workspace-hint">GitHub branch: {current.branch}. Import commit: <span className="mono">{current.current?.commit.slice(0, 12)}</span>.</p>}
       <button className="button small" disabled={busy(settingsKey)} onClick={() => void run(settingsKey, "github-settings", { project: selected })}>Refresh connection</button>
       <Status task={tasks[settingsKey]} taskKey={settingsKey} run={run} />
+      <div className="action-buttons">
+        <button className="button small" disabled={busy(devKey)} onClick={() => void run(devKey, "dev-start", { project: selected })}>Start or retry dev</button>
+        <button className="button small" disabled={busy(devKey)} onClick={() => void run(devKey, "dev-status", { project: selected })}>Check dev status</button>
+      </div>
+      <Status task={tasks[devKey]} taskKey={devKey} run={run} />
+      {dev?.status && <p role="status">Dev: {dev.status}. {dev.error}</p>}
+      {dev?.urls?.filter(url => /^https?:\/\//.test(url)).map(url => <p key={url}><a href={url} target="_blank" rel="noopener noreferrer">Open dev environment</a></p>)}
       {settings?.sync && <label className="storage-attestation"><input type="checkbox" checked={settings.sync.enabled} disabled={busy(operationKey)} onChange={(e) => void operate("github-settings", { enabled: e.target.checked })} />Sync accepted main revisions to GitHub</label>}
       <form className="storage-form" onSubmit={(e) => { e.preventDefault(); void operate("github-fork", { name: checkout }).then((result) => { if (result) setCheckout(""); }); }}>
         <label>GitHub checkout name<input value={checkout} onChange={(e) => setCheckout(e.target.value)} required pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?" maxLength={48} /></label>
