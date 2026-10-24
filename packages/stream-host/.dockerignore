@@ -1,3 +1,6 @@
 target
-test/node_modules
+**/node_modules
+**/__pycache__
+**/.godot
+.cargo
 .state
