@@ -425,6 +425,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "enginebox-engine-builds"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "enginebox-agents",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "enginebox-install"
 version = "0.3.0"
 dependencies = [

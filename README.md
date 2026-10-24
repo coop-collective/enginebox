@@ -99,6 +99,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Local Cloudflare fleet, shared Store transport and debugging](docs/LOCAL-FLEET.md)
 - [Enginebox integration, batching and protected CI evidence](docs/INTEGRATION-CI.md)
 - [Native Codex task-assistant setup and recovery](docs/TASK-ASSISTANT.md)
+- [Exact-source engine builds, playable artifacts and caches](docs/ENGINE-BUILDS.md)
 - [Project roadmap tasks and scoped native Codex tools](docs/TASK-WORKFLOW.md)
 - [Build artifacts, batch review and playtest evidence](docs/PLAYTEST-EVIDENCE.md)
 - [LayerFS game workspaces, container integration and large-project measurements](docs/GAME-WORKSPACES.md)
