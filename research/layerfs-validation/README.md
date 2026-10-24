@@ -1,6 +1,6 @@
 # Disposable LayerFS validation
 
-This research directory contains the Linux experiment used for [LayerFS qualification](../../docs/LAYERFS-VALIDATION.md). It is test tooling, not an Engine Box storage provider, production installer or fleet backend. The runtime and native agent homes do not depend on LayerFS.
+This research directory contains the Linux experiment used for [LayerFS qualification](../../docs/reports/LAYERFS-VALIDATION.md). It is test tooling, not an Engine Box storage provider, production installer or fleet backend. The runtime and native agent homes do not depend on LayerFS.
 
 The pinned upstream revision is `968a5d0be0ea3e9456b06f9148b65523138e9490`. The experiment uses the actual Rust daemon and Node native binding, Docker/FUSE mounts, a real Git repository, TypeScript dependencies, independent file manifests and explicit content assertions. It preserves failed outcomes in JSONL rather than treating a completed campaign as every case passing.
 

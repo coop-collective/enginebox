@@ -1,7 +1,7 @@
 # Remote agent startup experiment
 
 Manual comparison probes, excluded from product builds. The measured results and
-limitations are in [the October 23 report](../../docs/REMOTE-AGENT-TIMING-2026-10-23.md).
+limitations are in [the October 23 report](../../docs/reports/REMOTE-AGENT-TIMING-2026-10-23.md).
 These scripts use the installed native CLI or documented provider/controller API.
 They do not replace an agent harness or proxy inference.
 

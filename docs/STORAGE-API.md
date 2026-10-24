@@ -85,7 +85,7 @@ printf '%s\n' '{"host_id":"worker","project":"game","name":"agent-a"}' | ebox to
 printf '%s\n' '{"host_id":"worker","operation":"list"}' | ebox tool storage_inspect
 ```
 
-See [LayerFS backend operation](LAYERFS-BACKEND.md) for source import, immutable caches and node-local configuration, and the [backend validation results](LAYERFS-BACKEND-VALIDATION.md) for the earlier live storage qualification.
+See [LayerFS backend operation](LAYERFS-BACKEND.md) for source import, immutable caches and node-local configuration, and the [backend validation results](reports/LAYERFS-BACKEND-VALIDATION.md) for the earlier live storage qualification.
 
 ## Verification boundary
 

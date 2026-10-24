@@ -65,7 +65,7 @@ may retain its old credential even after a controller updates files.
 [Cursor automation authentication](https://cursor.com/docs/cli/reference/authentication),
 [Codex external-token authentication](https://learn.chatgpt.com/docs/app-server#3c-log-in-with-externally-managed-chatgpt-tokens-chatgptauthtokens).
 
-On October 23, Cursor `2026.10.22-27dcf5f` passed access-only credential delivery, three fresh read tasks and exact-session resume in a disposable Ubuntu workspace with its native sandbox enabled. See the [timing follow-up](REMOTE-AGENT-TIMING-2026-10-23.md#cursor-follow-up-qualification). That qualification does not upgrade existing fleet templates or qualify the Cursor Cloud service.
+On October 23, Cursor `2026.10.22-27dcf5f` passed access-only credential delivery, three fresh read tasks and exact-session resume in a disposable Ubuntu workspace with its native sandbox enabled. See the [timing follow-up](reports/REMOTE-AGENT-TIMING-2026-10-23.md#cursor-follow-up-qualification). That qualification does not upgrade existing fleet templates or qualify the Cursor Cloud service.
 
 Subscription entitlement, available models and concurrency remain provider/account
 decisions. Signing in successfully does not establish successful inference. API
@@ -128,7 +128,7 @@ usage limit. Codex's initial `workspace-write` sandbox failed with
 profile, a separate delegated-credential test passed both inference turns with
 normal `workspace-write` sandboxing and no bypass. See the
 [sandbox setup](CODEX-SANDBOX.md) and
-[acceptance record](VALIDATION.md#native-inference-and-conversation-resume)
+[acceptance record](reports/VALIDATION.md#native-inference-and-conversation-resume)
 for command patterns and remaining qualification.
 
 Cursor also needs permission for its own namespace helper on the tested Ubuntu

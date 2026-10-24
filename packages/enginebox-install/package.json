@@ -1,1 +1,11 @@
-{"name":"@enginebox/install","version":"0.3.0","private":true,"license":"SEE LICENSE IN ../../LICENSE","scripts":{"build":"cargo build -p enginebox-install --release","test":"cargo test -p enginebox-install","check":"cargo clippy -p enginebox-install --all-targets -- -D warnings"}}
+{
+  "name": "@enginebox/install",
+  "version": "0.3.0",
+  "private": true,
+  "license": "BUSL-1.1",
+  "scripts": {
+    "build": "cargo build -p enginebox-install --release",
+    "test": "cargo test -p enginebox-install",
+    "check": "cargo clippy -p enginebox-install --all-targets -- -D warnings"
+  }
+}

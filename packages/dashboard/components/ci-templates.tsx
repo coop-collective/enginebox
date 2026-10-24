@@ -1,7 +1,8 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/client";
+import { api, errorMessage } from "@/lib/client";
+import { useVisibleInterval } from "@/lib/visible-interval";
 
 type Installation = {
   node_id: string;
@@ -37,7 +38,7 @@ function Entry({ recipe, refresh }: { recipe: Recipe; refresh: () => Promise<voi
       });
       await refresh();
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -89,16 +90,16 @@ export function CiTemplates() {
       const result = await api<{ templates: Recipe[] }>(endpoint, { signal: controller.signal });
       if (!controller.signal.aborted) { setRecipes(result.templates); setLoadError(""); }
     } catch (err) {
-      if (!controller.signal.aborted) { setLoadError((err as Error).message); setRecipes(null); }
+      if (!controller.signal.aborted) { setLoadError(errorMessage(err)); setRecipes(null); }
     } finally {
       if (current.current === controller) current.current = null;
     }
   }, []);
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 2000);
-    return () => { clearInterval(timer); current.current?.abort(); current.current = null; };
+    return () => { current.current?.abort(); current.current = null; };
   }, [refresh]);
+  useVisibleInterval(() => void refresh(), 2000);
   async function register(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError(""); setNotice("");
     try {
@@ -108,7 +109,7 @@ export function CiTemplates() {
       await api(endpoint, { method: "POST", body: JSON.stringify({ manifest: parsed }) });
       await refresh();
       setNotice("CI template registered. Enable it to install on compatible workers. Updates to enabled templates synchronize automatically.");
-    } catch (err) { setError((err as Error).message); }
+    } catch (err) { setError(errorMessage(err)); }
     finally { setBusy(false); }
   }
   return <section className="catalog-panel" aria-labelledby="ci-templates-title">

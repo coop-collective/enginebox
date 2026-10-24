@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Mutex};
-fn iso(n: f64) -> Option<String> {
+pub(crate) fn iso(n: f64) -> Option<String> {
     chrono::DateTime::from_timestamp(n as i64, 0).map(|d| d.to_rfc3339())
 }
 pub fn unavailable(p: &str, detail: Option<&str>) -> Value {

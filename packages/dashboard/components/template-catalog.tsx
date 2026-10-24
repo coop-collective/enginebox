@@ -1,7 +1,8 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/client";
+import { api, errorMessage } from "@/lib/client";
+import { useVisibleInterval } from "@/lib/visible-interval";
 import type { Resources, TemplateRecord } from "@/lib/types";
 
 function resources(value: Resources) {
@@ -64,7 +65,7 @@ function TemplateEntry({
       );
       await refresh();
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -204,7 +205,7 @@ export function TemplateCatalog({
       }
     } catch (err) {
       if (!controller.signal.aborted) {
-        setLoadError((err as Error).message);
+        setLoadError(errorMessage(err));
         setRecords(null);
       }
     } finally {
@@ -214,13 +215,12 @@ export function TemplateCatalog({
   }, []);
   useEffect(() => {
     void load();
-    const timer = setInterval(() => void load(), 2000);
     return () => {
-      clearInterval(timer);
       current.current?.abort();
       current.current = null;
     };
   }, [load, refreshToken]);
+  useVisibleInterval(() => void load(), 2000);
   async function register(event: FormEvent) {
     event.preventDefault();
     setSubmitting(true);
@@ -250,7 +250,7 @@ export function TemplateCatalog({
       );
       registered();
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }

@@ -12,7 +12,7 @@ Median is the middle observation, averaging the two middle values for even count
 
 ## Measurement boundaries
 
-The release integration test is [boot_benchmarks.rs](../packages/enginebox-core/tests/boot_benchmarks.rs). It calls the production Rust `EngineBox::lifecycle` and `fleet::wait_ready` functions on the Incus host, without an SSH round trip per operation.
+The release integration test is [boot_benchmarks.rs](../../packages/enginebox-core/tests/boot_benchmarks.rs). It calls the production Rust `EngineBox::lifecycle` and `fleet::wait_ready` functions on the Incus host, without an SSH round trip per operation.
 
 Each sample first acquires the existing root-owned host lease, checks all native provider leases are idle, and records host load and a guest process marker. It then cleanly stops, freezes, or hibernates **its own fixture**. That preparation time is recorded separately. The start timer begins immediately before `lifecycle("resume")`, which includes Incus status queries, the start request and the returned state. Full readiness adds the actual Rust helper-version validation and guest-readiness loop. Lock acquisition, prior stop/pause/hibernate, API queueing, dashboard polling and credential delegation are outside this start timer.
 

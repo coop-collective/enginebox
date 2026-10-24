@@ -1,7 +1,7 @@
 # LayerFS storage and checkout validation
 
-Current direction: [LayerFS game workspaces](GAME-WORKSPACES.md) and
-[Store distribution](STORE-DISTRIBUTION.md) record the October 23 owner decision.
+Current direction: [LayerFS game workspaces](../GAME-WORKSPACES.md) and
+[Store distribution](../STORE-DISTRIBUTION.md) record the October 23 owner decision.
 The experiments below retain their original versions and qualification limits;
 the older optional-candidate wording is historical, not the current product scope.
 
@@ -81,7 +81,7 @@ pinned preview backend.
 
 On October 19, 2026, the pinned LayerFS preview **did share a complete checkout and installed dependencies across independent writable mounts**. This validates the basic storage idea. It does not yet qualify LayerFS as Engine Box's persistent filesystem or as a shared store across its existing Incus VMs.
 
-Upstream revision: `968a5d0be0ea3e9456b06f9148b65523138e9490`. The independent [research harness](../research/layerfs-validation/README.md) builds the actual upstream Rust daemon and Node addon. [Source-level integration boundaries](LAYERFS.md) cover durability, same-kernel storage access, restart recovery and retention. [Rust boot measurements](RUST-BOOT-BENCHMARKS.md) are a separate experiment; LayerFS forks are not VM boots.
+Upstream revision: `968a5d0be0ea3e9456b06f9148b65523138e9490`. The independent [research harness](../../research/layerfs-validation/README.md) builds the actual upstream Rust daemon and Node addon. [Source-level integration boundaries](../LAYERFS.md) cover durability, same-kernel storage access, restart recovery and retention. [Rust boot measurements](RUST-BOOT-BENCHMARKS.md) are a separate experiment; LayerFS forks are not VM boots.
 
 ## Workload and timing boundaries
 

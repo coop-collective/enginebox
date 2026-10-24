@@ -29,3 +29,23 @@ test('docs navigation, availability and a real not-found page',async({page,isMob
   await expect(page.locator('.doc-content')).toContainText(/Linux/);
   const response=await page.goto('/missing-environment');expect(response.status()).toBe(404);await expect(page.getByRole('heading',{name:'This environment doesn’t exist.'})).toBeVisible();
 });
+test('pricing page lists the per-node price and is reachable from the nav',async({page,isMobile})=>{
+  await page.goto('/');
+  if(isMobile)await page.getByRole('button',{name:'Toggle navigation'}).click();
+  await page.locator('#main-nav a[href="/pricing/"]').click();
+  await expect(page).toHaveURL(/\/pricing\/$/);
+  await expect(page.getByRole('heading',{level:1})).toContainText('$10');
+  await expect(page.locator('.plans')).toContainText('$10');
+  await expect(page.locator('.plans')).toContainText('Managed hosting'.toUpperCase());
+  await expect(page.locator('.node-example')).toContainText('$30');
+  await page.getByText('Is the node count enforced automatically?').click();
+  await expect(page.locator('.faq-list')).toContainText('does not currently enforce');
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
+test('pricing checkout button is disabled until CHECKOUT_URL is configured',async({page})=>{
+  await page.goto('/pricing/');
+  const buy=page.locator('[data-checkout]');
+  if(await buy.evaluate(el=>el.tagName==='A')){await expect(buy).toHaveAttribute('href',/^https:\/\//);}
+  else{await expect(buy).toBeDisabled();await expect(buy).toHaveText('Checkout opening soon');}
+  const sitemap=await page.request.get('/sitemap.xml');expect(await sitemap.text()).toContain('/pricing/');
+});

@@ -67,6 +67,8 @@ pub struct Controller {
     token: String,
     gate: Mutex<Gate>,
     observations: Mutex<std::collections::BTreeMap<String, Value>>,
+    // Last background reconcile failure (message, RFC 3339 time); cleared on success.
+    reconcile_error: Mutex<Option<(String, String)>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -99,6 +101,7 @@ impl Controller {
                 runtime: None,
             }),
             observations: Mutex::new(std::collections::BTreeMap::new()),
+            reconcile_error: Mutex::new(None),
         }))
     }
     pub fn activate(self: &Arc<Self>) -> Result<Value> {
@@ -213,7 +216,17 @@ impl Controller {
     }
     pub fn status(&self) -> Value {
         let g = self.gate.lock().unwrap();
-        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.pending_jobs()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION")})
+        json!({"accepting_mutations":g.mode==Mode::Active,"mode":g.mode.name(),"active_jobs":g.runtime.as_ref().map_or(0,|r|r.pending_jobs()),"active_auth_sessions":g.runtime.as_ref().map_or(0,|r|r.agents.pending()),"active_requests":g.requests,"background_tasks":g.background,"state_schema":STATE_SCHEMA,"version":env!("CARGO_PKG_VERSION"),"background_reconcile_error":self.reconcile_error.lock().unwrap().as_ref().map(|(message,at)|json!({"message":message,"at":at}))})
+    }
+    fn record_reconcile(&self, errors: Vec<String>) {
+        let mut last = self.reconcile_error.lock().unwrap();
+        if errors.is_empty() {
+            *last = None;
+            return;
+        }
+        let message = errors.join("; ");
+        eprintln!("Background reconcile failed: {message}");
+        *last = Some((message, chrono::Utc::now().to_rfc3339()));
     }
     pub fn start_background(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
@@ -230,14 +243,22 @@ impl Controller {
                 };
                 let controller = this.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(r) = &runtime {
-                        // Queue CI work; installers run in their own execution pool.
-                        let _ = r.ci.reconcile(&r.ci_jobs);
+                    let mut errors = Vec::new();
+                    if let Some(r) = &runtime
+                        && let Err(e) = r.ci.reconcile(&r.ci_jobs)
+                    {
+                        // Installers run in the CI pool; report queue/state failures.
+                        errors.push(format!("ci: {e:#}"));
                     }
-                    let _ = controller.fleet.reconcile();
-                    if let Some(r) = runtime {
-                        let _ = r.agents.reconcile();
+                    if let Err(e) = controller.fleet.reconcile() {
+                        errors.push(format!("fleet: {e:#}"));
                     }
+                    if let Some(r) = runtime
+                        && let Err(e) = r.agents.reconcile()
+                    {
+                        errors.push(format!("agents: {e:#}"));
+                    }
+                    controller.record_reconcile(errors);
                 })
                 .await;
                 this.gate.lock().unwrap().background -= 1;
@@ -1076,6 +1097,20 @@ mod tests {
         assert_eq!(value["usage"]["freshness"], "stale");
         assert!(value["usage"]["allowance_windows"][0]["remaining_percentage"].is_null());
         assert_eq!(c.status()["mode"], "drained");
+    }
+    #[tokio::test]
+    async fn status_reports_background_reconcile_failure_until_next_success() {
+        let (_temp, c) = setup();
+        assert!(c.status()["background_reconcile_error"].is_null());
+        c.record_reconcile(vec!["fleet: boom".into(), "agents: bang".into()]);
+        let s = c.status();
+        assert_eq!(
+            s["background_reconcile_error"]["message"],
+            "fleet: boom; agents: bang"
+        );
+        assert!(s["background_reconcile_error"]["at"].as_str().is_some());
+        c.record_reconcile(Vec::new());
+        assert!(c.status()["background_reconcile_error"].is_null());
     }
     #[tokio::test]
     async fn only_one_controller_can_activate_and_rollback_reloads_state() {

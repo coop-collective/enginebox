@@ -15,7 +15,7 @@ the staged controller cutover remain separate checks.
 ## What the test does
 
 The test in
-[`legacy_state_qualification.rs`](../packages/enginebox-controller/tests/legacy_state_qualification.rs)
+[`legacy_state_qualification.rs`](../../packages/enginebox-controller/tests/legacy_state_qualification.rs)
 reads only `jobs`, `agent-runs`, and `templates` below an explicitly supplied
 source state directory, plus an explicitly supplied fleet configuration file.
 It copies the completed metadata and configuration into a new mode-0700

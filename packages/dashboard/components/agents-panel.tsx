@@ -1,7 +1,8 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/client";
+import { api, errorMessage } from "@/lib/client";
+import { usePageVisible } from "@/lib/visible-interval";
 import {
   activeAuth,
   officialAuthorizationUrl,
@@ -41,8 +42,9 @@ function ProviderCard({
   useEffect(() => {
     if (bound(account.session)) setSession(account.session!);
   }, [account.session]);
+  const visible = usePageVisible();
   useEffect(() => {
-    if (!session || !activeAuth(session) || busy) return;
+    if (!session || !activeAuth(session) || busy || !visible) return;
     const controller = new AbortController();
     pollRequest.current = controller;
     let timer: ReturnType<typeof setTimeout>;
@@ -63,7 +65,7 @@ function ProviderCard({
         if (activeAuth(data.session)) timer = setTimeout(poll, 1000);
       } catch (err) {
         if (controller.signal.aborted) return;
-        setError(`Could not refresh sign-in: ${(err as Error).message}`);
+        setError(`Could not refresh sign-in: ${errorMessage(err)}`);
         timer = setTimeout(poll, 2000);
       }
     }
@@ -72,7 +74,7 @@ function ProviderCard({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [session?.id, session?.status, base, busy, changed]);
+  }, [session?.id, session?.status, base, busy, visible, changed]);
   async function mutate(path: string, body: object = {}) {
     pollRequest.current?.abort();
     const controller = new AbortController();
@@ -93,7 +95,7 @@ function ProviderCard({
       setSession(data.session);
       if (data.session.status === "succeeded") void changed();
     } catch (err) {
-      if (!controller.signal.aborted) setError((err as Error).message);
+      if (!controller.signal.aborted) setError(errorMessage(err));
     } finally {
       pendingRequests.current.delete(controller);
       if (!controller.signal.aborted) setBusy(false);
@@ -286,7 +288,7 @@ function ControllerAgents() {
       }
     } catch (err) {
       if (!controller.signal.aborted) {
-        setError((err as Error).message);
+        setError(errorMessage(err));
         setProviders(null);
       }
     } finally {

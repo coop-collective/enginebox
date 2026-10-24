@@ -9,7 +9,7 @@ upstream core ideas to the existing container backend and its remaining gates.
 worker Stores, immutable generation transfer and safe disk-pressure eviction.
 Those distributed services are planned; the local Docker integration already exists.
 
-The [disposable Linux validation](LAYERFS-VALIDATION.md) establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. Its mtime, Git metadata, recovery and topology limits still apply. Making the backend first-class does not turn that evidence into a production durability guarantee.
+The [disposable Linux validation](reports/LAYERFS-VALIDATION.md) establishes real independent mounts, cheap file branches and a corrected offline pnpm-cache recipe at a pinned preview revision. Its mtime, Git metadata, recovery and topology limits still apply. Making the backend first-class does not turn that evidence into a production durability guarantee.
 
 The upstream [README](https://github.com/Ephemeral-AI-Lab/layerfs) describes independent writable workspaces over a shared store, copy-on-write branches, content-addressed deduplication, chunking and versioned checkpoints. This matches Engine Box's goal of reusing large checkouts and installed dependencies without giving agents a shared writable project directory. Upstream performance examples are their measurements, not Engine Box benchmarks.
 
@@ -93,4 +93,4 @@ The product feature is coordinated environment branching: code, prepared depende
 5. Specify file revision/VM checkpoint ordering and rollback compatibility. Preserve a stopped workspace for inspection on uncertain recovery; never silently discard uncommitted changes.
 6. Prove install, version pinning, upgrade, downgrade refusal for incompatible store formats and removal using disposable test data. A controller rollback must not silently downgrade a store.
 
-The existing [backend](LAYERFS-BACKEND-VALIDATION.md), [recovery](LAYERFS-RECOVERY-VALIDATION.md) and [Incus attachment](LAYERFS-INCUS.md) qualifications establish the initial disposable-workspace path. The next work extends that path to native agent sessions, representative projects and the proposed database publication adapters. No production migration or universal instant-start claim follows from the small fixtures alone.
+The existing [backend](reports/LAYERFS-BACKEND-VALIDATION.md), [recovery](reports/LAYERFS-RECOVERY-VALIDATION.md) and [Incus attachment](LAYERFS-INCUS.md) qualifications establish the initial disposable-workspace path. The next work extends that path to native agent sessions, representative projects and the proposed database publication adapters. No production migration or universal instant-start claim follows from the small fixtures alone.
