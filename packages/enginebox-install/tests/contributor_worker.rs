@@ -215,6 +215,23 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
             .unwrap(),
         "fixture-native-prompt"
     );
+    // Revocation must terminate a running native job and its detached descendant.
+    let pid_file = root.join("descendant.pid");
+    let script = format!(
+        "$p=Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 90') -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Start-Sleep -Seconds 90",
+        pid_file.to_string_lossy().replace("'", "''")
+    );
+    api(&client,&url,&path,Some(json!({"request_id":"revoke-proof","kind":"ci","request":{"schema_version":1,"request_id":"revoke-proof","event":"workflow_dispatch","sha":"a".repeat(40),"job":{"runner":"automation","runs-on":["windows","pwsh"],"shell":"pwsh","run":script,"artifacts":[],"timeout-minutes":1}}}))).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !pid_file.is_file() {
+        assert!(Instant::now() < deadline, "child process never started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     api(
         &client,
         &url,
@@ -227,6 +244,20 @@ async fn windows_enrollment_runs_ci_and_agent_then_revokes_without_replay() {
         .unwrap()
         .unwrap();
     assert!(!status.success());
+    let check = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}"),
+        ])
+        .status()
+        .await
+        .unwrap();
+    assert!(
+        check.success(),
+        "revocation left the worker's descendant alive"
+    );
     server.abort();
     proxy.abort();
 }

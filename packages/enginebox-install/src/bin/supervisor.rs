@@ -63,6 +63,9 @@ fn main() -> Result<()> {
                     "ENGINEBOX_DASHBOARD_PASSWORD",
                     "ENGINEBOX_SESSION_SECRET",
                     "ENGINEBOX_DASHBOARD_ORIGIN",
+                    "ENGINEBOX_NODE_INSTALLER_URL",
+                    "ENGINEBOX_NODE_INSTALLER_SHA256",
+                    "ENGINEBOX_NODE_PUBLIC_ORIGIN",
                     "PATH"
                 ]
                 .contains(&key.as_str()),

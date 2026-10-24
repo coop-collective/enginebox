@@ -143,7 +143,7 @@ impl Contributors {
             "This worker release requires Windows x64"
         );
         let mut nodes = self.nodes.lock().unwrap();
-        let n = nodes.get_mut(key).context("Unknown registration")?;
+        let mut n = nodes.get(key).cloned().context("Unknown registration")?;
         ensure!(
             !n.revoked && n.expires > now() && equal(&n.code_hash, &secret_hash(code)),
             "Registration code expired or invalid"
@@ -165,9 +165,12 @@ impl Contributors {
             n.budget = e.budget;
             n.os = e.os;
             n.architecture = e.architecture;
-            self.save(n)?;
+            self.save(&n)?;
         }
-        Ok(json!({"id":n.id,"budget":n.budget,"workloads":n.invitation.workloads,"enrolled":true}))
+        let response =
+            json!({"id":n.id,"budget":n.budget,"workloads":n.invitation.workloads,"enrolled":true});
+        nodes.insert(key.to_owned(), n);
+        Ok(response)
     }
     pub fn authenticated(&self, token: &str) -> bool {
         let Some((key, _)) = token.split_once('.') else {

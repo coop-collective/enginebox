@@ -1619,5 +1619,5 @@ input::placeholder {
 .contributor-panel h2 { font-size: 18px; }
 .contributor-panel .button { justify-self: start; }
 .contributor-form .contributor-choice { display: flex; align-items: center; gap: 9px; font-size: 13px; }
-.contributor-form .contributor-choice input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.contributor-form .contributor-choice input { width: 16px; height: 16px; margin: 0; accent-color: var(--teal); }
 @media (max-width: 640px) { .contributor-heading { align-items: flex-start; flex-direction: column; } }

@@ -52,3 +52,8 @@ test('command rejects shell injection and credential-bearing controller origins'
   assert.throws(()=>installCommand(code,{...budget,cpu:NaN}));
   process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN='https://user:password@enginebox.example';assert.throws(()=>installCommand(code,budget));
 });
+test('an older supervisor cannot issue an unusable worker invitation',async t=>{
+  const fetch=t.mock.method(globalThis,'fetch',async (url:string)=>{assert.ok(url.endsWith('/__enginebox/status'));return Response.json({current:'old'});});
+  await assert.rejects(contributors(ownerRequest({budget}),['enrollments']),(e:unknown)=>e instanceof HttpError&&e.status===503);
+  assert.equal(fetch.mock.callCount(),1);
+});
