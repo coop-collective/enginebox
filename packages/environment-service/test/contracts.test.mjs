@@ -43,7 +43,7 @@ test('pinned images, bounded resource claims and unique loopback ports are manda
   const config = fixture(); config.environments[0].ports[1].host = 18081;
   assert.throws(() => validateConfig(config), /duplicate-port/);
 });
-test('source follows only main, checks out exact commits, and preserves prior code and data', async () => {
+test('source follows only main, checks out exact commits, and preserves prior code and data', { skip: process.platform === 'win32' }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'ebox-environment-test-'));
   try {
     const repo = join(root, 'origin'); await mkdir(repo);
