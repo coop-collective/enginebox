@@ -22,10 +22,6 @@ RUN case "$TARGETARCH" in \
     install -m 755 "/tmp/godot/Godot_v4.7.2-stable_linux.$godot_arch" /usr/local/bin/godot
 
 FROM debian:bookworm-slim AS runtime
-ARG SOURCE_REVISION
-LABEL org.opencontainers.image.source="https://github.com/coop-collective/enginebox" \
-      org.opencontainers.image.revision=$SOURCE_REVISION \
-      org.opencontainers.image.title="Enginebox Godot stream host"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates ffmpeg xvfb libgl1-mesa-dri libegl1 tini python3 \
     libx11-6 libxcursor1 libxinerama1 libgl1 libxi6 libxrandr2 libfontconfig1 libasound2 libudev1 \
@@ -38,6 +34,10 @@ COPY --from=godot /usr/local/bin/godot /usr/local/bin/godot
 COPY LICENSE /usr/share/doc/enginebox-stream-host/LICENSE
 COPY container/godot-host.py /usr/local/bin/enginebox-godot-host
 COPY examples/godot-check /opt/enginebox/godot-check
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/coop-collective/enginebox" \
+      org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.title="Enginebox Godot stream host"
 USER 1000:1000
 ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
