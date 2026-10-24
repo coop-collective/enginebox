@@ -4,6 +4,7 @@ pub mod config;
 pub mod github;
 pub mod incus;
 mod runtime;
+pub use runtime::Runtime;
 pub mod source;
 pub mod sync;
 

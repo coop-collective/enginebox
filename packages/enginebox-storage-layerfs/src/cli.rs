@@ -2,7 +2,10 @@ use crate::{config::Config, runtime::Runtime, source};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 #[derive(Args)]
 pub struct Storage {
@@ -58,6 +61,9 @@ enum Command {
         message: String,
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// One-transfer repository-bound credential over private stdin.
+        #[arg(long, conflicts_with = "token_file")]
+        token_stdin: bool,
     },
     /// Advance an export, obtain a conflict agent task, or accept its resolution.
     GithubDelivery {
@@ -68,6 +74,9 @@ enum Command {
         attempt: Option<String>,
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// One-transfer repository-bound credential over private stdin.
+        #[arg(long, conflicts_with = "token_file")]
+        token_stdin: bool,
     },
     /// Fetch a GitHub branch and review its exact committed source tree.
     GithubPreview {
@@ -79,6 +88,9 @@ enum Command {
         /// Private node credential JSON; never stored in the imported project.
         #[arg(long)]
         token_file: Option<PathBuf>,
+        /// One-transfer repository-bound credential over private stdin.
+        #[arg(long, conflicts_with = "token_file")]
+        token_stdin: bool,
     },
     /// Import a reviewed GitHub tree as a LayerFS-owned project.
     GithubImport {
@@ -230,26 +242,75 @@ pub fn run(args: Storage) -> Result<Value> {
             merge,
             message,
             token_file,
-        } => runtime.github_promote(
-            &project,
-            &name,
-            &expected_main,
-            merge,
-            &message,
-            token_file.as_deref(),
-        ),
+            token_stdin,
+        } => {
+            let binding = runtime.github_settings(&project, None)?;
+            let private = token_stdin
+                .then(|| {
+                    delegated_token(
+                        std::io::stdin().lock(),
+                        binding["repository"].as_str(),
+                        binding["branch"].as_str(),
+                    )
+                })
+                .transpose()?;
+            runtime.github_promote(
+                &project,
+                &name,
+                &expected_main,
+                merge,
+                &message,
+                private.as_ref().map(|f| f.path()).or(token_file.as_deref()),
+            )
+        }
         Command::GithubDelivery {
             project,
             action,
             attempt,
             token_file,
-        } => runtime.github_delivery(&project, &action, attempt.as_deref(), token_file.as_deref()),
+            token_stdin,
+        } => {
+            let binding = runtime.github_settings(&project, None)?;
+            let private = token_stdin
+                .then(|| {
+                    delegated_token(
+                        std::io::stdin().lock(),
+                        binding["repository"].as_str(),
+                        binding["branch"].as_str(),
+                    )
+                })
+                .transpose()?;
+            runtime.github_delivery(
+                &project,
+                &action,
+                attempt.as_deref(),
+                private.as_ref().map(|f| f.path()).or(token_file.as_deref()),
+            )
+        }
         Command::GithubPreview {
             name,
             repository,
             branch,
             token_file,
-        } => runtime.github_preview(&name, &repository, branch.as_deref(), token_file.as_deref()),
+            token_stdin,
+        } => {
+            let repository = crate::github::repository(&repository)?;
+            let private = token_stdin
+                .then(|| {
+                    delegated_token(
+                        std::io::stdin().lock(),
+                        Some(&repository),
+                        branch.as_deref(),
+                    )
+                })
+                .transpose()?;
+            runtime.github_preview(
+                &name,
+                &repository,
+                branch.as_deref(),
+                private.as_ref().map(|f| f.path()).or(token_file.as_deref()),
+            )
+        }
         Command::GithubImport {
             name,
             revision,
@@ -319,5 +380,73 @@ pub fn run(args: Storage) -> Result<Value> {
         Command::IncusReconcile { .. } => unreachable!(),
         Command::List => runtime.list(),
         Command::Preview { .. } => unreachable!(),
+    }
+}
+
+// A temporary file is private, removed on return, and never part of the project.
+fn delegated_token(
+    input: impl Read,
+    repository: Option<&str>,
+    branch: Option<&str>,
+) -> Result<tempfile::NamedTempFile> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Credential {
+        schema: u32,
+        repository: String,
+        branch: String,
+        token: String,
+    }
+    let mut bytes = Vec::new();
+    input.take(32769).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 32768, "Credential exceeds transfer limit");
+    let credential: Credential = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid delegated GitHub credential"))?;
+    anyhow::ensure!(
+        credential.schema == 1
+            && Some(credential.repository.as_str()) == repository
+            && Some(credential.branch.as_str()) == branch,
+        "Delegated credential does not match this repository and branch"
+    );
+    anyhow::ensure!(
+        !credential.token.is_empty()
+            && credential.token.len() <= 16384
+            && credential
+                .token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
+        "Invalid delegated token"
+    );
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(&serde_json::to_vec(
+        &serde_json::json!({"token":credential.token}),
+    )?)?;
+    file.flush()?;
+    Ok(file)
+}
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    #[test]
+    fn stdin_credentials_are_bound_bounded_and_removed_after_transfer() {
+        let value = br#"{"schema":1,"repository":"owner/private","branch":"main","token":"ghs_APP.jwt-fixture"}"#;
+        let file = delegated_token(&value[..], Some("owner/private"), Some("main")).unwrap();
+        let path = file.path().to_owned();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        drop(file);
+        assert!(!path.exists());
+        assert!(delegated_token(&value[..], Some("other/repo"), Some("main")).is_err());
+        assert!(delegated_token(&value[..], Some("owner/private"), Some("other")).is_err());
+        assert!(
+            delegated_token(&vec![b' '; 32769][..], Some("owner/private"), Some("main")).is_err()
+        );
     }
 }

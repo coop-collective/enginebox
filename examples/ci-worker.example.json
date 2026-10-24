@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "fleet": "/etc/enginebox/ci-fleet.toml",
+  "state_root": "/var/lib/enginebox-ci",
+  "host_id": "ci-local",
+  "template": "ci-linux",
+  "resources": { "cpu": 4, "memory_gib": 8, "disk_gib": 40 },
+  "runner_version": "2.337.0",
+  "layerfs": null,
+  "projects": {}
+}

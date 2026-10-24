@@ -19,6 +19,20 @@ function Status({ task, run, taskKey }: { task?: StorageTask; run: Run; taskKey:
   </div>;
 }
 export function GitHubStorage({ projects, rows, tasks, run, refresh }: { projects: GitHubProject[]; rows: Checkout[]; tasks: Record<string, StorageTask>; run: Run; refresh: () => Promise<void> }) {
+  const [connected, setConnected] = useState<{ id: number; full_name: string; branch: string }[]>([]);
+  useEffect(() => {
+    let active = true;
+    void fetch("/api/control/v1/github", { signal: AbortSignal.timeout(10000) }).then(async response => {
+      if (!response.ok) return;
+      const status = await response.json();
+      if (!active || !Array.isArray(status.repositories)) return;
+      setConnected(status.repositories);
+      const id = new URLSearchParams(window.location.search).get("github_repository");
+      const selected = status.repositories.find((r: {id: number}) => String(r.id) === id);
+      if (selected) { setRepository(selected.full_name); setBranch(selected.branch); }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
   const [project, setProject] = useState("");
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("");
@@ -62,8 +76,10 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
   return <section className="storage-source" aria-label="GitHub connections">
     <h4>GitHub connections</h4>
     <p className="workspace-hint">Import files into LayerFS, then optionally sync accepted main revisions back to GitHub. Your working branches stay in LayerFS.</p>
-    <details>
+    <details open={connected.some(r => r.full_name === repository)}>
       <summary>Import a GitHub repository</summary>
+      {connected.length > 0 && <label>Connected repository<select value={connected.some(r => r.full_name === repository) ? repository : ""} onChange={e => { const selected = connected.find(r => r.full_name === e.target.value); if (selected) { setRepository(selected.full_name); setBranch(selected.branch); setReviewed(false); } }}><option value="">Choose an authorized repository</option>{connected.map(r => <option key={r.id} value={r.full_name}>{r.full_name}</option>)}</select></label>}
+      <p><a href="/?panel=github">Connect a GitHub account or change repository access</a></p>
       <form className="storage-form" onSubmit={inspect}>
         <label>GitHub project ID<input value={project} onChange={(e) => { setProject(e.target.value); setReviewed(false); }} pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?" maxLength={48} required placeholder="my-app" /></label>
         <label>GitHub repository<input value={repository} onChange={(e) => { setRepository(e.target.value); setReviewed(false); }} required maxLength={200} placeholder="owner/repository" /></label>

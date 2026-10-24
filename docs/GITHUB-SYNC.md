@@ -145,3 +145,7 @@ the clean-path Linux publication/export and GitHub-write qualification for that
 single-owner fixture. Live conflict-agent dispatch and distributed delivery remain
 separate gates. The test also caught and corrected empty exports from Docker's
 archive API when `/project` is a later-installed LayerFS mount.
+
+## Connected account credentials
+
+The optional [GitHub account module](GITHUB-ACTIONS.md) replaces manual node tokens when configured. Select the repository and branch in the dashboard, then use this existing review/import/acceptance flow. Each network operation revalidates owner access and delegates a short-lived installation token restricted to that repository over private stdin. The updated node checks its retained repository/branch binding and removes the temporary credential file after the operation. Refresh tokens and App keys remain in controller storage. Existing deployments without the account module retain their manual credential-file configuration.

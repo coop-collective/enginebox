@@ -6,7 +6,14 @@ license-file = "../../LICENSE"
 publish = false
 description = "Optional non-agent CI jobs and native GitHub Actions runners"
 
+[[bin]]
+name = "enginebox-ci-worker"
+path = "src/main.rs"
+
 [dependencies]
+enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
 enginebox-core = { path = "../enginebox-core" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

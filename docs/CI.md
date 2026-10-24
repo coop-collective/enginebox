@@ -341,3 +341,7 @@ not establish those capabilities or a successful mobile store release.
 Protocol references: [GitHub workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event),
 [self-hosted runner routing and ephemeral lifecycle](https://docs.github.com/en/actions/reference/runners/self-hosted-runners),
 and [official listener command/environment handling](https://github.com/actions/runner/blob/main/src/Runner.Listener/CommandSettings.cs).
+
+## Organization runner pools
+
+The optional [GitHub account and Actions service](GITHUB-ACTIONS.md) adds separate organization runner approval, signed workflow-job webhooks and bounded disposable Incus JIT runners. It complements the explicit dispatch/runner interfaces above. Configure provider credentials through the [Kitbash secret setup](GITHUB-SECRETS.md); existing organization runners require an explicit routing/drain migration.

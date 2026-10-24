@@ -367,7 +367,9 @@ name = "enginebox-ci"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "clap",
  "enginebox-core",
+ "enginebox-storage-layerfs",
  "fs2",
  "reqwest",
  "serde",
@@ -376,6 +378,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -406,6 +409,7 @@ dependencies = [
  "enginebox-agents",
  "enginebox-ci",
  "enginebox-core",
+ "enginebox-github",
  "enginebox-storage-layerfs",
  "fs2",
  "http-body-util",
@@ -455,6 +459,23 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "enginebox-github"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "enginebox-core",
+ "enginebox-storage-layerfs",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
  "uuid",
 ]
 

@@ -326,10 +326,10 @@ fn network_git(cache: &Path, token_file: Option<&Path>, args: &[&str]) -> Result
                 .context("GitHub credential file needs a token string")?;
             ensure!(
                 !token.is_empty()
-                    && token.len() <= 4096
+                    && token.len() <= 16384
                     && token
                         .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
                 "Invalid GitHub token format"
             );
             Ok(token.to_owned())
