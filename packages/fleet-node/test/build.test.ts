@@ -166,88 +166,125 @@ console.log(JSON.stringify({artifactId:crypto.createHash('sha256').update(text).
   } as Assignment;
   return { config, client, assignment, root, uploads, source, recipePath };
 }
-test("build adapter binds protected source and publishes actual CLI artifact with no inherited credentials", async (t) => {
-  const f = await fixture(t);
-  const previous = process.env.ENGINEBOX_BUILD_TEST_SECRET;
-  process.env.ENGINEBOX_BUILD_TEST_SECRET = "must-not-enter-builder";
-  t.after(() => {
-    if (previous === undefined) delete process.env.ENGINEBOX_BUILD_TEST_SECRET;
-    else process.env.ENGINEBOX_BUILD_TEST_SECRET = previous;
-  });
-  const outcome = await new EngineBuilds(f.config, f.client).execute(
-    f.assignment,
-    new AbortController().signal,
-  );
-  assert.match(String(outcome.artifact), /^[a-f0-9]{64}$/);
-  assert.equal(outcome.generation, f.assignment.generation);
-  assert(f.uploads.includes("/v1/projects/demo/artifacts"));
-});
-test("source mismatch and forged output paths publish nothing", async (t) => {
-  const f = await fixture(t, "escape");
-  await assert.rejects(
-    () =>
-      new EngineBuilds(f.config, f.client).execute(
-        f.assignment,
-        new AbortController().signal,
+test(
+  "build adapter binds protected source and publishes actual CLI artifact with no inherited credentials",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const f = await fixture(t);
+    const previous = process.env.ENGINEBOX_BUILD_TEST_SECRET;
+    process.env.ENGINEBOX_BUILD_TEST_SECRET = "must-not-enter-builder";
+    t.after(() => {
+      if (previous === undefined)
+        delete process.env.ENGINEBOX_BUILD_TEST_SECRET;
+      else process.env.ENGINEBOX_BUILD_TEST_SECRET = previous;
+    });
+    const outcome = await new EngineBuilds(f.config, f.client).execute(
+      f.assignment,
+      new AbortController().signal,
+    );
+    assert.match(String(outcome.artifact), /^[a-f0-9]{64}$/);
+    assert.equal(outcome.generation, f.assignment.generation);
+    assert(f.uploads.includes("/v1/projects/demo/artifacts"));
+  },
+);
+test(
+  "source mismatch and forged output paths publish nothing",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const f = await fixture(t, "escape");
+    await assert.rejects(
+      () =>
+        new EngineBuilds(f.config, f.client).execute(
+          f.assignment,
+          new AbortController().signal,
+        ),
+      /escaped|symbolic links/,
+    );
+    assert.equal(f.uploads.length, 0);
+    const source = JSON.parse(
+      await readFile(join(f.source, "source.json"), "utf8"),
+    );
+    source.generation = "f".repeat(64);
+    await writeFile(join(f.source, "source.json"), JSON.stringify(source));
+    await assert.rejects(
+      () =>
+        new EngineBuilds(f.config, f.client).execute(
+          f.assignment,
+          new AbortController().signal,
+        ),
+      /provenance/,
+    );
+    assert.equal(f.uploads.length, 0);
+  },
+);
+test(
+  "lease cancellation is confirmed by CLI exit before returning and cannot publish",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const f = await fixture(t, "cancel"),
+      cancel = new AbortController();
+    const promise = new EngineBuilds(f.config, f.client).execute(
+      f.assignment,
+      cancel.signal,
+    );
+    setTimeout(() => cancel.abort(), 300);
+    await assert.rejects(() => promise, /failed|expired/);
+    assert.equal(f.uploads.length, 0);
+    const lease = JSON.parse(
+      await readFile(
+        join(f.config.bindings.demo.state, "attempts/attempt-a/lease.json"),
+        "utf8",
       ),
-    /escaped|symbolic links/,
-  );
-  assert.equal(f.uploads.length, 0);
-  const source = JSON.parse(
-    await readFile(join(f.source, "source.json"), "utf8"),
-  );
-  source.generation = "f".repeat(64);
-  await writeFile(join(f.source, "source.json"), JSON.stringify(source));
-  await assert.rejects(
-    () =>
-      new EngineBuilds(f.config, f.client).execute(
-        f.assignment,
-        new AbortController().signal,
-      ),
-    /provenance/,
-  );
-  assert.equal(f.uploads.length, 0);
-});
-test("lease cancellation is confirmed by CLI exit before returning and cannot publish", async (t) => {
-  const f = await fixture(t, "cancel"),
-    cancel = new AbortController();
-  const promise = new EngineBuilds(f.config, f.client).execute(
-    f.assignment,
-    cancel.signal,
-  );
-  setTimeout(() => cancel.abort(), 300);
-  await assert.rejects(() => promise, /failed|expired/);
-  assert.equal(f.uploads.length, 0);
-  const lease = JSON.parse(
-    await readFile(
-      join(f.config.bindings.demo.state, "attempts/attempt-a/lease.json"),
-      "utf8",
-    ),
-  );
-  assert.equal(lease.cancelled, true);
-});
-test("untrusted local mode, recipe drift, and arbitrary job argv are rejected", async (t) => {
-  const f = await fixture(t);
-  assert.throws(
-    () =>
-      new EngineBuilds({ ...f.config, localTrusted: false as any }, f.client),
-    /opt-in/,
-  );
-  const recipe = JSON.parse(await readFile(f.recipePath, "utf8"));
-  recipe.timeoutSeconds = 10;
-  await writeFile(f.recipePath, JSON.stringify(recipe));
-  await assert.rejects(
-    () =>
-      new EngineBuilds(f.config, f.client).execute(
-        f.assignment,
-        new AbortController().signal,
-      ),
-    /recipe/,
-  );
-  assert.equal(f.uploads.length, 0);
-  const { node, attempt, session, epoch, expires, ...spec } = f.assignment;
-  assert.throws(
-    () => validateEngineBuild({ ...spec, argv: ["curl", "private-url"] }),
-    /Unknown field/,
-  );
-});
+    );
+    assert.equal(lease.cancelled, true);
+  },
+);
+test(
+  "untrusted local mode, recipe drift, and arbitrary job argv are rejected",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const f = await fixture(t);
+    assert.throws(
+      () =>
+        new EngineBuilds({ ...f.config, localTrusted: false as any }, f.client),
+      /opt-in/,
+    );
+    const recipe = JSON.parse(await readFile(f.recipePath, "utf8"));
+    recipe.timeoutSeconds = 10;
+    await writeFile(f.recipePath, JSON.stringify(recipe));
+    await assert.rejects(
+      () =>
+        new EngineBuilds(f.config, f.client).execute(
+          f.assignment,
+          new AbortController().signal,
+        ),
+      /recipe/,
+    );
+    assert.equal(f.uploads.length, 0);
+    const { node, attempt, session, epoch, expires, ...spec } = f.assignment;
+    assert.throws(
+      () => validateEngineBuild({ ...spec, argv: ["curl", "private-url"] }),
+      /Unknown field/,
+    );
+  },
+);
+
+test(
+  "Windows native build execution requires the qualified Linux container",
+  { skip: process.platform !== "win32" },
+  () => {
+    assert.throws(
+      () =>
+        new EngineBuilds(
+          {
+            localTrusted: true,
+            binary: process.execPath,
+            binarySha256: "0".repeat(64),
+            bindings: {},
+          },
+          new Client("http://localhost", "test"),
+        ),
+      /qualified Linux build worker/,
+    );
+  },
+);
