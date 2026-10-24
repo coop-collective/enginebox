@@ -63,7 +63,9 @@ try{
   await new Promise(r=>setTimeout(r,1000));assert.equal(stats.inputsForwarded,2);
   await pages[0].evaluate(()=>closeSession());await wait(()=>stats.peers===1,'disconnect releases slot');
   await pages[0].evaluate(()=>openSession('control'));await wait(async()=>(await pages[0].evaluate(()=>stats())).frames>=10,'reconnect with a new session');
-  const samples=await Promise.all(pages.map(p=>p.evaluate(()=>stats())));
+  const fpsStart=await Promise.all(pages.map(p=>p.evaluate(()=>stats())));await new Promise(r=>setTimeout(r,3200));
+  const samples=(await Promise.all(pages.map(p=>p.evaluate(()=>stats())))).map((sample,index)=>({...sample,measurementMs:sample.timestamp-fpsStart[index].timestamp,decodedFramesInWindow:sample.frames-fpsStart[index].frames,decodedFps:(sample.frames-fpsStart[index].frames)*1000/(sample.timestamp-fpsStart[index].timestamp)}));
+  for(const sample of samples)assert(sample.measurementMs>=3000,'FPS measurement requires at least3seconds');
   // Expire the control lease while a watcher keeps the engine alive: input stops locally.
   for(const s of sessions.values())if(s.session.state==='open'&&s.session.mode==='control'){s.disableRenew=true;if(!fleet)s.session.expires=Date.now()+500;}
   await wait(()=>stats.peers===1,'lease expiry reclaims control',70000);
