@@ -91,6 +91,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 ## Design and implementation
 
 - [Persistent development environments and private data forks](docs/DEV-ENVIRONMENTS.md)
+- [Live services and HTTP/WebSocket/TCP/UDP exposure](docs/ENVIRONMENT-SERVICES.md)
 - [Terminal installation and platform roles](docs/INSTALL.md)
 - [Versioned updates, draining and rollback](docs/UPDATES.md)
 - [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)

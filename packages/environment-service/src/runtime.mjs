@@ -34,6 +34,7 @@ export function command(program, args, options = {}) {
 export class Environments {
   constructor(config, run = command) {
     this.config = config; this.run = run; this.states = {}; this.routes = []; this.busy = false;
+    this.gatewayWrites = Promise.resolve();
     this.owner = createHash('sha256').update(config.stateDir).digest('hex').slice(0, 16);
     this.routeFile = join(config.stateDir, 'routes.json');
     this.stateFile = join(config.stateDir, 'environments.json');
@@ -51,7 +52,10 @@ export class Environments {
     await this.render();
   }
   async save() { await atomic(this.stateFile, this.states); }
-  async render() { await atomic(this.dynamicFile, gatewayConfig(this.routes, this.config, new Set(Object.entries(this.states).filter(([, s]) => s.healthy).map(([id]) => id)))); }
+  async render() {
+    const write = this.gatewayWrites.then(() => atomic(this.dynamicFile, gatewayConfig(this.routes, this.config, new Set(Object.entries(this.states).filter(([, s]) => s.healthy).map(([id]) => id)))));
+    this.gatewayWrites = write.catch(() => {}); await write;
+  }
   catalog() {
     return { schema: 1, baseDomains: this.config.baseDomains, transportEntrypoints: this.config.transportEntrypoints, routes: this.routes,
       environments: this.config.environments.map(e => ({ id: e.id, source: { kind: e.source.kind, branch: e.source.branch }, services: e.ports.map(({ name, protocol }) => ({ name, protocol })), cpu: e.cpu, memoryMiB: e.memoryMiB, ...(this.states[e.id] ?? { status: 'pending', healthy: false }) })) };
