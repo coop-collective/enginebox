@@ -1,0 +1,116 @@
+name: enginebox-fleet
+x-runtime: &runtime
+  image: ${EBOX_FLEET_IMAGE}
+  build:
+    context: ../..
+    dockerfile: packages/fleet-dev/Dockerfile
+  init: true
+  restart: "no"
+  labels:
+    enginebox.fixture: local-fleet
+  stop_grace_period: 75s
+  healthcheck:
+    test:
+      [
+        CMD,
+        node,
+        -e,
+        "fetch('http://127.0.0.1:8790/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+      ]
+    interval: 2s
+    timeout: 2s
+    retries: 45
+services:
+  controller:
+    <<: *runtime
+    working_dir: /app/packages/fleet-controller
+    command:
+      [
+        pnpm,
+        exec,
+        wrangler,
+        dev,
+        --local,
+        --ip,
+        0.0.0.0,
+        --port,
+        "8787",
+        --inspector-port,
+        "9230",
+        --persist-to,
+        /state/wrangler,
+        --var,
+        ALLOW_HTTP_NODES:true,
+      ]
+    ports: ["127.0.0.1:${EBOX_FLEET_PORT}:8787"]
+    volumes:
+      - controller-state:/state
+      - type: bind
+        source: ${EBOX_FLEET_STATE}/controller.dev.vars
+        target: /app/packages/fleet-controller/.dev.vars
+        read_only: true
+      - ../fleet-controller/src:/app/packages/fleet-controller/src:ro
+      - ../fleet-protocol/src:/app/packages/fleet-protocol/src:ro
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+  agent-a:
+    <<: *runtime
+    command:
+      [node, --watch, packages/fleet-node/src/main.ts, serve, /config/node.json]
+    depends_on:
+      controller: { condition: service_healthy }
+    volumes:
+      - agent-a-state:/state
+      - ${EBOX_FLEET_STATE}/agent-a.json:/config/node.json:ro
+      - ../fleet-node/src:/app/packages/fleet-node/src:ro
+      - ../fleet-protocol/src:/app/packages/fleet-protocol/src:ro
+  agent-b:
+    <<: *runtime
+    command:
+      [node, --watch, packages/fleet-node/src/main.ts, serve, /config/node.json]
+    depends_on:
+      controller: { condition: service_healthy }
+    volumes:
+      - agent-b-state:/state
+      - ${EBOX_FLEET_STATE}/agent-b.json:/config/node.json:ro
+      - ../fleet-node/src:/app/packages/fleet-node/src:ro
+      - ../fleet-protocol/src:/app/packages/fleet-protocol/src:ro
+  storage:
+    <<: *runtime
+    profiles: [storage]
+    command:
+      [node, --watch, packages/fleet-node/src/main.ts, serve, /config/node.json]
+    depends_on:
+      controller: { condition: service_healthy }
+    volumes:
+      - storage-state:/state
+      - ${EBOX_FLEET_STATE}/storage.json:/config/node.json:ro
+      - ../fleet-node/src:/app/packages/fleet-node/src:ro
+      - ../fleet-protocol/src:/app/packages/fleet-protocol/src:ro
+  storage-rebuilt:
+    <<: *runtime
+    profiles: [recovery]
+    command:
+      [node, --watch, packages/fleet-node/src/main.ts, serve, /config/node.json]
+    depends_on:
+      controller: { condition: service_healthy }
+    volumes:
+      - storage-rebuilt-state:/state
+      - ${EBOX_FLEET_STATE}/storage-rebuilt.json:/config/node.json:ro
+      - ../fleet-node/src:/app/packages/fleet-node/src:ro
+      - ../fleet-protocol/src:/app/packages/fleet-protocol/src:ro
+volumes:
+  controller-state:
+  agent-a-state:
+  agent-b-state:
+  storage-state:
+  storage-rebuilt-state:

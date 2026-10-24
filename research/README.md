@@ -7,7 +7,7 @@ excluded from the product's pnpm/Cargo workspace and release artifacts.
 | Directory | Purpose |
 | --- | --- |
 | [layerfs-validation](layerfs-validation/README.md) | Pinned upstream LayerFS experiments, dependency/cache controls and a disposable Incus attachment campaign. |
-| [storage-benchmarks](storage-benchmarks/README.md) | Local Lore storage measurements against a private copy of Unity content. |
+| [storage-benchmarks](storage-benchmarks/README.md) | Storage distribution and recovery qualification; current product checks are in the fleet packages. |
 | [agent-startup](agent-startup/README.md) | Manual remote-agent timing probes with separate admission, VM readiness and completion measurements. |
 
 Product services, CLIs, installers and libraries remain in `packages/`. Tests that

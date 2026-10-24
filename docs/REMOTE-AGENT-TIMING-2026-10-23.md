@@ -47,7 +47,7 @@ controlled cross-model inference comparison.
 
 | Service | What was actually observed | What remains unmeasured |
 | --- | --- | --- |
-| Cursor Cloud | Configured user API key rejected with HTTP 401; native CLI subscription login is a separate connection | VM readiness, first tool call, completion |
+| Cursor Cloud | Initial key returned HTTP 401; a later key authenticated, but explicit Grok 4.7 and Composer 2.5 launches returned `400 usage_limit_exceeded` | VM readiness, first tool call, completion |
 | Claude Cloud | Three `claude --cloud` submissions acknowledged in **9.970, 11.843, 23.417 s**; median **11.843 s** | VM readiness, first action and completion |
 | Codex Cloud | Installed 0.163.0 CLI task list empty; its environment picker had no selectable environment | All live cloud task timing |
 
@@ -71,7 +71,8 @@ unprepared first launch. Reuse of prepared dependencies alone is not unique to
 Engine Box. [Cursor Builds](https://cursor.com/docs/cloud-agent/builds).
 
 The Cursor API offers per-run SSE events for status, tool calls and terminal
-results; the research probe is ready for a valid Cloud API key. Claude's native
+results; the research probe supports an explicit model, but launch eligibility
+still blocks a live timing result. Claude's native
 `--cloud` command creates hosted sessions, while Remote Control steers a session
 on the user's own machine. Those are different execution locations and should not
 be mixed in the result table. [Cursor Cloud API](https://cursor.com/docs/cloud-agent/api/endpoints),
@@ -132,18 +133,60 @@ includes costs that may be amortized by subsequent CLI launches; this experiment
 did not isolate them.
 
 The qualification deliberately used the candidate's exact version constraint on
-credential delivery. It does not mean the deployed controller or existing
-revision-4 templates have been upgraded. The compatible controller/guest release
-and a newly prepared revision-5 template must be rolled out together before
-claiming the normal fleet API is repaired. Signed-in developer workspaces are not
-silently reinstalled.
+credential delivery. At that point the compatible controller/guest release and
+revision-5 template had not been deployed. The subsequent rollout below verifies
+the normal fleet API path, including credential delegation.
+
+## Fleet rollout and explicit-model follow-up — October 24, Hong Kong
+
+Rust **0.3.1-live.1** and native-dev **revision 5** subsequently passed a live
+qualification through the deployed fleet MCP, which uses the controller HTTP
+API. One disposable 4-vCPU / 4-GiB warm workspace reached internal readiness in
+**0.639 seconds**; its full allocation/delegation job took **2.815 seconds**.
+
+| Provider | Fresh read task | Exact-session follow-up |
+| --- | ---: | ---: |
+| Claude (Haiku) | 5.089 s | 3.031 s |
+| Codex (native default) | 9.448 s | 4.072 s |
+| Cursor (native default) | 53.286 s | 15.723 s |
+
+Each cell is **one observation**, not a median or percentile. The timers include
+the MCP request, controller admission/delegation, native task and terminal-result
+polling. Fresh tasks ran across providers in parallel; follow-ups used the exact
+native session IDs and recalled a conversation-only marker. They do not measure
+VM startup or first-token latency. The same native client versions were used:
+Codex 0.163.0, Claude Code 2.1.302 and Cursor 2026.10.22-27dcf5f.
+
+The fleet task CLI returned all six runs with elapsed times and usage scope.
+Codex also passed ACP launch and continuation. One earlier ACP launch and direct
+API probes were rejected before creating runs; the cause was not established,
+and the later successful test followed revalidation of access-only delegation.
+That remains a diagnostics follow-up, not evidence of reliable admission under
+load. Both existing private workspaces retained their boot IDs and recorded
+native history files. The disposable test VM was removed with no active provider
+writer leases, and two fresh warm reserves remained ready.
+
+The rollout observer recorded 2,047 successful checks out of 2,048. One public
+dashboard session request timed out after cutover; subsequent checks succeeded.
+There were no local API failures. Chromium separately passed all sidebar views,
+session reload and mobile layout without browser or HTTP errors. These checks
+support the observed rollout, not a zero-downtime guarantee.
+
+For Cursor Cloud, a replacement key passed `/v1/me`, repository access and model
+discovery. The API listed `grok-4.7` and `composer-2.5`; explicitly selecting each
+still returned **HTTP 400, `usage_limit_exceeded`**, at agent creation. Neither
+attempt created an agent. These are launch rejections, not startup measurements;
+changing the requested model did not make either test eligible to run. Cloud SSE
+timings and cleanup remain unqualified. Credentials and raw account responses
+were kept out of the repository.
 
 ## Next comparable run
 
-1. Roll out the qualified Cursor version and new template, then repeat through
-   the normal controller HTTP path. Native guest inference and resume now pass.
-2. Configure a valid Cursor Cloud user API key locally and select a prepared
-   Build for the same benchmark repository.
+1. Resolve the intermittent admission rejection and add safe diagnostics before
+   using the small successful fleet sample as evidence of load reliability.
+2. Resolve Cursor Cloud launch eligibility, then select a prepared Build for the
+   same benchmark repository. Authentication and explicit model selection have
+   now been checked; no cloud run has started.
 3. Select a suitable Codex Cloud environment and an accessible cloud task channel.
 4. Enable an observable Claude cloud session channel for the account.
 5. Match model/settings, repository SHA, prepared-state policy and client location;

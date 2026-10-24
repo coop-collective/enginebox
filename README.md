@@ -2,7 +2,7 @@
 
 Prepared environments for native coding agents, on hardware you control.
 
-Engine Box manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Agent planning and swarm orchestration stay with other tools.
+Engine Box manages the environment around **Codex, Cursor Agent and Claude Code**: working files, installed tools, snapshots, shared caches and optional desktop/MCP access. You run the official clients and use their native sign-in flows. Native clients keep their planning loops; Enginebox owns the reusable task, workspace, integration and validation workflow that apps such as Gamejam consume.
 
 The goal is less repeated setup and faster, trustworthy feedback from builds and tests. Self-hosted CI optimization is an optional module on the same foundation.
 
@@ -11,6 +11,12 @@ The [product site and developer guide](packages/site/README.md) run locally with
 ## Status
 
 **Early development: native Rust services and tools, a capacity-aware fleet API, Vinext dashboard and headless browser MCP.** See [Rust migration and qualification](docs/RUST-MIGRATION.md) for the current release boundary.
+
+The target [fleet control plane uses Cloudflare Workers and Durable Objects](docs/DESIGN.md#required-cloudflare-fleet-control-plane),
+deployed in production or run with local Wrangler for development/tests.
+Production bare-metal servers are managed nodes; this migration is planned, not deployed.
+A dedicated storage node is optional. Single-node project storage can stay local;
+multi-node project execution requires shared storage, which R2 directly can provide.
 
 | Available in this repository | Planned |
 |---|---|
@@ -26,15 +32,32 @@ The [product site and developer guide](packages/site/README.md) run locally with
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
 | Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
-The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. Rust qualification passed real Codex/Claude coding, exact conversation resume and browser MCP use. A later disposable Cursor 2026.10.22 qualification passed delegated inference and exact-session resume; rollout of the compatible release and fresh templates is still required. The reference fleet now runs Rust 0.3.1-live.0 with account state preserved; Codex/Claude coding and exact resume also passed through the deployed operator MCP. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
+The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The reference fleet now runs Rust 0.3.1-live.1 with native-dev revision 5. All three providers passed delegated MCP launches and exact conversation resume; Codex also passed ACP continuation. Existing private workspace boots and recorded native histories were preserved. The [timing report](docs/REMOTE-AGENT-TIMING-2026-10-23.md) records the small sample, an unresolved admission rejection and the blocked Cursor Cloud comparison. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
 [Reference-host validation](docs/VALIDATION.md) records fresh workspace creation, independent clones, RAM continuity, real Chromium control and operation timings.
+
+## Develop the Cloudflare fleet locally
+
+Use Node 24+, pnpm 12.14.0 and Docker Compose with Linux containers on Linux, macOS or Windows (Docker Desktop/WSL2). No Cloudflare account is needed:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm fleet:dev --storage
+pnpm fleet:fixture
+pnpm fleet:status
+pnpm fleet:smoke
+pnpm fleet:down
+```
+
+This starts Wrangler with persistent local Durable Objects/R2, two agent nodes and an optional storage cache. Source edits reload automatically; database state stays on Linux named volumes. Health is at **http://127.0.0.1:8799/health**. Omit `--storage` for R2-only shared storage. `fleet:down` preserves development data; the smoke test creates and removes its own isolated fleet.
+
+See [local development, debugging, recovery and current limits](docs/LOCAL-FLEET.md). The new stack implements generation publication, verification, cache reads, fallback and job leases. Existing native/provider/engine services retain their separate launchers; `pnpm dev` still starts only the dashboard. Automatic restored-Store activation and production controller migration remain explicit release gates.
 
 ## Bootstrap a server
 
 Use the [terminal installer](docs/INSTALL.md) for release binaries. Admin/operator tools can run on Linux, macOS and Windows; the current compute backend needs a Linux server with usable KVM, Incus and administrative access. The controller and Linux node have separate installation roles. Existing Incus resources can be referenced explicitly; the [fresh-server example](examples/fresh-server.toml) opts into package installation and bounded development storage.
 
-To build from source, install Rust, Node 22.12+ and the pinned pnpm version, then use the root workspace. Python is not a runtime prerequisite.
+To build from source, install Rust, Node 24+ and the pinned pnpm version, then use the root workspace. Python is not a runtime prerequisite.
 
 ```sh
 git clone https://github.com/coop-collective/enginebox.git
@@ -76,7 +99,12 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Interrupted-command and daemon recovery qualification](docs/LAYERFS-RECOVERY-VALIDATION.md)
 - [LayerFS checkout attachment to Incus](docs/LAYERFS-INCUS.md)
 - [Storage registration, controller API and MCP](docs/STORAGE-API.md)
-- [Lore, Cloudflare Artifacts and measured game-project storage](docs/LORE-STORAGE.md)
+- [Local Cloudflare fleet, shared Store transport and debugging](docs/LOCAL-FLEET.md)
+- [Enginebox integration, batching and protected CI evidence](docs/INTEGRATION-CI.md)
+- [Native Codex task-assistant setup and recovery](docs/TASK-ASSISTANT.md)
+- [Project roadmap tasks and scoped native Codex tools](docs/TASK-WORKFLOW.md)
+- [LayerFS game workspaces, container integration and large-project measurements](docs/GAME-WORKSPACES.md)
+- [Project Store distribution, worker NVMe caches and safe eviction](docs/STORE-DISTRIBUTION.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)
 - [Implementation milestones and acceptance criteria](docs/IMPLEMENTATION-PLAN.md)
 - [Native client installation and authentication](docs/NATIVE-CLIENTS.md)

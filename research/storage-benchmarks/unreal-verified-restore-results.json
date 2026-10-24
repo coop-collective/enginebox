@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-23",
+  "scope": "research; same-host archive restoration in a fresh disposable Engine Box VM; no engine launch",
+  "fixture": {
+    "files": 379,
+    "content_bytes": 11168790731,
+    "archive_bytes": 11124733098,
+    "format": "zstd tar of Unreal environment assets; private manifest"
+  },
+  "guest": {
+    "vcpus": 4,
+    "memory_gib": 8,
+    "copies": 2
+  },
+  "baseline": {
+    "extract_and_sync_seconds": 28.046743375249207,
+    "serial_ready_seconds": 37.2612409152492,
+    "readback_verified": true
+  },
+  "inline": {
+    "wall_seconds": 64.6205516923219,
+    "content_verified": true,
+    "readback_verified": false,
+    "files": 379,
+    "bytes": 11168790731,
+    "restore_and_verify_seconds": 64.508789912,
+    "engine_started": false
+  },
+  "audits": [
+    {
+      "stage": "baseline-readback",
+      "readback_verified": true,
+      "workers": 1,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 9.214497539999996
+    },
+    {
+      "stage": "baseline-readback",
+      "readback_verified": true,
+      "workers": 4,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 2.594929912999987
+    },
+    {
+      "stage": "baseline-readback",
+      "readback_verified": true,
+      "workers": 1,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 10.074313892999982
+    },
+    {
+      "stage": "baseline-readback",
+      "readback_verified": true,
+      "workers": 4,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 2.6653665870000225
+    },
+    {
+      "stage": "inline-readback",
+      "readback_verified": true,
+      "workers": 4,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 2.8402512530000195
+    },
+    {
+      "stage": "inline-readback",
+      "readback_verified": true,
+      "workers": 1,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 10.858570818000004
+    },
+    {
+      "stage": "inline-readback",
+      "readback_verified": true,
+      "workers": 4,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 2.7827368339999907
+    },
+    {
+      "stage": "inline-readback",
+      "readback_verified": true,
+      "workers": 1,
+      "files": 379,
+      "bytes": 11168790731,
+      "readback_seconds": 10.839448301000004
+    }
+  ],
+  "summary": {
+    "all_eight_audits_passed": true,
+    "serial_median_seconds": 10.456881096999993,
+    "four_worker_median_seconds": 2.7240517105000066,
+    "median_component_speedup": 3.8387234194906696,
+    "estimated_baseline_plus_first_parallel_audit_seconds": 30.641673288249194,
+    "estimate_is_not_separate_end_to_end_run": true,
+    "streaming_implementation_improved_readiness": false,
+    "recommendation": "bounded four-worker full-file read-back before project access; retain current integrity gate"
+  },
+  "limitations": [
+    "Small sample on one shared host; no latency percentile or fixed physical-disk cold state.",
+    "Only owned source archive cache eviction requested; OS/device cache states uncontrolled.",
+    "Read-back uses the filesystem/page cache; not a physical-media scrub.",
+    "Audit order baseline: 1,4,1,4; streaming copy: 4,1,4,1.",
+    "Baseline syncs the guest; inline extraction fsyncs each file and directory. No isolated attribution of slowdown.",
+    "Incoming-byte verification and stored-file read-back are separate integrity boundaries.",
+    "No engine-start overlap, rendered startup, Lore/LayerFS transport or deployed provider measured.",
+    "Trusted manifest and private immutable namespace required; writable engine forks are a proposed integration."
+  ]
+}

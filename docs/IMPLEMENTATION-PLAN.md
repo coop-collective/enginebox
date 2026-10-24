@@ -1,6 +1,6 @@
 # Implementation plan
 
-Updated October 20, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. This plan distinguishes implemented capabilities from platform and release acceptance still required.
+Updated October 23, 2026. Scope: portable environments for native Codex, Cursor Agent and Claude Code; persistent private agent state; optional personal-computer resources with owner-set CPU/RAM limits; optional CI optimization; a source-available foundation with a managed offering. The target fleet requires Cloudflare as controller and treats every bare-metal server as a managed node. This plan distinguishes implemented capabilities from platform and release acceptance still required.
 
 ## Milestones
 
@@ -16,12 +16,46 @@ Updated October 20, 2026. Scope: portable environments for native Codex, Cursor 
 | P7 | Native session API and private state | P3 | MCP launches all three native harnesses; exact conversation resume; bounded execution/output; state persists in the private workspace; overlapping writers and conflicting lifecycle actions rejected. Protocol fixtures and live provider inference are reported separately. |
 | P8 | Optional personal-resource node | P1, P7 | Explicit opt-in enrollment; enforce chosen aggregate CPU/RAM budget locally and at admission; one disposable Docker workspace validated on Mac and Windows separately; disconnect/sleep/reconnect cannot duplicate a run; no daemon socket in agent containers. |
 | P9 | Movable tenant state and native engine hosts | P7, P8 | Authenticated tenant authorization, account separation and private volume attach/lease tests before public multi-tenancy; independent Windows/macOS worker and GPU/image qualification. |
+| P10 | Cloudflare fleet authority and shared Store generations | P4, P7 | Local Wrangler/Compose parity, scoped node leases, R2 durability before acceptance, cache miss/fallback/rebuild, bounded local eviction; native runtime migration and real-cloud failure qualification before production cutover. |
 
 Current implementation includes P0, P1 and the existing-Incus path of P2/P3, plus capacity-aware fleet REST/MCP and a Vinext dashboard. Live validation uses newly created VMs in a separate project on the reference host. Fresh-host package/network installation, host reboot, off-host backup restore, independent installation and wider deployment qualification remain release gates. P4 is partial; P5/P6 are not complete. Login/inference acceptance is separate from installation and environment tests.
 
-The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. It does not add agent orchestration or automatic placement.
+The fleet slice adds explicit host selection, clean-template cloning, bounded asynchronous jobs, capacity admission, lifecycle controls, owner authentication, persistent portable templates and opt-in warm workspace pools. A native launch/resume API executes official CLIs without supplying an agent loop. Automatic placement and integration execution remain Enginebox follow-up work, with the current gate described in [integration and CI](INTEGRATION-CI.md).
+
+## Cloudflare control-plane delivery
+
+P10 has a locally tested fleet, transport and CI gate; production migration remains pending. See [local development](LOCAL-FLEET.md). Complete the qualification and migration steps in the [required control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane):
+
+1. Establish Workers API authorization and SQLite-backed Durable Objects for
+   membership, node capacity/reservations and project decisions. Persist each
+   authority's state; use derived indexes only for discovery/reporting.
+   Add a pinned local Wrangler launcher for the same controller code, isolated
+   persistent state and explicit local/test/production resource selection.
+2. Enroll a disposable bare-metal/VM node through its outbound authenticated
+   connection. Add durable command IDs, boot/session identity, fencing epochs,
+   bounded leases, local operation receipts and reconciliation after reconnect.
+3. Exercise duplicate delivery, lost acknowledgments, partial reservations,
+   Cloudflare/object restarts, node restart, clock/lease expiry and partitions.
+   Prove no duplicate exclusive engine allocation or stale accepted-head update.
+4. Qualify one-node local storage and multi-node shared storage. R2 directly must
+   permit two compute nodes without a dedicated storage node. Block cross-node
+   placement when the shared backend is absent or unready; retain local work.
+   Cover one local Wrangler controller with one Linux node, then two nodes using
+   one simulated object API, then separate kernels and an isolated real R2 bucket.
+   Qualify laptop Linux volumes/FUSE separately from native-host Wrangler support.
+5. Migrate versioned desired state and native credential ownership with explicit
+   compatibility checks. Drain/reconcile/fence the native controller before
+   enabling Cloudflare mutations. Validate node replacement with the Cloudflare
+   catalog intact and control-state recovery without reviving old leases.
+
+The native runtime remains the execution backend. Bare-metal storage nodes receive
+replication/repair assignments from Cloudflare; they never become fleet controllers.
+Current production services remain on their existing controller until this cutover
+is qualified. No implied deployment or credential migration accompanies this plan.
 
 ## Current agent-readiness work
+
+The [local Cloudflare fleet](LOCAL-FLEET.md) implements the first P10 storage/control-plane slice: persistent local DO/R2, two enrolled agent nodes, optional storage read-through service, consistent SQLite publication, generation manifests, compare-and-swap acceptance, job leases and bounded chunk/snapshot caches. Tests cover separate-node restore, storage loss fallback, controller restart, corrupt-cache repair and snapshots larger than cache capacity. Linux containers keep the same development topology across host operating systems. Native restored-Store activation, logical cross-worker integration, production R2 recovery drills and migration of the existing controller/provider state remain separate P10 gates.
 
 The reference Linux fleet now runs Rust 0.3.1-live.0 with its original account state preserved. Two private workspaces received native helper/browser migration, and native-dev revision 4 plus two fresh reserves are synchronized. The migration now supports an external private state root. Real supervisor update/rollback checks preserve that root, browser sessions and stdio MCP access; a separate [metadata qualification](RUST-STATE-QUALIFICATION.md) loaded the deployed Python controller's completed jobs, runs and templates in an isolated copy.
 
@@ -123,13 +157,42 @@ CPU/RAM limits are the first resource contract. GPU contribution is a separate o
 
 Public multi-tenancy requires real tenant authorization and private account/state storage. The current single-owner controller and per-workspace native homes do not establish that guarantee. Shared writable `.claude`, `.codex` or Cursor state across unrelated users is prohibited. Moving a tenant's state between workspaces needs stable paths, exclusive writer leases and recovery tests; see [native state](TENANT-AGENT-STATE.md).
 
-Automatic placement, swarm orchestration, GPU memory restoration, a new CI scheduler and premium engine recipes remain separate work. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
+Automatic placement, task/merge orchestration and engine-pool recipes are Enginebox work; their native execution gates remain incomplete. GPU memory restoration remains unqualified. Usage widgets never equate model context, local token costs or quota reset dates with a subscription balance or billing renewal. A preview release may publish tested operator/runtime artifacts while P6/P8/P9 remain incomplete, provided its release notes state those limits.
 
 ## Checkout storage and large game assets
 
 [LayerFS](LAYERFS.md) is a first-class checkout provider exposed through controller registration, durable API jobs, MCP and the Storage dashboard. The pinned preview remains explicitly provisioned on qualified Linux nodes; it is not downloaded by a general installer. Keep file checkpoints separate from Incus RAM checkpoints, and retain uncertain state for operator inspection. See [the backend contract](LAYERFS-BACKEND.md) and [Incus attachment](LAYERFS-INCUS.md) for the tested boundaries and remaining release gates.
 
-[Lore and Artifacts assessment](LORE-STORAGE.md) records a 3.96 GB Unity fixture and the current Artifacts size limits. Lore is a proposed first-class source/asset provider feeding prepared LayerFS bases. The local Lore benchmark is complete; fleet ingestion, native engine builds, cross-host distribution and an R2-backed service remain separate implementation and qualification work.
+The October 23 owner decision selects [LayerFS game workspaces](GAME-WORKSPACES.md)
+as the foundation. The existing backend already combines
+private container branches with stable `/project` mounts and prepared checkpoint
+forks. Preserve native provider homes and the separately qualified Incus export.
+The design maps all ten upstream core ideas to implemented behavior or explicit
+remaining work; a LayerFS version upgrade is not implicit in this decision.
+
+[Store distribution](STORE-DISTRIBUTION.md) separates shared generation storage
+from workers' local NVMe Stores under Cloudflare authority. A dedicated storage
+node is optional, and one node may combine compute and storage. Single-node editing
+can use local-only project storage; multi-node project execution requires a ready
+shared service, which R2 directly can supply. Work proceeds through these boundaries:
+
+1. Qualify the pinned container backend for game ingestion, exact task checkpoints
+   and native engine cache reuse; complete allocation/attachment readiness.
+2. Publish consistent, verified Store generations; qualify desync chunk delivery
+   against SQLite's remote-copy baseline; add manifest authorization, single-flight
+   hydration, residency leases, space reservations and recoverability-gated eviction.
+   Qualify incremental R2 recovery, retained manifests and acceptance records,
+   fenced authority recovery and an empty-cache rebuild with the original host
+   unavailable. RAID10 and worker caches do not satisfy off-host durability.
+   Connect publication and placement to P10; qualify both R2-direct delivery and
+   the optional managed-origin path without making a storage server mandatory.
+   Add resumable storage-node warmup, generation-specific readiness and gradual
+   read preference with bounded R2 fallback under concurrent publication/GC.
+3. Add logical cross-worker result import into the canonical LayerFS history and
+   Engine Box's batched candidate checks, consumed by Gamejam through APIs. Database copying must never stand in for
+   merging independently written Stores or accepting a tested artifact.
+
+The local fleet implements bounded cache eviction, chunk transport, storage reconstruction and candidate CI gates. Native Store activation, logical cross-worker integration and real-cloud recovery remain unqualified. Archive/checksum measurements alone do not qualify those paths or first playable frame.
 
 ## Persistent project environments and disposable agent forks
 
@@ -140,3 +203,7 @@ The online core publishes a consistent versioned baseline; agents receive dispos
 The first [Wrangler recipe](LAYERFS.md#wrangler-environment-state-forks-proposed) covers local D1/KV/R2/SQLite Durable Object data and connected Workers. The historical 15-check local prototype is documented with its exact paths and versions in [the evidence record](DEV-ENVIRONMENTS.md#existing-local-proof). It does not qualify online capture, LayerFS database locking, managed staging, main-branch reconciliation or hosted lifecycle. DuckDB is not a product dependency, and remote Cloudflare bindings are not included in filesystem forks.
 
 Delivery order: project registry and owned startup service; code updates that preserve data and apply explicit migrations; sleep/wake and application readiness; consistent version publication under concurrent writes; two isolated agent forks with restart/readback and failed-publication tests; then dashboard/API/MCP integration and representative performance measurements. Each fork has its own persistence directory. Intentionally shared services are accessed through scoped APIs. Return code through Git review and data through explicit migrations/imports, never an automatic merge of database files.
+
+## Shared integration and CI ownership
+
+[Integration and CI](INTEGRATION-CI.md) applies the Beanstalk principles within Enginebox: private task results, frozen batched candidates, protected full checks and conditional accepted-head promotion. The Cloudflare candidate gate is implemented and tested with a 100-change record; automatic batch composition, logical LayerFS merge/import, red-batch isolation and native engine validation remain Enginebox work. Gamejam consumes the APIs and presents application state; it does not own a second integration queue or CI authority.
