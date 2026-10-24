@@ -9,7 +9,8 @@ import type {
   Job,
   Resources,
 } from "@/lib/types";
-import { api, RequestError } from "@/lib/client";
+import { api, errorMessage, RequestError } from "@/lib/client";
+import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
@@ -708,20 +709,20 @@ export default function Dashboard() {
         setSession("login");
         setFleet(null);
       }
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       loading.current = false;
       setRefreshing(false);
     }
   }, []);
+  const visible = usePageVisible();
   useEffect(() => {
     if (session !== "ready") return;
     void refresh();
-    const timer = setInterval(refresh, 10_000);
-    return () => clearInterval(timer);
   }, [session, refresh]);
+  useVisibleInterval(refresh, session === "ready" ? 10_000 : null);
   useEffect(() => {
-    if (session !== "ready" || !jobs.some(active)) return;
+    if (session !== "ready" || !visible || !jobs.some(active)) return;
     let cancelled = false;
     const timer = setTimeout(async () => {
       const updates = await Promise.all(
@@ -734,7 +735,7 @@ export default function Dashboard() {
           } catch (err) {
             return {
               ...job,
-              error: `Status unavailable: ${(err as Error).message}`,
+              error: `Status unavailable: ${errorMessage(err)}`,
             };
           }
         }),
@@ -751,7 +752,7 @@ export default function Dashboard() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [jobs, session, refresh]);
+  }, [jobs, session, visible, refresh]);
   async function signIn(event: FormEvent) {
     event.preventDefault();
     setSubmitting(true);
@@ -764,7 +765,7 @@ export default function Dashboard() {
       setPassword("");
       setSession("ready");
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }
@@ -779,7 +780,7 @@ export default function Dashboard() {
       setSection("fleet");
       setError("");
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
     }
   }
   async function queue(
@@ -803,7 +804,7 @@ export default function Dashboard() {
       );
       return true;
     } catch (err) {
-      setError((err as Error).message);
+      setError(errorMessage(err));
       return false;
     } finally {
       setPendingInstances((current) => current.filter((key) => key !== target));
