@@ -13,7 +13,7 @@ async function signIn(page: Page) {
 test("GitHub selects private repositories, links LayerFS sync and drains without granting runner permissions implicitly", async ({ page, request }) => {
   await request.post(`${fixtureOrigin}/__test/reset`);
   const repo = { id: 12, installation_id: 4, full_name: "fixture/private", private: true, branch: "main", default_branch: "main", permissions: { push: true } };
-  const status = { configured: true, runner_app_configured: true, accounts: [{ kind: "repos", login: "fixture" }], repositories: [] as typeof repo[], pools: [{ id: "linux", organization: "fixture", labels: ["enginebox-linux"], runner_group_id: 8, max_runners: 1 }], jobs: [], draining: false };
+  const status = { configured: true, runner_app_configured: true, accounts: [{ kind: "repos", login: "fixture" }], repositories: [] as typeof repo[], pools: [{ id: "linux", organization: "fixture", labels: ["enginebox-linux"], runner_group_id: 8, max_runners: 1, preparation: { repository_id: 12, workflows: ["fixture/private/.github/workflows/ci.yml@refs/heads/main"] } }], jobs: [], draining: false };
   const writes: { path: string; body: Record<string, unknown> }[] = [];
   await page.route("**/api/control/v1/github**", async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -29,6 +29,7 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
     await route.fulfill({ json: value });
   });
   await signIn(page);
+  await expect(page.getByText("LayerFS preparation required")).toBeVisible();
   await expect(page.getByText("Connected as fixture")).toBeVisible();
   await page.getByRole("button", { name: "Choose repositories" }).click();
   await page.getByLabel("GitHub installation").selectOption("4");
@@ -37,6 +38,14 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
   await page.getByRole("button", { name: "Add repository" }).click();
   await expect(page.getByText("fixture/private", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "Import or sync in Storage" })).toHaveAttribute("href", "/?panel=storage&github_repository=12");
+  await page.getByLabel("Prepared runner profile").selectOption("linux");
+  await page.getByLabel("Runner group name").fill("fixture-prepared");
+  await page.getByLabel("Enginebox action at commit SHA").fill(`fixture/enginebox/packages/enginebox-actions@${"a".repeat(40)}`);
+  await page.getByLabel("Checkout action at commit SHA").fill(`actions/checkout@${"b".repeat(40)}`);
+  await page.getByRole("button", { name: "Preview prepared workflow" }).click();
+  await expect(page.getByLabel("Prepared workflow fragment")).toHaveValue(/install-scripts: deny/);
+  await expect(page.getByLabel("Prepared workflow fragment")).toHaveValue(/labels: "enginebox-linux"/);
+  expect(writes.some(w => w.path.includes("workflow"))).toBe(false);
   await page.getByRole("button", { name: "Drain runners", exact: true }).click();
   await expect(page.getByRole("button", { name: "Resume runner provisioning" })).toBeVisible();
   expect(writes.some(w => w.path.includes("connect"))).toBe(false);

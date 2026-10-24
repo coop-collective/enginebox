@@ -2,6 +2,12 @@
 
 Implementation added October 24, 2026. This is an optional, single-owner GitHub.com integration. It has offline protocol, state, Git and dashboard tests. **Real OAuth approval, organization JIT registration and a disposable Linux workflow have not been qualified in this change.** No existing runner, organization setting or developer workspace was changed.
 
+[Required LayerFS preparation](GITHUB-ACTIONS-ACCELERATION.md) is now implemented
+as an opt-in accelerated profile with repository-safe admission, a mandatory
+LayerFS work root and a post-checkout pnpm dependency action. See
+[prepared runner setup](PREPARED-ACTIONS-SETUP.md) for supported configuration and
+[qualification evidence](reports/ACTIONS-PREPARATION-VALIDATION.md) for its limits.
+
 
 ## Product contract
 
@@ -106,28 +112,36 @@ The dashboard exposes the public callback and webhook forwarding paths and prese
 
 ## LayerFS storage and cache design
 
-Optional worker configuration sets `layerfs` to the node's qualified LayerFS configuration and maps a GitHub full name to an approved project/generation:
+Prepared profiles require both controller `preparation` and worker `acceleration`
+configuration. The former optional-mount-only configuration fails validation.
+Use the [prepared worker and catalog setup](PREPARED-ACTIONS-SETUP.md), which
+includes migration instructions and example configuration.
 
-```json
-{
-  "layerfs": "/etc/enginebox/layerfs.json",
-  "projects": {
-    "example-org/private-project": {"project": "private-project", "from": "prepared-deps"}
-  }
-}
-```
+Each admitted job receives an isolated LayerFS branch at `/project`; native JIT
+configuration places the official runner's work directory at `/project/work`.
+Root-owned bootstrap and a mandatory start hook check the mount and actual job
+assignment before workflow steps. Pnpm caches live outside checkout under
+`/project/caches`. Official `actions/checkout` still selects and cleans source.
+The separate preparation action restores exact compatible installed dependencies
+after checkout or performs ordinary locked install. Arbitrary workflow commands
+and GitHub's `actions/cache` protocol are not intercepted.
 
-This fragment extends the worker example. `from` can be null to fork the project's original imported base. For a prepared generation, use the existing reviewed Git import, a fresh preparation fork, the compatible dependency recipe, and a completed file checkpoint. Approve that credential-free generation before referencing it. Never select an earlier CI job's private checkpoint as a base.
+The Cloudflare fleet owns immutable preparation catalog approvals/revocations;
+its existing verified chunk transport hydrates Store snapshots. A node-side
+resolver rechecks approval and invokes explicit native activation with the
+matching SDK discovery record. Activation copies into a new owned Store and
+protects its main revision; subsequent job branches remain private. This is a
+complete SQLite transfer, not lazy mounting of R2. Native Store reopen and branch
+isolation are tested; Incus attachment of a transferred preparation and a real
+Actions run are still release gates. Warm compute placement remains configured
+rather than automatic.
 
-Each job gets a distinct writable branch mounted at `/project` with the existing exclusive Incus attachment protocol. Toolchains remain in the clean VM image. The native runner's default `_work` stays on its disposable VM disk; workflows must explicitly use `/project` to benefit from its prepared files. The adapter does not silently alter `actions/checkout` or claim that every action cache is redirected.
-
-For example, a reviewed workflow can synchronize the exact `actions/checkout` tree into `/project`, preserve an installed dependency tree only when its lockfile/toolchain key matches the approved generation, and run build/test from `/project`. Do not disable checkout cleaning globally to retain unknown prior-job files. `actions/cache` still uses its own GitHub-supported protocol; Engine Box is not an Actions cache server.
-
-Cache keys must include owner/installation, repository, trust class (trusted branch versus untrusted contribution), OS/architecture, toolchain/ABI, package manager/version, lockfile digest and recipe revision. Publish immutable generations with one trusted writer. An untrusted job may consume only an approved compatible generation and must never publish a base used by a trusted workflow. Repository selection alone does not make arbitrary public PR code safe to run alongside private services. The current service is for one trusted owner; public hostile multi-tenancy remains a release gate.
-
-After a job, detach only after the VM stops, then create a **private job file checkpoint** and close its LayerFS sandbox. This may contain workflow-generated secrets or source and is never automatically promoted to a cache. The first worker retains these private branches and local diagnostic archives; operators must budget storage and manage retention. It does not implement safe branch garbage collection. Disk-reserve admission bounds further work when storage fills.
-
-This native Incus runner adapter uses node-local LayerFS storage and private CoW checkouts; [its qualified backend](LAYERFS-BACKEND.md) and [Incus attachment](LAYERFS-INCUS.md) are not a distributed object-store service. The newer [Cloudflare fleet and R2 distribution](LOCAL-FLEET.md) remain separate from this native controller adapter. Connecting its cross-node generation placement, CI data receipts, prefetch and eviction to Actions runner pools remains planned. Template desired-state synchronization retains its existing independent contract. No claim of distributed speed/cost superiority is made by this implementation.
+After a job, detach only after the VM stops, create a **private job file
+checkpoint** and close the sandbox. This may contain workflow secrets/source and
+never becomes an approved generation automatically. Native branches and diagnostic
+archives retain the existing bounded-admission/manual-retention contract. The
+hydrated snapshot cache can evict immutable copies; it does not evict live Stores.
+No cost or speed superiority claim is made before comparative measurements.
 
 ## Existing runner migration and acceptance
 

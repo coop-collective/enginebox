@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "recipe": "pnpm-installed-v1",
+  "namespace": "github-installation-123",
+  "repository": "789",
+  "trust": "repository-read",
+  "image": "0000000000000000000000000000000000000000000000000000000000000000",
+  "pnpm": "12.15.0",
+  "scripts": "deny"
+}

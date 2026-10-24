@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["packages/enginebox-*"]
-exclude = ["packages/enginebox-deploy"]
+exclude = ["packages/enginebox-deploy", "packages/enginebox-actions", "packages/enginebox-preparation"]
 
 [workspace.package]
 version = "0.3.0"

@@ -18,6 +18,8 @@ mod dev_export;
 mod github_runtime;
 #[path = "integration.rs"]
 mod integration;
+#[path = "preparation.rs"]
+mod preparation;
 #[path = "publication.rs"]
 mod publication;
 #[path = "recovery.rs"]
@@ -408,7 +410,26 @@ impl Runtime {
     }
     fn bridge(&self, p: &Project, operation: &str, extra: Value, timeout: u64) -> Result<Value> {
         self.owned_volume(p)?;
-        let bridge_path = if operation.starts_with("project-") {
+        let bridge_path = if operation.starts_with("preparation-") {
+            let content = include_str!("preparation-bridge.mjs");
+            let path = self.config.root.join("preparation-v1.mjs");
+            if path.exists() {
+                real_path(&path)?;
+                ensure!(
+                    fs::read_to_string(&path)? == content,
+                    "Preparation adapter differs; install a compatible version"
+                );
+            } else {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                file.write_all(content.as_bytes())?;
+                file.sync_all()?;
+            }
+            path
+        } else if operation.starts_with("project-") {
             let content = include_str!("publication-bridge.mjs");
             let path = self.config.root.join("publication-v1.mjs");
             if path.exists() {

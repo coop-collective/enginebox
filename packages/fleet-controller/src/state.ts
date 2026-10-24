@@ -13,6 +13,7 @@ import {
   type CandidateSpec,
   type CheckRequirement,
   type ChangeSubmission,
+  type Preparation,
   type TaskActor,
   type TaskApproval,
   type TaskCreate,
@@ -518,6 +519,30 @@ type CandidateRecord = {
   taskRequirements?: Record<string, string>;
 };
 export class Project extends State {
+  async preparation(key: string) {
+    const value = this.get<Preparation>(`preparation:${key}`);
+    return value && !this.get(`preparation-revoked:${key}`) ? value : null;
+  }
+  async approvePreparation(value: Preparation) {
+    requireThat(value.project === this.get('id'), 'Preparation project differs', 409);
+    const generation = this.get<GenerationRecord>(`generation:${value.generation}`);
+    const recordHash = createHash('sha256').update(Buffer.from(value.projectRecord, 'base64')).digest('hex');
+    requireThat(generation && generation.manifest.metadata.preparationKey === value.key && generation.manifest.metadata.preparationRecipe === value.recipe && generation.manifest.metadata.projectRecordHash === recordHash, 'Publish the matching preparation generation first', 409);
+    requireThat(!this.get(`preparation-revoked:${value.key}`), 'Revoked preparation identities cannot be reused', 409);
+    const existing = this.get<Preparation>(`preparation:${value.key}`);
+    requireThat(!existing || canonical(existing) === canonical(value), 'Preparation identity is immutable', 409);
+    if (!existing) {
+      const count = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM records WHERE key >= 'preparation:' AND key < 'preparation;'").one().n;
+      requireThat(count < 1024, 'Preparation catalog is full', 409);
+      this.put(`preparation:${value.key}`, value);
+    }
+    return value;
+  }
+  async revokePreparation(key: string) {
+    requireThat(this.get(`preparation:${key}`), 'Unknown preparation', 404);
+    this.put(`preparation-revoked:${key}`, { at: Date.now() });
+    return { revoked: true };
+  }
   private machines() {
     return new Machines(this, this.ctx.storage.sql);
   }

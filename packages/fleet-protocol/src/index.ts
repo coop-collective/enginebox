@@ -3,6 +3,7 @@ import { validateNativeSettings, type NativeSettings } from "./machines.ts";
 export * from "./machines.ts";
 export * from "./integration.ts";
 export * from "./engine-build.ts";
+export * from "./preparation.ts";
 import { validateEngineBuild, type EngineBuildJob } from "./engine-build.ts";
 export const SCHEMA = 1;
 export * from "./artifacts.ts";

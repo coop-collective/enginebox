@@ -21,6 +21,7 @@ import {
   validateNode,
   validateCandidate,
   validateChecks,
+  validatePreparation,
   validateTaskCreate,
   validateTaskUpdate,
   validateTaskMove,
@@ -534,6 +535,24 @@ export default {
         projectAccess(p, project);
         await requireProject(env, project);
         const authority = env.PROJECTS.getByName(project);
+        if (parts[3] === 'preparations') {
+          if (parts.length === 4 && request.method === 'POST') {
+            admin(p);
+            const value = validatePreparation(await jsonBody(request));
+            requireThat(value.project === project, 'Preparation project differs');
+            return json(await authority.approvePreparation(value));
+          }
+          requireThat(parts.length === 5, 'Unknown preparation route', 404);
+          const key = part(parts, 4); digest(key);
+          if (request.method === 'DELETE') {
+            admin(p);
+            return json(await authority.revokePreparation(key));
+          }
+          requireThat(request.method === 'GET', 'Unknown preparation method', 405);
+          const value = await authority.preparation(key);
+          requireThat(value, 'Preparation unavailable', 404);
+          return json(value);
+        }
         if (
           [
             "machines",

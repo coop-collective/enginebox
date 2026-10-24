@@ -1,0 +1,33 @@
+name: Enginebox prepared pnpm dependencies
+description: Reuse verified dependencies after checkout, or run a locked pnpm install on the private LayerFS workspace.
+inputs:
+  path:
+    description: Checkout path relative to GITHUB_WORKSPACE
+    default: '.'
+  install-scripts:
+    description: Explicit lifecycle policy, run or deny; must match the administrator profile
+    default: run
+  require-hit:
+    description: Fail instead of installing when the exact prepared dependency tree is unavailable
+    default: 'false'
+  offline:
+    description: Forbid dependency downloads on the normal install path
+    default: 'false'
+outputs:
+  mode:
+    description: installed-tree or install
+    value: ${{ steps.prepare.outputs.mode }}
+  key:
+    description: Actual dependency preparation identity
+    value: ${{ steps.prepare.outputs.key }}
+runs:
+  using: composite
+  steps:
+    - id: prepare
+      shell: bash
+      env:
+        ENGINEBOX_ACTION_PATH: ${{ inputs.path }}
+        ENGINEBOX_ACTION_SCRIPTS: ${{ inputs.install-scripts }}
+        ENGINEBOX_ACTION_REQUIRE_HIT: ${{ inputs.require-hit }}
+        ENGINEBOX_ACTION_OFFLINE: ${{ inputs.offline }}
+      run: node "$GITHUB_ACTION_PATH/src/action.mjs"
