@@ -22,7 +22,7 @@ p.write_text('{"fixture":"preserve pending identity"}')
 $seed | & wsl.exe -d $name -u root --exec python3 -
 if ($LASTEXITCODE) { throw 'Could not seed disposable identity/workspace state' }
 $backup=Backup-AndRemoveRuntime $name $root
-$disk=Join-Path $backup 'enginebox.vhdx'
+$disk=Join-Path $backup 'enginebox.tar'
 $receipt=Get-Content -Raw -LiteralPath (Join-Path $backup 'backup.json') | ConvertFrom-Json
 try {
   Invoke-Wsl -Arguments @('--install','--from-file',([IO.Path]::GetFullPath($Image)),'--name',$name,'--location',(Join-Path $root 'fresh'),'--version','2','--vhd-size','20GB','--no-launch')
@@ -37,8 +37,8 @@ assert not (root/'override-workspace-proof.txt').exists()
   Invoke-Wsl -Arguments @('--unregister',$name)
   # The runner needs space for the exported disk and its independent restore;
   # the clean replacement has already been checked and is no longer needed.
-  # Import copies the backup. Never boot/import-in-place the original archive.
-  Invoke-Wsl -Arguments @('--import',$restored,(Join-Path $root 'restored'),$disk,'--vhd')
+  # Import restores the filesystem into a separate WSL2 virtual disk.
+  Invoke-Wsl -Arguments @('--import',$restored,(Join-Path $root 'restored'),$disk,'--version','2')
   $verify=@'
 import pathlib
 root=pathlib.Path('/var/lib/enginebox')

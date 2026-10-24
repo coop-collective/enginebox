@@ -28,8 +28,7 @@ allowance. Older API clients may supply an explicit owner ceiling.
 When the normal installer finds an owned Enginebox distribution, it asks
 **Override existing? [Y/n]**. Pressing Enter chooses Yes: the installer downloads
 and verifies the replacement, stops only Enginebox, exports its complete stopped
-VHDX into `%LOCALAPPDATA%\Enginebox\wsl-node\backups\<timestamp-id>`, checks the
-export and records its SHA-256, then removes the old WSL registration and installs
+filesystem as a TAR archive into `%LOCALAPPDATA%\Enginebox\wsl-node\backups\<timestamp-id>`, validates the archive and records its SHA-256, then removes the old WSL registration and installs
 a fresh runtime. The backup retains the previous identity, credentials, settings
 and LayerFS workspace data. Keep it private. A failed export prevents removal.
 Other WSL distributions are untouched.
@@ -40,7 +39,7 @@ to continue the existing runtime and identity instead. Automatic startup uses
 holds a local file lock so two copies cannot replace the same installation at
 once. Backup archives can be restored as a separate WSL2 distribution using
 [Microsoft's export/import commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands#export-a-distribution);
-import a copy rather than booting the original backup in place.
+retain the original archive after importing it.
 
 The installer updates WSL to at least 2.5.7 when needed. Enabling WSL can trigger
 Windows UAC and require a reboot. It saves non-secret setup state and schedules

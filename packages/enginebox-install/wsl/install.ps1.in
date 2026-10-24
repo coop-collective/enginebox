@@ -83,7 +83,7 @@ function Get-RuntimeImage([string]$Directory) {
 }
 function Backup-AndRemoveRuntime([string]$Name,[string]$Directory) {
   # The caller must establish ownership and obtain the override choice first.
-  # Export a stopped VHD before unregistering, so credentials and LayerFS data
+  # Export the stopped filesystem before unregistering, so credentials and LayerFS data
   # remain together in a private, recoverable backup.
   $owner=(& wsl.exe --distribution $Name --user root --exec cat /etc/enginebox/installation-owner 2>$null | Out-String).Trim()
   if ($LASTEXITCODE -ne 0 -or $owner -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { throw 'Cannot replace a distribution without matching Enginebox ownership.' }
@@ -96,32 +96,37 @@ function Backup-AndRemoveRuntime([string]$Name,[string]$Directory) {
   Invoke-Wsl -Arguments @('--distribution',$Name,'--user','root','--exec','systemctl','stop','enginebox-worker.service','enginebox-docker.service') | Out-Host
   Invoke-Wsl -Arguments @('--distribution',$Name,'--user','root','--exec','sync') | Out-Host
   Invoke-Wsl -Arguments @('--terminate',$Name) | Out-Host
-  $disk=Join-Path $backup 'enginebox.vhdx'
+  $disk=Join-Path $backup 'enginebox.tar'
   if (Test-Path -LiteralPath $disk) { throw 'The new backup path already exists; no state was removed.' }
-  # Terminate can return before Windows releases the VHD handle. Retry only
-  # that explicit transient error; never shut down other WSL distributions.
-  for ($attempt=1; $attempt -le 15; $attempt++) {
-    $preference=$ErrorActionPreference
-    try {
-      $ErrorActionPreference='Continue'
-      $exportOutput=@(& wsl.exe --export $Name $disk --vhd 2>&1)
-      $exportExit=$LASTEXITCODE
-    } finally { $ErrorActionPreference=$preference }
-    $exportDetail=(($exportOutput | Out-String) -replace "`0",'').Trim()
-    if ($exportExit -eq 0) { break }
-    if ($exportDetail -notmatch 'ERROR_SHARING_VIOLATION' -or $attempt -eq 15) { throw "Backup export failed (exit $exportExit): $exportDetail`nThe existing distribution was retained. Backup directory: $backup" }
-    if ($attempt -eq 1) { Write-Host 'Waiting for Windows to release the Enginebox virtual disk...' }
-    # Only this attempt's incomplete export can be removed. The source runtime
-    # and every previous backup remain intact.
-    if (Test-Path -LiteralPath $disk) { Remove-Item -LiteralPath $disk -Force }
-    Start-Sleep -Seconds 2
+  # TAR export works without shutting down the shared WSL VM. VHD export can
+  # retain ERROR_SHARING_VIOLATION even after a distribution has terminated.
+  $preference=$ErrorActionPreference
+  try {
+    $ErrorActionPreference='Continue'
+    $exportOutput=@(& wsl.exe --export $Name $disk 2>&1)
+    $exportExit=$LASTEXITCODE
+  } finally { $ErrorActionPreference=$preference }
+  if ($exportExit -ne 0) {
+    $detail=(($exportOutput | Out-String) -replace "`0",'').Trim()
+    throw "Backup export failed (exit $exportExit): $detail`nThe existing distribution was retained. Backup directory: $backup"
   }
   if (-not (Test-Path -LiteralPath $disk) -or (Get-Item -LiteralPath $disk).Length -lt 1MB) { throw "Backup is incomplete. The existing distribution was retained. Backup directory: $backup" }
-  $stream=[IO.File]::OpenRead($disk)
-  try { $magic=New-Object byte[] 8; $read=$stream.Read($magic,0,8) } finally { $stream.Dispose() }
-  if ($read -ne 8 -or [Text.Encoding]::ASCII.GetString($magic) -ne 'vhdxfile') { throw "Backup is not a VHDX. The existing distribution was retained. Backup directory: $backup" }
+  # Parse the entire archive without extracting private files onto Windows.
+  # Stream names instead of keeping a potentially large file inventory in RAM.
+  $required=@('etc/enginebox/installation-owner','etc/enginebox/wsl-runtime','usr/local/bin/enginebox-node','var/lib/enginebox')
+  $seen=@{}
+  $preference=$ErrorActionPreference
+  try {
+    $ErrorActionPreference='Continue'
+    & tar.exe -tf $disk 2> (Join-Path $backup 'archive-validation.txt') | ForEach-Object {
+      $entry=($_ -replace '^(\./|/)+','').TrimEnd('/')
+      if ($required -ccontains $entry) { $seen[$entry]=$true }
+    }
+    $archiveExit=$LASTEXITCODE
+  } finally { $ErrorActionPreference=$preference }
+  if ($archiveExit -ne 0 -or $seen.Count -ne $required.Count) { throw "Backup archive validation failed. The existing distribution was retained. Backup directory: $backup" }
   $hash=(Get-FileHash -Algorithm SHA256 -LiteralPath $disk).Hash.ToLowerInvariant()
-  @{schema=1;distribution=$Name;sha256=$hash;bytes=(Get-Item -LiteralPath $disk).Length;created=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'backup.json') -Encoding UTF8
+  @{schema=1;format='tar';distribution=$Name;sha256=$hash;bytes=(Get-Item -LiteralPath $disk).Length;created=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'backup.json') -Encoding UTF8
   $setup=Join-Path $Directory 'setup.json'
   if (Test-Path -LiteralPath $setup) { Copy-Item -LiteralPath $setup -Destination (Join-Path $backup 'setup.json') }
   Invoke-Wsl -Arguments @('--unregister',$Name) | Out-Host
@@ -233,6 +238,7 @@ if ($hasDistro) {
       $identity=Get-RuntimeIdentity
       if ($identity.enrolled -and $EnrollmentCode -and $EnrollmentCode.Split('.')[0] -eq $identity.id) { throw 'This code belongs to the enrolled runtime. Create an install command for a new machine before overriding. The existing runtime was retained.' }
       # Download and verify the replacement before stopping the old runtime.
+      if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) { throw 'Windows tar.exe is required to verify the backup. The existing runtime was retained.' }
       $null=Get-RuntimeImage $root
       Stop-ScheduledTask -TaskName $TaskName
       $null=Backup-AndRemoveRuntime $Distro $root
