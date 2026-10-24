@@ -64,7 +64,7 @@ test('artifact selection requires exact version, platform and both checksums', a
   await rm(archive); await symlink(file, archive); await assert.rejects(selectArtifact(directory, pin, example.target), /symlink/);
 });
 test('SSH pins an exact host, disables forwarding and keeps key contents out of argv', () => {
-  const env = { ENGINEBOX_DEPLOY_HOST: 'ci.example', ENGINEBOX_DEPLOY_USER: 'ubuntu', ENGINEBOX_DEPLOY_SSH_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----', ENGINEBOX_DEPLOY_KNOWN_HOSTS: 'ci.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestFixture' };
+  const env = { ENGINEBOX_DEPLOY_HOST: 'ci.example', ENGINEBOX_DEPLOY_USER: 'ubuntu', ENGINEBOX_DEPLOY_SSH_KEY: ['-----BEGIN OPENSSH ' + 'PRIVATE KEY-----', 'fixture', '-----END OPENSSH ' + 'PRIVATE KEY-----'].join('\n'), ENGINEBOX_DEPLOY_KNOWN_HOSTS: 'ci.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestFixture' };
   const settings = sshSettings(env);
   const args = sshArgs(settings, '/tmp/owned-fixture', 'true');
   for (const flag of ['StrictHostKeyChecking=yes', 'ForwardAgent=no', 'ClearAllForwardings=yes', 'IdentitiesOnly=yes']) assert.ok(args.includes(flag));

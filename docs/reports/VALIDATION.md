@@ -6,7 +6,7 @@ Updated October 20, 2026. These are development acceptance results on disposable
 
 The 0.3 Rust port merged in [PR #2](https://github.com/coop-collective/enginebox/pull/2) as `c8aaf37dab78111af0a7444313304b7f9e46bc2b` on October 19, 2026. The [native verification matrix](https://github.com/coop-collective/enginebox/actions/runs/39244413008) passed tests, strict Clippy and builds on Linux, macOS and Windows MSVC. Local checks also passed TypeScript, 20 dashboard unit tests and 19 dashboard browser tests; Linux CI passed the browser suite. Windows service installation remains a separate qualification. That merge did not itself deploy a replacement for the then-running v0.2 control plane.
 
-The actual native supervisor/controller/dashboard test stages a separately compiled next controller version, continuously calls authenticated GET/POST endpoints through upgrade and rollback, and verifies exclusive ownership, retained jobs/templates/private Claude scratchnotes, valid browser cookies and previous immutable browser assets. Failed version health and failed activation retain or restore the prior controller. Killing/restarting the supervisor releases old children through their lifelines. An actual stdio fleet MCP process also survives those transitions. See [UPDATES.md](UPDATES.md) for the reproducible opt-in test and its receipt.
+The actual native supervisor/controller/dashboard test stages a separately compiled next controller version, continuously calls authenticated GET/POST endpoints through upgrade and rollback, and verifies exclusive ownership, retained jobs/templates/private Claude scratchnotes, valid browser cookies and previous immutable browser assets. Failed version health and failed activation retain or restore the prior controller. Killing/restarting the supervisor releases old children through their lifelines. An actual stdio fleet MCP process also survives those transitions. See [UPDATES.md](../UPDATES.md) for the reproducible opt-in test and its receipt.
 
 Subprocess regression tests also cover an exited parent whose background child retains output pipes. The transport now bounds stream draining as well as process execution and reports an uncertain failure when the deadline expires. The reproduced 100 ms timeout previously waited 3.01 seconds; the fixed case completed in 0.11 seconds. Native provider leases remain held by surviving children until their descriptors close.
 
@@ -28,15 +28,15 @@ On October 20, separate [Rust native-agent qualification](RUST-NATIVE-QUALIFICAT
 
 The reference-host cutover then activated Rust 0.3.0 with original account state preserved. Native helper/browser migration completed on two private workspaces; native-dev revision 4 and two fresh reserves synchronized. A subsequent fresh native-dev revision-4 warm allocation passed real Codex/Claude code assertions through the installed operator MCP and HTTP controller. Both native conversations resumed exactly after MCP pause/resume, with boot identity preserved. Cursor was not retried after its provider usage-limit rejection. This qualifies that deployed path on ordinary guest storage; it is not a fresh physical-host installation or proof of LayerFS-mounted native inference.
 
-These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. LayerFS is a [first-class checkout backend](LAYERFS-BACKEND.md), exposed through controller registration, API/MCP jobs and the Storage dashboard. Its pinned artifacts remain explicitly provisioned on qualified Linux nodes; it is not a default-installed dependency or an automatic replacement for fleet VM disks.
+These results do not reuse the historical provider inference claims below. The first Python-to-Rust cutover requires a short control-plane interruption; compatible Rust-to-Rust updates use the tested handoff. LayerFS is a [first-class checkout backend](../LAYERFS-BACKEND.md), exposed through controller registration, API/MCP jobs and the Storage dashboard. Its pinned artifacts remain explicitly provisioned on qualified Linux nodes; it is not a default-installed dependency or an automatic replacement for fleet VM disks.
 
 After merge, [35 disposable Rust boot/resume samples](RUST-BOOT-BENCHMARKS.md) passed: full host-local readiness medians were 0.512 s from frozen RAM, 6.034 s from stopped and 5.846 s from hibernation. [Pinned LayerFS experiments](LAYERFS-VALIDATION.md) separately exercised real mounts, storage sharing, Git and offline dependency reuse, with remaining integration limits recorded.
 
 The subsequent Rust LayerFS CLI test passed approved Git import, separate writable branches, prepared dependency forks, stable-path remounts, resource admission, parallel commands and refusal to replay interrupted operations. [Measured results and reproduction instructions](LAYERFS-BACKEND-VALIDATION.md) distinguish full Docker workspace creation from branch-reference creation and VM resume.
 
-Follow-on [recovery qualification](LAYERFS-RECOVERY-VALIDATION.md) exercised a killed operator CLI and replacement from a completed checkpoint after sandbox daemon loss. The separate [Incus attachment qualification](LAYERFS-INCUS.md#live-qualification--2026-10-19) passed 53 commands covering guest writes, script/ELF execution, shared mmap, pause/resume, clean detach/checkpoint/remount and cold reattachment. These tests do not establish power-loss durability, coordinated file/RAM hibernation, automatic attachment repair or authenticated native sessions on the mounted checkout. Controller/node compatibility enforcement remains a gate before automatic attachment.
+Follow-on [recovery qualification](LAYERFS-RECOVERY-VALIDATION.md) exercised a killed operator CLI and replacement from a completed checkpoint after sandbox daemon loss. The separate [Incus attachment qualification](../LAYERFS-INCUS.md#live-qualification--2026-10-19) passed 53 commands covering guest writes, script/ELF execution, shared mmap, pause/resume, clean detach/checkpoint/remount and cold reattachment. These tests do not establish power-loss durability, coordinated file/RAM hibernation, automatic attachment repair or authenticated native sessions on the mounted checkout. Controller/node compatibility enforcement remains a gate before automatic attachment.
 
-The [earlier Cloudflare local experiment](DEV-ENVIRONMENTS.md#existing-local-proof) passed 15 stopped-state fork/isolation/restart checks in the adjacent research checkout. It was not a LayerFS test. Persistent core environments following main, online data publication, managed application sleep/wake and a registered Cloudflare recipe remain planned.
+The [earlier Cloudflare local experiment](../DEV-ENVIRONMENTS.md#existing-local-proof) passed 15 stopped-state fork/isolation/restart checks in the adjacent research checkout. It was not a LayerFS test. Persistent core environments following main, online data publication, managed application sleep/wake and a registered Cloudflare recipe remain planned.
 
 ## Historical v0.2 qualification
 
@@ -185,7 +185,7 @@ Cursor's two fields contain the same access credential, not its browser refresh
 credential. This is a tested compatibility format, not a promise that native
 status proves usable quota or that future client versions retain the format.
 
-After the [Ubuntu bubblewrap profile repair](CODEX-SANDBOX.md), Codex's model-free
+After the [Ubuntu bubblewrap profile repair](../CODEX-SANDBOX.md), Codex's model-free
 sandbox check passed. Two small inference turns then passed with
 `sandbox_mode="workspace-write"` throughout; no sandbox bypass was used. Claude
 also passed two small Haiku turns with the delegated token. Each client created a
@@ -238,7 +238,7 @@ Cursor Agent `2026.10.16-e3cb207` initially failed before inference because its
 own sandbox helper lacked Ubuntu's user-namespace permission. A scoped helper
 profile fixed native startup without disabling the global restriction. Native
 model-free tests allowed workspace writes and denied an outside-home write and
-outbound socket; see [Cursor sandbox qualification](CURSOR-SANDBOX.md). The exact
+outbound socket; see [Cursor sandbox qualification](../CURSOR-SANDBOX.md). The exact
 operator MCP launch was then retried with the sandbox still enabled. It reached
 the provider, which rejected inference because the test team's usage limit had
 been reached and reported a reset on October 23, 2026. The native process exited

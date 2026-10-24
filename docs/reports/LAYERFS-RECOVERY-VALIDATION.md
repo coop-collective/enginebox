@@ -4,7 +4,7 @@ Status: implemented and exercised on **2026-10-19**, following the initial [back
 
 ## Final run
 
-The extended [live lifecycle test](../packages/enginebox-storage-layerfs/tests/live_backend.rs), campaign D, passed in **33.63 seconds**. It used a new private state root, synthetic Git source, an immutable TypeScript 5.9.3 dependency cache and two workspace slots. Each sandbox was limited to 1 CPU and 1 GiB RAM; each temporary SDK helper to 1 CPU and 1 GiB.
+The extended [live lifecycle test](../../packages/enginebox-storage-layerfs/tests/live_backend.rs), campaign D, passed in **33.63 seconds**. It used a new private state root, synthetic Git source, an immutable TypeScript 5.9.3 dependency cache and two workspace slots. Each sandbox was limited to 1 CPU and 1 GiB RAM; each temporary SDK helper to 1 CPU and 1 GiB.
 
 The Linux host was Ubuntu 26.04. Qualification used a task-owned Docker 29.5.3 daemon, API 1.54, with separate data/socket/network state inside a container limited to 4 CPUs and 6 GiB. The existing host Docker daemon was not upgraded or reconfigured. The selected Unix socket was supplied explicitly in node configuration. This test shared its outer resource budget with the separate Incus attachment experiment; the storage projects and roots were separate.
 
@@ -51,7 +51,7 @@ The SDK source remains pinned to `968a5d0be0ea3e9456b06f9148b65523138e9490`, wit
 
 Engine Box was built with Rust 1.96.0. Local and Linux storage unit/source-policy tests and strict Clippy passed. The actual Linux release executable ran the disposable integration test.
 
-Workspace mutations now write receipt schema 2; the runtime accepts schema 1 and 2. Older storage binaries refuse schema 2 instead of silently erasing recovery history or ignoring attachment leases. This does not protect against older controllers that ignore attachment markers; rollback to those controllers remains unsupported until every checkout is cleanly detached, as documented in [update compatibility](UPDATES.md). Attachment upgrades the workspace receipt before publishing an export. Existing project/config bindings remain compatible, including omission of the default Docker socket from serialized bindings. Legacy interrupted commands lacking exact helper-completion evidence remain blocked.
+Workspace mutations now write receipt schema 2; the runtime accepts schema 1 and 2. Older storage binaries refuse schema 2 instead of silently erasing recovery history or ignoring attachment leases. This does not protect against older controllers that ignore attachment markers; rollback to those controllers remains unsupported until every checkout is cleanly detached, as documented in [update compatibility](../UPDATES.md). Attachment upgrades the workspace receipt before publishing an export. Existing project/config bindings remain compatible, including omission of the default Docker socket from serialized bindings. Legacy interrupted commands lacking exact helper-completion evidence remain blocked.
 
 ## Evidence and cleanup boundary
 
