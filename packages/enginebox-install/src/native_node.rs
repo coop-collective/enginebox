@@ -627,4 +627,97 @@ mod tests {
         }
         server.abort();
     }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires native Apple hardware and ENGINEBOX_TEST_FFMPEG"]
+    async fn real_apple_encoder_node_stops_owned_worker_when_controller_revokes() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let ffmpeg = PathBuf::from(
+            std::env::var("ENGINEBOX_TEST_FFMPEG").expect("explicit test FFmpeg path"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let script = root.join("worker.sh");
+        std::fs::write(&script, "echo $$ > worker.pid\nsleep 60\n").unwrap();
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let worker = Worker {
+            sha256: sha256_file(&shell).unwrap(),
+            executable: shell,
+            args: vec![script.to_string_lossy().into_owned()],
+            directory: root.clone(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server_calls = calls.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/v1/node/enroll",
+                        post(|| async { Json(json!({"node":{"id":"fixture","role":"native"}})) }),
+                    )
+                    .route(
+                        "/v1/node/hello",
+                        post(|Json(body): Json<Value>| async move {
+                            Json(json!({"epoch":1,"session":body["session"]}))
+                        }),
+                    )
+                    .route(
+                        "/v1/node/heartbeat",
+                        post(move || {
+                            let calls = server_calls.clone();
+                            async move {
+                                (
+                                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        StatusCode::OK
+                                    } else {
+                                        StatusCode::UNAUTHORIZED
+                                    },
+                                    Json(json!({"ok":true})),
+                                )
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let path = root.join("private/node.json");
+        enroll(
+            &path,
+            &origin,
+            &format!("fixture.enroll.{}", "a".repeat(64)),
+            Profile::AppleVideotoolbox,
+            ffmpeg,
+            Some(worker),
+            true,
+        )
+        .await
+        .unwrap();
+        let result = run(&path, false, true).await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let pid: i32 = std::fs::read_to_string(root.join("worker.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "Owned worker survived revocation"
+        );
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(root.join("private/status.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["online"], false);
+        server.abort();
+    }
 }

@@ -83,6 +83,14 @@ The host supplies NVIDIA drivers and NVIDIA Container Toolkit. Use native Window
 
 ## Current boundary
 
+Validation on October 24, 2026: root `pnpm check`, `pnpm test`, `pnpm lint:rust` and `pnpm build` passed. Native node builds/tests and Windows PowerShell parsing passed on the Windows/Linux/macOS installer matrix. The opt-in Mac lifecycle test used the actual hardware encoder, enrolled a disposable identity with a local controller fixture, launched an owned process, and proved the process stopped after credential revocation. Controller runtime tests cover expiration, competing claims, retry after Durable Object eviction, privilege boundaries and revocation. No private inventory or credentials are checked into Git.
+
+Repeat the Mac hardware/lifecycle check explicitly:
+
+```sh
+ENGINEBOX_TEST_FFMPEG=/opt/homebrew/bin/ffmpeg cargo test --locked -p enginebox-install --lib real_apple_encoder -- --ignored
+```
+
 This native role enrolls, qualifies encoding, reports liveness and supervises a locally configured worker. Remote game artifact deployment, workload placement, TURN/media ingress, resource admission and trusted project assignment are subsequent Enginebox adapters; existing Linux/LayerFS/agent scheduling is unchanged. `streamingQualified` remains false in node telemetry until an integrated host-specific game/browser acceptance has been recorded. No L4/RTX capacity claim is made from Mac or CI results.
 
 Sources: [Apple encoder selection](https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_requirehardwareacceleratedvideoencoder), [NVIDIA codec matrix](https://developer.nvidia.com/video-encode-decode-support-matrix), [Windows service sessions](https://learn.microsoft.com/en-us/windows/win32/services/interactive-services).

@@ -1,6 +1,6 @@
 # Portable operators and optional resource hosts
 
-Updated October 19, 2026. Engine Box's runtime and administrative tools are Rust binaries; the dashboard remains TypeScript/Vinext. The implemented workspace backend is Linux Incus VMs. A native Windows or macOS binary does not, by itself, make those machines compute nodes.
+Updated October 24, 2026. Engine Box's runtime and administrative tools are Rust binaries; the dashboard remains TypeScript/Vinext. The implemented VM workspace backend is Linux Incus. [Native GPU nodes](NATIVE-GPU-NODES.md) now have scoped enrollment, encoder qualification and supervision of an owner-configured local process, with a Windows user-service installer. That role does not yet participate in automatic workspace placement or remote artifact deployment. Installing the operator/controller alone still does not contribute compute capacity.
 
 ## Installation and current platform boundary
 
