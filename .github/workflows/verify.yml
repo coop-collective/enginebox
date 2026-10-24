@@ -26,6 +26,8 @@ jobs:
       - run: pnpm exec cargo fmt --all --check
       - run: pnpm check
       - run: pnpm test
+      - name: Qualify pinned CI toolchain installation on the native worker
+        run: pnpm exec cargo test --workspace --locked --test template_download -- --ignored
       - run: pnpm lint:rust
       - run: pnpm build
       - if: runner.os == 'Linux'
