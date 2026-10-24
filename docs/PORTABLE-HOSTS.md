@@ -73,7 +73,7 @@ Release checks must also install the exact built artifact on each advertised ope
 ## Isolated container contribution
 
 The personal-machine WebRTC contribution path is documented in the
-[stream-host guide](../packages/stream-host/README.md) and
+[Gamejam streaming guide](https://github.com/coop-collective/gamejam/tree/main/packages/stream-host) and
 [machine authority contract](../packages/fleet-controller/MACHINES.md). Its Linux
 container runs an isolated workload/display and joins one project with a
 restricted native identity. Docker Desktop can run that Linux container on macOS

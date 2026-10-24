@@ -142,10 +142,11 @@ The shared browser fixture also supports `ENGINEBOX_TEST_FLEET_PORT` and `ENGINE
 ## Personal machine and WebRTC development
 
 The [machine controller contract](../packages/fleet-controller/MACHINES.md) and
-[stream-host container guide](../packages/stream-host/README.md) describe the
+[Gamejam streaming container guide](https://github.com/coop-collective/gamejam/tree/main/packages/stream-host) describe the
 separate personal-computer contribution path. Enginebox owns invitation claims,
 process fencing, Account-issued viewer grants and exclusive control leases;
-Gamejam consumes those APIs. A machine token cannot access Store data, jobs,
+Gamejam consumes those APIs and owns the capture, encoder, WebRTC/input runtime,
+engine-specific images and browser qualification. A machine token cannot access Store data, jobs,
 provider credentials or task shipping evidence.
 
 Use a fresh local Wrangler configuration and persistence directory for this

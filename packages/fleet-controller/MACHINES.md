@@ -143,8 +143,9 @@ and still forces watch through TURN; `"relay"` forces both through TURN.
 Wrangler 4.152.0 filters local `.dev.vars` through `secrets.required` when that
 configuration is present. A separate machine-development configuration must
 list both `ADMIN_TOKEN` and `MACHINE_TURN_CONFIG`, or omit that local allowlist.
-The checked-in `stream-host/test/start-fleet.mjs` supplies both and verifies an
-actual disposable relay grant before launching containers. Do not make TURN a
+Gamejam’s [stream-host qualification](https://github.com/coop-collective/gamejam/tree/main/packages/stream-host)
+supplies both and verifies an actual disposable relay grant before launching
+containers. That package pins this controller as an explicit test dependency. Do not make TURN a
 required binding for storage-only production deployments.
 
 Limits are 8 simultaneous peers per host, one control peer, 64 live peers per
@@ -166,4 +167,13 @@ fields and cross-mode renewals, and preserve admitted policies across changes to
 the administrator override. Broker
 tests cover protected upstream requests and failure behavior. These tests prove
 controller authority, not video capture, NAT traversal, GPU support, or production
-Account login; the stream-host/browser qualification covers the media path.
+Account login; Gamejam’s stream-host/browser qualification covers the media path.
+
+## Runtime ownership
+
+Enginebox retains machine registration, scoped identities, grants, signaling and
+exclusive control leases. Gamejam owns native capture/encoding, WebRTC peers,
+input injection, engine-specific images and browser/media qualification in
+[`packages/stream-host`](https://github.com/coop-collective/gamejam/tree/main/packages/stream-host).
+The existing `enginebox-stream-host` executable, state directory and published
+GHCR digest remain compatible; moving source does not require re-enrollment.
