@@ -31,7 +31,7 @@ $fixtureImage=Join-Path $testRoot 'image-fixture'
 [IO.File]::WriteAllText($fixtureImage,'fixture-rootfs')
 $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 (Get-Content -Raw -LiteralPath $path).Replace('@@ROOTFS_URL@@','https://fixture.invalid/enginebox.wsl').Replace('@@ROOTFS_SHA256@@',$fixtureHash) | Set-Content -LiteralPath $flowScript -Encoding UTF8
-$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0 }
+$global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0 }
 function global:Get-CimInstance { [pscustomobject]@{NumberOfLogicalProcessors=16;TotalPhysicalMemory=32GB} }
 function global:Get-ScheduledTask { return $null }
 function global:Register-ScheduledTask {
@@ -47,6 +47,10 @@ function global:Read-Host {
 }
 function global:Start-Process {
   param($FilePath,$ArgumentList,$Verb,[switch]$Wait,[switch]$PassThru)
+  if ($FilePath -eq 'wsl.exe' -and $ArgumentList -eq '--install --no-distribution --web-download' -and $Verb -eq 'RunAs') {
+    $global:EngineboxWslFixture.enables++
+    return [pscustomobject]@{ExitCode=3010}
+  }
   if ($FilePath -ne 'wsl.exe' -or $ArgumentList -ne '--update --web-download' -or $Verb -ne 'RunAs') { throw 'Unexpected elevated host operation' }
   $global:EngineboxWslFixture.updates++
   $global:EngineboxWslFixture.version='2.6.0'
@@ -99,7 +103,14 @@ try {
   $code=('a'*32)+'.'+('b'*64)
   & $flowScript -InstallDirectory (Join-Path $testRoot 'fresh') -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
   if ($f.downloads -ne 1 -or $f.claim -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or $f.code -ne $code -or -not $f.enrolled) { throw 'Fresh distribution import/claim/registration failed' }
-  Write-Output 'Fresh import and stdin registration, default prompts, custom controller/resources, WSL upgrade, resumed settings and WSL-only startup passed.'
+  $f.version=''; $f.calls=@(); $beforeStarts=$f.starts
+  $rebootRoot=Join-Path $testRoot 'reboot'
+  & $flowScript -InstallDirectory $rebootRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
+  if ($LASTEXITCODE -ne 3010 -or $f.enables -ne 1 -or $f.starts -ne $beforeStarts -or ($f.calls | Where-Object { $_ -like '*configure*' })) { throw 'WSL prerequisite reboot must save setup without starting workloads' }
+  $saved=Get-Content -Raw -LiteralPath (Join-Path $rebootRoot 'setup.json')
+  if ($saved.Contains($code) -or -not (Test-Path -LiteralPath (Join-Path $rebootRoot 'install.ps1'))) { throw 'Resume must retain its installer and must not retain the code' }
+  $global:LASTEXITCODE=0
+  Write-Output 'Fresh import and stdin registration, defaults, custom controller/resources, WSL upgrade/reboot, resumed settings and WSL-only startup passed.'
 } finally {
   Remove-Item -LiteralPath $testRoot -Recurse -Force
   foreach ($name in @('Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }

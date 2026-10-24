@@ -73,10 +73,13 @@ $cores=[int]$computer.NumberOfLogicalProcessors
 $memory=[int][math]::Floor([double]$computer.TotalPhysicalMemory/1GB)
 $drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($root))
 $free=[int][math]::Floor($drive.AvailableFreeSpace/1GB)
-if ($memory -lt 6 -or $free -lt 25) { throw 'At least 6 GiB physical RAM and 25 GiB free disk are required.' }
-$Cpu=Read-Number 'CPU cores to contribute' $Cpu ([math]::Max(1,[math]::Min(4,[math]::Floor($cores/2)))) 1 $cores
-$MemoryGiB=Read-Number 'Memory allowance in GiB' $MemoryGiB ([math]::Max(4,[math]::Min(8,[math]::Floor($memory/2)))) 4 ($memory-2)
-$DiskGiB=Read-Number 'Linux disk maximum in GiB (includes templates)' $DiskGiB ([math]::Max(20,[math]::Min(50,[math]::Floor($free/2)))) 20 ([math]::Max(20,$free-5))
+if ($memory -lt 6 -or (-not $settings -and $free -lt 25)) { throw 'At least 6 GiB physical RAM and 25 GiB free disk are required for a new installation.' }
+$Cpu=Read-Number 'CPU cores to contribute' $Cpu ([math]::Max(1,[math]::Min(4,[math]::Floor($cores/2)))) 1 ([math]::Min(256,$cores))
+$MemoryGiB=Read-Number 'Memory allowance in GiB' $MemoryGiB ([math]::Max(4,[math]::Min(8,[math]::Floor($memory/2)))) 4 ([math]::Min(4096,$memory-2))
+# Existing VHD allocations already consume host free space. Resumption retains
+# the original maximum instead of requiring that capacity a second time.
+$diskMaximum=if ($settings) { [int]$settings.disk_gib } else { [math]::Min(65536,[math]::Max(20,$free-5)) }
+$DiskGiB=Read-Number 'Linux disk maximum in GiB (includes templates)' $DiskGiB ([math]::Max(20,[math]::Min(50,[math]::Floor($free/2)))) 20 $diskMaximum
 if ($settings -and ($settings.controller -ne $Controller -or $settings.cpu -ne $Cpu -or $settings.memory_gib -ne $MemoryGiB -or $settings.disk_gib -ne $DiskGiB)) { throw 'Existing installation has different settings. This installer preserves its identity, resources and workspaces.' }
 New-Item -ItemType Directory -Force -Path $root | Out-Null; Protect-Directory $root
 if ($PSCommandPath -ne $resumeScript) { Copy-Item -LiteralPath $PSCommandPath -Destination $resumeScript -Force }
