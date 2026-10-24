@@ -1,5 +1,6 @@
 //! Versioned, integrity-checked installs and a stable controller front door.
 pub mod bootstrap;
+pub mod contributor;
 pub mod native_node;
 pub mod release;
 pub mod supervisor;

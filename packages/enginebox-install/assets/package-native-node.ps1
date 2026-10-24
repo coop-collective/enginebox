@@ -11,7 +11,7 @@ $output=[IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $archive=Join-Path $output 'enginebox-node-windows-x64.zip'
 if (Test-Path -LiteralPath $archive) { throw 'Output already exists; use a fresh packaging directory.' }
-$files=@('enginebox-node.exe','install-native-node.ps1','README.md','LICENSE','NOTICE','SHA256SUMS') | ForEach-Object {
+$files=@('enginebox-node.exe','install-native-node.ps1','install-worker-node.ps1','README.md','LICENSE','NOTICE','SHA256SUMS') | ForEach-Object {
   $file=Join-Path $package $_
   if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing package file: $_" }
   $file

@@ -3,6 +3,11 @@
 param(
   [ValidateSet('Install','Inspect')][string]$Mode='Install',
   [string]$Controller,
+  [string]$EnrollmentCode,
+  [ValidateSet('worker','gpu')][string]$Workload='worker',
+  [ValidateRange(1,256)][int]$Cpu=4,
+  [ValidateRange(2,4096)][int]$MemoryGiB=8,
+  [ValidateRange(10,65536)][int]$DiskGiB=50,
   [string]$FfmpegPath,
   [string]$WorkerConfig
 )
@@ -18,7 +23,7 @@ function Get-VerifiedNodePackage([string]$Uri,[string]$Sha256,[string]$Destinati
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   $zip=[IO.Compression.ZipFile]::OpenRead($archive)
   try {
-    $allowed=@('enginebox-node.exe','install-native-node.ps1','README.md','LICENSE','NOTICE','SHA256SUMS')
+    $allowed=@('enginebox-node.exe','install-native-node.ps1','install-worker-node.ps1','README.md','LICENSE','NOTICE','SHA256SUMS')
     $seen=@{}
     foreach ($entry in $zip.Entries) {
       if ($entry.FullName -cnotin $allowed -or $seen.ContainsKey($entry.FullName) -or $entry.Length -gt 100MB) { throw 'Unexpected package entry.' }
@@ -55,6 +60,15 @@ New-Item -ItemType Directory -Path $scratch | Out-Null
 try {
   Write-Host 'Downloading and verifying the Windows node package...'
   Get-VerifiedNodePackage -Uri '@@ARCHIVE_URL@@' -Sha256 '@@ARCHIVE_SHA256@@' -Destination $scratch
+  if ($Mode -eq 'Install' -and $Workload -eq 'worker') {
+    $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $scratch 'install-worker-node.ps1'),
+      '-ExpectedBinarySha256','@@BINARY_SHA256@@','-Cpu',$Cpu,'-MemoryGiB',$MemoryGiB,'-DiskGiB',$DiskGiB)
+    if ($Controller) { $arguments+=@('-Controller',$Controller) }
+    if ($EnrollmentCode) { $arguments+=@('-EnrollmentCode',$EnrollmentCode) }
+    & powershell.exe @arguments
+    if ($LASTEXITCODE -ne 0) { throw 'Worker registration/setup failed; see the preceding error.' }
+    return
+  }
   if (-not $FfmpegPath) { $FfmpegPath=Find-NodeFfmpeg }
   if (-not $FfmpegPath) {
     $winget=Get-Command winget.exe -ErrorAction SilentlyContinue

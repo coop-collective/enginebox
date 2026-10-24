@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - 'packages/enginebox-install/**'
+      - 'packages/enginebox-controller/**'
+      - 'packages/enginebox-node-protocol/**'
       - '.github/workflows/native-gpu-node.yml'
       - 'Cargo.lock'
   workflow_dispatch:
@@ -55,6 +57,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked -p enginebox-install --lib
+          cargo test --locked -p enginebox-install --test contributor_worker
           cargo clippy --locked -p enginebox-install --all-targets -- -D warnings
           cargo build --locked --release -p enginebox-install --bin enginebox-node
       - name: Validate Windows installer syntax
@@ -62,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           $tokens=$null; $errors=$null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/packages/enginebox-install/assets/install-native-node.ps1",[ref]$tokens,[ref]$errors) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/packages/enginebox-install/assets/install-worker-node.ps1",[ref]$tokens,[ref]$errors) | Out-Null
           if ($errors.Count) { $errors | Format-List; throw 'Installer syntax failed' }
           & target/release/enginebox-node.exe --version
           if ($LASTEXITCODE) { throw 'Native executable failed' }
@@ -73,6 +76,7 @@ jobs:
           if [[ '${{ runner.os }}' == Windows ]]; then
             cp target/release/enginebox-node.exe .state/native-node/
             cp packages/enginebox-install/assets/install-native-node.ps1 .state/native-node/
+            cp packages/enginebox-install/assets/install-worker-node.ps1 .state/native-node/
           else
             cp target/release/enginebox-node .state/native-node/
           fi

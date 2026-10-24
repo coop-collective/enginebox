@@ -23,6 +23,9 @@ export default defineConfig({
       reuseExistingServer: false,
       env: {
         HOST: "127.0.0.1",
+        ENGINEBOX_NODE_PUBLIC_ORIGIN: "https://controller.fixture.example",
+        ENGINEBOX_NODE_INSTALLER_URL: "https://github.com/coop-collective/enginebox/releases/download/fixture-1/install.ps1",
+        ENGINEBOX_NODE_INSTALLER_SHA256: "f".repeat(64),
         PORT: dashboardPort,
         ENGINEBOX_DASHBOARD_ORIGIN: dashboardOrigin,
         ENGINEBOX_DASHBOARD_PASSWORD: "fixture-dashboard-password",

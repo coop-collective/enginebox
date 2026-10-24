@@ -6,9 +6,14 @@ $root=Join-Path ([IO.Path]::GetTempPath()) ('enginebox-bootstrap-test-'+[guid]::
 $assets=Join-Path $PSScriptRoot '..\assets'
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
+  foreach ($name in @('install-worker-node.ps1','install-native-node.ps1')) {
+    $tokens=$null; $errors=$null
+    [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $assets $name),[ref]$tokens,[ref]$errors) | Out-Null
+    if ($errors.Count) { throw "PowerShell 5.1 syntax errors: $name" }
+  }
   $package=Join-Path $root 'package'
   New-Item -ItemType Directory -Path $package | Out-Null
-  foreach ($name in @('enginebox-node.exe','README.md','LICENSE','NOTICE','SHA256SUMS')) {
+  foreach ($name in @('enginebox-node.exe','install-worker-node.ps1','README.md','LICENSE','NOTICE','SHA256SUMS')) {
     [IO.File]::WriteAllText((Join-Path $package $name),'owned test fixture')
   }
   # A fixture installer intentionally records nothing and accepts the real API.

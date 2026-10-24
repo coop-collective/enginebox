@@ -115,3 +115,7 @@ ENGINEBOX_TEST_FFMPEG=/opt/homebrew/bin/ffmpeg cargo test --locked -p enginebox-
 This native role enrolls, qualifies encoding, reports liveness and supervises a locally configured worker. Remote game artifact deployment, workload placement, TURN/media ingress, resource admission and trusted project assignment are subsequent Enginebox adapters; existing Linux/LayerFS/agent scheduling is unchanged. `streamingQualified` remains false in node telemetry until an integrated host-specific game/browser acceptance has been recorded. No L4/RTX capacity claim is made from Mac or CI results.
 
 Sources: [Apple encoder selection](https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_requirehardwareacceleratedvideoencoder), [NVIDIA codec matrix](https://developer.nvidia.com/video-encode-decode-support-matrix), [Windows service sessions](https://learn.microsoft.com/en-us/windows/win32/services/interactive-services).
+
+For CPU/memory/disk-limited Windows registration for CI and native agents, use
+[Windows workers](WINDOWS-WORKERS.md). The online installer defaults to that flow;
+pass `-Mode Inspect` for a GPU check or `-Workload gpu` for the separate GPU worker.

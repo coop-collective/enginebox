@@ -91,13 +91,13 @@ pub struct Config {
     pub worker: Option<Worker>,
 }
 
-fn client() -> Result<Client> {
+pub(crate) fn client() -> Result<Client> {
     Ok(Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(8))
         .build()?)
 }
-async fn post(
+pub(crate) async fn post(
     client: &Client,
     origin: &Url,
     path: &str,

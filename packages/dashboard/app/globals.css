@@ -1607,3 +1607,7 @@ input::placeholder {
 .environment-panel .host-card p { margin: 8px 0; line-height: 1.5; overflow-wrap: anywhere; }
 .environment-panel form.host-card { display: grid; gap: 16px; }
 .environment-panel .button { justify-self: start; }
+.contributor-resources { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.contributor-resources input { width: 100%; }
+.storage-panel textarea { width: 100%; resize: vertical; font-family: monospace; }
+@media (max-width: 640px) { .contributor-resources { grid-template-columns: 1fr; } }
