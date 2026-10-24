@@ -1,4 +1,4 @@
-import { fixtureOrigin, dashboardOrigin } from "./tests/browser/urls";
+import { fixtureOrigin, dashboardOrigin, dashboardPort } from "./tests/browser/urls";
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
@@ -23,7 +23,7 @@ export default defineConfig({
       reuseExistingServer: false,
       env: {
         HOST: "127.0.0.1",
-        PORT: process.env.ENGINEBOX_TEST_DASHBOARD_PORT ?? "3007",
+        PORT: dashboardPort,
         ENGINEBOX_DASHBOARD_ORIGIN: dashboardOrigin,
         ENGINEBOX_DASHBOARD_PASSWORD: "fixture-dashboard-password",
         ENGINEBOX_SESSION_SECRET:

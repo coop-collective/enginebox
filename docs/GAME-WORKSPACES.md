@@ -11,7 +11,7 @@ Every production bare-metal server is a managed compute and/or storage node. A d
 server is optional. One agent node may keep project storage local; execution across
 multiple agent nodes requires shared storage, which R2 directly can supply.
 
-The existing container integration is implemented. The independent [local fleet implementation #17](https://github.com/coop-collective/enginebox/pull/17) adds Wrangler/Compose, verified Store transport, cache eviction and protected candidate CI gates. Automatic merge/import, batch composition, engine validation and production controller migration remain Engine Box work. See [the local development guide](LOCAL-FLEET.md) and [integration/CI contract](INTEGRATION-CI.md). See the [control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
+The existing container integration is implemented. The independent [local fleet implementation #17](https://github.com/coop-collective/enginebox/pull/17) adds Wrangler/Compose, verified Store transport, cache eviction and protected candidate CI gates. The fleet now also executes operator-selected [same-Store logical integration](LOGICAL-INTEGRATION.md), protected Godot Web/Linux builds and recorded playtest review. Automatic batch composition, cross-Store import, native Unity/Unreal build qualification and production controller migration remain Engine Box work. See [the local development guide](LOCAL-FLEET.md), [integration/CI contract](INTEGRATION-CI.md) and [control-plane design](DESIGN.md#required-cloudflare-fleet-control-plane).
 The [local development contract](DESIGN.md#local-development-and-test-fleets) keeps
 Wrangler control state separate from the Linux LayerFS node's Store and task branches.
 

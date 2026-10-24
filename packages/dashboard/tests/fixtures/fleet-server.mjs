@@ -680,6 +680,6 @@ createServer(async (req, res) => {
     });
   }
   send(404, { error: "Not found" });
-}).listen(Number(process.env.ENGINEBOX_TEST_FLEET_PORT ?? 18765), "127.0.0.1", () =>
+}).listen(Number(process.env.ENGINEBOX_TEST_FLEET_PORT ?? process.env.EBOX_TEST_FLEET_PORT ?? "18765"), "127.0.0.1", () =>
   process.stdout.write("Test fleet API listening on loopback.\n"),
 );

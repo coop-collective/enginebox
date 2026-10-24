@@ -7,6 +7,11 @@ Engine Box's merge/LayerFS work can call the same trigger API as an operator.
 This change supplies that boundary; it does not implement a merge engine or a
 LayerFS merge-event listener.
 
+This native CI module is not yet an adapter for the Cloudflare project's
+protected checks. Shell/GitHub runner results cannot satisfy those checks or
+publish protected build artifacts. The qualified fleet integration and engine
+build path is described in [INTEGRATION-CI.md](INTEGRATION-CI.md).
+
 ## Execution and resource decision
 
 **Use dedicated CI nodes by default.** Builds must not compete with interactive

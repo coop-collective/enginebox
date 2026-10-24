@@ -36,7 +36,7 @@ impl Runtime {
                     "Retained GitHub generation is not a proved complete import; inspect it on the node");
                 self.owned_volume(&p)?;
             } else {
-                self.import(generation, repo, commit, digest)?;
+                self.import(generation, repo, commit, digest, true)?;
             }
             Ok(())
         })

@@ -27,7 +27,26 @@ export type TaskCreate = {
   source: TaskSource | null;
   review: "required" | "automatic";
 };
+export type TaskReviewReceipt = {
+  candidate: string;
+  generation: string;
+  requirements: string;
+  approvedBy: string;
+  approvedAt: number;
+};
+export type TaskApproval = { operationId: string; expectedRevision: number };
+export function validateTaskApproval(value: unknown): TaskApproval {
+  record(value);
+  exactKeys(value, ["operationId", "expectedRevision"]);
+  identifier(value.operationId);
+  integer(value.expectedRevision, 1, Number.MAX_SAFE_INTEGER);
+  return {
+    operationId: value.operationId,
+    expectedRevision: value.expectedRevision,
+  };
+}
 export type Task = TaskCreate & {
+  reviewReceipt?: TaskReviewReceipt;
   project: string;
   status: TaskStatus;
   revision: number;
@@ -62,7 +81,7 @@ export type TaskMove = {
 export type TaskEvent = {
   sequence: number;
   taskId: string;
-  action: "created" | "updated" | "moved" | "shipped";
+  action: "created" | "updated" | "moved" | "shipped" | "reviewed";
   actor: string;
   at: number;
   revision: number;

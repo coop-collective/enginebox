@@ -25,9 +25,10 @@ then requires its generation metadata to bind `integration`, `treeHash`,
 Files are copied and hashed before execution. Changed bytes, escaping links and
 Git metadata are refused. Publishing a candidate alone never authorizes activation.
 
-The generic integration executor is separate work. This adapter neither merges
-branches nor imports a Store. Its contract tests use an HTTP authority fixture;
-live LayerFS integration still needs qualification. A missing export binding is
+The generic [same-Store integration executor](LOGICAL-INTEGRATION.md) has separate
+native qualification. This adapter neither merges branches nor imports a Store.
+Its accepted-source activation handoff is tested with an HTTP authority fixture;
+that handoff still needs a live fleet-to-service qualification. A missing export binding is
 reported explicitly while the existing service remains available. Cross-node
 export transport and private Git authentication are not supplied here.
 

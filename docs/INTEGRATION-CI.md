@@ -14,7 +14,7 @@ The source review covered Gitstalk checkout `63dae2ccf2cf76d09384f525042c21f163f
 | Sprout before stalk/main | Integration produces a frozen candidate. The accepted/live channel advances only after its required full checks and policy decisions. |
 | Parallel preparation, short publication | Many tasks prepare concurrently. Compatible results share a candidate and validation run; only the accepted-head compare-and-swap is serialized. |
 | Bounded unvalidated work | Task, integration, CI and editor leases use explicit capacity. Cancellation does not release native capacity until the prior executor is reconciled. |
-| Failure stays attributable | A failed batch retains its receipts. The integration service can split/bisect it and return conflicting changes for repair while preserving accepted state. |
+| Failure stays attributable | A failed batch retains its receipts and leaves accepted state unchanged. Automatic splitting/bisection remains planned; an operator can submit a new smaller batch. |
 | Protected evidence | Check identity includes the candidate, generation, recipe, executor and scope. Selected-test success cannot satisfy a required full check. A changed candidate or recipe requires new evidence. |
 | Safe skipping | Selection is an opt-in pre-land optimization. Unknown inputs/dependencies fall back to full checks. Full candidate validation remains required. |
 
@@ -63,6 +63,8 @@ With an empty required-check policy, Enginebox remains a storage/workspace servi
 
 The runtime tests include a **100-change candidate** covered by one full check, rejection of selected results, recipe/executor drift, stale sessions and concurrent dispatch. This qualifies the controller records and gate, not 100 native agents or a 100-way LayerFS merge. `pnpm fleet:smoke` exercises the configured gate with the actual built-in storage verifier in separate containers.
 
+The [logical integration executor](LOGICAL-INTEGRATION.md) now materializes an operator-selected batch from immutable references in one node-local LayerFS Store. Successful integration publishes a generation, moves member tasks to Testing and queues protected `verify` and `engine-build` checks. [Engine build recipes](ENGINE-BUILDS.md) bind exported source, toolchain and immutable playable artifacts. The controller records owner review receipts and enforces optional [playtest evidence](PLAYTEST-EVIDENCE.md) before promoting the batch. Gamejam's approval action calls this controller; it does not coordinate acceptance itself. A real two-task Godot flow has exercised integration, Linux/Web builds, browser recording, CPU media validation and reviewed acceptance; see the [qualification record](LAYERFS-INTEGRATION-VALIDATION.md).
+
 ## Test reuse and engine caches
 
 Gitstalk's current optional skipper supports a restricted Node ESM test runner, caps analysis at 16 MiB and 10,000 files/directories, and starts from a full green baseline with unchanged before/after input snapshots. Selected passes never seed a new full baseline. Configuration, lockfile, fixture or inventory changes, unsupported dependencies and analyzer errors fall back to the full suite. The gateway rejects a selected response to required full validation.
@@ -73,6 +75,6 @@ Cache reuse and validation reuse are separate. Shader/import/build caches can re
 
 ## Remaining Enginebox work
 
-The generic merge/import executor, automatic compatible-batch selection, dependency handling, bounded sprout window, red-batch isolation/bisection, engine recipes/pool scheduling and engine-aware test analysis remain Enginebox implementation/qualification work. Cross-node result import must reconstruct a branch from its base using supported LayerFS operations; independently written SQLite databases and WAL files are never merged. Same-node `branch.publish` is not a complete distributed acceptance protocol.
+Automatic compatible-batch selection, dependency handling, bounded sprout windows, red-batch isolation/bisection, engine-pool scheduling and engine-aware test analysis remain Enginebox work. The current operator-driven executor is qualified for same-Store logical integration and Godot Web/Linux builds. Unity/Unreal recipes require native qualification, and large real-project editor/cache startup remains unmeasured by this flow. Cross-node result import must reconstruct a branch from its base using supported LayerFS operations; independently written SQLite databases and WAL files are never merged. Same-node `branch.publish` is not a complete distributed acceptance protocol.
 
 Gamejam should integrate through these shared Enginebox capabilities rather than filling those gaps with app-specific infrastructure. Its remaining work is application UX, game/community data and presentation of Enginebox task, review, session and release state.

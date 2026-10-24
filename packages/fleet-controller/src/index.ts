@@ -14,6 +14,7 @@ import {
   requireThat,
   readOnlyJob,
   sha256,
+  validateSubmission,
   validateChunks,
   validateGeneration,
   validateJob,
@@ -23,11 +24,14 @@ import {
   validateTaskCreate,
   validateTaskUpdate,
   validateTaskMove,
+  validateTaskApproval,
   taskStatus,
   type Assignment,
   type NodeView,
 } from "@enginebox/fleet-protocol";
 import { assistantRoute } from "./assistant.ts";
+import { recordingRoute } from "./recording-routes.ts";
+import { artifactRoute } from "./artifacts.ts";
 export { Registry, FleetNode, Project } from "./state.ts";
 
 const json = (value: unknown, status = 200) =>
@@ -196,6 +200,11 @@ export default {
             request.method === "GET") ||
             (parts[1] === "projects" &&
               (parts[3] === "tasks" ||
+                ["test-contexts", "test-sessions", "recordings"].includes(
+                  parts[3],
+                ) ||
+                (parts[3] === "artifacts" &&
+                  ["GET", "HEAD"].includes(request.method)) ||
                 (parts[3] === "activity" &&
                   parts.length === 4 &&
                   request.method === "GET") ||
@@ -416,9 +425,12 @@ export default {
             });
           for (const project of n.projects) {
             const authority = env.PROJECTS.getByName(project);
-            const next = await authority.next(
-              n.assistantProjects?.includes(project) ?? false,
-            );
+            const next = await authority.next({
+              assistant: n.assistantProjects?.includes(project) ?? false,
+              media: n.mediaProjects?.includes(project) ?? false,
+              integration: n.integrationProjects?.includes(project) ?? false,
+              buildNode: n.buildProjects?.includes(project) ? n.id : undefined,
+            });
             if (!next) continue;
             const reserved = await stub.reserve(next, s.epoch, s.session);
             try {
@@ -446,12 +458,36 @@ export default {
           const { assignment: a, body } = await assignmentBody(request, p);
           requireThat(typeof body.ok === "boolean", "Result status required");
           requireThat(body.result !== undefined, "Result body required");
-          const job = await env.PROJECTS.getByName(a.project).finish(
-            a,
-            canonical(body.result),
-            body.ok,
-          );
-          await stub.finish(a, canonical(body.result));
+          const authority = env.PROJECTS.getByName(a.project),
+            result = canonical(body.result);
+          let job;
+          try {
+            job = await authority.finish(a, result, body.ok);
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : "Completion failed";
+            const status =
+              error instanceof ProtocolError
+                ? error.status
+                : Number(message.match(/\[EBOX (\d{3})\]/)?.[1]);
+            if (![400, 409].includes(status)) throw error;
+            const recorded = await authority.job(a.id);
+            if (
+              !recorded ||
+              !["completed", "failed"].includes(recorded.status) ||
+              recorded.assignment?.node !== a.node ||
+              recorded.assignment.epoch !== a.epoch ||
+              recorded.assignment.session !== a.session ||
+              recorded.assignment.attempt !== a.attempt ||
+              recorded.result !== result ||
+              (recorded.status === "completed") !== body.ok
+            )
+              throw error;
+            // The executor result is durable. A later queue/promotion conflict
+            // must not keep already-exited native work occupying a fleet slot.
+            job = await authority.noteCompletionError(a, message);
+          }
+          await stub.finish(a, result);
           return json(job);
         }
       }
@@ -460,6 +496,48 @@ export default {
         projectAccess(p, project);
         await requireProject(env, project);
         const authority = env.PROJECTS.getByName(project);
+        if (
+          [
+            "test-contexts",
+            "test-sessions",
+            "recordings",
+            "playtest-policy",
+          ].includes(parts[3])
+        ) {
+          requireThat(
+            p.admin || p.node.role === "agent",
+            "Recording access requires an agent or owner",
+            403,
+          );
+          return await recordingRoute(
+            request,
+            env,
+            project,
+            parts.slice(3),
+            p.admin ? "owner" : `node:${p.node.id}`,
+            p.admin,
+            !p.admin && !p.node.taskOnly ? p.node.id : null,
+          );
+        }
+        if (
+          ["artifacts", "artifact-files", "artifact-file-pages"].includes(
+            parts[3],
+          )
+        ) {
+          requireThat(
+            p.admin || p.node.role === "agent",
+            "Artifact access requires an agent or owner",
+            403,
+          );
+          return await artifactRoute(
+            request,
+            env,
+            project,
+            parts.slice(3),
+            p.admin || !p.node.taskOnly,
+            p.admin ? "owner" : `node:${p.node.id}`,
+          );
+        }
         if (
           parts[3] === "assistant" &&
           (parts.length === 4 || parts.length === 5)
@@ -519,6 +597,16 @@ export default {
             return json(task);
           }
           if (parts.length === 6 && request.method === "POST") {
+            if (parts[5] === "approve") {
+              admin(p);
+              return json(
+                await authority.approveTask(
+                  parts[4],
+                  validateTaskApproval(await jsonBody(request)),
+                  actor,
+                ),
+              );
+            }
             if (parts[5] === "update")
               return json(
                 await authority.updateTask(
@@ -598,6 +686,31 @@ export default {
           record(body);
           return json(
             await authority.configureChecks(validateChecks(body.checks)),
+          );
+        }
+        if (
+          parts.length === 4 &&
+          parts[3] === "submissions" &&
+          request.method === "POST"
+        ) {
+          admin(p);
+          const spec = validateSubmission(await jsonBody(request));
+          requireThat(spec.project === project, "Project mismatch");
+          return json(await authority.submitChange(spec), 201);
+        }
+        if (
+          parts.length === 4 &&
+          parts[3] === "integrations" &&
+          request.method === "POST"
+        ) {
+          admin(p);
+          const body = await jsonBody(request);
+          record(body);
+          identifier(body.id);
+          requireThat(Array.isArray(body.changes), "Submission IDs required");
+          return json(
+            await authority.integrate(body.id, body.changes as string[]),
+            201,
           );
         }
         if (

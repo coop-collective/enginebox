@@ -16,8 +16,12 @@ import {
   type Assignment,
   type NodeSpec,
 } from "@enginebox/fleet-protocol";
+import { executeIntegration, type IntegrationConfig } from "./integration.ts";
+import { EngineBuilds, type EngineBuildConfig } from "./build.ts";
+import { executeMedia, type MediaConfig } from "./media.ts";
 import { Cache } from "./cache.ts";
 import { Client } from "./client.ts";
+import { deliverFinishedResult } from "./result-delivery.ts";
 import { Generations, publishSnapshot, type Published } from "./generations.ts";
 import {
   NativeAssistant,
@@ -33,6 +37,9 @@ export type Config = NodeSpec & {
   snapshotBytes?: number;
   warmDelayMs?: number;
   nativeAssistant?: NativeAssistantConfig;
+  media?: MediaConfig;
+  integration?: IntegrationConfig;
+  engineBuilds?: EngineBuildConfig;
   layerfs?: {
     ebox: string;
     config: string;
@@ -107,7 +114,11 @@ function errorStatus(error: unknown) {
 
 export async function runNode(config: Config) {
   identifier(config.id);
-  requireThat(!config.taskOnly, "Task-only credentials cannot run a fleet node", 403);
+  requireThat(
+    !config.taskOnly,
+    "Task-only credentials cannot run a fleet node",
+    403,
+  );
   requireThat(
     config.role === "agent" || config.role === "storage",
     "Invalid role",
@@ -150,6 +161,26 @@ export async function runNode(config: Config) {
       canonical(Object.keys(config.nativeAssistant?.bindings ?? {}).sort()),
     "Enrolled assistant projects must match configured native bindings",
   );
+  for (const [capabilities, bindings, kind] of [
+    [
+      config.integrationProjects ?? [],
+      Object.keys(config.integration?.projects ?? {}),
+      "integration",
+    ],
+    [
+      config.buildProjects ?? [],
+      Object.keys(config.engineBuilds?.bindings ?? {}),
+      "build",
+    ],
+    [config.mediaProjects ?? [], config.media?.projects ?? [], "media"],
+  ] as [string[], string[], string][])
+    requireThat(
+      canonical([...capabilities].sort()) === canonical([...bindings].sort()),
+      `Enrolled ${kind} projects must match configured bindings`,
+    );
+  const engineBuilds = config.engineBuilds
+    ? new EngineBuilds(config.engineBuilds, client)
+    : null;
   let blockedNative = false;
   let stopping = false;
   let connected = false;
@@ -272,6 +303,35 @@ export async function runNode(config: Config) {
             409,
           );
           result = await nativeAssistant.execute(assignment, signal);
+        } else if (assignment.kind === "integration") {
+          requireThat(
+            config.integration,
+            "Integration runtime is not configured",
+            409,
+          );
+          result = await executeIntegration(
+            config.integration,
+            assignment,
+            client,
+            config.state,
+            signal,
+          );
+        } else if (assignment.kind === "engine-build") {
+          requireThat(
+            engineBuilds,
+            "Protected engine builds are not configured",
+            409,
+          );
+          result = await engineBuilds.execute(assignment, signal);
+        } else if (assignment.kind === "media-finalize") {
+          requireThat(config.media, "Media validation is not configured", 409);
+          result = await executeMedia(
+            config.media,
+            assignment,
+            client,
+            config.state,
+            signal,
+          );
         } else {
           await generations.hydrate(assignment.project, assignment.generation);
           requireThat(
@@ -324,8 +384,8 @@ export async function runNode(config: Config) {
         canonical({ ok, result }),
       );
     try {
-      await client.json("/v1/node/finish", { assignment, ok, result });
-      log("job_finished", { job: assignment.id, ok });
+      const delivered = await deliverFinishedResult(client, assignment, journal);
+      log("job_finished", { job: assignment.id, ok: delivered.ok });
     } catch (error) {
       log("result_pending", {
         job: assignment.id,
@@ -403,7 +463,10 @@ export async function runNode(config: Config) {
                 reservation.expires <= Date.now())
             )
               blockedNative = true;
-            else if (readOnlyJob(reservation) && reservation.epoch !== client.epoch)
+            else if (
+              readOnlyJob(reservation) &&
+              reservation.epoch !== client.epoch
+            )
               await client.json("/v1/node/reconcile", {
                 attempt: reservation.attempt,
               });
