@@ -1,0 +1,38 @@
+name: Windows build
+on:
+  workflow_dispatch:
+    inputs:
+      enginebox_sha:
+        description: Exact source commit supplied by Engine Box
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_WINDOWS_RUNNER || '"windows-2025"') }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.enginebox_sha }}
+          persist-credentials: false
+      - name: Build and test
+        shell: pwsh
+        run: |
+          cmake -S . -B build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --install build --prefix dist --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path dist/* -DestinationPath windows-build.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-${{ inputs.enginebox_sha }}
+          path: |
+            windows-build.zip
+          if-no-files-found: error
+          retention-days: 7

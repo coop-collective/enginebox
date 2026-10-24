@@ -2,7 +2,7 @@
 
 Engine Box's next application-environment workflow has two lifetimes: a persistent **core environment** for the project, and disposable **agent environments** for individual tasks. The core follows the project's main branch and keeps its application data as code changes. An agent starts from a published revision of that environment, makes changes against its own data, and submits code for review.
 
-This is the intended product contract, not an implemented environment service. The current runtime supplies native agent workspaces, templates, lifecycle controls, checkout storage and file checkpoints. The project environment registry, branch-following reconciler, application startup service and consistent data publication adapters remain to be built. No new CLI command or template field is defined by this document.
+The broader fork/publication workflow below remains a product contract. The optional [environment service](ENVIRONMENT-SERVICES.md) now implements a protected registry, exact-source following, bounded application containers, persistent data, readiness, recovery and dashboard-managed HTTP/WebSocket/TCP/UDP routes. Git main has executable end-to-end qualification; the accepted LayerFS export adapter has provenance/byte-integrity contract tests and still needs live qualification with the separate integration executor. Consistent online data publication and disposable data forks remain unimplemented. No template field is defined by this document.
 
 ## One persistent core per project
 
@@ -38,7 +38,7 @@ These are design steps, not currently callable Engine Box operations. Publicatio
 
 Two environments must not point independent SQLite/Miniflare runtimes at the same writable persistence directory. Fork isolation comes from independent writable state, not from distinct ports or branch names. Sharing a service is a different choice: agents call its API with the intended permissions and accept that writes affect shared state.
 
-Later changes in the core do not silently appear in an existing fork. Refresh creates a new fork or performs a deliberate application-specific import. Code returns through reviewed Git changes. Data returns only through an explicit migration, export/import or application operation; there is no automatic database merge. Task completion can discard the fork without deleting the core or its published baseline.
+Later changes in the core do not silently appear in an existing fork. Refresh creates a new fork or performs a deliberate application-specific import. Code returns through reviewed LayerFS branch integration. An optional GitHub connection exports accepted main revisions and uses a specialized Git environment for external conflicts; see [GitHub sync](GITHUB-SYNC.md). Data returns only through an explicit migration, export/import or application operation; there is no automatic database merge. Task completion can discard the fork without deleting the core or its published baseline.
 
 ## Cloudflare as the first recipe
 

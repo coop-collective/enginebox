@@ -15,6 +15,7 @@ path = "src/mcp.rs"
 
 [dependencies]
 enginebox-core = { path = "../enginebox-core" }
+enginebox-ci = { path = "../enginebox-ci" }
 enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

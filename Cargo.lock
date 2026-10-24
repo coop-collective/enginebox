@@ -363,11 +363,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "enginebox-ci"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "enginebox-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "enginebox-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "enginebox-ci",
  "enginebox-core",
  "enginebox-storage-layerfs",
  "reqwest",
@@ -387,7 +401,9 @@ dependencies = [
  "chrono",
  "clap",
  "enginebox-agents",
+ "enginebox-ci",
  "enginebox-core",
+ "enginebox-storage-layerfs",
  "fs2",
  "http-body-util",
  "libc",
@@ -425,6 +441,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "enginebox-engine-builds"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "enginebox-agents",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "enginebox-install"
 version = "0.3.0"
 dependencies = [
@@ -455,6 +486,7 @@ name = "enginebox-storage-layerfs"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "enginebox-core",
  "fs2",

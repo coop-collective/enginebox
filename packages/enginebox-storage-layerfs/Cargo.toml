@@ -8,6 +8,7 @@ description = "Node-local LayerFS checkout storage for Engine Box"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 enginebox-core = { path = "../enginebox-core" }
 fs2 = "0.4"

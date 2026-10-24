@@ -4,6 +4,7 @@ import {
   requireThat,
   type Task,
   type TaskActor,
+  type TaskApproval,
   type TaskCreate,
   type TaskEvent,
   type TaskMove,
@@ -219,6 +220,48 @@ export class Tasks {
     this.event(task, action, actor.id, decision);
     return task;
   }
+  approve(id: string, input: TaskApproval, actor: TaskActor) {
+    requireThat(actor.owner, "Only the owner may approve shipping", 403);
+    const prior = this.prior(id, input.operationId, input, actor);
+    if (prior) return prior;
+    const task = this.current(id, input.expectedRevision);
+    requireThat(
+      task.status === "testing" && task.candidate && task.resultGeneration,
+      "A frozen tested candidate is required before approval",
+      409,
+    );
+    const candidate = this.store.get<TaskCandidate>(
+      `candidate:${task.candidate}`,
+    );
+    requireThat(
+      candidate?.taskRequirements?.[id] === requirements(task) &&
+        candidate.spec.changes.some(
+          (change) =>
+            change.id === id && change.generation === task.resultGeneration,
+        ),
+      "Task no longer matches the tested candidate",
+      409,
+    );
+    task.reviewReceipt = {
+      candidate: task.candidate,
+      generation: task.resultGeneration,
+      requirements: requirements(task),
+      approvedBy: actor.id,
+      approvedAt: Date.now(),
+    };
+    return this.save(task, "reviewed", input.operationId, input, actor);
+  }
+  reviewReady(task: Task, candidate: TaskCandidate) {
+    return (
+      task.status === "testing" &&
+      task.candidate === candidate.spec.id &&
+      candidate.taskRequirements?.[task.id] === requirements(task) &&
+      (task.review === "automatic" ||
+        (task.reviewReceipt?.candidate === task.candidate &&
+          task.reviewReceipt.generation === task.resultGeneration &&
+          task.reviewReceipt.requirements === requirements(task)))
+    );
+  }
   update(id: string, input: TaskUpdate, actor: TaskActor) {
     const prior = this.prior(id, input.operationId, input, actor);
     if (prior) return prior;
@@ -237,6 +280,7 @@ export class Tasks {
       );
     Object.assign(task, input.patch);
     if (contentChanged) {
+      delete task.reviewReceipt;
       task.resultGeneration = null;
       task.candidate = null;
       if (task.status === "testing") task.status = "in_progress";
@@ -252,6 +296,18 @@ export class Tasks {
     const prior = this.prior(id, input.operationId, input, actor);
     if (prior) return prior;
     const task = this.current(id, input.expectedRevision);
+    requireThat(
+      !this.store.get<AcceptedTaskEvidence>("pendingDecision")?.validation
+        ?.taskRequirements?.[id],
+      "Acceptance must settle before moving its tasks",
+      409,
+    );
+    if (
+      input.status !== "testing" ||
+      (input.generation && input.generation !== task.resultGeneration) ||
+      (input.candidate && input.candidate !== task.candidate)
+    )
+      delete task.reviewReceipt;
     if (input.generation) {
       requireThat(
         this.store.get(`generation:${input.generation}`),
@@ -340,7 +396,12 @@ export class Tasks {
       if (
         !task ||
         task.status !== "testing" ||
-        task.review !== "automatic" ||
+        !(
+          task.review === "automatic" ||
+          (task.reviewReceipt?.candidate === candidate.id &&
+            task.reviewReceipt.generation === task.resultGeneration &&
+            task.reviewReceipt.requirements === requirements(task))
+        ) ||
         evidence.validation.taskRequirements?.[task.id] !==
           requirements(task) ||
         task.resultGeneration !== change.generation ||
@@ -352,9 +413,9 @@ export class Tasks {
       task.shippedGeneration = evidence.generation;
       task.revision++;
       task.updatedAt = Date.now();
-      task.updatedBy = "policy:automatic";
+      task.updatedBy = task.reviewReceipt?.approvedBy ?? "policy:automatic";
       this.store.put(`task:${task.id}`, task);
-      this.event(task, "shipped", "policy:automatic", evidence.id);
+      this.event(task, "shipped", task.updatedBy, evidence.id);
     }
   }
 }

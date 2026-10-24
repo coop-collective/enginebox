@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod ci;
 pub mod tasks;
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
@@ -108,6 +109,30 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 pub fn tools() -> Vec<Value> {
     vec![
         tool(
+            "ci_nodes",
+            "List registered build workers and their declared OS/image/toolchain capabilities.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "ci_register",
+            "Register an authorized, already provisioned dedicated CI node. Does not install an OS image.",
+            json!({"manifest":{"type":"object"}}),
+            &["manifest"],
+        ),
+        tool(
+            "ci_plan",
+            "Resolve a non-agent CI trigger without executing it.",
+            json!({"request":{"type":"object"}}),
+            &["request"],
+        ),
+        tool(
+            "ci_trigger",
+            "Trigger a shell automation or GitHub workflow once per request_id; poll fleet_job. GitHub dispatch is not build success.",
+            json!({"request":{"type":"object"}}),
+            &["request"],
+        ),
+        tool(
             "fleet_inventory",
             "List configured hosts, capacity budgets, prepared templates and workspaces.",
             json!({}),
@@ -216,6 +241,48 @@ pub fn tools() -> Vec<Value> {
             &["host_id"],
         ),
         tool(
+            "storage_github_settings",
+            "Inspect a LayerFS project's main revision and optional GitHub delivery state; set enabled to change outbound synchronization. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"enabled":{"type":"boolean"}}),
+            &["host_id", "project"],
+        ),
+        tool(
+            "storage_github_promote",
+            "Promote or merge a closed LayerFS checkpoint to main against expected_main. Enabled GitHub sync reconciles separately; conflicts produce a specialized agent task. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"name":{"type":"string"},"expected_main":{"type":"string"},"merge":{"type":"boolean"},"message":{"type":"string"}}),
+            &["host_id", "project", "name", "expected_main"],
+        ),
+        tool(
+            "storage_github_delivery",
+            "Export accepted LayerFS main, continue delivery, request the dedicated conflict-agent task, accept a resolved agent result, or retry stale reconciliation. The connector alone pushes after LayerFS acceptance. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"action":{"type":"string","enum":["export","deliver","agent-task","resolve","retry"]},"attempt":{"type":"string"}}),
+            &["host_id", "project", "action"],
+        ),
+        tool(
+            "storage_github_preview",
+            "Fetch a GitHub branch on a registered storage node and review its exact commit and approval digest. Omit branch to discover the default on first import; subsequent checks retain the selected branch. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"repository":{"type":"string"},"branch":{"type":"string"}}),
+            &["host_id", "project", "repository"],
+        ),
+        tool(
+            "storage_github_import",
+            "Import a reviewed GitHub tree into LayerFS without Git metadata. LayerFS owns subsequent main revisions. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"revision":{"type":"string"},"approval":{"type":"string"},"credential_free":{"type":"boolean","const":true}}),
+            &[
+                "host_id",
+                "project",
+                "revision",
+                "approval",
+                "credential_free",
+            ],
+        ),
+        tool(
+            "storage_github_fork",
+            "Fork the current published GitHub generation. Optional from must be a completed checkpoint in that same generation. Poll fleet_job.",
+            json!({"host_id":{"type":"string"},"project":{"type":"string"},"name":{"type":"string"},"from":{"type":"string"}}),
+            &["host_id", "project", "name"],
+        ),
+        tool(
             "storage_preview",
             "Review a registered repository's tracked file list and exact commit approval digest before import. Does not fetch Git or import files.",
             json!({"host_id":{"type":"string"},"project":{"type":"string"},"revision":{"type":"string","default":"HEAD"}}),
@@ -292,13 +359,38 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         );
     }
     let result = match name {
+        "ci_nodes" => ("/v1/ci".into(), None),
+        "ci_register" => {
+            let node: enginebox_ci::Node = serde_json::from_value(args["manifest"].clone())?;
+            node.validate()?;
+            ("/v1/ci/nodes".into(), Some(serde_json::to_value(node)?))
+        }
+        "ci_plan" | "ci_trigger" => {
+            let request: enginebox_ci::Request = serde_json::from_value(args["request"].clone())?;
+            request.validate()?;
+            (
+                format!("/v1/ci/{}", if name == "ci_plan" { "plan" } else { "runs" }),
+                Some(serde_json::to_value(request)?),
+            )
+        }
         "fleet_inventory" => ("/v1/fleet".into(), None),
         "template_catalog" => ("/v1/templates".into(), None),
         "agent_connections" => ("/v1/agents".into(), None),
         "agent_runs" => ("/v1/agent-runs".into(), None),
         "storage_catalog" => ("/v1/storage".into(), None),
-        "storage_inspect" | "storage_preview" | "storage_import" | "storage_fork"
-        | "storage_action" | "storage_prepare" | "storage_allocation" => {
+        "storage_inspect"
+        | "storage_preview"
+        | "storage_import"
+        | "storage_fork"
+        | "storage_action"
+        | "storage_prepare"
+        | "storage_allocation"
+        | "storage_github_preview"
+        | "storage_github_import"
+        | "storage_github_fork"
+        | "storage_github_settings"
+        | "storage_github_promote"
+        | "storage_github_delivery" => {
             let mut body = json!({});
             let operation = match name {
                 "storage_inspect" => {
@@ -329,7 +421,66 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
                     body = json!({"name":id(args,"name",true)?});
                     "allocation"
                 }
-                "storage_preview" | "storage_import" => {
+                "storage_github_settings"
+                | "storage_github_promote"
+                | "storage_github_delivery" => {
+                    body["project"] = json!(storage_id(args, "project")?);
+                    if name == "storage_github_settings" {
+                        if let Some(enabled) = object.get("enabled") {
+                            ensure!(enabled.is_boolean(), "enabled must be boolean");
+                            body["enabled"] = enabled.clone();
+                        }
+                        "github-settings"
+                    } else if name == "storage_github_promote" {
+                        body["name"] = json!(storage_id(args, "name")?);
+                        let expected = field(args, "expected_main")?;
+                        ensure!(
+                            enginebox_storage_layerfs::config::digest(expected),
+                            "Exact main revision required"
+                        );
+                        body["expected_main"] = json!(expected);
+                        if let Some(merge) = object.get("merge") {
+                            ensure!(merge.is_boolean(), "merge must be boolean");
+                            body["merge"] = merge.clone();
+                        }
+                        if let Some(message) = object.get("message") {
+                            let text = message.as_str().context("Invalid message")?;
+                            ensure!(
+                                text.len() <= 4096 && !text.contains('\0'),
+                                "Invalid message"
+                            );
+                            body["message"] = message.clone();
+                        }
+                        "github-promote"
+                    } else {
+                        let action = field(args, "action")?;
+                        ensure!(
+                            ["export", "deliver", "agent-task", "resolve", "retry"]
+                                .contains(&action),
+                            "Unsupported sync action"
+                        );
+                        body["action"] = json!(action);
+                        if action != "export" {
+                            body["attempt"] = json!(storage_id(args, "attempt")?);
+                        } else {
+                            ensure!(
+                                !object.contains_key("attempt"),
+                                "Export selects accepted main"
+                            );
+                        }
+                        "github-delivery"
+                    }
+                }
+                "storage_github_preview" => {
+                    body = json!({"project":storage_id(args,"project")?,"repository":enginebox_storage_layerfs::github::repository(field(args,"repository")?)?});
+                    if object.contains_key("branch") {
+                        let branch = field(args, "branch")?;
+                        enginebox_storage_layerfs::github::branch(branch)?;
+                        body["branch"] = json!(branch);
+                    }
+                    "github-preview"
+                }
+                "storage_preview" | "storage_import" | "storage_github_import" => {
                     body["project"] = json!(storage_id(args, "project")?);
                     let revision = args
                         .get("revision")
@@ -344,7 +495,7 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
                         "Invalid revision"
                     );
                     body["revision"] = json!(revision);
-                    if name == "storage_import" {
+                    if name != "storage_preview" {
                         let approval = field(args, "approval")?;
                         ensure!(
                             [40, 64].contains(&revision.len())
@@ -366,17 +517,25 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
                         );
                         body["approval"] = json!(approval);
                         body["credential_free"] = json!(true);
-                        "import"
+                        if name == "storage_github_import" {
+                            "github-import"
+                        } else {
+                            "import"
+                        }
                     } else {
                         "preview"
                     }
                 }
-                "storage_fork" => {
+                "storage_fork" | "storage_github_fork" => {
                     body = json!({"project":storage_id(args,"project")?,"name":storage_id(args,"name")?});
                     if object.contains_key("from") {
                         body["from"] = json!(storage_id(args, "from")?);
                     }
-                    "fork"
+                    if name == "storage_github_fork" {
+                        "github-fork"
+                    } else {
+                        "fork"
+                    }
                 }
                 "storage_action" => {
                     let action = field(args, "action")?;
@@ -616,8 +775,41 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            22
+            32
         );
+    }
+    #[test]
+    fn github_tools_expose_review_promotion_and_fenced_resolution_without_credentials() {
+        let (path,body)=tool_request("storage_github_preview",&json!({"host_id":"worker","project":"app","repository":"https://github.com/Owner/App.git"})).unwrap();
+        assert_eq!(path, "/v1/storage/hosts/worker/github-preview");
+        assert_eq!(body.unwrap()["repository"], "owner/app");
+        let (path, body) = tool_request(
+            "storage_github_delivery",
+            &json!({"host_id":"worker","project":"app","action":"resolve","attempt":"sync-a"}),
+        )
+        .unwrap();
+        assert_eq!(path, "/v1/storage/hosts/worker/github-delivery");
+        assert_eq!(body.unwrap()["attempt"], "sync-a");
+        for (tool, args) in [
+            (
+                "storage_github_preview",
+                json!({"host_id":"worker","project":"app","repository":"a/b","token":"synthetic-secret"}),
+            ),
+            (
+                "storage_github_promote",
+                json!({"host_id":"worker","project":"app","name":"agent","expected_main":"HEAD"}),
+            ),
+            (
+                "storage_github_delivery",
+                json!({"host_id":"worker","project":"app","action":"force-push","attempt":"sync-a"}),
+            ),
+            (
+                "storage_github_settings",
+                json!({"host_id":"worker","project":"app","enabled":"true"}),
+            ),
+        ] {
+            assert!(tool_request(tool, &args).is_err());
+        }
     }
     #[test]
     fn storage_tools_preserve_review_and_do_not_expose_shell_or_paths() {

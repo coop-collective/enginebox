@@ -39,6 +39,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Optional non-agent CI jobs, node capabilities and GitHub Actions runners.
+    Ci(enginebox_cli::ci::Ci),
     /// Report binary storage compatibility; does not imply host readiness.
     NodeProtocol,
     /// Optional checkout storage, independent of VM and private agent state.
@@ -171,6 +173,14 @@ fn output(v: Value) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
+        Commands::Ci(ci) => {
+            ensure!(
+                args.host.as_deref().is_none_or(|host| host == "local")
+                    && args.fleet_host.is_none(),
+                "CI uses registered nodes; omit --host and --fleet-host"
+            );
+            return output(enginebox_cli::ci::run(ci)?);
+        }
         Commands::NodeProtocol => {
             ensure!(
                 args.host.as_deref().is_none_or(|host| host == "local")

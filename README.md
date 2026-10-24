@@ -27,9 +27,10 @@ multi-node project execution requires shared storage, which R2 directly can prov
 | Native CLI launch/resume through operator MCP; persistent private workspace state | Movable tenant state volumes and authenticated multi-tenant service |
 | Account usage cards with native Codex allowance reads and provider links | Claude/Cursor allowance ingestion and subscription renewal dates |
 | Native packages, terminal installer plans, version pinning and supervised update/rollback | Enrolled Docker/Windows/macOS resource workers and GPU scheduling |
-| Pause/resume, hibernate, disk/memory snapshots and forks | Optional GitHub Actions runner/cache module |
+| Pause/resume, hibernate, disk/memory snapshots and forks | Qualified CI image provisioning and compatible persistent build caches |
+| Optional CI triggers, dedicated native build-node registry and GitHub Actions runner adapter | Live cross-platform CI/runner qualification and signing integrations |
 | Private Chromium profiles controlled through official Playwright MCP | Specialized game-engine and Cloudflare recipes |
-| Controller-managed LayerFS checkout storage, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
+| Controller-managed LayerFS storage, GitHub import/export with conflict-agent handoff, prepared dependency forks and MCP operations | Qualified cross-platform storage and off-host recovery |
 
 The first target is one trusted owner operating Linux/KVM servers. Connect Codex, Claude and Cursor in the controller’s **Agents** panel; compatible native credentials synchronize to assigned private workspaces. The reference fleet now runs Rust 0.3.1-live.1 with native-dev revision 5. All three providers passed delegated MCP launches and exact conversation resume; Codex also passed ACP continuation. Existing private workspace boots and recorded native histories were preserved. The [timing report](docs/REMOTE-AGENT-TIMING-2026-10-23.md) records the small sample, an unresolved admission rejection and the blocked Cursor Cloud comparison. Native inference on LayerFS attachments remains unqualified. Hostile tenancy, cross-host memory migration and a portable CI module are not validated. Reusable bases and unassigned warm reserves stay credential-free.
 
@@ -80,6 +81,8 @@ The [Vinext dashboard](docs/DASHBOARD.md) provides inventory, creation, lifecycl
 
 The [ACP adapter and fleet task CLI](docs/ACP.md) connect ACP clients to native remote conversations. `ebox tasks --watch` shows parallel jobs across agent types, their tasks, elapsed time and reported usage. `ebox acp` supports prompts, exact-session continuation and targeted cancellation through the same controller.
 
+The optional [CI module](docs/CI.md) triggers shell automations and GitHub Actions without an agent loop. Dedicated build nodes register OS, architecture, image and toolchain labels; the controller rejects configured agent hosts as CI targets. iOS, Android, Windows and Linux templates support the same merge-event handoff. Native image provisioning and live build qualification remain separate from this experimental execution support.
+
 
 [Browser MCP](docs/BROWSER.md) gives each native CLI its own persistent headless Chromium profile. Agents can navigate, inspect pages, type, click and take screenshots. It controls the workspace browser; personal laptop browser sessions are not imported.
 
@@ -88,6 +91,7 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 ## Design and implementation
 
 - [Persistent development environments and private data forks](docs/DEV-ENVIRONMENTS.md)
+- [Live services and HTTP/WebSocket/TCP/UDP exposure](docs/ENVIRONMENT-SERVICES.md)
 - [Terminal installation and platform roles](docs/INSTALL.md)
 - [Versioned updates, draining and rollback](docs/UPDATES.md)
 - [Rust workspace and migration qualification](docs/RUST-MIGRATION.md)
@@ -96,10 +100,14 @@ The runtime targets an Incus project named `enginebox` by default, with `ebox-` 
 - [Interrupted-command and daemon recovery qualification](docs/LAYERFS-RECOVERY-VALIDATION.md)
 - [LayerFS checkout attachment to Incus](docs/LAYERFS-INCUS.md)
 - [Storage registration, controller API and MCP](docs/STORAGE-API.md)
+- [GitHub import, optional sync and specialized conflict environments](docs/GITHUB-SYNC.md)
 - [Local Cloudflare fleet, shared Store transport and debugging](docs/LOCAL-FLEET.md)
 - [Enginebox integration, batching and protected CI evidence](docs/INTEGRATION-CI.md)
+- [Logical LayerFS integration executor and operator queue](docs/LOGICAL-INTEGRATION.md)
 - [Native Codex task-assistant setup and recovery](docs/TASK-ASSISTANT.md)
+- [Exact-source engine builds, playable artifacts and caches](docs/ENGINE-BUILDS.md)
 - [Project roadmap tasks and scoped native Codex tools](docs/TASK-WORKFLOW.md)
+- [Build artifacts, batch review and playtest evidence](docs/PLAYTEST-EVIDENCE.md)
 - [LayerFS game workspaces, container integration and large-project measurements](docs/GAME-WORKSPACES.md)
 - [Project Store distribution, worker NVMe caches and safe eviction](docs/STORE-DISTRIBUTION.md)
 - [Architecture and portable bootstrap design](docs/DESIGN.md)

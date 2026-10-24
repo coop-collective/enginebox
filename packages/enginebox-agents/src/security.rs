@@ -226,7 +226,6 @@ pub fn legacy_digest(v: &Value) -> String {
     format!("{:x}", Sha256::digest(encode(v)))
 }
 pub struct Lease {
-    #[cfg_attr(not(unix), allow(dead_code))] // Retained for the lifetime of the file lock.
     file: File,
 }
 impl Lease {
@@ -254,20 +253,32 @@ impl Lease {
         use std::os::fd::AsRawFd;
         self.file.as_raw_fd()
     }
+    fn release_probe(self) -> Result<()> {
+        // This descriptor was only acquired to observe availability, never to
+        // protect a native writer. A concurrent fork can copy it before exec;
+        // explicitly unlock the shared probe so that copy cannot manufacture
+        // a busy lease after the observation returned false.
+        FileExt::unlock(&self.file)?;
+        Ok(())
+    }
     pub fn active(root: &Path, relative: &str) -> Result<bool> {
         let path = safe_path(root, relative, false)?;
         if !path.exists() {
             return Ok(false);
         };
         match Self::acquire(root, relative) {
-            Ok(_) => Ok(false),
+            Ok(probe) => {
+                probe.release_probe()?;
+                Ok(false)
+            }
             Err(e) if e.to_string().contains("active operation") => Ok(true),
             Err(e) => Err(e),
         }
     }
 }
-// Do not explicitly LOCK_UN: inherited descriptors share this flock. Closing
-// this copy leaves the lease held by a surviving native child until it exits.
+// Writer leases must not explicitly unlock on Drop: inherited descriptors
+// share this flock. Closing the parent leaves a surviving native child holding
+// its writer lease until it exits. Only completed observational probes unlock.
 pub fn remove(root: &Path, relative: &str) -> Result<()> {
     let path = safe_path(root, relative, false)?;
     if read_bytes(root, relative, LIMIT, false)?.is_some() {
@@ -289,4 +300,60 @@ pub fn absolute_existing(path: &Path) -> Result<std::path::PathBuf> {
         bail!("Path must be an existing directory.")
     }
     Ok(path.canonicalize()?)
+}
+
+#[cfg(all(test, unix))]
+mod lease_tests {
+    use super::*;
+    use std::{
+        os::{
+            fd::AsRawFd,
+            unix::{net::UnixStream, process::CommandExt},
+        },
+        time::Duration,
+    };
+
+    #[test]
+    fn an_observation_does_not_leave_a_lock_in_an_unrelated_pre_exec_child() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        private_dir(&root).unwrap();
+        let probe = Lease::acquire(&root, "probe.lock").unwrap();
+        let (mut ready, child_ready) = UnixStream::pair().unwrap();
+        let (mut release, child_release) = UnixStream::pair().unwrap();
+        ready
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let spawning = std::thread::spawn(move || {
+            let ready_fd = child_ready.as_raw_fd();
+            let release_fd = child_release.as_raw_fd();
+            let mut command =
+                crate::process::command(&["/bin/sleep".into(), "5".into()], None, None).unwrap();
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = 1u8;
+                    if libc::write(ready_fd, (&byte as *const u8).cast(), 1) != 1
+                        || libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap()
+        });
+        // Freeze a concurrent fork before exec, while it still has the probe's
+        // CLOEXEC descriptor. No native writer was launched with this lease.
+        ready.read_exact(&mut [0]).unwrap();
+        probe.release_probe().unwrap();
+        let falsely_active = Lease::active(&root, "probe.lock").unwrap();
+        release.write_all(&[1]).unwrap();
+        let mut child = spawning.join().unwrap();
+        crate::process::stop(&mut child);
+        assert!(
+            !falsely_active,
+            "a completed observation must not create a native writer"
+        );
+    }
 }

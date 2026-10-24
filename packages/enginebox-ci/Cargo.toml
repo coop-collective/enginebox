@@ -1,0 +1,16 @@
+[package]
+name = "enginebox-ci"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+publish = false
+description = "Optional non-agent CI jobs and native GitHub Actions runners"
+
+[dependencies]
+enginebox-core = { path = "../enginebox-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+url = "2"
+tempfile = "3"
