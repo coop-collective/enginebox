@@ -898,3 +898,261 @@ it("reads and collects mailboxes with maximum-length IDs without exceeding SQLit
     "long-project-node",
   );
 });
+
+it("stores mode-derived ICE policy and returns the same scoped policy to the viewer and native host", async () => {
+  const { app, host } = await setup();
+  const control = await open(app, "direct-control", "control");
+  const watch = await open(app, "relayed-watch", "watch");
+  expect(control.session.mode).toBe("control");
+  expect(control.iceTransportPolicy).toBe("all");
+  expect(control.iceServers).toEqual(watch.iceServers);
+  expect(control.iceServers[0].credential).toBe("fixture-only");
+  expect(watch.session.mode).toBe("watch");
+  expect(watch.iceTransportPolicy).toBe("relay");
+  await inspectDO(env.PROJECTS.getByName("demo") as any, (instance: any) => {
+    for (const [id, mode, policy] of [
+      ["direct-control", "control", "all"],
+      ["relayed-watch", "watch", "relay"],
+    ]) {
+      const grant = instance.get(`machine-grant:grant-${id}`);
+      const session = instance.get(`machine-session:${id}`);
+      expect(grant.input.mode).toBe(mode);
+      expect(grant.ice.iceTransportPolicy).toBe(policy);
+      expect(session.view.mode).toBe(mode);
+      expect(session.ice).toEqual(grant.ice);
+    }
+  });
+  const poll = await ok("/v1/node/machine-sessions/poll", {}, host);
+  expect(
+    poll.sessions.map((session: any) => [
+      session.id,
+      session.mode,
+      session.iceTransportPolicy,
+    ]),
+  ).toEqual([
+    ["direct-control", "control", "all"],
+    ["relayed-watch", "watch", "relay"],
+  ]);
+});
+
+it("honors explicit relay override for new control sessions while preserving admitted policies on retry and renewal", async () => {
+  const { app, host } = await setup();
+  const original = await open(app, "existing-control", "control");
+  const override = {
+    ...localEnv,
+    MACHINE_TURN_CONFIG: JSON.stringify({
+      ...JSON.parse(localEnv.MACHINE_TURN_CONFIG!),
+      iceTransportPolicy: "relay",
+    }),
+  } as Env;
+  const again = await req(
+    `${P}/machine-session-grants`,
+    {
+      id: "grant-existing-control",
+      sessionId: "existing-control",
+      nodeId: "laptop",
+      actorId: "account-owner",
+      mode: "control",
+    },
+    owner,
+    undefined,
+    undefined,
+    override,
+  );
+  expect(again.status).toBe(200);
+  expect(await again.json()).toEqual(original.grant);
+  const newGrant = await req(
+    `${P}/machine-session-grants`,
+    {
+      id: "renew-existing-control",
+      sessionId: "existing-control",
+      nodeId: "laptop",
+      actorId: "account-owner",
+      mode: "control",
+    },
+    owner,
+    undefined,
+    undefined,
+    override,
+  );
+  expect(newGrant.status).toBe(201);
+  const renewal: any = await newGrant.json();
+  const renewed = await req(
+    `${P}/machine-sessions/existing-control/renew`,
+    { grant: renewal.grant },
+    app,
+    undefined,
+    client,
+    override,
+  );
+  expect(renewed.status).toBe(200);
+  const value: any = await renewed.json();
+  expect(value.iceTransportPolicy).toBe("all");
+  expect(value.iceExpires).toBe(original.iceExpires);
+  expect(value.iceServers).toEqual(original.iceServers);
+  const retry: any = await (
+    await req(
+      `${P}/machine-sessions`,
+      {
+        id: "existing-control",
+        grant: original.grant.grant,
+        clientSecretHash: await sha256(client),
+      },
+      app,
+      undefined,
+      undefined,
+      override,
+    )
+  ).json();
+  expect(retry.iceTransportPolicy).toBe("all");
+  await ok(
+    `${P}/machine-sessions/existing-control/end`,
+    { id: "end-original" },
+    app,
+    undefined,
+    client,
+  );
+
+  const fresh = await req(
+    `${P}/machine-session-grants`,
+    {
+      id: "relay-control-grant",
+      sessionId: "relay-control",
+      nodeId: "laptop",
+      actorId: "account-owner",
+      mode: "control",
+    },
+    owner,
+    undefined,
+    undefined,
+    override,
+  );
+  expect(fresh.status).toBe(201);
+  const grant: any = await fresh.json();
+  // Opening under a different configuration still uses the immutable grant.
+  const relayed = await ok(
+    `${P}/machine-sessions`,
+    {
+      id: "relay-control",
+      grant: grant.grant,
+      clientSecretHash: await sha256(client),
+    },
+    app,
+  );
+  expect(relayed.session.mode).toBe("control");
+  expect(relayed.iceTransportPolicy).toBe("relay");
+  const next = await grantForRelay();
+  const relayRenewed = await ok(
+    `${P}/machine-sessions/relay-control/renew`,
+    { grant: next.grant },
+    app,
+    undefined,
+    client,
+  );
+  expect(relayRenewed.iceTransportPolicy).toBe("relay");
+  expect(relayRenewed.iceExpires).toBe(relayed.iceExpires);
+  expect(
+    (await ok("/v1/node/machine-sessions/poll", {}, host)).sessions[0],
+  ).toMatchObject({
+    id: "relay-control",
+    mode: "control",
+    iceTransportPolicy: "relay",
+  });
+  async function grantForRelay() {
+    return ok(`${P}/machine-session-grants`, {
+      id: "relay-renewal",
+      sessionId: "relay-control",
+      nodeId: "laptop",
+      actorId: "account-owner",
+      mode: "control",
+    });
+  }
+});
+
+it("rejects caller-selected routing and cross-mode grants without upgrading a watch session", async () => {
+  const { app, host } = await setup();
+  const watch = await grant("watch-grant", "immutable-mode", "watch");
+  // Even an earlier legitimate control grant cannot upgrade an existing watch lease.
+  const control = await grant("control-grant", "immutable-mode", "control");
+  const input = {
+    id: "immutable-mode",
+    grant: watch.grant,
+    clientSecretHash: await sha256(client),
+  };
+  for (const extra of [{ iceTransportPolicy: "all" }, { mode: "control" }]) {
+    expect(
+      (await req(`${P}/machine-sessions`, { ...input, ...extra }, app)).status,
+    ).toBe(400);
+  }
+  const opened = await ok(`${P}/machine-sessions`, input, app);
+  expect(opened.iceTransportPolicy).toBe("relay");
+  expect(
+    (
+      await req(
+        `${P}/machine-sessions/immutable-mode/renew`,
+        { grant: control.grant },
+        app,
+        undefined,
+        client,
+      )
+    ).status,
+  ).toBe(403);
+  expect(
+    (
+      await req(
+        `${P}/machine-sessions/immutable-mode/renew`,
+        { grant: watch.grant, iceTransportPolicy: "all" },
+        app,
+        undefined,
+        client,
+      )
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await req(`${P}/machine-session-grants`, {
+        id: "cross-mode",
+        sessionId: "immutable-mode",
+        nodeId: "laptop",
+        actorId: "account-owner",
+        mode: "control",
+      })
+    ).status,
+  ).toBe(403);
+  expect(
+    (
+      await req(`${P}/machine-session-grants`, {
+        id: "caller-policy",
+        sessionId: "another-view",
+        nodeId: "laptop",
+        actorId: "account-owner",
+        mode: "watch",
+        iceTransportPolicy: "all",
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await req(
+        `${P}/machine-sessions`,
+        { ...input, grant: control.grant },
+        app,
+      )
+    ).status,
+  ).toBe(409);
+  const read = await ok(
+    `${P}/machine-sessions/immutable-mode`,
+    undefined,
+    app,
+    undefined,
+    client,
+  );
+  expect(read.session.mode).toBe("watch");
+  expect(
+    (await ok("/v1/node/machine-sessions/poll", {}, host)).sessions[0],
+  ).toMatchObject({
+    id: "immutable-mode",
+    mode: "watch",
+    iceTransportPolicy: "relay",
+  });
+});

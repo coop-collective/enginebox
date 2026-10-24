@@ -1,4 +1,4 @@
-import { ProtocolError, readBounded, requireThat } from "@enginebox/fleet-protocol";
+import { ProtocolError, readBounded, requireThat, type MachineMode } from "@enginebox/fleet-protocol";
 
 declare global {
   interface Env { MACHINE_TURN_CONFIG?: string }
@@ -47,9 +47,11 @@ function servers(value: unknown, local: boolean): MachineIce["iceServers"] {
   return result;
 }
 
-/** Call only after authorization. Persist the result privately with its admission;
+/** Call only with the authorized, immutable mode. Transport never grants input.
+ * Persist the result privately with its admission;
  * never mint on each poll, log it, or return the provider key to clients. */
-export async function machineIce(env: Env): Promise<MachineIce> {
+export async function machineIce(env: Env, mode: MachineMode): Promise<MachineIce> {
+  requireThat(mode === "watch" || mode === "control", "Authorized machine mode required", 403);
   if (!env.MACHINE_TURN_CONFIG) throw unavailable();
   let config: unknown;
   try { config = JSON.parse(env.MACHINE_TURN_CONFIG); } catch { throw unavailable(); }
@@ -57,15 +59,16 @@ export async function machineIce(env: Env): Promise<MachineIce> {
   const ttl = config.ttlSeconds ?? 3600;
   requireThat(Number.isInteger(ttl) && Number(ttl) >= 120 && Number(ttl) <= 3600, "Invalid machine relay lifetime", 503);
   const iceExpires = Date.now() + Number(ttl) * 1000;
+  const iceTransportPolicy = mode === "watch" || config.iceTransportPolicy === "relay" ? "relay" : "all";
   if (config.local === true) {
     requireThat(String(env.ALLOW_HTTP_NODES) === "true", "Local relay configuration is disabled", 503);
     requireThat(Object.keys(config).every(key => ["local", "iceServers", "iceTransportPolicy", "ttlSeconds"].includes(key)), "Invalid local relay configuration", 503);
     requireThat(config.iceTransportPolicy === "all" || config.iceTransportPolicy === "relay", "Invalid local relay policy", 503);
-    return { iceServers: servers(config.iceServers, true), iceTransportPolicy: config.iceTransportPolicy, iceExpires };
+    return { iceServers: servers(config.iceServers, true), iceTransportPolicy, iceExpires };
   }
   requireThat(Object.keys(config).every(key => ["keyId", "apiToken", "ttlSeconds", "iceTransportPolicy"].includes(key)) &&
     typeof config.keyId === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(config.keyId) && boundedString(config.apiToken, 4096) &&
-    (config.iceTransportPolicy === undefined || config.iceTransportPolicy === "relay"), "Invalid machine relay configuration", 503);
+    (config.iceTransportPolicy === undefined || config.iceTransportPolicy === "relay" || config.iceTransportPolicy === "all"), "Invalid machine relay configuration", 503);
   try {
     const response = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${config.keyId}/credentials/generate-ice-servers`, {
       method: "POST", redirect: "error", signal: AbortSignal.timeout(5000),
@@ -75,7 +78,7 @@ export async function machineIce(env: Env): Promise<MachineIce> {
     if (!response.ok) { await response.body?.cancel(); throw unavailable(); }
     const value: unknown = JSON.parse(new TextDecoder().decode(await readBounded(response.body, 16 * 1024)));
     if (!object(value)) throw unavailable();
-    return { iceServers: servers(value.iceServers, false), iceTransportPolicy: "relay", iceExpires };
+    return { iceServers: servers(value.iceServers, false), iceTransportPolicy, iceExpires };
   } catch {
     // Provider errors may contain credentials or internal request metadata.
     throw unavailable();
