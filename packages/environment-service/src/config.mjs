@@ -28,17 +28,19 @@ export function validateConfig(config) {
   check(Number.isInteger(config.pollSeconds) && config.pollSeconds >= 2 && config.pollSeconds <= 300, 'invalid-poll-interval');
   if (config.bootstrap !== undefined) {
     const b = config.bootstrap;
-    fields(b, ['hosts', 'templates', 'portRange', 'domain', 'urlScheme', 'access', 'maxCpu', 'maxMemoryMiB', 'maxProjects']);
+    fields(b, ['hosts', 'templates', 'portRange', 'domain', 'urlScheme', 'urlPort', 'access', 'maxCpu', 'maxMemoryMiB', 'maxProjects']);
     check(Array.isArray(b.hosts) && b.hosts.length > 0 && b.hosts.length <= 256, 'invalid-bootstrap-hosts');
     const hosts = new Set();
     for (const host of b.hosts) {
-      fields(host, ['id', 'command']);
+      fields(host, ['id', 'command', 'workspaceCommand']);
       check(typeof host.id === 'string' && /^[a-z0-9][a-z0-9-]{0,47}$/.test(host.id) && !hosts.has(host.id), 'invalid-bootstrap-host'); hosts.add(host.id);
       check(Array.isArray(host.command) && host.command.length > 0 && host.command.length <= 63 && isAbsolute(host.command[0]) && host.command.every(v => typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.includes('\0')), 'invalid-bootstrap-export-command');
     }
+    for (const host of b.hosts) if (host.workspaceCommand !== undefined) check(Array.isArray(host.workspaceCommand) && host.workspaceCommand.length > 0 && host.workspaceCommand.length <= 61 && isAbsolute(host.workspaceCommand[0]) && host.workspaceCommand.every(v => typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.includes('\0')), 'invalid-workspace-export-command');
     check(Array.isArray(b.templates) && b.templates.length <= 256, 'invalid-dev-template-catalog');
     check(Array.isArray(b.portRange) && b.portRange.length === 2 && b.portRange.every(port) && b.portRange[0] <= b.portRange[1], 'invalid-bootstrap-port-range');
     check(hostname(b.domain) && config.baseDomains.some(d => b.domain === d || b.domain.endsWith(`.${d}`)), 'invalid-bootstrap-domain');
+    check(b.urlPort === undefined || (Number.isInteger(b.urlPort) && b.urlPort >= 1 && b.urlPort <= 65535), 'invalid-public-url-port');
     check(b.urlScheme === undefined || ['http', 'https'].includes(b.urlScheme), 'invalid-public-url-scheme');
     check(['public', 'authenticated'].includes(b.access) && (b.access !== 'authenticated' || config.basicAuthUsers.length > 0), 'invalid-bootstrap-access');
     check(Number.isFinite(b.maxCpu) && b.maxCpu >= 0.1 && b.maxCpu <= 8 && Number.isInteger(b.maxMemoryMiB) && b.maxMemoryMiB >= 64 && b.maxMemoryMiB <= 16384 && Number.isInteger(b.maxProjects) && b.maxProjects >= 1 && b.maxProjects <= 24, 'invalid-bootstrap-limits');
@@ -46,13 +48,14 @@ export function validateConfig(config) {
   check(Array.isArray(config.environments) && config.environments.length <= 64, 'invalid-environments');
   const names = new Set(); const bindings = new Set();
   for (const env of config.environments) {
-    fields(env, ['id', 'source', 'image', 'command', 'prepare', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds', 'updateMode', 'writableDirs', 'cwd', 'env', 'dataId', 'sourceInputs', 'publicHost', 'publicScheme']);
+    fields(env, ['id', 'source', 'image', 'command', 'prepare', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds', 'updateMode', 'writableDirs', 'cwd', 'env', 'dataId', 'sourceInputs', 'publicHost', 'publicScheme', 'publicPort']);
     check(id(env.id) && !names.has(env.id), 'duplicate-or-invalid-environment'); names.add(env.id);
     check(env.updateMode === undefined || ['restart', 'files'].includes(env.updateMode), 'invalid-update-mode');
-    check(env.updateMode !== 'files' || ['layerfs', 'accepted'].includes(env.source.kind), 'files-update-requires-layerfs');
+    check(env.updateMode !== 'files' || ['layerfs', 'accepted', 'workspace'].includes(env.source.kind), 'files-update-requires-layerfs');
     check(env.cwd === undefined || env.cwd === '.' || sourcePath(env.cwd), 'invalid-working-directory');
     check(env.dataId === undefined || id(env.dataId), 'invalid-data-id');
     check(env.publicHost === undefined || (hostname(env.publicHost) && ['http', 'https'].includes(env.publicScheme)), 'invalid-public-host');
+    check(env.publicPort === undefined || (env.publicHost && Number.isInteger(env.publicPort) && env.publicPort >= 1 && env.publicPort <= 65535), 'invalid-public-url-port');
     if (env.env !== undefined) {
       check(env.env && typeof env.env === 'object' && !Array.isArray(env.env) && Object.keys(env.env).length <= 64, 'invalid-environment-values');
       for (const [key, value] of Object.entries(env.env)) check(/^[A-Z_][A-Z0-9_]{0,63}$/.test(key) && key !== 'HOME' && !key.startsWith('ENGINEBOX_') && typeof value === 'string' && value.length <= 4096 && !value.includes('\0'), 'invalid-environment-value');
@@ -66,8 +69,9 @@ export function validateConfig(config) {
       fields(env.source, ['kind', 'url', 'branch']);
       check(typeof env.source.url === 'string' && (isAbsolute(env.source.url) || /^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9_./-]+$/.test(env.source.url)), 'invalid-source');
       check(typeof env.source.branch === 'string' && /^[A-Za-z0-9][A-Za-z0-9_./-]{0,127}$/.test(env.source.branch) && !env.source.branch.includes('..'), 'invalid-source-branch');
-    } else if (env.source.kind === 'layerfs') {
-      fields(env.source, ['kind', 'project', 'workspace', 'command']);
+    } else if (['layerfs', 'workspace'].includes(env.source.kind)) {
+      fields(env.source, env.source.kind === 'workspace' ? ['kind', 'project', 'workspace', 'command', 'preview', 'lease'] : ['kind', 'project', 'workspace', 'command']);
+      if (env.source.kind === 'workspace') check(id(env.source.preview) && typeof env.source.lease === 'string' && /^[a-f0-9]{64}$/.test(env.source.lease) && storageId(env.source.workspace), 'invalid-workspace-source');
       check(storageId(env.source.project) && (env.source.workspace === undefined || storageId(env.source.workspace)), 'invalid-layerfs-project');
       check(Array.isArray(env.source.command) && env.source.command.length > 0 && env.source.command.length <= 64 && isAbsolute(env.source.command[0]) && env.source.command.every(v => typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.includes('\0')), 'invalid-layerfs-export-command');
     } else {
