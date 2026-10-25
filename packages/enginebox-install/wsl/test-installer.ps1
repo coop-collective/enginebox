@@ -33,6 +33,7 @@ $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 (Get-Content -Raw -LiteralPath $path).Replace('@@ROOTFS_URL@@','https://fixture.invalid/enginebox.wsl').Replace('@@ROOTFS_SHA256@@',$fixtureHash) | Set-Content -LiteralPath $flowScript -Encoding UTF8
 $global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false; overrideChoice='n'; pendingId=$null; exportFailure=$false; exportInvalid=$false; enrollmentError=$null; stopped=0 }
 $global:EngineboxWslFixture.claimError=$null
+$global:EngineboxWslFixture.claimWarning=$false
 $global:EngineboxWslFixture.locationOverride=$null
 function global:Get-ItemProperty {
   param($Path,$ErrorAction)
@@ -90,6 +91,7 @@ function global:wsl.exe {
     if ($global:EngineboxWslFixture.claimError) {
       $global:LASTEXITCODE=1; Write-Error $global:EngineboxWslFixture.claimError; return
     }
+    if ($global:EngineboxWslFixture.claimWarning) { Write-Error "wsl: Failed to start the systemd user session for 'root'." }
     $global:EngineboxWslFixture.claim=$args[-1]
     $args[-1]
     return
@@ -169,9 +171,10 @@ try {
   $claimRoot=Join-Path $testRoot 'interrupted-claim'; $failed=$false
   try { & $flowScript -InstallDirectory $claimRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code } catch { $failed=$_.Exception.Message -like '*Wsl/Service/E_UNEXPECTED*' }
   if (-not $failed -or -not $f.installed -or $f.starts -ne $beforeStarts) { throw 'Claim failure must retain the runtime and show the WSL error' }
-  $f.claimError=$null; $f.calls=@(); $beforeDownloads=$f.downloads
+  $f.claimError=$null; $f.claimWarning=$true; $f.calls=@(); $beforeDownloads=$f.downloads
   & $flowScript -InstallDirectory $claimRoot -Resume -EnrollmentCode $code
   if (-not $f.enrolled -or $f.downloads -ne $beforeDownloads -or ($f.calls | Where-Object { $_ -like '--install*' -or $_ -like '--unregister*' })) { throw 'Interrupted ownership must recover without reinstalling or removing state' }
+  $f.claimWarning=$false
   $f.locationOverride=Join-Path $testRoot 'unrelated'; $f.calls=@(); $failed=$false
   try { & $flowScript -InstallDirectory $claimRoot -Resume } catch { $failed=$_.Exception.Message -like '*outside this installation*' }
   if (-not $failed -or ($f.calls | Where-Object { $_ -like '--distribution*' })) { throw 'A different registered location must be refused before Linux execution' }

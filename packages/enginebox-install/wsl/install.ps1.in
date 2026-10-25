@@ -120,7 +120,10 @@ print(owner)
     $claimExit=$LASTEXITCODE
   } finally { $ErrorActionPreference=$previous }
   $detail=(($output | Out-String) -replace "`0",'').Trim()
-  if ($claimExit -ne 0 -or $detail -ne $owner) {
+  # WSL may report a user-session warning on stderr even though this root
+  # command succeeded. Require the verified SID on stdout and a zero exit.
+  $confirmed=@($output | Where-Object { $_ -is [string] -and $_.Trim() -ceq $owner }).Count -eq 1
+  if ($claimExit -ne 0 -or -not $confirmed) {
     $detail=$detail -replace '[a-fA-F0-9]{32}\.[a-fA-F0-9]{64}','[redacted credential]'
     if ($detail.Length -gt 4000) { $detail=$detail.Substring(0,4000) }
     if (-not $detail) { $detail='WSL returned no error output.' }
