@@ -32,6 +32,14 @@ $fixtureImage=Join-Path $testRoot 'image-fixture'
 $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 (Get-Content -Raw -LiteralPath $path).Replace('@@ROOTFS_URL@@','https://fixture.invalid/enginebox.wsl').Replace('@@ROOTFS_SHA256@@',$fixtureHash) | Set-Content -LiteralPath $flowScript -Encoding UTF8
 $global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false; overrideChoice='n'; pendingId=$null; exportFailure=$false; exportInvalid=$false; enrollmentError=$null; stopped=0 }
+$global:EngineboxWslFixture.claimError=$null
+$global:EngineboxWslFixture.locationOverride=$null
+function global:Get-ItemProperty {
+  param($Path,$ErrorAction)
+  if ($Path -ne 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*') { throw 'Unexpected registry lookup' }
+  $location=if ($global:EngineboxWslFixture.locationOverride) { $global:EngineboxWslFixture.locationOverride } else { Join-Path $root 'distro' }
+  [pscustomobject]@{DistributionName='Enginebox';BasePath=('\\?\'+$location)}
+}
 function global:Get-CimInstance { [pscustomobject]@{NumberOfLogicalProcessors=16;TotalPhysicalMemory=32GB} }
 function global:Get-ScheduledTask { return $null }
 function global:Register-ScheduledTask {
@@ -77,6 +85,15 @@ function global:tar.exe {
 function global:wsl.exe {
   $global:LASTEXITCODE=0
   $global:EngineboxWslFixture.calls+=@(($args -join ' '))
+  if ($args[0] -eq '--distribution' -and $args -contains '-c') {
+    if ($args[4] -ne '--cd' -or $args[5] -ne '/' -or $args[8] -ne '-c' -or $args[9] -notlike 'import base64;exec*') { throw 'Ownership must use explicit Linux argv and working directory' }
+    if ($global:EngineboxWslFixture.claimError) {
+      $global:LASTEXITCODE=1; Write-Error $global:EngineboxWslFixture.claimError; return
+    }
+    $global:EngineboxWslFixture.claim=$args[-1]
+    $args[-1]
+    return
+  }
   switch ($args[0]) {
     '--version' { 'WSL version: '+$global:EngineboxWslFixture.version }
     '--list' { if ($global:EngineboxWslFixture.installed) { 'Enginebox' }; 'Ubuntu' }
@@ -146,6 +163,19 @@ try {
   $code=('a'*32)+'.'+('b'*64)
   & $flowScript -InstallDirectory (Join-Path $testRoot 'fresh') -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
   if ($f.downloads -ne 1 -or $f.claim -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or $f.code -ne $code -or -not $f.enrolled) { throw 'Fresh distribution import/claim/registration failed' }
+  # A failed initial ownership claim retains the imported runtime and can be
+  # retried without another import. The underlying WSL error must be visible.
+  $f.installed=$false; $f.enrolled=$false; $f.claimError='Wsl/Service/E_UNEXPECTED'; $beforeStarts=$f.starts
+  $claimRoot=Join-Path $testRoot 'interrupted-claim'; $failed=$false
+  try { & $flowScript -InstallDirectory $claimRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code } catch { $failed=$_.Exception.Message -like '*Wsl/Service/E_UNEXPECTED*' }
+  if (-not $failed -or -not $f.installed -or $f.starts -ne $beforeStarts) { throw 'Claim failure must retain the runtime and show the WSL error' }
+  $f.claimError=$null; $f.calls=@(); $beforeDownloads=$f.downloads
+  & $flowScript -InstallDirectory $claimRoot -Resume -EnrollmentCode $code
+  if (-not $f.enrolled -or $f.downloads -ne $beforeDownloads -or ($f.calls | Where-Object { $_ -like '--install*' -or $_ -like '--unregister*' })) { throw 'Interrupted ownership must recover without reinstalling or removing state' }
+  $f.locationOverride=Join-Path $testRoot 'unrelated'; $f.calls=@(); $failed=$false
+  try { & $flowScript -InstallDirectory $claimRoot -Resume } catch { $failed=$_.Exception.Message -like '*outside this installation*' }
+  if (-not $failed -or ($f.calls | Where-Object { $_ -like '--distribution*' })) { throw 'A different registered location must be refused before Linux execution' }
+  $f.locationOverride=$null
   $f.enrolled=$false; $f.controllerChoice='https://override.example'; $f.secret=('c'*32)+'.'+('d'*64)
   & $flowScript -InstallDirectory (Join-Path $testRoot 'override') -Controller 'https://original.example' -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
   if ($f.configuration.controller -ne $f.controllerChoice -or $f.code -ne $f.secret) { throw 'A controller override must not receive another controller''s registration code' }
@@ -220,6 +250,6 @@ try {
   Write-Output 'Fresh import and stdin registration, defaults, custom controller/resources, WSL upgrade/reboot, constrained-memory recovery, immutable registered budgets, minimum capacity and WSL-only startup passed.'
 } finally {
   Remove-Item -LiteralPath $testRoot -Recurse -Force
-  foreach ($name in @('Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','tar.exe','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
+  foreach ($name in @('Get-ItemProperty','Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','tar.exe','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
   Remove-Variable EngineboxWslFixture -Scope Global
 }

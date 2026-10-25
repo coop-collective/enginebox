@@ -65,8 +65,8 @@ jobs:
           if (-not $version -or $version -lt [version]'2.5.7') { throw 'WSL 2.5.7 or newer is required for qualification.' }
           wsl.exe --install --from-file "$PWD/.state/wsl-release/enginebox.wsl" --name EngineboxCI --location "$PWD/.state/wsl-ci" --version 2 --vhd-size 20GB --no-launch
           if ($LASTEXITCODE) { throw 'WSL2 import/boot failed' }
-          [Security.Principal.WindowsIdentity]::GetCurrent().User.Value | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl claim
-          if ($LASTEXITCODE) { throw 'Windows-to-Linux ownership claim failed' }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-ownership.ps1 -Location "$PWD/.state/wsl-ci"
+          if ($LASTEXITCODE) { throw 'Real Windows PowerShell 5.1 ownership/recovery qualification failed' }
           '{"controller":"https://fixture.invalid","cpu":2,"memory_gib":4,"disk_gib":20}' | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl configure
           if ($LASTEXITCODE) { throw 'Real WSL LayerFS/isolation qualification failed' }
           wsl.exe -d EngineboxCI -u root --exec cat /var/lib/enginebox/qualification.json
