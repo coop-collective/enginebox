@@ -1,8 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
+import { sourceAction, SourceLifecycleError, validateLifecycle, type SourceLifecycle } from "./source-lifecycle.ts";
 import {
   identifier,
   requireThat,
   readBounded,
+  ProtocolError,
   type Assignment,
 } from "@enginebox/fleet-protocol";
 
@@ -17,6 +19,8 @@ export type NativeAssistantConfig = {
       workspace: string;
       workdir?: string;
       taskToolsConfigured: true;
+      mode?: "tasks" | "code";
+      sourceLifecycle?: SourceLifecycle;
     }
   >;
 };
@@ -50,6 +54,9 @@ export class NativeAssistant {
         binding.taskToolsConfigured === true,
         "Qualify scoped task MCP tools in the native workspace before enabling its assistant",
       );
+      requireThat(binding.mode === undefined || ["tasks", "code"].includes(binding.mode), "Invalid native assistant mode");
+      requireThat(binding.mode === "code" ? Boolean(binding.sourceLifecycle) : !binding.sourceLifecycle, "Code execution requires an operator source lifecycle");
+      if (binding.sourceLifecycle) validateLifecycle(binding.sourceLifecycle);
       const dir = binding.workdir ?? ".";
       requireThat(
         dir.length > 0 &&
@@ -76,7 +83,7 @@ export class NativeAssistant {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: "error",
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(body !== undefined && path.endsWith('/agent-runs') ? 90_000 : 10_000),
     });
     // Never include native controller bodies, credentials or private URLs in an app error.
     requireThat(
@@ -117,11 +124,14 @@ export class NativeAssistant {
     let path: string | undefined;
     let settled = false;
     try {
+      if (binding.sourceLifecycle) await sourceAction(binding.sourceLifecycle, "prepare", assignment.project, assignment.attempt, signal);
       const submitted = await this.call(base, {
         provider: "codex",
         workdir: binding.workdir ?? ".",
         timeout_seconds: assignment.timeoutSeconds,
-        prompt: `You are managing Enginebox project ${assignment.project}. Use the configured enginebox task MCP tools to read, create, update and move its tasks. Do not claim changes without successful tool results. You cannot approve or ship work; those require owner review and accepted candidate evidence. Do not modify provider credentials or operate on another project.\n\nUser request:\n${assignment.prompt}`,
+        prompt: binding.mode === "code"
+          ? `You are editing the source of Enginebox project ${assignment.project} in this private workspace. Read the repository instructions and implement the user's request in the actual files. Run appropriate tests. Source is managed by LayerFS; there is no Git checkout here. Do not initialize Git, push, publish, modify credentials, or operate outside this project. The trusted executor validates and accepts your completed source after you finish; do not claim that acceptance or deployment has happened. You may use the scoped task MCP to manage related roadmap work.\n\nUser request:\n${assignment.prompt}`
+          : `You are managing Enginebox project ${assignment.project}. Use the configured enginebox task MCP tools to read, create, update and move its tasks. Do not claim changes without successful tool results. You cannot approve or ship work; those require owner review and accepted candidate evidence. Do not modify provider credentials or operate on another project.\n\nUser request:\n${assignment.prompt}`,
       });
       requireThat(
         /^[a-f0-9]{32}$/.test(submitted.run?.id),
@@ -162,16 +172,30 @@ export class NativeAssistant {
             "Native Codex run failed; inspect the native run record",
             409,
           );
+          const sourceSummary = binding.sourceLifecycle ? await sourceAction(binding.sourceLifecycle, "complete", assignment.project, assignment.attempt, signal) : "";
           return {
             provider: "codex",
             nativeRunId: run.id,
-            text: nativeText(run.result.output ?? ""),
+            text: nativeText(run.result.output ?? "") + (sourceSummary ? `\n\n${sourceSummary}` : ""),
           };
         }
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       throw new Error("Assistant lease or execution deadline expired");
     } catch (error) {
+      if (!path && error instanceof ProtocolError && [400, 401, 403, 404, 409, 422].includes(error.status)) {
+        // The native API only returns these admission refusals before it
+        // accepts a run. Transport failures and server errors stay uncertain.
+        settled = true;
+        this.db.prepare("UPDATE assistant_runs SET state='settled' WHERE attempt=?").run(assignment.attempt);
+      }
+      if (error instanceof SourceLifecycleError) {
+        if (error.uncertain) throw new UncertainNativeRun(error.message);
+        if (!path) {
+          settled = true; // No native submission occurred.
+          this.db.prepare("UPDATE assistant_runs SET state='settled' WHERE attempt=?").run(assignment.attempt);
+        }
+      }
       if (!settled && path) {
         try {
           await this.call(`${path}/cancel`, {});

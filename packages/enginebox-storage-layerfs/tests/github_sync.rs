@@ -38,6 +38,7 @@ impl Remote for LocalRemote {
                 &format!("{commit}:{reference}"),
             ],
         )?;
+        enginebox_storage_layerfs::lfs::copy_cache(&self.repo, repo, commit)?;
         Ok(())
     }
     fn push(&self, repo: &Path, expected: &str, commit: &str) -> Result<()> {
@@ -67,6 +68,7 @@ impl LocalRemote {
                 commit,
             ],
         )?;
+        enginebox_storage_layerfs::lfs::copy_cache(repo, &self.repo, commit)?;
         Ok(())
     }
 }
@@ -128,6 +130,43 @@ impl Fixture {
         .unwrap()
     }
 }
+#[test]
+fn lfs_assets_roundtrip_through_resolution_and_delivery_as_real_source_bytes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = Fixture::new();
+    let attributes = "*.png filter=lfs diff=lfs merge=lfs -text\n";
+    fs::write(f.remote.repo.join(".gitattributes"), attributes).unwrap();
+    fs::write(f.remote.repo.join("card.png"), b"initial asset bytes").unwrap();
+    git(&f.remote.repo, &["add", "--all"]);
+    git(&f.remote.repo, &["commit", "-m", "track LFS artwork"]);
+    f.base = git(&f.remote.repo, &["rev-parse", "HEAD"]);
+    f.outbox = Outbox::open(&f._root.path().join("lfs-outbox"), &f.base).unwrap();
+    fs::write(f.source.join(".gitattributes"), attributes).unwrap();
+    fs::write(f.source.join("card.png"), b"updated asset bytes").unwrap();
+    let id = f.enqueue();
+    assert_eq!(
+        f.outbox.prepare(&id, &f.remote).unwrap().status,
+        Status::AwaitingAcceptance
+    );
+    f.outbox
+        .accept(&id, |_, files| {
+            assert_eq!(fs::read(files.join("card.png"))?, b"updated asset bytes");
+            assert!(!files.join(".git").exists());
+            Ok(("accepted-lfs-assets".into(), 2))
+        })
+        .unwrap();
+    let delivered = f.outbox.deliver(&id, &f.remote).unwrap();
+    assert_eq!(delivered.status, Status::Delivered);
+    let preview = source::preview(&f.remote.repo, "main").unwrap();
+    let staging = f._root.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    source::stage_files(&f.remote.repo, &preview, &staging).unwrap();
+    assert_eq!(
+        fs::read(staging.join("source/card.png")).unwrap(),
+        b"updated asset bytes"
+    );
+}
+
 #[test]
 fn disabled_sync_has_no_environment_and_duplicate_promotions_are_idempotent() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

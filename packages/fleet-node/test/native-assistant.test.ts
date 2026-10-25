@@ -7,6 +7,9 @@ import {
   UncertainNativeRun,
 } from "../src/native-assistant.ts";
 import type { Assignment } from "@enginebox/fleet-protocol";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const assignment: Assignment = {
   id: "turn",
@@ -184,4 +187,47 @@ test("lease loss confirms native cancellation before the assignment can finish",
   } finally {
     await f.close();
   }
+});
+
+test("code execution prepares source before submission and returns only a successful validator receipt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'source-lifecycle-'));
+  const record = join(directory, 'actions');
+  const id = 'b'.repeat(32);
+  const f = await fixture(async (req, res) => {
+    if (req.method === 'POST') {
+      assert.equal(await readFile(record, 'utf8'), 'prepare\n');
+      let body = ''; for await (const chunk of req) body += chunk;
+      assert.match(JSON.parse(body).prompt, /actual files/);
+    }
+    res.end(JSON.stringify({ run: { id, status: 'succeeded', result: { exit_code: 0, output: JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Edited the source.' } }) } } }));
+  });
+  f.adapter.config.bindings.demo.mode = 'code';
+  f.adapter.config.bindings.demo.sourceLifecycle = { command: [process.execPath, '-e', `const fs=require('node:fs');let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const r=JSON.parse(s);fs.appendFileSync(${JSON.stringify(record)},r.action+'\\n');process.stdout.write(JSON.stringify({ok:true,summary:'Trusted validation passed.'}));});`] };
+  try {
+    const result = await f.adapter.execute(assignment, new AbortController().signal);
+    assert.equal(await readFile(record, 'utf8'), 'prepare\ncomplete\n');
+    assert.equal(result.text, 'Edited the source.\n\nTrusted validation passed.');
+  } finally { await f.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("offline source preparation settles without submitting a native run", async () => {
+  let submissions = 0;
+  const f = await fixture((_req, res) => { submissions++; res.end('{}'); });
+  f.adapter.config.bindings.demo.mode = 'code';
+  f.adapter.config.bindings.demo.sourceLifecycle = { command: [process.execPath, '-e', 'process.stdout.write(JSON.stringify({ok:false,uncertain:false,summary:"Build machine offline"}))'] };
+  try {
+    await assert.rejects(f.adapter.execute(assignment, new AbortController().signal), /Build machine offline/);
+    assert.equal(submissions, 0);
+    assert.equal((f.db.prepare('SELECT state FROM assistant_runs').get() as {state:string}).state, 'settled');
+  } finally { await f.close(); }
+});
+
+test("an explicit native admission refusal settles without cancellation or resubmission", async () => {
+  let requests = 0;
+  const f = await fixture((_req, res) => { requests++; res.writeHead(400); res.end('{}'); });
+  try {
+    await assert.rejects(f.adapter.execute(assignment, new AbortController().signal), e => e instanceof Error && !(e instanceof UncertainNativeRun) && /refused/.test(e.message));
+    assert.equal(requests, 1);
+    assert.equal((f.db.prepare('SELECT state FROM assistant_runs').get() as {state:string}).state, 'settled');
+  } finally { await f.close(); }
 });

@@ -2,7 +2,7 @@
 
 Enginebox queues task-assistant requests in its Cloudflare project authority. An explicitly configured node delegates each request to the existing native Enginebox agent-run API. That runtime launches the official Codex client in a private prepared workspace; this adapter does not supply an inference loop or share the native controller credential with the model, browser or game room.
 
-Assistant requests manage project tasks through scoped MCP tools. They are metadata jobs with no Store generation and cannot serve as build, CI or merge evidence. Their capacity reservations and leases use the same node/project records as other fleet jobs. Native engine builds, logical LayerFS merging and artifact promotion retain their separate gates.
+By default, assistant requests manage project tasks through scoped MCP tools. They are metadata jobs with no Store generation and cannot serve as build, CI or merge evidence. Their capacity reservations and leases use the same node/project records as other fleet jobs. An operator may additionally enable the source lifecycle below; its trusted build receipts, never assistant prose, determine whether source can be accepted and published.
 
 ## Configure a native executor
 
@@ -32,6 +32,51 @@ Assistant requests manage project tasks through scoped MCP tools. They are metad
 The endpoint must be an origin without embedded credentials, paths or redirects. A deliberately local HTTP runtime additionally requires `allowHttp: true`. The public app cannot select the native endpoint, host, workspace, provider, timeout or resume identity. Each app turn starts a new bounded Codex run; cross-account native conversation resumption is not exposed. Codex reads the current project tasks through its tools.
 
 Codex supports [stdio MCP registration](https://learn.chatgpt.com/docs/developer-commands#codex-mcp). Use the task server's documented explicit tool allowlist/approval policy for noninteractive runs. Native sign-in, model selection and provider credentials remain governed by the existing native runtime configuration. Default Compose nodes do not contain Codex or private provider credentials, so the app correctly reports the assistant unavailable until a configured executor connects.
+
+## Optional source editing
+
+A private binding may set `mode: "code"`, `workdir: "source"`, and
+`sourceLifecycle: {"command":["/absolute/node","/absolute/source-driver.mjs","/private/driver.json"],"timeoutSeconds":900}`.
+The static command is installed by the operator outside project files. The app
+and model cannot choose it. It receives bounded JSON on stdin with `action`
+(`prepare` or `complete`), `project`, and the immutable assignment `attempt`.
+It returns `{ok, summary, uncertain?}`. A known validation refusal can set
+`uncertain:false`; interrupted or ambiguous operations retain capacity for
+operator inspection. Source preparation runs before any model submission.
+
+[`source-driver.mjs`](../packages/fleet-node/src/source-driver.mjs) connects an
+existing owned native VM, the LayerFS GitHub connector, and a protected build
+service. It forks accepted main (or retains a previous unsuccessful draft),
+attaches it while the VM is stopped, and verifies guest writes and execution.
+The native run sees only Git-free files under `/workspace/source`. After the
+run finishes, the driver stops the VM, detaches, checkpoints, closes, and exports
+an immutable candidate. The build service validates those exact archive bytes.
+Only a passing candidate with an unchanged base can be promoted through the
+existing connector. Publication additionally requires confirmed GitHub delivery
+and an accepted source tree identical to the validated tree.
+
+The driver stores private durable phase receipts and never replays an uncertain
+operation. Failed validation retains a draft for the next request. An unchanged
+source tree creates no GitHub commit or build. Concurrent GitHub changes stop the
+automatic path for reconciliation. This operator integration currently targets
+a `main` connection and one existing native VM; it is not a new scheduler,
+multi-tenant build sandbox, or automatic host-restart recovery system.
+
+The build service contract is authenticated loopback HTTP: `GET /health`,
+`POST /builds/:32hex` with a gzip source archive and `x-source-sha256`, then
+`POST /builds/:32hex/publish` with the exact delivered Git commit. Keep its token,
+GitHub credential, native controller credential, and source-driver configuration
+outside the agent-readable checkout. Install a dedicated compatible Docker
+daemon when the host daemon cannot support the pinned LayerFS API; never upgrade
+or restart an unrelated daemon implicitly.
+
+Build and publication submissions acknowledge their durable intent immediately;
+the driver polls `GET /builds/:32hex` until a terminal receipt arrives. Native
+compilation therefore does not depend on a long-lived HTTP response.
+
+Explicit native API admission rejections settle the request without claiming a
+model ran. Lost acknowledgements and server errors remain uncertain. Native
+submission allows time for credential attachment; polling stays bounded.
 
 ## App API
 

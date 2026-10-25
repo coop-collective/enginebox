@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod github;
 pub mod incus;
+pub mod lfs;
 mod runtime;
 pub use runtime::Runtime;
 pub mod source;

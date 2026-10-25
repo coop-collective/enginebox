@@ -25,7 +25,7 @@ pub(crate) fn git_input(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Res
     let mut argv = vec![
         "env".into(),
         "-i".into(),
-        "PATH=/usr/bin:/bin:/usr/local/bin".into(),
+        "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin".into(),
         "HOME=/nonexistent".into(),
         "LC_ALL=C".into(),
         "GIT_CONFIG_NOSYSTEM=1".into(),
@@ -48,6 +48,16 @@ pub(crate) fn git_input(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Res
         "init.templateDir=".into(),
         "-c".into(),
         "commit.gpgsign=false".into(),
+        "-c".into(),
+        "filter.lfs.clean=git-lfs clean -- %f".into(),
+        "-c".into(),
+        "filter.lfs.smudge=git-lfs smudge --skip -- %f".into(),
+        "-c".into(),
+        "filter.lfs.process=git-lfs filter-process --skip".into(),
+        "-c".into(),
+        "filter.lfs.required=true".into(),
+        "-c".into(),
+        "lfs.storage=lfs".into(),
         "-c".into(),
         "user.name=Engine Box".into(),
         "-c".into(),
@@ -118,12 +128,20 @@ pub fn safe_link(path: &str, target: &str) -> Result<()> {
     allowed_path(&parts.join("/"))
 }
 pub fn preview(repo: &Path, revision: &str) -> Result<Preview> {
-    preview_tree(repo, revision, false)
+    preview_tree(repo, revision, false, true)
 }
 pub fn preview_for_export(repo: &Path, revision: &str) -> Result<Preview> {
-    preview_tree(repo, revision, true)
+    preview_tree(repo, revision, true, true)
 }
-fn preview_tree(repo: &Path, revision: &str, allow_empty: bool) -> Result<Preview> {
+pub(crate) fn preview_before_hydration(repo: &Path, revision: &str) -> Result<Preview> {
+    preview_tree(repo, revision, true, false)
+}
+fn preview_tree(
+    repo: &Path,
+    revision: &str,
+    allow_empty: bool,
+    verify_lfs: bool,
+) -> Result<Preview> {
     ensure!(
         !revision.is_empty() && revision.len() < 512 && !revision.contains(['\0', '\n', '\r']),
         "Invalid revision"
@@ -174,8 +192,7 @@ fn preview_tree(repo: &Path, revision: &str, allow_empty: bool) -> Result<Previe
         files.push(path.to_owned());
     }
     ensure!(allow_empty || !files.is_empty(), "Empty source tree");
-    // Git LFS stores pointers in Git, not the asset bytes. Refuse to publish a
-    // deceptively complete base until an explicit LFS ingestion path exists.
+    // Count actual asset bytes and require verified cache objects for import.
     // Batch in small chunks so the process output bound does not cap tree size.
     for objects in small_blobs.chunks(1024) {
         let input = format!("{}\n", objects.join("\n"));
@@ -194,12 +211,15 @@ fn preview_tree(repo: &Path, revision: &str, allow_empty: bool) -> Result<Previe
                 .parse()?;
             remaining = &remaining[end + 1..];
             ensure!(remaining.len() > size, "Truncated blob response");
-            ensure!(
-                !remaining[..size].starts_with(b"version https://git-lfs.github.com/spec/v1\n")
-                    && !remaining[..size]
-                        .starts_with(b"version https://git-lfs.github.com/spec/v1\r\n"),
-                "Git LFS assets require separate hydration; refusing to import pointer files as complete assets"
-            );
+            if let Some(pointer) = crate::lfs::parse(&remaining[..size])? {
+                bytes = bytes
+                    .checked_sub(size as u64)
+                    .and_then(|n| n.checked_add(pointer.size))
+                    .context("Hydrated tree size overflow")?;
+                if verify_lfs {
+                    crate::lfs::verified_object(repo, &pointer)?;
+                }
+            }
             remaining = &remaining[size + 1..];
         }
     }
@@ -293,6 +313,7 @@ pub fn stage(repo: &Path, preview: &Preview, directory: &Path) -> Result<()> {
     fs::write(source.join(".git/shallow"), format!("{}\n", preview.commit))?;
     git(&source, &["update-ref", "refs/heads/main", &preview.commit])?;
     git(&source, &["reset", "--hard", &preview.commit])?;
+    crate::lfs::materialize(repo, &preview.commit, &source)?;
     Ok(())
 }
 
