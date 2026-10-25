@@ -26,16 +26,23 @@ else if(op==='github-settings')r={main:{revision:'${'a'.repeat(64)}'}};
 else if(op==='github-promote'){fs.writeFileSync(${JSON.stringify(promoted)},'yes');r={sync:{attempt:{status:'delivered',delivery_commit:'${'c'.repeat(40)}'}}};}
 else throw Error('Unexpected storage command');process.stdout.write(JSON.stringify(r));`);
     await chmod(config.ebox, 0o755);
-    let publications = 0;
+    let publications = 0, sourceDigest, publishing = false, polls = 0;
     const fetcher = async (url, options) => {
       if (url.startsWith('https://api.github.com/')) return Response.json({ object: { sha: 'b'.repeat(40) } });
-      if (url.endsWith('/publish')) { publications++; assert.equal(JSON.parse(options.body).commit, 'c'.repeat(40)); return Response.json({ status: 'published', commit: 'c'.repeat(40), url: 'https://game.example.com' }); }
+      if (url.endsWith('/publish')) { publications++; publishing = true; assert.equal(JSON.parse(options.body).commit, 'c'.repeat(40)); return Response.json({ status: 'publishing' }); }
+      if (options.method === 'GET') {
+        polls++;
+        if (publishing) return Response.json({ status: 'published', commit: 'c'.repeat(40), url: 'https://game.example.com' });
+        return Response.json({ status: outcome === 'validation-failed' ? 'failed' : 'validated', ok: outcome !== 'validation-failed', sourceDigest });
+      }
       assert.equal(options.headers['x-source-sha256'], createHash('sha256').update(options.body).digest('hex'));
-      return Response.json({ status: outcome === 'validation-failed' ? 'failed' : 'validated', ok: outcome !== 'validation-failed', sourceDigest: options.headers['x-source-sha256'] });
+      sourceDigest = options.headers['x-source-sha256'];
+      return Response.json({ status: 'building' });
     };
     const result = await lifecycle(config, { action: 'complete', project: 'demo', attempt }, fetcher);
     assert.equal(result.ok, outcome === 'published');
     assert.equal(publications, outcome === 'published' ? 1 : 0);
+    assert.equal(polls, outcome === 'published' ? 2 : 1);
     const operations = await readFile(calls, 'utf8');
     assert.equal(operations.includes('github-promote'), outcome !== 'validation-failed');
     if (outcome === 'validation-failed') assert.equal(result.uncertain, false);

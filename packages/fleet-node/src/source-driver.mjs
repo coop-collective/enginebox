@@ -89,9 +89,18 @@ export async function lifecycle(config, request, fetcher = globalThis.fetch) {
   }
   const buildConnection = await readJson(config.buildConnection);
   async function build(path, body, headers = {}) {
-    const response = await fetcher(buildConnection.url + path, { method: body === undefined ? 'GET' : 'POST', headers: { authorization: 'Bearer ' + buildConnection.token, ...headers }, body, redirect: 'error', signal: AbortSignal.timeout(840_000) });
+    const response = await fetcher(buildConnection.url + path, { method: body === undefined ? 'GET' : 'POST', headers: { authorization: 'Bearer ' + buildConnection.token, ...headers }, body, redirect: 'error', signal: AbortSignal.timeout(60_000) });
     if (!response.ok) throw new Error('Engine build service refused the operation');
     return response.json();
+  }
+  async function buildReceipt(receipt) {
+    const deadline = Date.now() + 840_000;
+    while (['building', 'publishing'].includes(receipt.status)) {
+      if (Date.now() >= deadline) throw new Error('Engine build completion is uncertain; inspect the retained receipt');
+      await new Promise(r => setTimeout(r, 2000));
+      receipt = await build('/builds/' + id);
+    }
+    return receipt;
   }
   async function remoteHead() {
     const credentials = await readJson(config.githubToken);
@@ -153,7 +162,7 @@ export async function lifecycle(config, request, fetcher = globalThis.fetch) {
     await exec(['/usr/bin/tar', '-czf', archive, '-C', snapshot.sourceRoot, '.']);
     const bytes = await fs.readFile(archive), digest = createHash('sha256').update(bytes).digest('hex');
     await phase('validating', { snapshotRevision: snapshot.revision, treeHash: snapshot.manifest.treeHash, sourceDigest: digest });
-    const validated = await build('/builds/' + id, bytes, { 'content-type': 'application/gzip', 'x-source-sha256': digest });
+    const validated = await buildReceipt(await build('/builds/' + id, bytes, { 'content-type': 'application/gzip', 'x-source-sha256': digest }));
     if (validated.status !== 'validated' || !validated.ok || validated.sourceDigest !== digest) {
       await phase('validation_failed', { build: validated });
       throw new Refusal('The Unity build or game-core tests failed. Your edits are retained for the next request; GitHub and the live game were not changed.');
@@ -171,7 +180,7 @@ export async function lifecycle(config, request, fetcher = globalThis.fetch) {
     const accepted = await storage('dev-export', config.sourceProject);
     if (accepted.manifest.treeHash !== snapshot.manifest.treeHash) throw new Error('Reconciled source differs from the validated build; publication was withheld');
     await phase('publishing', { commit: attempt.delivery_commit });
-    const publication = await build('/builds/' + id + '/publish', JSON.stringify({ commit: attempt.delivery_commit }), { 'content-type': 'application/json' });
+    const publication = await buildReceipt(await build('/builds/' + id + '/publish', JSON.stringify({ commit: attempt.delivery_commit }), { 'content-type': 'application/json' }));
     if (publication.status !== 'published' || publication.commit !== attempt.delivery_commit) throw new Error('Publication acknowledgement missing');
     current.published = true;
     await writeJson(currentPath, current);
