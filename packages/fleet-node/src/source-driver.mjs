@@ -142,6 +142,10 @@ export async function lifecycle(config, request, fetcher = globalThis.fetch) {
       await guest('mount', '--bind', '/project', '/workspace/source');
       current = { workspace: journal.workspace, attempt: request.attempt, closed: false, published: false };
       await writeJson(currentPath, current);
+      // Native admission also takes the host operation lock. Wait for any
+      // post-resume reconciliation before returning the prepared workspace;
+      // never retry a model submission to compensate for a busy host.
+      await exec(['/usr/bin/flock', '-w', '60', '/run/lock/enginebox-host.lock', '/usr/bin/true']);
       await phase('prepared');
       return { ok: true, summary: 'Private LayerFS source is ready for native Codex.' };
     }
