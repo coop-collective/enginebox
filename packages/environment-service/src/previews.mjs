@@ -53,12 +53,15 @@ export class WorkspacePreviews extends ProjectBootstrap {
       urls: this.live(p) ? value.urls : [], status: !this.live(p) ? (p.revoked ? 'revoked' : 'expired') : value.status };
   }
   async changeLease(value) {
-    fields(value, ['id', 'lease', 'expectedRevision', 'ttlSeconds', 'revoke']);
+    fields(value, ['id', 'lease', 'expectedRevision', 'ttlSeconds', 'revoke', 'retry']);
     const p = this.records[value.id];
     check(p && value.lease === p.lease && value.expectedRevision === p.revision, 'stale-preview-lease');
     check(this.live(p), 'preview-lease-expired');
-    if (value.revoke === true) { check(value.ttlSeconds === undefined, 'invalid-preview-request'); p.revoked = true; }
-    else { check(value.revoke === undefined, 'invalid-preview-request'); p.expiresAt = this.expiry(value.ttlSeconds); }
+    if (value.revoke === true) { check(value.ttlSeconds === undefined && value.retry === undefined, 'invalid-preview-request'); p.revoked = true; }
+    else {
+      check(value.revoke === undefined && (value.retry === undefined || typeof value.retry === 'boolean'), 'invalid-preview-request');
+      p.expiresAt = this.expiry(value.ttlSeconds); if (value.retry === true) p.retry = true;
+    }
     // Fence immediately, even while a slow immutable export is in flight.
     p.revision++; await this.save(); this.arm(p);
     if (p.revoked) { await this.withdraw(p); await this.exclusive(() => this.cleanup(p)); }

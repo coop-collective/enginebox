@@ -132,7 +132,18 @@ test('projection validates project/workspace/lease provenance and failed depende
     const failed = m.previews.summary(m.previews.records[p.id]);
     assert.equal(failed.error, 'setup-failed'); assert.equal(failed.healthy, true); assert.equal(failed.environment, before.environment);
     assert.equal(await readFile(join(root, before.environment, 'workspace/app.mjs'), 'utf8'), 'one');
-    await m.previews.register({ id: p.id, lease: p.lease, expectedRevision: 1, revoke: true });
+    await assert.rejects(m.previews.register({ id: p.id, lease: p.lease, expectedRevision: 1, revoke: true, retry: true }), /invalid-preview-request/);
+    await assert.rejects(m.previews.register({ id: p.id, lease: p.lease, expectedRevision: 1, ttlSeconds: 300, retry: 'yes' }), /invalid-preview-request/);
+    h.failSetup(false);
+    await m.tick(); assert.equal(m.previews.summary(m.previews.records[p.id]).status, 'failed', 'same failed revision remains suppressed until explicit retry');
+    const retry = { id: p.id, lease: p.lease, expectedRevision: 1, ttlSeconds: 300, retry: true };
+    const renewed = await m.previews.register(retry); assert.equal(renewed.revision, 2); assert.equal(renewed.environment, before.environment); assert.equal(renewed.healthy, true);
+    await assert.rejects(m.previews.register(retry), /stale-preview-lease/);
+    await m.tick(); const recovered = m.previews.summary(m.previews.records[p.id]);
+    assert.equal(recovered.id, p.id); assert.equal(recovered.lease, p.lease); assert.equal(recovered.status, 'ready'); assert.equal(recovered.healthy, true);
+    assert.notEqual(recovered.environment, before.environment);
+    assert.equal(await readFile(join(root, recovered.environment, 'workspace/app.mjs'), 'utf8'), 'two');
+    await m.previews.register({ id: p.id, lease: p.lease, expectedRevision: 2, revoke: true });
     assert.equal(h.containers.size, 0);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

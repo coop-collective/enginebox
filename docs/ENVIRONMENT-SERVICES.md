@@ -310,9 +310,12 @@ The result contains `id`, `host`, `project`, `workspace`, `task`, `lease`,
 `environment`, `sourceRevision`, `desiredSourceRevision`, `urls`, and an optional
 `error`. A queued draft has no environment, source revision or URL yet. Read with
 `GET /v1/environments/previews/:id` or list with `GET /v1/environments/previews`.
-Renew through POST `{id, lease, expectedRevision, ttlSeconds}`; revoke through POST
+Renew through POST `{id, lease, expectedRevision, ttlSeconds, retry?}`; revoke through POST
 `{id, lease, expectedRevision, revoke:true}`. Stale revisions, other leases, expired
-leases and revoked leases are rejected. Re-creating an expired binding allocates a
+leases and revoked leases are rejected. An explicit boolean `retry:true` on renewal
+retries a failed preparation at the same source/template revision, retaining the
+prior healthy draft until its replacement is ready. Ordinary renewal only extends
+the lease; `retry` is rejected on revocation. Re-creating an expired binding allocates a
 new identity and lease. These endpoints are authenticated even for reads.
 
 Add an operator-owned `workspaceCommand` to the existing bootstrap host:
