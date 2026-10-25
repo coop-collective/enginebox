@@ -165,7 +165,11 @@ impl Repositories {
             repo,
             requested_branch,
             max_bytes,
-            |cache, repo, branch| fetch(cache, repo, branch, token_file),
+            |cache, repo, branch| {
+                let selected = fetch(cache, repo, branch, token_file)?;
+                hydrate_lfs(cache, repo, "refs/heads/source", token_file, max_bytes)?;
+                Ok(selected)
+            },
         )
     }
     fn preview_with(
@@ -423,6 +427,72 @@ fn fetch(
     Ok(selected)
 }
 
+fn lfs_transfer(
+    cache: &Path,
+    repository: &str,
+    token_file: Option<&Path>,
+    arguments: &[&str],
+) -> Result<()> {
+    // Override repository-supplied endpoints and transfer adapters. The ordinary
+    // GitHub authorization header remains scoped to github.com, not object URLs.
+    let endpoint = format!("https://github.com/{repository}.git/info/lfs");
+    let settings = [
+        format!("lfs.url={endpoint}"),
+        format!("lfs.pushurl={endpoint}"),
+    ];
+    let mut args = vec!["-c", settings[0].as_str(), "-c", settings[1].as_str()];
+    for setting in [
+        "lfs.storage=lfs",
+        "lfs.basictransfersonly=true",
+        "lfs.fetchrecentalways=false",
+        "lfs.fetchrecentrefsdays=0",
+        "lfs.fetchrecentcommitsdays=0",
+        "lfs.remote.autodetect=false",
+        "lfs.remote.searchall=false",
+        "lfs.concurrenttransfers=4",
+    ] {
+        args.extend(["-c", setting]);
+    }
+    args.push("lfs");
+    args.extend_from_slice(arguments);
+    network_git(cache, token_file, &args)?;
+    Ok(())
+}
+
+fn hydrate_lfs(
+    cache: &Path,
+    repository: &str,
+    revision: &str,
+    token_file: Option<&Path>,
+    max_bytes: u64,
+) -> Result<()> {
+    let preview = source::preview_before_hydration(cache, revision)?;
+    ensure!(
+        preview.bytes <= max_bytes,
+        "Hydrated source exceeds import limit"
+    );
+    let objects = crate::lfs::objects(cache, revision)?;
+    if objects.is_empty() {
+        return Ok(());
+    }
+    if objects
+        .iter()
+        .any(|(_, p)| crate::lfs::verified_object(cache, p).is_err())
+    {
+        let url = format!("https://github.com/{repository}.git");
+        lfs_transfer(
+            cache,
+            repository,
+            token_file,
+            &["fetch", "--include=", "--exclude=", &url, &preview.commit],
+        )?;
+    }
+    for (_, pointer) in objects {
+        crate::lfs::verified_object(cache, &pointer)?;
+    }
+    Ok(())
+}
+
 /// Repository and branch are normalized at construction; callers cannot choose
 /// transport schemes, credentials, arbitrary URLs or refspecs.
 pub struct GitHubRemote {
@@ -497,6 +567,7 @@ impl crate::sync::Remote for GitHubRemote {
                     &format!("{sha}:{reference}"),
                 ],
             )?;
+            crate::lfs::copy_cache(&self.control, repo, sha)?;
             return Ok(());
         }
         network_git(
@@ -510,6 +581,13 @@ impl crate::sync::Remote for GitHubRemote {
                 &self.url(),
                 &format!("{sha}:{reference}"),
             ],
+        )?;
+        hydrate_lfs(
+            repo,
+            &self.repository,
+            sha,
+            self.credential.as_deref(),
+            1024 * 1024 * 1024,
         )?;
         Ok(())
     }
@@ -528,6 +606,7 @@ impl crate::sync::Remote for GitHubRemote {
                 &format!("+{sha}:refs/enginebox/synced"),
             ],
         )?;
+        crate::lfs::copy_cache(repo, &self.control, sha)?;
         Ok(())
     }
     fn push(&self, repo: &Path, expected: &str, sha: &str) -> Result<()> {
@@ -539,6 +618,16 @@ impl crate::sync::Remote for GitHubRemote {
                 == expected,
             "Sync commit must extend the observed GitHub head"
         );
+        let objects = crate::lfs::objects(repo, sha)?;
+        for (_, pointer) in &objects {
+            crate::lfs::verified_object(repo, pointer)?;
+        }
+        for chunk in objects.chunks(64) {
+            let url = self.url();
+            let mut args = vec!["push", "--object-id", url.as_str()];
+            args.extend(chunk.iter().map(|(_, p)| p.oid.as_str()));
+            lfs_transfer(repo, &self.repository, self.credential.as_deref(), &args)?;
+        }
         network_git(
             repo,
             self.credential.as_deref(),

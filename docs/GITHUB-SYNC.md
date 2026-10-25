@@ -6,6 +6,15 @@ bundles contain no `.git` directory or Git credentials. Git object caches and
 reconciliation environments belong to the connector, outside project storage.
 This supersedes the earlier assumption that agents use Git inside LayerFS.
 
+Git LFS assets are hydrated by the connector using the installed native
+`git-lfs` client. Preview counts expanded object sizes against the import budget;
+import verifies each object's SHA-256 and length before materializing ordinary
+asset bytes into LayerFS. Pointer files, LFS caches and credentials are not
+handed to an agent as substitute game assets. Export uses fixed native LFS
+filters, retains verified connector object caches, and uploads the required LFS
+objects before conditionally updating the Git branch. Missing, malformed,
+corrupt or symlinked cache objects stop the transfer.
+
 ## Transaction boundary
 
 1. Import an exact reviewed GitHub tree into LayerFS, preserving file bytes,
