@@ -70,6 +70,10 @@ outside the agent-readable checkout. Install a dedicated compatible Docker
 daemon when the host daemon cannot support the pinned LayerFS API; never upgrade
 or restart an unrelated daemon implicitly.
 
+Build and publication submissions acknowledge their durable intent immediately;
+the driver polls `GET /builds/:32hex` until a terminal receipt arrives. Native
+compilation therefore does not depend on a long-lived HTTP response.
+
 Explicit native API admission rejections settle the request without claiming a
 model ran. Lost acknowledgements and server errors remain uncertain. Native
 submission allows time for credential attachment; polling stays bounded.

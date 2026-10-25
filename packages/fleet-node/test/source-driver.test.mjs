@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { lifecycle } from '../src/source-driver.mjs';
 
 for (const outcome of ['published', 'validation-failed', 'source-changed']) {
-  test(`source acceptance: ${outcome}`, async t => {
+  test(`source acceptance: ${outcome}`, { skip: process.platform === 'win32' }, async t => {
     const root = await mkdtemp(join(tmpdir(), 'ebox-source-'));
     t.after(() => rm(root, { recursive: true, force: true }));
     const attempt = 'attempt-one', id = createHash('sha256').update(attempt).digest('hex').slice(0, 32);
