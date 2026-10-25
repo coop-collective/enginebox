@@ -4,6 +4,8 @@ import { check, fields, validateConfig, validateRoutes } from './config.mjs';
 import { atomic, load } from './state.mjs';
 import { digest, projectId, validateTemplate, resolveProject, templateEnvironment } from './project-template.mjs';
 
+// Adding a draft exporter must not invalidate an accepted-main source binding.
+const mainBinding = host => { const value = { ...host }; delete value.workspaceCommand; return digest(value); };
 const safeError = error => /^[a-z0-9-]+$/.test(error.message) ? error.message : 'project-bootstrap-failed';
 
 export class ProjectBootstrap {
@@ -38,7 +40,7 @@ export class ProjectBootstrap {
   routeId(p, port) { return `${p.id}-${digest(port.name).slice(0, 10)}`; }
   source(p) {
     const host = this.policy?.hosts.find(h => h.id === p.host);
-    check(host && p.binding === digest(host), 'project-source-binding-changed');
+    check(host && p.binding === mainBinding(host), 'project-source-binding-changed');
     return { kind: 'layerfs', project: p.project, command: [...host.command, p.project] };
   }
   add(env) {
@@ -51,7 +53,7 @@ export class ProjectBootstrap {
     return { id: p.id, host: p.host, project: p.project, status: p.status, error: p.error, healthy: state?.healthy ?? false,
       environment: p.active?.env.id, revision: state?.revision, desiredRevision: p.desiredRevision,
       template: p.active && { id: p.active.template.id, revision: p.active.template.revision, digest: p.active.templateDigest },
-      urls: this.manager.routes.filter(r => r.environment === p.active?.env.id && r.hostname).map(r => `${this.policy?.urlScheme ?? (this.config.httpTls ? 'https' : 'http')}://${r.hostname}`) };
+      urls: this.manager.routes.filter(r => r.environment === p.active?.env.id && r.hostname).map(r => `${this.policy?.urlScheme ?? (this.config.httpTls ? 'https' : 'http')}://${r.hostname}${this.policy?.urlPort ? `:${this.policy.urlPort}` : ''}`) };
   }
   catalog() { return Object.values(this.records).map(p => this.summary(p)); }
   async register(value) {
@@ -63,7 +65,7 @@ export class ProjectBootstrap {
     let p = this.records[key];
     if (!p) {
       check(Object.keys(this.records).length < this.policy.maxProjects, 'project-capacity-limit');
-      p = this.records[key] = { id: key, host: value.host, project: value.project, binding: digest(host), status: 'queued' };
+      p = this.records[key] = { id: key, host: value.host, project: value.project, binding: mainBinding(host), status: 'queued' };
     }
     if (value.retry) p.retry = true;
     await this.save(); return this.summary(p);
@@ -141,7 +143,7 @@ export class ProjectBootstrap {
       if (!desired) {
         check(!p.active, 'project-config-removed'); p.status = 'not-configured'; delete p.error; return;
       }
-      desired.fingerprint = digest([desired.fingerprint, this.policy.domain, this.policy.urlScheme ?? (this.config.httpTls ? 'https' : 'http'), this.policy.access]);
+      desired.fingerprint = digest([desired.fingerprint, this.policy.domain, this.policy.urlScheme ?? (this.config.httpTls ? 'https' : 'http'), this.policy.access, ...(this.policy.urlPort === undefined ? [] : [this.policy.urlPort])]);
       if (p.active?.fingerprint === desired.fingerprint) {
         if (p.pending) { await this.discard(p.pending); delete p.pending; }
         await this.manager.reconcile(p.active.env);
@@ -155,7 +157,7 @@ export class ProjectBootstrap {
         const env = templateEnvironment(desired.template, `${p.id}-${desired.fingerprint.slice(0, 12)}`, sourceConfig, this.allocate(desired.template.ports.length));
         env.dataId = p.id; env.sourceInputs = desired.inputs;
         const publicPort = desired.template.ports.find(port => port.expose && port.name === desired.template.health.port) ?? desired.template.ports.find(port => port.expose);
-        if (publicPort) { env.publicHost = `${p.id}-${publicPort.name}.${this.policy.domain}`; env.publicScheme = this.policy.urlScheme ?? (this.config.httpTls ? 'https' : 'http'); }
+        if (publicPort) { env.publicHost = `${p.id}-${publicPort.name}.${this.policy.domain}`; env.publicScheme = this.policy.urlScheme ?? (this.config.httpTls ? 'https' : 'http'); if (this.policy.urlPort) env.publicPort = this.policy.urlPort; }
         check(env.cpu <= this.policy.maxCpu && env.memoryMiB <= this.policy.maxMemoryMiB, 'project-resource-policy-exceeded');
         // Validate before publishing to the shared runtime registry.
         validateConfig({ ...this.config, environments: [...this.config.environments, env] });

@@ -69,6 +69,8 @@ enum Command {
         #[arg(long)]
         workspace: Option<String>,
     },
+    /// Export an open, idle workspace under its writer lease (never checkpoints it).
+    WorkspaceExport { project: String, workspace: String },
     /// Observe the current accepted LayerFS main revision.
     Main { project: String },
     /// Promote or merge a closed checkpointed branch to LayerFS main.
@@ -292,6 +294,9 @@ pub fn run(args: Storage) -> Result<Value> {
             key,
             credential_free: _,
         } => runtime.preparation_snapshot(&project, &name, &key),
+        Command::WorkspaceExport { project, workspace } => {
+            runtime.workspace_export(&project, &workspace)
+        }
         Command::DevExport { project, workspace } => {
             runtime.dev_export(&project, workspace.as_deref())
         }

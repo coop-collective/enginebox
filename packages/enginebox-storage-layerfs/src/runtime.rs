@@ -146,7 +146,7 @@ impl Runtime {
             None,
             300,
         )?;
-        self.docker(
+        let copied = self.docker(
             &[
                 "cp".into(),
                 format!("{container}:{staging}/."),
@@ -154,7 +154,22 @@ impl Runtime {
             ],
             None,
             300,
-        )?;
+        );
+        let cleaned = self.docker(
+            &[
+                "exec".into(),
+                "--user=501:20".into(),
+                container.into(),
+                "rm".into(),
+                "-rf".into(),
+                "--".into(),
+                staging,
+            ],
+            None,
+            30,
+        );
+        copied?;
+        cleaned?;
         Ok(())
     }
     fn docker(&self, args: &[String], input: Option<&[u8]>, seconds: u64) -> Result<Vec<u8>> {

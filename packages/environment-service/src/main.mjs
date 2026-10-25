@@ -19,6 +19,17 @@ export async function serve(config, run) {
       if (!timingSafeEqual(hash(request.headers.authorization ?? ''), hash(`Bearer ${token}`))) return reply(401, { error: 'unauthorized' });
       if (!ready) return reply(503, { error: 'initializing' });
       if (request.url === '/v1/environments' && request.method === 'GET') return reply(200, manager.catalog());
+      if (request.url === '/v1/environments/previews' && request.method === 'GET') return reply(200, { previews: manager.previews.catalog() });
+      if (request.url?.startsWith('/v1/environments/previews/') && request.method === 'GET') {
+        const key = request.url.slice('/v1/environments/previews/'.length);
+        const preview = id(key) && manager.previews.records[key];
+        return preview ? reply(200, manager.previews.summary(preview)) : reply(404, { error: 'unknown-preview' });
+      }
+      if (request.url === '/v1/environments/previews' && request.method === 'POST') {
+        let body = ''; for await (const chunk of request) { body += chunk; check(Buffer.byteLength(body) <= 8192, 'body-too-large'); }
+        const value = JSON.parse(body);
+        return reply(value.id ? 200 : 202, await manager.previews.register(value));
+      }
       if (request.url === '/v1/environments/projects' && request.method === 'GET') return reply(200, { projects: manager.projects.catalog() });
       if (request.url === '/v1/environments/projects' && request.method === 'POST') {
         let body = ''; for await (const chunk of request) { body += chunk; check(Buffer.byteLength(body) <= 8192, 'body-too-large'); }
@@ -44,7 +55,7 @@ export async function serve(config, run) {
   const tick = async () => { try { await manager.tick(); } catch { console.error('environment-reconcile-failed'); } finally { if (!stopped) timer = setTimeout(tick, config.pollSeconds * 1000); } };
   void tick();
   // Containers remain supervised by Docker while the control service restarts.
-  return { manager, server, close: async () => { stopped = true; clearTimeout(timer); await new Promise(r => server.close(r)); while (manager.busy) await new Promise(r => setTimeout(r, 50)); } };
+  return { manager, server, close: async () => { stopped = true; clearTimeout(timer); const leasesClosed = manager.previews.close(); await new Promise(r => server.close(r)); while (manager.busy) await new Promise(r => setTimeout(r, 50)); await leasesClosed; } };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const service = await serve(JSON.parse(await readFile(process.argv[2], 'utf8')));
