@@ -46,7 +46,7 @@ resources for evidence and explicit cleanup. Observed:
 - A trusted local transport copied the immutable Linux export into a local staging
   directory while preserving its manifest; the consumer verified source provenance.
 
-The environment-service test suite passed 30 tests, including six preview tests
+The environment-service test suite passed 31 tests, including seven preview tests
 covering lifecycle, independent environments, stale and concurrent lease mutations,
 source project/workspace/sandbox/branch fencing, source rename/removal, failed
 preparation, restart, expired in-flight source retrieval, ownership-checked cleanup,
@@ -62,5 +62,8 @@ individual saves during a long-running native command.
 
 Repository gates also passed: `pnpm install --frozen-lockfile`, `pnpm check`,
 `pnpm test`, `pnpm lint:rust`, and `pnpm build`. A final environment-service test
-run after lease shutdown fencing passed all 30 tests. The fleet build used
+run after lease shutdown and early-timer fencing passed all 31 tests. The seven
+preview tests also passed on Linux Node 24.22.0, and the blocked-export expiry
+regression passed 30 consecutive Linux runs. An injected assertion failure exited
+promptly with its expected failure after releasing the blocked export. The fleet build used
 Wrangler's dry-run mode; no production service or Worker was deployed.

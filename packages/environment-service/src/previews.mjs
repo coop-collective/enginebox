@@ -89,7 +89,10 @@ export class WorkspacePreviews extends ProjectBootstrap {
     if (this.closed || !this.live(p)) return;
     const timer = setTimeout(() => {
       this.timers.delete(p.id);
-      if (this.live(p) || this.closed) return;
+      if (this.closed) return;
+      // Timer delays and the wall clock can disagree by a tick (or after a
+      // clock adjustment). Keep the lease armed until its actual deadline.
+      if (this.live(p)) { this.arm(p); return; }
       // Withdrawal does not wait for a slow source fetch/dependency install.
       // Reconciliation checks the same lease before starting or routing a draft.
       const action = this.withdraw(p).then(() => this.exclusive(() => this.cleanup(p)));

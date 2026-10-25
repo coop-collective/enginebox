@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, realpath, symlink } from 'node
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { Environments } from '../src/runtime.mjs';
+import { WorkspacePreviews } from '../src/previews.mjs';
 import { validateConfig } from '../src/config.mjs';
 import { digest, resolveProject } from '../src/project-template.mjs';
 import { serve } from '../src/main.mjs';
@@ -171,24 +172,30 @@ test('preview HTTP API authenticates every path and rejects caller-selected comm
   } finally { if (service) await service.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test('expiration withdraws routes while an export is in flight and prevents stale activation', { skip: process.platform === 'win32' }, async () => {
+test('expiration withdraws routes while an export is in flight and prevents stale activation', { skip: process.platform === 'win32', timeout: 20000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'ebox-preview-expiry-'));
-  let m;
+  let m; let release; let runningTick;
+  t.signal.addEventListener('abort', () => release?.(), { once: true });
   try {
     const h = await harness(root); m = await h.create();
     const p = await m.previews.register(request()); await m.tick();
     assert.equal(m.routes.length, 1);
-    const original = m.run; let release; let entered;
+    const original = m.run; let entered;
     const blocked = new Promise(r => { release = r; }); const started = new Promise(r => { entered = r; });
     m.run = async (program, args, options) => { if (program === resolve('/workspace-export')) { entered(); await blocked; } return original(program, args, options); };
-    const tick = m.tick(); await started;
+    runningTick = m.tick(); await started;
     const record = m.previews.records[p.id]; record.expiresAt = new Date(Date.now() + 30).toISOString(); m.previews.arm(record);
-    const deadline = Date.now() + 2000;
+    const deadline = Date.now() + 10000;
     while (m.routes.length && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
     assert.equal(m.routes.length, 0); assert.equal(m.previews.summary(record).healthy, false);
-    release(); await tick; await m.previews.operations;
+    release(); await runningTick; await m.previews.operations;
     assert.equal(h.containers.size, 0); assert.equal(m.routes.length, 0);
-  } finally { await m?.previews.close(); await rm(root, { recursive: true, force: true }); }
+  } finally {
+    // Assertions and test cancellation must release the intentional blocked read
+    // before close() waits for the preview operation queue.
+    release?.(); await runningTick?.catch(() => {});
+    await m?.previews.close(); await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('enabling a draft exporter preserves an existing accepted-main host binding', { skip: process.platform === 'win32' }, async () => {
@@ -215,4 +222,23 @@ test('explicit ingress ports reach status URLs and the framework public URL', { 
     assert(start.includes(`ENGINEBOX_PUBLIC_URL=${ready.urls[0]}`));
     for (const invalid of [0, -1, 65536, 1.5, '8443']) assert.throws(() => validateConfig({ ...m.config, bootstrap: { ...m.config.bootstrap, urlPort: invalid } }), /invalid-public-url-port/);
   } finally { await m?.previews.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+
+test('an early lease timer re-arms until the current wall-clock deadline', async t => {
+  const previews = new WorkspacePreviews({ config: { stateDir: resolve('/unused-preview-timer-test') } });
+  const p = { id: 'timer-proof', expiresAt: new Date(Date.now() + 60000).toISOString() };
+  const callbacks = []; let withdrawn = 0; let cleaned = 0;
+  previews.withdraw = async () => { withdrawn++; }; previews.cleanup = async () => { cleaned++; };
+  // Invoke the timer before wall-clock expiry, then after expiry. No real wait,
+  // host filesystem access or Docker process is involved in this clock test.
+  const scheduled = t.mock.method(globalThis, 'setTimeout', callback => { callbacks.push(callback); return { unref() {} }; });
+  const cleared = t.mock.method(globalThis, 'clearTimeout', () => {});
+  try {
+    previews.arm(p); assert.equal(callbacks.length, 1);
+    callbacks.shift()(); assert.equal(callbacks.length, 1); assert.equal(withdrawn, 0);
+    p.expiresAt = new Date(0).toISOString(); callbacks.shift()();
+  } finally { scheduled.mock.restore(); cleared.mock.restore(); }
+  await Promise.all([...previews.expirations]); await previews.close();
+  assert.equal(withdrawn, 1); assert.equal(cleaned, 1);
 });
