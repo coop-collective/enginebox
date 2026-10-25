@@ -33,6 +33,13 @@ a fresh runtime. The backup retains the previous identity, credentials, settings
 and LayerFS workspace data. Keep it private. A failed export prevents removal.
 Other WSL distributions are untouched.
 
+Ownership setup verifies that WSL registered Enginebox in this installation's
+directory. It can finish an interrupted import with no ownership marker, and a
+retry with the same Windows owner leaves the marker unchanged. The SID is passed
+as a non-secret argument; the Linux claim reads its input inside Linux. A different
+owner, a different registration directory, or configured state without an owner
+marker is refused. Ownership errors include the underlying WSL/native output.
+
 Use a newly generated dashboard install command for a replacement. Choose **N**
 to continue the existing runtime and identity instead. Automatic startup uses
 `-Resume`, which never asks to replace an existing distribution. The installer
