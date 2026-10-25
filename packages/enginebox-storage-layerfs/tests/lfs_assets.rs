@@ -1,3 +1,5 @@
+// Source connector commands use the same sanitized Unix environment as github_sync.
+#![cfg(unix)]
 use enginebox_storage_layerfs::{lfs, source};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
