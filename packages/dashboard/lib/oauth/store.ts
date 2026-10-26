@@ -15,6 +15,8 @@ import { HttpError } from "../server";
 
 export type AuthMethod = "none" | "client_secret_basic" | "client_secret_post";
 export type WorkspaceGrant = { host: string; instance: string; profiles: string[] };
+/** A consented pool: the controller places each run on a free member. `profile` is the pool's own, if any. */
+export type PoolGrant = { pool: string; profile: string | null };
 
 export type Client = {
   client_id: string;
@@ -46,6 +48,8 @@ export type Code = {
   resource: string;
   user_id: string;
   workspaces: WorkspaceGrant[];
+  /** Absent in state written before pool grants existed. */
+  pools?: PoolGrant[];
   expires_at: number;
   used_at: number | null;
   /** The grant this code produced, so a replay can revoke it. */
@@ -60,6 +64,14 @@ export type Grant = {
   scope: string;
   resource: string;
   workspaces: WorkspaceGrant[];
+  /** Absent in state written before pool grants existed. */
+  pools?: PoolGrant[];
+  /**
+   * HMAC key the controller signs this grant's run callbacks with. Passed to
+   * every access token minted for the grant, returned to the client once at
+   * the code exchange. Absent for grants made before callbacks were supported.
+   */
+  callback_secret?: string;
   created_at: number;
   refreshed_at: number;
   revoked_at: number | null;

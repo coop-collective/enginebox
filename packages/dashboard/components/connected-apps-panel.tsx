@@ -8,6 +8,7 @@ type Connection = {
   client_name: string;
   redirect_hosts: string[];
   workspaces: { host: string; instance: string; profiles: string[] }[];
+  pools?: { pool: string; profile: string | null }[];
   created_at: string;
   refreshed_at: string;
   access_token_active: boolean;
@@ -49,7 +50,7 @@ export function ConnectedAppsPanel() {
       <div className="contributor-heading">
         <div>
           <h2>Connected apps</h2>
-          <p>Apps you approved to run agents on selected workspaces. Each holds an hour-long access token it renews until you disconnect it.</p>
+          <p>Apps you approved to run agents on selected workspaces and pools. Each holds an hour-long access token it renews until you disconnect it.</p>
         </div>
         <button className="button small" onClick={() => void refresh()}>Refresh</button>
       </div>
@@ -68,6 +69,12 @@ export function ConnectedAppsPanel() {
                 <li key={`${w.host}/${w.instance}`}>
                   <code>{w.host}/{w.instance}</code>
                   {w.profiles.length ? ` · profiles: ${w.profiles.join(", ")}` : ""}
+                </li>
+              ))}
+              {(c.pools ?? []).map((p) => (
+                <li key={`pool:${p.pool}`}>
+                  pool <code>{p.pool}</code>
+                  {p.profile ? ` · profile: ${p.profile}` : ""}
                 </li>
               ))}
             </ul>

@@ -1,6 +1,6 @@
 import { config, HttpError } from "../server";
 import type { Fleet } from "../types";
-import type { WorkspaceGrant } from "./store";
+import type { PoolGrant, WorkspaceGrant } from "./store";
 
 /** Every agent-run operation; the `agent-runs` scope grants exactly these. */
 export const AGENT_RUN_OPERATIONS = ["agent_runs.start", "agent_runs.get", "agent_runs.list", "agent_runs.cancel"];
@@ -23,21 +23,38 @@ async function call(path: string, init: { method: string; body?: unknown }) {
 
 export type Minted = { id: string; secret: string; expires_at: number };
 
-/** Mint a short-lived scoped service token: the OAuth access token. */
-export async function mintAccessToken(grantId: string, workspaces: WorkspaceGrant[], ttlSeconds: number): Promise<Minted> {
+/** The controller refused the grant itself (a workspace, pool or profile no longer exists). */
+export class GrantRefused extends Error {}
+
+/** Everything one access token carries: the consented workspaces and pools, and the grant's callback key. */
+export type TokenGrant = { workspaces: WorkspaceGrant[]; pools: PoolGrant[]; callback_secret?: string | null };
+
+/**
+ * Mint a short-lived scoped service token: the OAuth access token. Profiles
+ * named on workspaces become the token's profile grant (the controller grants
+ * profiles per token, not per workspace); a pool grant carries its own profile.
+ */
+export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSeconds: number): Promise<Minted> {
+  const profiles = [...new Set(grant.workspaces.flatMap((w) => w.profiles))].sort();
   const response = await call("v1/service-tokens", {
     method: "POST",
     body: {
       label: `oauth grant ${grantId}`,
-      scopes: workspaces.map((w) => ({ host_id: w.host, name: w.instance })),
+      scopes: grant.workspaces.map((w) => ({ host_id: w.host, name: w.instance })),
       operations: AGENT_RUN_OPERATIONS,
       expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      // Optional fields only when used, so older controllers keep accepting workspace-only grants.
+      ...(profiles.length ? { profiles } : {}),
+      ...(grant.pools.length ? { pools: grant.pools.map((p) => p.pool) } : {}),
+      ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
     },
   });
   const body = (await response.json().catch(() => null)) as {
     token?: { id?: unknown; expires_at?: unknown };
     secret?: unknown;
   } | null;
+  // 400: the controller validated the request and refused it, so this grant cannot be honoured any more.
+  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools or profiles are no longer available.");
   const id = body?.token?.id, secret = body?.secret, expires = Date.parse(String(body?.token?.expires_at));
   if (response.status !== 201 || typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id) || typeof secret !== "string" || !secret.startsWith(`ebst_${id}.`) || !Number.isFinite(expires))
     throw new HttpError(503, "The fleet service could not issue an access token.");
@@ -67,4 +84,29 @@ export async function grantableWorkspaces(): Promise<Workspace[]> {
       .filter((i) => i.managed && (!i.warm_pool_state || i.warm_pool_state === "claimed"))
       .map((i) => ({ host: host.id, host_label: host.label || host.id, instance: i.name, label: i.workspace_name || i.name })),
   );
+}
+
+export type Pool = { name: string; description: string; profile: string | null; members: number };
+
+/** Owner-managed pools the owner can grant. */
+export async function grantablePools(): Promise<Pool[]> {
+  const response = await call("v1/pools", { method: "GET" });
+  if (!response.ok) throw new HttpError(503, "The fleet service could not list pools.");
+  const body = (await response.json()) as { pools?: { name?: unknown; description?: unknown; profile?: unknown; members?: unknown }[] };
+  return (body.pools ?? [])
+    .filter((p) => typeof p.name === "string")
+    .map((p) => ({
+      name: p.name as string,
+      description: typeof p.description === "string" ? p.description : "",
+      profile: typeof p.profile === "string" ? p.profile : null,
+      members: Array.isArray(p.members) ? p.members.length : 0,
+    }));
+}
+
+/** Names of the owner's profiles, so consent never stores one the controller would refuse at mint. */
+export async function profileNames(): Promise<string[]> {
+  const response = await call("v1/profiles", { method: "GET" });
+  if (!response.ok) throw new HttpError(503, "The fleet service could not list profiles.");
+  const body = (await response.json()) as { profiles?: { name?: unknown }[] };
+  return (body.profiles ?? []).map((p) => p.name).filter((n): n is string => typeof n === "string");
 }

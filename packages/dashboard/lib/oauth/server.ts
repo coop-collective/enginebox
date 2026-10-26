@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { config, HttpError, json, requireOrigin, requireSession } from "../server";
-import { grantableWorkspaces, mintAccessToken, revokeAccessToken, type Minted } from "./controller";
+import { GrantRefused, grantablePools, grantableWorkspaces, mintAccessToken, profileNames, revokeAccessToken, type Minted, type Pool, type Workspace } from "./controller";
 import { users } from "./identity";
 import { consentPage, errorPage, page, signInPage } from "./pages";
 import {
@@ -13,6 +13,7 @@ import {
   type AuthMethod,
   type Client,
   type Grant,
+  type PoolGrant,
   type State,
   type WorkspaceGrant,
 } from "./store";
@@ -25,6 +26,8 @@ export const REFRESH_SECONDS = 30 * 24 * 60 * 60;
 const MAX_CLIENTS = 200;
 const MAX_PENDING = 200;
 const MAX_GRANT_WORKSPACES = 64;
+/** Workspaces and pools together, so the token response stays bounded. */
+const MAX_GRANT_TARGETS = 64;
 const REFRESH_PREFIX = "ebrt_";
 const CODE_PREFIX = "ebac_";
 const CLIENT_SECRET_PREFIX = "ebcs_";
@@ -235,22 +238,30 @@ const sameResource = (value: string) => value === resourceId() || value === `${r
 
 function render(request: Request, pendingId: string, client: Client, redirectUri: string, extra: { error?: string; setCookie?: string } = {}) {
   return (async () => {
-    let response: Response;
-    try {
-      response = consentPage({
-        request: pendingId,
-        clientName: client.client_name,
-        clientId: client.client_id,
-        redirectUri,
-        workspaces: await grantableWorkspaces(),
-        error: extra.error,
-      });
-    } catch {
-      return errorPage("Engine Box could not list your workspaces. Check that the fleet service is running.", 503);
-    }
+    const listed = await grantable();
+    if (!listed) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
+    const response = consentPage({
+      request: pendingId,
+      clientName: client.client_name,
+      clientId: client.client_id,
+      redirectUri,
+      workspaces: listed.workspaces,
+      pools: listed.pools,
+      error: extra.error,
+    });
     if (extra.setCookie) response.headers.append("Set-Cookie", extra.setCookie);
     return response;
   })();
+}
+
+/**
+ * What the owner can grant. Either list may fail on its own (a host whose
+ * inventory cannot be read still leaves its pools grantable); null when both do.
+ */
+async function grantable(): Promise<{ workspaces: Workspace[]; pools: Pool[] } | null> {
+  const [workspaces, pools] = await Promise.allSettled([grantableWorkspaces(), grantablePools()]);
+  if (workspaces.status === "rejected" && pools.status === "rejected") return null;
+  return { workspaces: workspaces.status === "fulfilled" ? workspaces.value : [], pools: pools.status === "fulfilled" ? pools.value : [] };
 }
 
 function findPending(state: State, id: string | null) {
@@ -367,23 +378,38 @@ export async function authorizePost(request: Request) {
   if (action !== "approve") return errorPage("Unknown action.");
 
   const chosen = [...new Set(form.getAll("workspace"))];
-  if (!chosen.length) return render(request, id, client, pending.redirect_uri, { error: "Select at least one workspace." });
-  if (chosen.length > MAX_GRANT_WORKSPACES) return render(request, id, client, pending.redirect_uri, { error: "Select fewer workspaces." });
-  let available;
-  try {
-    available = await grantableWorkspaces();
-  } catch {
-    return errorPage("Engine Box could not list your workspaces. Check that the fleet service is running.", 503);
-  }
+  const chosenPools = [...new Set(form.getAll("pool"))];
+  if (!chosen.length && !chosenPools.length) return render(request, id, client, pending.redirect_uri, { error: "Select at least one workspace or pool." });
+  if (chosen.length > MAX_GRANT_WORKSPACES || chosen.length + chosenPools.length > MAX_GRANT_TARGETS)
+    return render(request, id, client, pending.redirect_uri, { error: "Select fewer workspaces and pools." });
+  const available = await grantable();
+  if (!available) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
   const workspaces: WorkspaceGrant[] = [];
   for (const value of chosen) {
-    const workspace = available.find((w) => `${w.host}/${w.instance}` === value);
+    const workspace = available.workspaces.find((w) => `${w.host}/${w.instance}` === value);
     if (!workspace) return render(request, id, client, pending.redirect_uri, { error: "A selected workspace is no longer available." });
-    // Profiles are stored as names only; another component will validate them.
     const profiles = [...new Set((form.get(`profiles:${value}`) ?? "").split(",").map((p) => p.trim()).filter(Boolean))];
     if (profiles.length > 16 || profiles.some((p) => !PROFILE.test(p)))
       return render(request, id, client, pending.redirect_uri, { error: "Profile names use letters, digits, dot, dash or underscore (at most 16 per workspace)." });
     workspaces.push({ host: workspace.host, instance: workspace.instance, profiles });
+  }
+  const pools: PoolGrant[] = [];
+  for (const name of chosenPools) {
+    const pool = available.pools.find((p) => p.name === name);
+    if (!pool) return render(request, id, client, pending.redirect_uri, { error: "A selected pool is no longer available." });
+    pools.push({ pool: pool.name, profile: pool.profile });
+  }
+  // The controller refuses to mint a token naming an unknown profile; say so here instead.
+  const named = [...new Set(workspaces.flatMap((w) => w.profiles))];
+  if (named.length) {
+    let known: string[];
+    try {
+      known = await profileNames();
+    } catch {
+      return errorPage("Engine Box could not list your profiles. Check that the fleet service is running.", 503);
+    }
+    const unknown = named.filter((p) => !known.includes(p));
+    if (unknown.length) return render(request, id, client, pending.redirect_uri, { error: `Unknown profile: ${unknown.join(", ")}.` });
   }
   const code = `${CODE_PREFIX}${randomToken()}`;
   const ok = withState((state, now) => {
@@ -399,6 +425,7 @@ export async function authorizePost(request: Request) {
       resource: pending.resource,
       user_id: user.id,
       workspaces,
+      pools,
       expires_at: now + CODE_SECONDS * 1000,
       used_at: null,
       grant_id: null,
@@ -454,17 +481,28 @@ function authenticateClient(request: Request, form: URLSearchParams, state: Stat
 
 // ---------------------------------------------------------------- token endpoint
 
-function grantsView(workspaces: WorkspaceGrant[]) {
-  return workspaces.map((w) => ({ host: w.host, instance: w.instance, profiles: w.profiles }));
+/**
+ * The `enginebox_grants` extension: one entry per consented workspace
+ * (`{kind: "workspace", host, instance, profiles}`, the original shape plus
+ * `kind`) and per pool (`{kind: "pool", pool, profile, profiles}`, where
+ * `profile` is the pool's own profile and `profiles` repeats it as a list).
+ */
+export function grantsView(grant: Pick<Grant, "workspaces" | "pools">) {
+  return [
+    ...grant.workspaces.map((w) => ({ kind: "workspace" as const, host: w.host, instance: w.instance, profiles: w.profiles })),
+    ...(grant.pools ?? []).map((p) => ({ kind: "pool" as const, pool: p.pool, profile: p.profile, profiles: p.profile ? [p.profile] : [] })),
+  ];
 }
-function tokenResponse(minted: Minted, refresh: string, grant: Pick<Grant, "workspaces">) {
+function tokenResponse(minted: Minted, refresh: string, grant: Pick<Grant, "workspaces" | "pools">, callbackSecret?: string) {
   return oauthJson({
     access_token: minted.secret,
     token_type: "Bearer",
     expires_in: Math.max(1, Math.floor((minted.expires_at - Date.now()) / 1000)),
     refresh_token: refresh,
     scope: SCOPE,
-    enginebox_grants: grantsView(grant.workspaces),
+    enginebox_grants: grantsView(grant),
+    // Only at the code exchange: the key that signs this connection's run callbacks.
+    ...(callbackSecret ? { enginebox_callback_secret: callbackSecret } : {}),
   });
 }
 
@@ -539,7 +577,15 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
   if ("failure" in claimed) throw new OAuthError("invalid_grant", claimed.failure!);
   if (claimed.replay) throw new OAuthError("invalid_grant", "The authorization code was already used; its tokens are revoked.");
   const { record, client } = claimed;
-  const minted = await mintAccessToken(grantId, record.workspaces, ACCESS_TOKEN_SECONDS);
+  const pools = record.pools ?? [];
+  const callbackSecret = randomToken(32);
+  let minted: Minted;
+  try {
+    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, callback_secret: callbackSecret }, ACCESS_TOKEN_SECONDS);
+  } catch (error) {
+    if (error instanceof GrantRefused) throw new OAuthError("invalid_grant", error.message);
+    throw error;
+  }
   const refreshToken = `${REFRESH_PREFIX}${grantId}.${randomToken()}`;
   const stored = withState((state, now) => {
     const current = state.codes.find((c) => c.hash === record.hash);
@@ -554,6 +600,8 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
       scope: record.scope,
       resource: record.resource,
       workspaces: record.workspaces,
+      pools,
+      callback_secret: callbackSecret,
       created_at: now,
       refreshed_at: now,
       revoked_at: null,
@@ -568,7 +616,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
     return true;
   });
   if (!stored) throw new OAuthError("invalid_grant", "The authorization code was already used; its tokens are revoked.");
-  return tokenResponse(minted, refreshToken, record);
+  return tokenResponse(minted, refreshToken, { workspaces: record.workspaces, pools }, callbackSecret);
 }
 
 function sha256b64(value: string) {
@@ -592,7 +640,18 @@ async function refresh(request: Request, form: URLSearchParams) {
   });
   if (checked.reuse) throw new OAuthError("invalid_grant", "The refresh token was already used; this connection is revoked.");
   const grant = checked.grant;
-  const minted = await mintAccessToken(grant.id, grant.workspaces, ACCESS_TOKEN_SECONDS);
+  let minted: Minted;
+  try {
+    minted = await mintAccessToken(grant.id, { workspaces: grant.workspaces, pools: grant.pools ?? [], callback_secret: grant.callback_secret }, ACCESS_TOKEN_SECONDS);
+  } catch (error) {
+    if (!(error instanceof GrantRefused)) throw error;
+    // What the owner consented to is gone: end the connection so the app asks again.
+    withState((state, now) => {
+      const current = state.grants.find((g) => g.id === grant.id);
+      if (current) revokeGrantIn(state, current, "consented workspaces or pools no longer available", now);
+    });
+    throw new OAuthError("invalid_grant", error.message);
+  }
   const next = `${REFRESH_PREFIX}${grant.id}.${randomToken()}`;
   const outcome = withState((state, now) => {
     const current = state.grants.find((g) => g.id === grant.id);
@@ -653,11 +712,16 @@ export async function revoke(request: Request) {
 // ---------------------------------------------------------------- the protected resource
 
 const SEGMENT = "[A-Za-z0-9][A-Za-z0-9_-]{0,99}";
-const RESOURCE_ROUTES: [string, RegExp][] = [
+/** The controller's pool names. */
+const POOL = "[a-z][a-z0-9-]{0,31}";
+export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["GET", /^v1\/agent-runs$/],
   ["GET", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}$`)],
   ["POST", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs$`)],
   ["POST", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}/cancel$`)],
+  ["POST", new RegExp(`^v1/pools/${POOL}/agent-runs$`)],
+  ["GET", new RegExp(`^v1/pools/${POOL}/agent-runs/${SEGMENT}$`)],
+  ["POST", new RegExp(`^v1/pools/${POOL}/agent-runs/${SEGMENT}/cancel$`)],
 ];
 
 function challenge(error?: string, description?: string) {
@@ -728,7 +792,7 @@ export async function resourceProxy(request: Request, segments: string[]) {
   }
   if (response.status === 401) return unauthorized("invalid_token", "The access token is unknown, expired or revoked.");
   if (response.status === 403)
-    return json(result, 403, { "WWW-Authenticate": challenge("insufficient_scope", "The token is not granted that operation on that workspace.") });
+    return json(result, 403, { "WWW-Authenticate": challenge("insufficient_scope", "The token is not granted that operation on that workspace or pool.") });
   return json(result, response.status);
 }
 
@@ -750,7 +814,8 @@ export function listGrants(request: Request) {
         client_name: client?.client_name ?? "Unknown app",
         redirect_hosts: [...new Set((client?.redirect_uris ?? []).map((u) => new URL(u).host))],
         scope: g.scope,
-        workspaces: grantsView(g.workspaces),
+        workspaces: grantsView({ workspaces: g.workspaces }),
+        pools: (g.pools ?? []).map((p) => ({ pool: p.pool, profile: p.profile })),
         created_at: new Date(g.created_at).toISOString(),
         refreshed_at: new Date(g.refreshed_at).toISOString(),
         access_token_active: g.access_token_id !== null && g.access_expires_at > now,

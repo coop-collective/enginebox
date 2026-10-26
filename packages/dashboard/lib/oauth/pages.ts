@@ -1,4 +1,4 @@
-import type { Workspace } from "./controller";
+import type { Pool, Workspace } from "./controller";
 import type { UserAuthenticator } from "./identity";
 
 const escape = (value: string) =>
@@ -64,9 +64,11 @@ export function consentPage(opts: {
   clientId: string;
   redirectUri: string;
   workspaces: Workspace[];
+  pools?: Pool[];
   error?: string;
 }) {
   const redirect = new URL(opts.redirectUri);
+  const pools = opts.pools ?? [];
   const list = opts.workspaces.length
     ? opts.workspaces
         .map((w) => {
@@ -76,6 +78,14 @@ export function consentPage(opts: {
         })
         .join("")
     : `<p class="muted">There are no assigned workspaces to share yet. Create one in the dashboard first.</p>`;
+  const poolList = pools
+    .map(
+      (p) =>
+        `<label class="ws"><input type="checkbox" name="pool" value="${escape(p.name)}"> <strong>${escape(p.name)}</strong> <span class="muted">${p.members} workspace${p.members === 1 ? "" : "s"}` +
+        `${p.profile ? ` · runs use profile <code>${escape(p.profile)}</code>` : ""}${p.description ? ` · ${escape(p.description)}` : ""}</span></label>`,
+    )
+    .join("");
+  const any = opts.workspaces.length > 0 || pools.length > 0;
   return page(
     "Connect an app to Engine Box",
     `<h1>Connect “${escape(opts.clientName)}”?</h1>` +
@@ -83,9 +93,10 @@ export function consentPage(opts: {
       `<p class="muted">The app chose its own name; check that you started this connection. Client ID <code>${escape(opts.clientId)}</code>.</p>` +
       (opts.error ? `<p class="warn" role="alert">${escape(opts.error)}</p>` : "") +
       `<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escape(opts.request)}">` +
+      (pools.length ? `<fieldset><legend>Pools it may run agents on (Engine Box picks a free workspace)</legend>${poolList}</fieldset>` : "") +
       `<fieldset><legend>Workspaces it may run agents on</legend>${list}</fieldset>` +
-      `<p class="muted">It can start, read, list and cancel agent runs in the workspaces you select, and nothing else: no fleet, template, storage, provider sign-in or account settings. You can disconnect it at any time from the dashboard.</p>` +
-      `<div class="actions"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="approve"${opts.workspaces.length ? "" : " disabled"}>Allow access</button></div></form>`,
+      `<p class="muted">It can start, read, list and cancel agent runs in the workspaces and pools you select, and nothing else: no fleet, template, storage, provider sign-in or account settings. You can disconnect it at any time from the dashboard.</p>` +
+      `<div class="actions"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="approve"${any ? "" : " disabled"}>Allow access</button></div></form>`,
     { formTarget: redirect.origin },
   );
 }
