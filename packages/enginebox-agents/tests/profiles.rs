@@ -54,7 +54,14 @@ fn tree(root: &Path) -> BTreeSet<String> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeSet<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            out.insert(path.strip_prefix(base).unwrap().display().to_string());
+            // '/'-separated on every platform, so prefix checks hold on Windows too
+            out.insert(
+                path.strip_prefix(base)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/"),
+            );
             let meta = std::fs::symlink_metadata(&path).unwrap();
             if meta.is_dir() {
                 walk(base, &path, out);
