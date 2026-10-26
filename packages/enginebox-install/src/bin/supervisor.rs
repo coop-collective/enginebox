@@ -66,6 +66,7 @@ fn main() -> Result<()> {
                     "ENGINEBOX_NODE_INSTALLER_URL",
                     "ENGINEBOX_NODE_INSTALLER_SHA256",
                     "ENGINEBOX_NODE_PUBLIC_ORIGIN",
+                    "ENGINEBOX_OAUTH_STATE_DIR",
                     "PATH"
                 ]
                 .contains(&key.as_str()),
