@@ -248,6 +248,9 @@ impl ServiceTokens {
             None => None,
         };
         let mut tokens = self.tokens.lock().unwrap();
+        if tokens.len() >= MAX_TOKENS {
+            self.prune_inactive(&mut tokens, now);
+        }
         ensure!(tokens.len() < MAX_TOKENS, "Service token limit reached");
         let id = uuid::Uuid::new_v4().simple().to_string();
         let secret = format!(
@@ -274,6 +277,36 @@ impl ServiceTokens {
         Ok(
             json!({"token":public,"secret":format!("{PREFIX}{id}.{secret}"),"secret_shown_once":true}),
         )
+    }
+    /// Short-lived tokens (for example OAuth access tokens renewed hourly) would
+    /// otherwise exhaust the limit. Records revoked or expired for over a day are
+    /// deleted; recent ones stay visible for audit.
+    fn prune_inactive(
+        &self,
+        tokens: &mut BTreeMap<String, Token>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let cutoff = now - chrono::Duration::days(1);
+        let stale: Vec<String> = tokens
+            .values()
+            .filter(|t| {
+                let revoked = t
+                    .revoked_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+                let expired = t
+                    .expires_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+                revoked.or(expired).is_some_and(|at| at <= cutoff)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in stale {
+            if std::fs::remove_file(self.root.join(format!("{id}.json"))).is_ok() {
+                tokens.remove(&id);
+            }
+        }
     }
     pub fn list(&self) -> Value {
         let tokens = self.tokens.lock().unwrap();
@@ -413,6 +446,57 @@ mod tests {
         )
         .unwrap();
         assert!(!stored.contains("profiles") && !stored.contains("callback_secret"));
+    }
+    #[test]
+    fn minting_at_the_limit_prunes_tokens_inactive_for_over_a_day() {
+        let temp = tempfile::tempdir().unwrap();
+        let tokens = ServiceTokens::open(temp.path()).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+        {
+            let mut map = tokens.tokens.lock().unwrap();
+            for i in 0..MAX_TOKENS {
+                let id = format!("{i:032x}");
+                let token = Token {
+                    id: id.clone(),
+                    label: "old".into(),
+                    secret_hash: secret_hash("x"),
+                    scopes: BTreeSet::new(),
+                    operations: BTreeSet::new(),
+                    created_at: old.clone(),
+                    expires_at: None,
+                    // Half are long revoked; the rest were revoked moments ago.
+                    revoked_at: Some(if i % 2 == 0 {
+                        old.clone()
+                    } else {
+                        recent.clone()
+                    }),
+                    profiles: BTreeSet::new(),
+                    callback_secret: None,
+                    pools: BTreeSet::new(),
+                };
+                tokens.save(&token).unwrap();
+                map.insert(id, token);
+            }
+        }
+        tokens
+            .mint(request(None), |_| true, |_| true, |_| false)
+            .unwrap();
+        let map = tokens.tokens.lock().unwrap();
+        assert_eq!(map.len(), MAX_TOKENS / 2 + 1);
+        assert!(
+            !temp
+                .path()
+                .join("service-tokens")
+                .join(format!("{:032x}.json", 0))
+                .exists()
+        );
+        assert!(
+            temp.path()
+                .join("service-tokens")
+                .join(format!("{:032x}.json", 1))
+                .exists()
+        );
     }
     #[test]
     fn minting_rejects_unknown_hosts_empty_grants_and_past_expiry() {

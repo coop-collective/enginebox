@@ -65,6 +65,8 @@ The controller root defaults to `~/.local/state/enginebox`; override it with `--
 
 Every `/v1/` request requires `Authorization: Bearer <token>`. The owner token reaches every endpoint below. A scoped service token (`ebst_…`, minted by the owner) reaches only the agent-run endpoints it was granted, on the workspaces it names; every other route answers 403, and an unknown, revoked or expired service token answers 401. POST bodies must be JSON objects and cannot exceed 16 KiB, except template registration (1 MiB), profile files (1.5 MiB, one base64-encoded file of up to 1 MiB) and profiles (256 KiB). Additional payload fields are rejected.
 
+Third-party apps get service tokens through OAuth instead of from the owner by hand: the dashboard is an OAuth 2.1 authorization server that mints an hour-long service token per consented connection and proxies the agent-run endpoints on its public origin. The owner's service-token store prunes records revoked or expired for over a day when it reaches its limit. See [OAuth for connected apps](OAUTH.md).
+
 | Request | Result |
 |---|---|
 | `GET /healthz` | Unauthenticated process-health response containing only `{"ok":true}`; does not check hosts. |
