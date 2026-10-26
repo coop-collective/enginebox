@@ -27,7 +27,7 @@ export type Minted = { id: string; secret: string; expires_at: number };
 export class GrantRefused extends Error {}
 
 /** Everything one access token carries: the consented workspaces and pools, and the grant's callback key. */
-export type TokenGrant = { workspaces: WorkspaceGrant[]; pools: PoolGrant[]; callback_secret?: string | null };
+export type TokenGrant = { workspaces: WorkspaceGrant[]; pools: PoolGrant[]; callback_secret?: string | null; project?: string | null };
 
 /**
  * Mint a short-lived scoped service token: the OAuth access token. Profiles
@@ -47,6 +47,8 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
       ...(profiles.length ? { profiles } : {}),
       ...(grant.pools.length ? { pools: grant.pools.map((p) => p.pool) } : {}),
       ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
+      // Restricts the pool grants to one project; the controller re-checks it on every request.
+      ...(grant.project && grant.pools.length ? { project: grant.project } : {}),
     },
   });
   const body = (await response.json().catch(() => null)) as {
@@ -86,21 +88,28 @@ export async function grantableWorkspaces(): Promise<Workspace[]> {
   );
 }
 
-export type Pool = { name: string; description: string; profile: string | null; members: number };
+export type Pool = { name: string; project: string; description: string; profile: string | null; members: number };
 
-/** Owner-managed pools the owner can grant. */
+/** Pools listed by a controller without projects belong to this one. */
+export const DEFAULT_PROJECT = "default";
+/** The controller's project IDs (the fleet Worker's identifier shape). */
+export const PROJECT = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
+
+/** Owner-managed pools the owner can grant, sorted by project then name. */
 export async function grantablePools(): Promise<Pool[]> {
   const response = await call("v1/pools", { method: "GET" });
   if (!response.ok) throw new HttpError(503, "The fleet service could not list pools.");
-  const body = (await response.json()) as { pools?: { name?: unknown; description?: unknown; profile?: unknown; members?: unknown }[] };
+  const body = (await response.json()) as { pools?: { name?: unknown; project?: unknown; description?: unknown; profile?: unknown; members?: unknown }[] };
   return (body.pools ?? [])
     .filter((p) => typeof p.name === "string")
     .map((p) => ({
       name: p.name as string,
+      project: typeof p.project === "string" && PROJECT.test(p.project) ? p.project : DEFAULT_PROJECT,
       description: typeof p.description === "string" ? p.description : "",
       profile: typeof p.profile === "string" ? p.profile : null,
       members: Array.isArray(p.members) ? p.members.length : 0,
-    }));
+    }))
+    .sort((a, b) => a.project.localeCompare(b.project) || a.name.localeCompare(b.name));
 }
 
 /** Names of the owner's profiles, so consent never stores one the controller would refuse at mint. */

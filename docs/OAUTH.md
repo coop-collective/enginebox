@@ -17,7 +17,11 @@ to list workspaces, pools and profiles for the consent screen.
 
 Set `ENGINEBOX_OAUTH_STATE_DIR` to an absolute directory owned by the dashboard
 user. Without it, every OAuth path answers 404. Under the supervisor, add it to the
-private `environment_file` (it is on the allowlist). The directory is created with
+private `environment_file` (it is on the allowlist of supervisors built from this
+release onward; an older supervisor refuses to start with a key it does not know,
+so set it in the supervisor's service environment instead, which its children
+inherit). `ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS` (optional, default 30) is on the
+same allowlist. The directory is created with
 mode 0700 and holds `oauth.json` (mode 0600) plus a short-lived lock file. Old and
 candidate dashboards share it safely during an update: every change is a locked
 read-modify-write with an atomic rename, and no network call happens under the lock.
@@ -35,12 +39,14 @@ read-modify-write with an atomic rename, and no network call happens under the l
 3. **Authorization.** The app sends the browser to `/oauth/authorize` with
    `response_type=code`, `client_id`, `redirect_uri`, `code_challenge` +
    `code_challenge_method=S256`, `resource=<origin>`, optional `scope=agent-runs`
-   and `state`.
+   and `state`, and optional `project=<id>` to ask for one project's pools only:
+   consent then offers only that project's pools, and the grant (and every access
+   token minted for it) is restricted to that project.
 4. **Sign-in and consent.** The owner signs in (if needed) and sees the app's
    self-chosen name, its redirect host and client ID, then ticks the pools and the
    workspaces (host/instance) it may use and, optionally, profile names per
-   workspace. Pools come from the controller's owner-managed pool list; a pool's
-   own profile is shown and is granted with the pool. Named profiles must exist on
+   workspace. Pools come from the controller's owner-managed pool list, grouped by
+   [project](QUEUE.md#pools); a pool's own profile is shown and is granted with the pool. Named profiles must exist on
    the controller. If one list cannot be read (for example, a host's inventory is
    unreachable), the other is still offered.
 5. **Code.** Engine Box redirects to the exact registered URI with `code`, the
@@ -57,7 +63,7 @@ read-modify-write with an atomic rename, and no network call happens under the l
   "scope": "agent-runs",
   "enginebox_grants": [
     { "kind": "workspace", "host": "primary", "instance": "ebox-work", "profiles": ["review"] },
-    { "kind": "pool", "pool": "workers", "profile": "coder", "profiles": ["coder"] }
+    { "kind": "pool", "pool": "workers", "project": "default", "profile": "coder", "profiles": ["coder"] }
   ],
   "enginebox_callback_secret": "<43 characters>"
 }
@@ -66,7 +72,9 @@ read-modify-write with an atomic rename, and no network call happens under the l
 `enginebox_grants` lists one entry per consented workspace (the original
 `{host, instance, profiles}` shape plus `kind`) and per pool. A pool entry's
 `profile` is the pool's own profile (or null) and `profiles` repeats it as a list,
-so clients that read `profiles` on every entry keep working.
+so clients that read `profiles` on every entry keep working. `project` is the
+project the pool belonged to at consent (`default` for grants made before pools had
+projects, or against a controller that does not report them).
 `enginebox_callback_secret` is returned only by the code exchange: it is the HMAC
 key the controller signs this connection's run [callbacks](FLEET.md#agent-runs-v2)
 with, and it stays the same across refreshes. A refresh response repeats
@@ -107,11 +115,12 @@ redirect hosts, workspaces, pools, profiles, last renewal) with a Disconnect but
 | Authorization code | 60 seconds, single use. Any presentation burns it (a wrong verifier cannot be retried); a replay revokes the connection it produced |
 | Access token | 1 hour. A scoped controller service token (`agent_runs.start/get/list/cancel` on exactly the consented workspaces and `pools`, with the named workspace profiles as its `profiles` grant and the connection's `callback_secret`), labelled `oauth grant <id>` |
 | Callback key | The life of the connection; generated at the code exchange and passed to every access token minted for it |
-| Refresh token | 30 days, sliding: each refresh issues a new one and resets the 30 days. Rotated tokens are remembered; presenting one again revokes the whole connection |
+| Refresh token | 30 days, sliding: each refresh issues a new one and resets the 30 days. Rotated tokens are remembered; presenting one again revokes the whole connection, except within the grace window below |
+| Refresh grace window | 30 seconds (`ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS`, 0 to 300; 0 turns it off). Presenting the immediately-previous refresh token within the window, from the same client, returns the same token pair that refresh already issued |
 | Client secret | No expiry |
 
 Codes, refresh tokens, client secrets and access tokens are stored only as SHA-256
-digests. Each refresh mints a new service token and revokes the previous one on the
+digests, except the one token pair kept for the refresh grace window (below). Each refresh mints a new service token and revokes the previous one on the
 controller. Revoking a connection (owner Disconnect, a client revoking its refresh
 token, refresh reuse or code replay) revokes the live access token too. If the
 controller cannot be reached, the revocation is queued and retried on the next
@@ -123,6 +132,40 @@ If the controller refuses to mint a token for a connection (HTTP 400: a consente
 workspace, pool or profile no longer exists), the code exchange or refresh answers
 `invalid_grant` and a refresh also revokes the connection, so the app asks the
 owner again instead of retrying forever.
+
+## Refresh grace window
+
+A refresh can succeed on the server while its response is lost (a timeout, a
+dropped connection, a crash before the client saved the new tokens). The client then
+retries with the refresh token it still holds, which was just rotated. Without a
+grace window that looks like token theft and revokes the whole connection.
+
+After each rotation, the previous refresh token's digest and the new pair are kept
+for the window. Within it, the same client presenting that previous token gets the
+**same** access and refresh tokens again (`expires_in` counts down from the original
+issue); nothing new is minted and nothing is extended. Two concurrent refreshes with
+one token are handled the same way: the loser's freshly minted access token is
+revoked and it receives the winner's pair. Outside the window, for a token two or
+more generations old, or from another client, reuse detection revokes the connection
+exactly as before. Revoking the connection, or the next rotation, closes the window.
+
+**Tradeoff.** Returning the same pair requires the new access and refresh tokens to
+be recoverable for the window, so they are kept in `oauth.json` as AES-256-GCM
+ciphertext (authenticated with the grant ID and the previous token's digest) under a
+key derived with HKDF-SHA256 from `ENGINEBOX_SESSION_SECRET`. The key is never
+written to disk, so a copy of `oauth.json` alone (a backup, a leaked file) does not
+reveal them; someone holding both the file and the dashboard's environment could
+read a pair for at most 30 seconds after each refresh. The ciphertext is deleted at
+the end of the window by the next state transaction (every OAuth call prunes it),
+and it is cleared on revocation. The cost of the window itself: a thief who replays
+the previous refresh token within 30 seconds of a legitimate refresh, as the same
+client (client authentication still applies; for public clients that is the client
+ID only), receives the current pair instead of triggering revocation; it does not
+gain anything the legitimate client did not already hold, and the next real refresh
+still rotates both. If the session secret changes during a window, the stored pair
+cannot be decrypted: the retry answers `invalid_grant` without revoking, and the
+client signs in again only if its new tokens were truly lost. Set the window to 0 to
+keep strict one-time refresh tokens.
 
 ## Security model
 

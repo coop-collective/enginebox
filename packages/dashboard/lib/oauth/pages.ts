@@ -65,6 +65,8 @@ export function consentPage(opts: {
   redirectUri: string;
   workspaces: Workspace[];
   pools?: Pool[];
+  /** The app asked for this project's pools only. */
+  project?: string | null;
   error?: string;
 }) {
   const redirect = new URL(opts.redirectUri);
@@ -78,13 +80,23 @@ export function consentPage(opts: {
         })
         .join("")
     : `<p class="muted">There are no assigned workspaces to share yet. Create one in the dashboard first.</p>`;
-  const poolList = pools
+  const poolRow = (p: Pool) =>
+    `<label class="ws"><input type="checkbox" name="pool" value="${escape(p.name)}"> <strong>${escape(p.name)}</strong> <span class="muted">${p.members} workspace${p.members === 1 ? "" : "s"}` +
+    `${p.profile ? ` · runs use profile <code>${escape(p.profile)}</code>` : ""}${p.description ? ` · ${escape(p.description)}` : ""}</span></label>`;
+  // Pools are grouped by the project they belong to.
+  const projects = [...new Set(pools.map((p) => p.project))];
+  const poolList = projects
     .map(
-      (p) =>
-        `<label class="ws"><input type="checkbox" name="pool" value="${escape(p.name)}"> <strong>${escape(p.name)}</strong> <span class="muted">${p.members} workspace${p.members === 1 ? "" : "s"}` +
-        `${p.profile ? ` · runs use profile <code>${escape(p.profile)}</code>` : ""}${p.description ? ` · ${escape(p.description)}` : ""}</span></label>`,
+      (project) =>
+        `<div class="project"><p class="muted">Project <code>${escape(project)}</code></p>${pools
+          .filter((p) => p.project === project)
+          .map(poolRow)
+          .join("")}</div>`,
     )
     .join("");
+  const poolLegend = opts.project
+    ? `Pools in project <code>${escape(opts.project)}</code> it may run agents on (the app asked for this project only; Engine Box picks a free workspace)`
+    : "Pools it may run agents on, by project (Engine Box picks a free workspace)";
   const any = opts.workspaces.length > 0 || pools.length > 0;
   return page(
     "Connect an app to Engine Box",
@@ -93,7 +105,7 @@ export function consentPage(opts: {
       `<p class="muted">The app chose its own name; check that you started this connection. Client ID <code>${escape(opts.clientId)}</code>.</p>` +
       (opts.error ? `<p class="warn" role="alert">${escape(opts.error)}</p>` : "") +
       `<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escape(opts.request)}">` +
-      (pools.length ? `<fieldset><legend>Pools it may run agents on (Engine Box picks a free workspace)</legend>${poolList}</fieldset>` : "") +
+      (pools.length ? `<fieldset><legend>${poolLegend}</legend>${poolList}</fieldset>` : "") +
       `<fieldset><legend>Workspaces it may run agents on</legend>${list}</fieldset>` +
       `<p class="muted">It can start, read, list and cancel agent runs in the workspaces and pools you select, and nothing else: no fleet, template, storage, provider sign-in or account settings. You can disconnect it at any time from the dashboard.</p>` +
       `<div class="actions"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="approve"${any ? "" : " disabled"}>Allow access</button></div></form>`,

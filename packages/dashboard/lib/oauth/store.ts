@@ -15,8 +15,11 @@ import { HttpError } from "../server";
 
 export type AuthMethod = "none" | "client_secret_basic" | "client_secret_post";
 export type WorkspaceGrant = { host: string; instance: string; profiles: string[] };
-/** A consented pool: the controller places each run on a free member. `profile` is the pool's own, if any. */
-export type PoolGrant = { pool: string; profile: string | null };
+/**
+ * A consented pool: the controller places each run on a free member. `profile` is the pool's own, if any.
+ * `project` is the pool's project at consent (absent in state written before pools had projects: "default").
+ */
+export type PoolGrant = { pool: string; profile: string | null; project?: string };
 
 export type Client = {
   client_id: string;
@@ -38,6 +41,8 @@ export type Pending = {
   scope: string;
   resource: string;
   expires_at: number;
+  /** The app asked for one project's pools (`project` authorization parameter). */
+  project?: string | null;
 };
 export type Code = {
   hash: string;
@@ -50,6 +55,8 @@ export type Code = {
   workspaces: WorkspaceGrant[];
   /** Absent in state written before pool grants existed. */
   pools?: PoolGrant[];
+  /** Restricts the grant's pools to one project (absent or null: no restriction). */
+  project?: string | null;
   expires_at: number;
   used_at: number | null;
   /** The grant this code produced, so a replay can revoke it. */
@@ -72,6 +79,8 @@ export type Grant = {
    * the code exchange. Absent for grants made before callbacks were supported.
    */
   callback_secret?: string;
+  /** Restricts the grant's pools to one project; every access token carries it. */
+  project?: string | null;
   created_at: number;
   refreshed_at: number;
   revoked_at: number | null;
@@ -82,6 +91,17 @@ export type Grant = {
   access_token_id: string | null;
   access_token_hash: string | null;
   access_expires_at: number;
+  /**
+   * Refresh grace window. After a rotation, the immediately-previous refresh
+   * token (`previous_refresh_hash`, a SHA-256 digest) may be presented again
+   * by the same client until `grace_until` and receives the same token pair,
+   * which is kept only as `grace_pair`: AES-256-GCM ciphertext under a key
+   * derived from ENGINEBOX_SESSION_SECRET. Cleared when the window ends, on the
+   * next rotation and on revocation. Absent in older state.
+   */
+  previous_refresh_hash?: string | null;
+  grace_until?: number;
+  grace_pair?: string | null;
 };
 export type State = {
   version: 1;
@@ -181,6 +201,11 @@ function prune(state: State, now: number) {
     (g) => !(g.revoked_at !== null && g.revoked_at + 30 * DAY < now) && !(g.revoked_at === null && g.refresh_expires_at + 30 * DAY < now),
   );
   for (const grant of state.grants) {
+    // The retrievable copy of a token pair lives only for its grace window.
+    if (grant.grace_pair && !((grant.grace_until ?? 0) > now)) {
+      grant.grace_pair = null;
+      grant.previous_refresh_hash = null;
+    }
     if (grant.revoked_at === null && grant.refresh_expires_at <= now) {
       grant.revoked_at = now;
       grant.revoke_reason = "expired";

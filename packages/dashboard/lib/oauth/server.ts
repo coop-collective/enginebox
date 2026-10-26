@@ -1,6 +1,6 @@
-import { timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { config, HttpError, json, requireOrigin, requireSession } from "../server";
-import { GrantRefused, grantablePools, grantableWorkspaces, mintAccessToken, profileNames, revokeAccessToken, type Minted, type Pool, type Workspace } from "./controller";
+import { DEFAULT_PROJECT, GrantRefused, grantablePools, grantableWorkspaces, mintAccessToken, PROJECT, profileNames, revokeAccessToken, type Minted, type Pool, type Workspace } from "./controller";
 import { users } from "./identity";
 import { consentPage, errorPage, page, signInPage } from "./pages";
 import {
@@ -23,6 +23,8 @@ export const ACCESS_TOKEN_SECONDS = 60 * 60;
 export const CODE_SECONDS = 60;
 const PENDING_SECONDS = 10 * 60;
 export const REFRESH_SECONDS = 30 * 24 * 60 * 60;
+/** Default refresh grace window; ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS sets 0 (off) to 300. */
+export const REFRESH_GRACE_SECONDS = 30;
 const MAX_CLIENTS = 200;
 const MAX_PENDING = 200;
 const MAX_GRANT_WORKSPACES = 64;
@@ -236,9 +238,15 @@ function redirectTo(redirectUri: string, params: Record<string, string | null>, 
 
 const sameResource = (value: string) => value === resourceId() || value === `${resourceId()}/`;
 
-function render(request: Request, pendingId: string, client: Client, redirectUri: string, extra: { error?: string; setCookie?: string } = {}) {
+function render(
+  request: Request,
+  pendingId: string,
+  client: Client,
+  redirectUri: string,
+  extra: { error?: string; setCookie?: string; project?: string | null } = {},
+) {
   return (async () => {
-    const listed = await grantable();
+    const listed = await grantable(extra.project);
     if (!listed) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
     const response = consentPage({
       request: pendingId,
@@ -247,6 +255,7 @@ function render(request: Request, pendingId: string, client: Client, redirectUri
       redirectUri,
       workspaces: listed.workspaces,
       pools: listed.pools,
+      project: extra.project,
       error: extra.error,
     });
     if (extra.setCookie) response.headers.append("Set-Cookie", extra.setCookie);
@@ -258,10 +267,15 @@ function render(request: Request, pendingId: string, client: Client, redirectUri
  * What the owner can grant. Either list may fail on its own (a host whose
  * inventory cannot be read still leaves its pools grantable); null when both do.
  */
-async function grantable(): Promise<{ workspaces: Workspace[]; pools: Pool[] } | null> {
+async function grantable(project?: string | null): Promise<{ workspaces: Workspace[]; pools: Pool[] } | null> {
   const [workspaces, pools] = await Promise.allSettled([grantableWorkspaces(), grantablePools()]);
   if (workspaces.status === "rejected" && pools.status === "rejected") return null;
-  return { workspaces: workspaces.status === "fulfilled" ? workspaces.value : [], pools: pools.status === "fulfilled" ? pools.value : [] };
+  const listed = pools.status === "fulfilled" ? pools.value : [];
+  return {
+    workspaces: workspaces.status === "fulfilled" ? workspaces.value : [],
+    // An app that asked for one project's pools is offered only those.
+    pools: project ? listed.filter((p) => p.project === project) : listed,
+  };
 }
 
 function findPending(state: State, id: string | null) {
@@ -279,7 +293,7 @@ export async function authorize(request: Request) {
   if (resumeId !== null) {
     const found = findPending(readState(), resumeId);
     if (!found) return errorPage("This authorization request has expired or was already used.");
-    if (users().current(request)) return render(request, resumeId, found.client, found.pending.redirect_uri);
+    if (users().current(request)) return render(request, resumeId, found.client, found.pending.redirect_uri, { project: found.pending.project });
     return signInPage(users(), resumeId, found.client.client_name);
   }
   const keys = [...params.keys()];
@@ -304,6 +318,9 @@ export async function authorize(request: Request) {
   if (scope.split(" ").some((s) => s !== SCOPE)) return fail("invalid_scope", `The only scope is ${SCOPE}.`);
   const resource = params.get("resource") ?? "";
   if (!sameResource(resource)) return fail("invalid_target", `resource must be ${resourceId()}.`);
+  // Optional: the app asks for one project's pools; the grant is then restricted to that project.
+  const project = params.get("project");
+  if (project !== null && !PROJECT.test(project)) return fail("invalid_request", "project must be a project ID.");
   const id = randomToken(24);
   withState((s, now) => {
     if (s.pending.length >= MAX_PENDING) s.pending.splice(0, s.pending.length - MAX_PENDING + 1);
@@ -316,9 +333,10 @@ export async function authorize(request: Request) {
       scope: SCOPE,
       resource: resourceId(),
       expires_at: now + PENDING_SECONDS * 1000,
+      project,
     });
   });
-  if (users().current(request)) return render(request, id, client, redirectUri);
+  if (users().current(request)) return render(request, id, client, redirectUri, { project });
   // The session cookie is SameSite=Strict, so it is not sent on the app's
   // cross-site redirect here. One same-origin navigation reveals whether the
   // owner is already signed in before asking for a password.
@@ -353,11 +371,12 @@ export async function authorizePost(request: Request) {
   const found = findPending(readState(), id);
   if (!found || !id) return errorPage("This authorization request has expired or was already used.");
   const { pending, client } = found;
+  const project = pending.project ?? null;
   const action = form.get("action");
   if (action === "sign_in") {
     try {
       const { setCookie } = users().signIn(form);
-      return render(request, id, client, pending.redirect_uri, { setCookie });
+      return render(request, id, client, pending.redirect_uri, { setCookie, project });
     } catch (error) {
       return signInPage(users(), id, client.client_name, error instanceof HttpError && error.status < 500 ? error.message : "Sign-in failed.");
     }
@@ -379,25 +398,25 @@ export async function authorizePost(request: Request) {
 
   const chosen = [...new Set(form.getAll("workspace"))];
   const chosenPools = [...new Set(form.getAll("pool"))];
-  if (!chosen.length && !chosenPools.length) return render(request, id, client, pending.redirect_uri, { error: "Select at least one workspace or pool." });
+  if (!chosen.length && !chosenPools.length) return render(request, id, client, pending.redirect_uri, { project, error: "Select at least one workspace or pool." });
   if (chosen.length > MAX_GRANT_WORKSPACES || chosen.length + chosenPools.length > MAX_GRANT_TARGETS)
-    return render(request, id, client, pending.redirect_uri, { error: "Select fewer workspaces and pools." });
-  const available = await grantable();
+    return render(request, id, client, pending.redirect_uri, { project, error: "Select fewer workspaces and pools." });
+  const available = await grantable(project);
   if (!available) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
   const workspaces: WorkspaceGrant[] = [];
   for (const value of chosen) {
     const workspace = available.workspaces.find((w) => `${w.host}/${w.instance}` === value);
-    if (!workspace) return render(request, id, client, pending.redirect_uri, { error: "A selected workspace is no longer available." });
+    if (!workspace) return render(request, id, client, pending.redirect_uri, { project, error: "A selected workspace is no longer available." });
     const profiles = [...new Set((form.get(`profiles:${value}`) ?? "").split(",").map((p) => p.trim()).filter(Boolean))];
     if (profiles.length > 16 || profiles.some((p) => !PROFILE.test(p)))
-      return render(request, id, client, pending.redirect_uri, { error: "Profile names use letters, digits, dot, dash or underscore (at most 16 per workspace)." });
+      return render(request, id, client, pending.redirect_uri, { project, error: "Profile names use letters, digits, dot, dash or underscore (at most 16 per workspace)." });
     workspaces.push({ host: workspace.host, instance: workspace.instance, profiles });
   }
   const pools: PoolGrant[] = [];
   for (const name of chosenPools) {
     const pool = available.pools.find((p) => p.name === name);
-    if (!pool) return render(request, id, client, pending.redirect_uri, { error: "A selected pool is no longer available." });
-    pools.push({ pool: pool.name, profile: pool.profile });
+    if (!pool) return render(request, id, client, pending.redirect_uri, { project, error: "A selected pool is no longer available." });
+    pools.push({ pool: pool.name, profile: pool.profile, project: pool.project });
   }
   // The controller refuses to mint a token naming an unknown profile; say so here instead.
   const named = [...new Set(workspaces.flatMap((w) => w.profiles))];
@@ -409,7 +428,7 @@ export async function authorizePost(request: Request) {
       return errorPage("Engine Box could not list your profiles. Check that the fleet service is running.", 503);
     }
     const unknown = named.filter((p) => !known.includes(p));
-    if (unknown.length) return render(request, id, client, pending.redirect_uri, { error: `Unknown profile: ${unknown.join(", ")}.` });
+    if (unknown.length) return render(request, id, client, pending.redirect_uri, { project, error: `Unknown profile: ${unknown.join(", ")}.` });
   }
   const code = `${CODE_PREFIX}${randomToken()}`;
   const ok = withState((state, now) => {
@@ -426,6 +445,7 @@ export async function authorizePost(request: Request) {
       user_id: user.id,
       workspaces,
       pools,
+      project,
       expires_at: now + CODE_SECONDS * 1000,
       used_at: null,
       grant_id: null,
@@ -485,12 +505,19 @@ function authenticateClient(request: Request, form: URLSearchParams, state: Stat
  * The `enginebox_grants` extension: one entry per consented workspace
  * (`{kind: "workspace", host, instance, profiles}`, the original shape plus
  * `kind`) and per pool (`{kind: "pool", pool, profile, profiles}`, where
- * `profile` is the pool's own profile and `profiles` repeats it as a list).
+ * `profile` is the pool's own profile and `profiles` repeats it as a list, and
+ * `project` is the project the pool belonged to at consent).
  */
 export function grantsView(grant: Pick<Grant, "workspaces" | "pools">) {
   return [
     ...grant.workspaces.map((w) => ({ kind: "workspace" as const, host: w.host, instance: w.instance, profiles: w.profiles })),
-    ...(grant.pools ?? []).map((p) => ({ kind: "pool" as const, pool: p.pool, profile: p.profile, profiles: p.profile ? [p.profile] : [] })),
+    ...(grant.pools ?? []).map((p) => ({
+      kind: "pool" as const,
+      pool: p.pool,
+      project: p.project ?? DEFAULT_PROJECT,
+      profile: p.profile,
+      profiles: p.profile ? [p.profile] : [],
+    })),
   ];
 }
 function tokenResponse(minted: Minted, refresh: string, grant: Pick<Grant, "workspaces" | "pools">, callbackSecret?: string) {
@@ -516,6 +543,61 @@ function revokeGrantIn(state: State, grant: Grant, reason: string, now: number) 
   if (grant.access_token_id) state.pending_revocations.push(grant.access_token_id);
   grant.access_token_id = null;
   grant.access_token_hash = null;
+  grant.grace_pair = null;
+  grant.previous_refresh_hash = null;
+}
+
+// ---------------------------------------------------------------- refresh grace window
+
+/**
+ * The grace window in seconds: ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS (0 turns it
+ * off, at most 300), else REFRESH_GRACE_SECONDS.
+ */
+export function refreshGraceSeconds() {
+  const raw = process.env.ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS;
+  if (raw === undefined || raw === "") return REFRESH_GRACE_SECONDS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 300) throw new HttpError(503, "ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS must be an integer from 0 to 300.");
+  return n;
+}
+type GracePair = { access_token: string; access_token_id: string; access_expires_at: number; refresh_token: string };
+/** AES-256-GCM key for grace pairs, derived from the dashboard's session secret (never stored). */
+function graceKey() {
+  return Buffer.from(hkdfSync("sha256", config().secret, "enginebox-oauth", "refresh-grace-v1", 32));
+}
+function sealGrace(grantId: string, previousHash: string, pair: GracePair) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", graceKey(), iv);
+  cipher.setAAD(Buffer.from(`${grantId}:${previousHash}`));
+  const sealed = Buffer.concat([cipher.update(JSON.stringify(pair), "utf8"), cipher.final()]);
+  return `v1.${Buffer.concat([iv, cipher.getAuthTag(), sealed]).toString("base64url")}`;
+}
+function openGrace(grantId: string, previousHash: string, blob: string): GracePair | null {
+  try {
+    if (!blob.startsWith("v1.")) return null;
+    const raw = Buffer.from(blob.slice(3), "base64url");
+    const decipher = createDecipheriv("aes-256-gcm", graceKey(), raw.subarray(0, 12));
+    decipher.setAAD(Buffer.from(`${grantId}:${previousHash}`));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    const pair = JSON.parse(Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString("utf8")) as GracePair;
+    return typeof pair.access_token === "string" && typeof pair.refresh_token === "string" ? pair : null;
+  } catch {
+    // A rotated session secret or a damaged record: the pair is unrecoverable.
+    return null;
+  }
+}
+/**
+ * The pair issued for `hash` when it is the grant's immediately-previous refresh
+ * token and its grace window is open; "closed" when it is not; "lost" when it is
+ * but the stored pair cannot be decrypted.
+ */
+function graceReplay(grant: Grant, hash: string, now: number): GracePair | "closed" | "lost" {
+  if (grant.revoked_at !== null || !grant.previous_refresh_hash || !grant.grace_pair || !((grant.grace_until ?? 0) > now)) return "closed";
+  if (!equalHash(grant.previous_refresh_hash, hash)) return "closed";
+  return openGrace(grant.id, hash, grant.grace_pair) ?? "lost";
+}
+function graceResponse(pair: GracePair, grant: Pick<Grant, "workspaces" | "pools">) {
+  return tokenResponse({ id: pair.access_token_id, secret: pair.access_token, expires_at: pair.access_expires_at }, pair.refresh_token, grant);
 }
 
 /** Revoke queued controller tokens; failures stay queued and are retried on the next call. */
@@ -581,7 +663,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
   const callbackSecret = randomToken(32);
   let minted: Minted;
   try {
-    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, callback_secret: callbackSecret }, ACCESS_TOKEN_SECONDS);
+    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, callback_secret: callbackSecret, project: record.project }, ACCESS_TOKEN_SECONDS);
   } catch (error) {
     if (error instanceof GrantRefused) throw new OAuthError("invalid_grant", error.message);
     throw error;
@@ -602,6 +684,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
       workspaces: record.workspaces,
       pools,
       callback_secret: callbackSecret,
+      project: record.project ?? null,
       created_at: now,
       refreshed_at: now,
       revoked_at: null,
@@ -631,18 +714,30 @@ async function refresh(request: Request, form: URLSearchParams) {
     const grant = parsed && state.grants.find((g) => g.id === parsed.grantId);
     if (!parsed || !grant || grant.client_id !== client.client_id) throw new OAuthError("invalid_grant", "The refresh token is invalid.");
     if (grant.used_refresh_hashes.includes(parsed.hash)) {
+      // The immediately-previous token, within its grace window, from the same
+      // client (checked above): the response to that refresh was probably lost.
+      // Answer with the same pair instead of treating it as theft.
+      const replay = graceReplay(grant, parsed.hash, now);
+      if (replay === "lost") throw new OAuthError("invalid_grant", "The refresh token was already used.");
+      if (replay !== "closed") return { reuse: false as const, replay, grant: structuredClone(grant) };
       // Reuse of a rotated refresh token: assume theft and end the whole family.
       revokeGrantIn(state, grant, "refresh token reused", now);
       return { reuse: true as const };
     }
     if (grant.revoked_at !== null || grant.refresh_hash !== parsed.hash) throw new OAuthError("invalid_grant", "The refresh token is invalid.");
-    return { reuse: false as const, grant: structuredClone(grant) };
+    return { reuse: false as const, replay: null, grant: structuredClone(grant) };
   });
   if (checked.reuse) throw new OAuthError("invalid_grant", "The refresh token was already used; this connection is revoked.");
+  if (checked.replay) return graceResponse(checked.replay, checked.grant);
   const grant = checked.grant;
+  const graceSeconds = refreshGraceSeconds();
   let minted: Minted;
   try {
-    minted = await mintAccessToken(grant.id, { workspaces: grant.workspaces, pools: grant.pools ?? [], callback_secret: grant.callback_secret }, ACCESS_TOKEN_SECONDS);
+    minted = await mintAccessToken(
+      grant.id,
+      { workspaces: grant.workspaces, pools: grant.pools ?? [], callback_secret: grant.callback_secret, project: grant.project },
+      ACCESS_TOKEN_SECONDS,
+    );
   } catch (error) {
     if (!(error instanceof GrantRefused)) throw error;
     // What the owner consented to is gone: end the connection so the app asks again.
@@ -660,13 +755,30 @@ async function refresh(request: Request, form: URLSearchParams) {
       return "revoked";
     }
     if (current.refresh_hash !== parsed!.hash) {
-      // A concurrent refresh already rotated this token: that is reuse.
       state.pending_revocations.push(minted.id);
+      // A concurrent refresh with the same token already rotated it: within the
+      // grace window, answer with the pair that refresh issued.
+      const replay = graceReplay(current, parsed!.hash, now);
+      if (replay !== "closed" && replay !== "lost") return replay;
+      if (replay === "lost") return "lost";
       revokeGrantIn(state, current, "refresh token reused", now);
       return "reused";
     }
     if (current.access_token_id) state.pending_revocations.push(current.access_token_id);
     current.used_refresh_hashes = [...current.used_refresh_hashes, parsed!.hash].slice(-100);
+    if (graceSeconds > 0) {
+      current.previous_refresh_hash = parsed!.hash;
+      current.grace_until = now + graceSeconds * 1000;
+      current.grace_pair = sealGrace(current.id, parsed!.hash, {
+        access_token: minted.secret,
+        access_token_id: minted.id,
+        access_expires_at: minted.expires_at,
+        refresh_token: next,
+      });
+    } else {
+      current.previous_refresh_hash = null;
+      current.grace_pair = null;
+    }
     current.refresh_hash = sha256(next);
     current.refresh_expires_at = now + REFRESH_SECONDS * 1000;
     current.refreshed_at = now;
@@ -677,6 +789,8 @@ async function refresh(request: Request, form: URLSearchParams) {
   });
   if (outcome === "reused") throw new OAuthError("invalid_grant", "The refresh token was already used; this connection is revoked.");
   if (outcome === "revoked") throw new OAuthError("invalid_grant", "The refresh token is invalid.");
+  if (outcome === "lost") throw new OAuthError("invalid_grant", "The refresh token was already used.");
+  if (outcome !== "ok") return graceResponse(outcome, grant);
   return tokenResponse(minted, next, grant);
 }
 
@@ -817,7 +931,8 @@ export function listGrants(request: Request) {
         redirect_hosts: [...new Set((client?.redirect_uris ?? []).map((u) => new URL(u).host))],
         scope: g.scope,
         workspaces: grantsView({ workspaces: g.workspaces }),
-        pools: (g.pools ?? []).map((p) => ({ pool: p.pool, profile: p.profile })),
+        pools: (g.pools ?? []).map((p) => ({ pool: p.pool, profile: p.profile, project: p.project ?? DEFAULT_PROJECT })),
+        project: g.project ?? null,
         created_at: new Date(g.created_at).toISOString(),
         refreshed_at: new Date(g.refreshed_at).toISOString(),
         access_token_active: g.access_token_id !== null && g.access_expires_at > now,

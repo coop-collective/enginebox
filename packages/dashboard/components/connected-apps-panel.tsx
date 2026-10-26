@@ -8,7 +8,9 @@ type Connection = {
   client_name: string;
   redirect_hosts: string[];
   workspaces: { host: string; instance: string; profiles: string[] }[];
-  pools?: { pool: string; profile: string | null }[];
+  pools?: { pool: string; profile: string | null; project?: string }[];
+  /** The connection is restricted to this project's pools. */
+  project?: string | null;
   created_at: string;
   refreshed_at: string;
   access_token_active: boolean;
@@ -64,6 +66,7 @@ export function ConnectedAppsPanel() {
             <p>Returns to {c.redirect_hosts.join(", ")} · client <code>{c.client_id}</code></p>
             <p>Connected {new Date(c.created_at).toLocaleString()} · last renewed {new Date(c.refreshed_at).toLocaleString()}</p>
             <p>{c.access_token_active ? "Access token active" : "No active access token"}</p>
+            {c.project ? <p>Restricted to pools in project <code>{c.project}</code></p> : null}
             <ul>
               {c.workspaces.map((w) => (
                 <li key={`${w.host}/${w.instance}`}>
@@ -71,12 +74,15 @@ export function ConnectedAppsPanel() {
                   {w.profiles.length ? ` · profiles: ${w.profiles.join(", ")}` : ""}
                 </li>
               ))}
-              {(c.pools ?? []).map((p) => (
-                <li key={`pool:${p.pool}`}>
-                  pool <code>{p.pool}</code>
-                  {p.profile ? ` · profile: ${p.profile}` : ""}
-                </li>
-              ))}
+              {[...(c.pools ?? [])]
+                .sort((a, b) => (a.project ?? "").localeCompare(b.project ?? "") || a.pool.localeCompare(b.pool))
+                .map((p) => (
+                  <li key={`pool:${p.pool}`}>
+                    pool <code>{p.pool}</code>
+                    {p.project ? ` · project ${p.project}` : ""}
+                    {p.profile ? ` · profile: ${p.profile}` : ""}
+                  </li>
+                ))}
             </ul>
             <button className="button small" disabled={busy === c.id} onClick={() => void disconnect(c)}>Disconnect</button>
           </article>
