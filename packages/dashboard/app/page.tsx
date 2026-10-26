@@ -1021,14 +1021,14 @@ export default function Dashboard() {
                   <p>{sections[section].description}</p>
                 </div>
                 <div className="heading-actions">
-                  <button
+                  {section !== "machines" && <button
                     className="button"
                     onClick={refresh}
                     disabled={refreshing}
                   >
                     <Icon name="refresh" size={16} />
                     {refreshing ? "Refreshing" : "Refresh"}
-                  </button>
+                  </button>}
                   {section === "fleet" && (
                     <button
                       className="button primary"

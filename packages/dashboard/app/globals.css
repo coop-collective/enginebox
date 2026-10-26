@@ -1623,10 +1623,54 @@ input::placeholder {
 
 .contributor-panel { display: grid; gap: 20px; }
 .contributor-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
-.contributor-panel .host-card { display: grid; gap: 12px; }
 .contributor-panel p { color: var(--muted); font-size: 13px; line-height: 1.6; }
 .contributor-panel h2 { font-size: 18px; }
+.contributor-panel h3 { font-size: 15px; }
+.contributor-panel h4 { margin: 0; font-size: 13px; }
 .contributor-panel .button { justify-self: start; }
+.worker-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.worker-surface { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: white; padding: 20px; }
+.contributor-form { display: grid; gap: 16px; max-width: 640px; }
+.worker-enrollment { display: grid; gap: 18px; border-color: #a5d6ce; }
+.worker-install-step { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.worker-command summary, .worker-history summary, .worker-manage summary { cursor: pointer; font-size: 13px; }
+.worker-command textarea { width: 100%; margin-top: 12px; resize: vertical; font: 12px/1.6 monospace; border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+.worker-code { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; padding: 18px; border-radius: 8px; background: #f0f7f5; }
+.worker-code > div { grid-column: 1 / -1; }
+.worker-code label { min-width: 0; }
+.worker-code input { width: 100%; font-family: monospace; font-size: 12px; background: white; }
+.worker-identity code { overflow-wrap: anywhere; font-size: 11px; }
+.worker-list-heading { display: flex; align-items: center; gap: 8px; padding-bottom: 16px; }
+.worker-list-heading h2 { font-size: 15px; }
+.worker-list-heading > span, .worker-count { font-size: 11px; color: #586c73; background: #edf2f3; border-radius: 5px; padding: 3px 7px; }
+.worker-list { list-style: none; padding: 0; margin: 0; }
+.worker-row { display: grid; grid-template-columns: minmax(140px, 1fr) 110px minmax(160px, 1fr) auto; align-items: start; gap: 18px; padding: 18px 0; border-top: 1px solid var(--line); }
+.worker-name, .worker-capacity { display: grid; gap: 6px; min-width: 0; font-size: 13px; }
+.worker-name strong { overflow-wrap: anywhere; font-weight: 600; }
+.worker-name small, .worker-capacity small { color: #65777e; font-size: 12px; line-height: 1.5; }
+.worker-name code { color: #65777e; font-size: 11px; overflow-wrap: anywhere; }
+.worker-status { justify-self: start; white-space: nowrap; border-radius: 5px; background: #f0f3f4; color: #596c74; padding: 5px 8px; font-size: 11px; }
+.worker-status.online { background: #e6f5ee; color: #176d48; }
+.worker-status.attention { background: #fff2d7; color: #855d13; }
+.worker-manage { max-width: 230px; }
+.worker-manage > div { display: grid; gap: 10px; margin-top: 12px; }
+.worker-empty { padding: 26px 0 14px; border-top: 1px solid var(--line); }
+.worker-empty strong { display: block; font-size: 14px; margin-bottom: 6px; }
+.worker-history { padding: 16px 20px; }
+.worker-history > summary { font-weight: 600; }
+.worker-history > summary .worker-count { margin-left: 8px; }
+.worker-history > p { margin: 14px 0; }
+.worker-history > ul { margin-top: 14px; }
+.worker-pending-row { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 14px 0; border-top: 1px solid var(--line); }
+.worker-pending-row .worker-actions { justify-content: flex-end; }
 .contributor-form .contributor-choice { display: flex; align-items: center; gap: 9px; font-size: 13px; }
 .contributor-form .contributor-choice input { width: 16px; height: 16px; margin: 0; accent-color: var(--teal); }
-@media (max-width: 640px) { .contributor-heading { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 760px) {
+  .contributor-heading, .worker-install-step, .worker-pending-row { align-items: flex-start; flex-direction: column; }
+  .worker-surface { padding: 16px; }
+  .worker-row { grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
+  .worker-row .worker-status { justify-self: end; }
+  .worker-manage { max-width: 180px; }
+  .worker-code { grid-template-columns: minmax(0, 1fr); padding: 14px; }
+  .worker-pending-row .worker-actions { justify-content: flex-start; }
+}
