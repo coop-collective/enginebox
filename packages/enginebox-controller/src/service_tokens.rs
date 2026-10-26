@@ -31,6 +31,16 @@ pub enum Operation {
     Cancel,
 }
 
+/// Access to one project's hosted repositories. `write`: create, list,
+/// read, mint read or write tokens and name the repository on a run. `read`:
+/// list, read and mint read tokens only.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryGrant {
+    pub project: String,
+    pub access: crate::repositories::Access,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
@@ -66,6 +76,10 @@ pub struct Token {
     /// unset so older releases still read the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Repository grants, one per project. Omitted when empty so older
+    /// releases still read the record.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub repositories: BTreeSet<RepositoryGrant>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,6 +121,17 @@ impl Token {
                 .as_deref()
                 .is_none_or(|project| pool_project == Some(project))
     }
+    /// This token's access to `project`'s repositories, inside its project
+    /// restriction if it has one.
+    pub fn repository_access(&self, project: &str) -> Option<crate::repositories::Access> {
+        if self.project.as_deref().is_some_and(|p| p != project) {
+            return None;
+        }
+        self.repositories
+            .iter()
+            .find(|g| g.project == project)
+            .map(|g| g.access)
+    }
     pub fn sees(&self, host_id: &str, name: &str) -> bool {
         self.scopes
             .iter()
@@ -131,6 +156,7 @@ impl Token {
             "profiles":self.profiles,
             "pools":self.pools,
             "project":self.project,
+            "repositories":self.repositories,
             "has_callback_secret":self.callback_secret.is_some(),
             "active":self.revoked_at.is_none() && !self.expired(now),
         })
@@ -152,9 +178,11 @@ pub struct MintRequest {
     pub callback_secret: Option<String>,
     #[serde(default)]
     pub pools: Vec<String>,
-    /// Restrict the pool grants to this project's pools.
+    /// Restrict the pool and repository grants to this project.
     #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
+    pub repositories: Vec<RepositoryGrant>,
 }
 
 fn secret_hash(secret: &str) -> String {
@@ -221,9 +249,26 @@ impl ServiceTokens {
             "label must contain 1-128 printable characters"
         );
         ensure!(
-            (!request.scopes.is_empty() || !request.pools.is_empty())
+            (!request.scopes.is_empty()
+                || !request.pools.is_empty()
+                || !request.repositories.is_empty())
                 && request.scopes.len() <= MAX_SCOPES,
-            "scopes must name 1-256 workspaces, or pools at least one pool"
+            "scopes must name 1-256 workspaces, or pools or repositories at least one grant"
+        );
+        ensure!(
+            request.repositories.len() <= MAX_SCOPES
+                && request
+                    .repositories
+                    .iter()
+                    .all(|g| enginebox_agents::pools::valid_project(&g.project))
+                && request
+                    .repositories
+                    .iter()
+                    .map(|g| &g.project)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == request.repositories.len(),
+            "repositories must name at most 256 distinct projects"
         );
         ensure!(
             request.pools.len() <= MAX_SCOPES
@@ -239,8 +284,12 @@ impl ServiceTokens {
                 "project must be a project ID"
             );
             ensure!(
-                !request.pools.is_empty(),
-                "project restricts pool grants; name at least one pool"
+                !request.pools.is_empty() || !request.repositories.is_empty(),
+                "project restricts pool and repository grants; name at least one"
+            );
+            ensure!(
+                request.repositories.iter().all(|g| &g.project == project),
+                "Every repository grant must name the token's project"
             );
             ensure!(
                 request
@@ -255,8 +304,11 @@ impl ServiceTokens {
             identifier(&scope.name, true)?;
             ensure!(known_host(&scope.host_id), "Unknown host in scope");
         }
+        // A repository-only token (for example read-only indexing) needs no
+        // agent-run operation; any workspace or pool grant does.
         ensure!(
-            !request.operations.is_empty(),
+            !request.operations.is_empty()
+                || (request.scopes.is_empty() && request.pools.is_empty()),
             "operations must name at least one agent-run operation"
         );
         ensure!(
@@ -308,6 +360,7 @@ impl ServiceTokens {
             callback_secret: request.callback_secret,
             pools: request.pools.into_iter().collect(),
             project: request.project,
+            repositories: request.repositories.into_iter().collect(),
         };
         self.save(&token)?;
         let public = token.public();
@@ -427,6 +480,7 @@ mod tests {
             callback_secret: None,
             pools: vec![],
             project: None,
+            repositories: vec![],
         }
     }
     #[test]
@@ -507,6 +561,78 @@ mod tests {
         assert!(
             !stored.contains("\"project\""),
             "unset project is omitted for older releases"
+        );
+    }
+    #[test]
+    fn repository_grants_are_per_project_and_respect_the_project_restriction() {
+        use crate::repositories::Access;
+        let temp = tempfile::tempdir().unwrap();
+        let tokens = ServiceTokens::open(temp.path()).unwrap();
+        let grant = |project: &str, access| RepositoryGrant {
+            project: project.into(),
+            access,
+        };
+        let only = |grants: Vec<RepositoryGrant>, project: Option<&str>| {
+            let mut r = request(None);
+            r.scopes.clear();
+            r.operations.clear();
+            r.repositories = grants;
+            r.project = project.map(str::to_owned);
+            r
+        };
+        // Repository-only tokens need no agent-run operation.
+        let minted = tokens
+            .mint(
+                only(
+                    vec![grant("alpha", Access::Write), grant("beta", Access::Read)],
+                    None,
+                ),
+                |_| true,
+                |_| true,
+                |_| None,
+            )
+            .unwrap();
+        assert_eq!(
+            minted["token"]["repositories"],
+            json!([{"project":"alpha","access":"write"},{"project":"beta","access":"read"}])
+        );
+        let token = tokens
+            .authenticate(minted["secret"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(token.repository_access("alpha"), Some(Access::Write));
+        assert_eq!(token.repository_access("beta"), Some(Access::Read));
+        assert_eq!(token.repository_access("gamma"), None);
+        // Duplicates, invalid projects and grants outside the restriction fail.
+        for bad in [
+            only(
+                vec![grant("alpha", Access::Read), grant("alpha", Access::Write)],
+                None,
+            ),
+            only(vec![grant("Alpha", Access::Read)], None),
+            only(vec![grant("beta", Access::Write)], Some("alpha")),
+        ] {
+            assert!(tokens.mint(bad, |_| true, |_| true, |_| None).is_err());
+        }
+        let restricted = tokens
+            .mint(
+                only(vec![grant("alpha", Access::Read)], Some("alpha")),
+                |_| true,
+                |_| true,
+                |_| None,
+            )
+            .unwrap();
+        assert_eq!(restricted["token"]["project"], "alpha");
+        // A workspace grant still needs operations.
+        let mut mixed = request(None);
+        mixed.operations.clear();
+        mixed.repositories = vec![grant("alpha", Access::Read)];
+        assert!(tokens.mint(mixed, |_| true, |_| true, |_| None).is_err());
+        assert!(
+            serde_json::from_value::<MintRequest>(json!({
+                "label":"x","scopes":[],"operations":[],
+                "repositories":[{"project":"alpha","access":"admin"}]
+            }))
+            .is_err()
         );
     }
     #[test]
@@ -613,6 +739,7 @@ mod tests {
                     callback_secret: None,
                     pools: BTreeSet::new(),
                     project: None,
+                    repositories: BTreeSet::new(),
                 };
                 tokens.save(&token).unwrap();
                 map.insert(id, token);

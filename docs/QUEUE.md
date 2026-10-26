@@ -91,10 +91,10 @@ Each event has `at`, `kind` (`run_admission_failed`, `pool_member_created`, `poo
 
 | Stage | Meaning | Reason codes |
 |---|---|---|
-| `resolve` | The profile (after a restart) or the pool could not be resolved | `profile_unavailable`, `pool_unavailable` |
+| `resolve` | The profile (after a restart) or the pool could not be resolved, or the run's [repository](REPOSITORIES.md) token could not be minted | `profile_unavailable`, `pool_unavailable`, `repository_unavailable` |
 | `place` | The chosen workspace cannot take the run | `workspace_unavailable` (missing or not running), `template_mismatch`, `lease_unresolved`, `admission_error` (bookkeeping failed; the run stays queued and is retried) |
 | `create` | A pool member could not be created | `create_failed`, `pool_has_no_template`, `name_unavailable`; `ok` on success |
-| `bootstrap` | The workspace could not be prepared for the run, or a created member could not be recorded | `workspace_locked`, `member_record_failed` |
+| `bootstrap` | The workspace could not be prepared for the run, or a created member could not be recorded | `workspace_locked`, `member_record_failed`, `guest_outdated` (the guest helper does not support repository runs) |
 | `delegate` | The provider credential could not be delegated to the workspace | `delegation_failed`, `provider_not_delegable` |
 | `start` | The guest helper failed to launch the run (the run is `execution_uncertain`, as before) | `guest_launch_failed` |
 

@@ -1,6 +1,19 @@
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { config, HttpError, json, requireOrigin, requireSession } from "../server";
-import { DEFAULT_PROJECT, GrantRefused, grantablePools, grantableWorkspaces, mintAccessToken, PROJECT, profileNames, revokeAccessToken, type Minted, type Pool, type Workspace } from "./controller";
+import {
+  DEFAULT_PROJECT,
+  GrantRefused,
+  grantablePools,
+  grantableRepositoryProjects,
+  grantableWorkspaces,
+  mintAccessToken,
+  PROJECT,
+  profileNames,
+  revokeAccessToken,
+  type Minted,
+  type Pool,
+  type Workspace,
+} from "./controller";
 import { users } from "./identity";
 import { consentPage, errorPage, page, signInPage } from "./pages";
 import {
@@ -14,6 +27,7 @@ import {
   type Client,
   type Grant,
   type PoolGrant,
+  type RepositoryGrant,
   type State,
   type WorkspaceGrant,
 } from "./store";
@@ -255,6 +269,7 @@ function render(
       redirectUri,
       workspaces: listed.workspaces,
       pools: listed.pools,
+      repositoryProjects: listed.projects,
       project: extra.project,
       error: extra.error,
     });
@@ -267,7 +282,7 @@ function render(
  * What the owner can grant. Either list may fail on its own (a host whose
  * inventory cannot be read still leaves its pools grantable); null when both do.
  */
-async function grantable(project?: string | null): Promise<{ workspaces: Workspace[]; pools: Pool[] } | null> {
+async function grantable(project?: string | null): Promise<{ workspaces: Workspace[]; pools: Pool[]; projects: string[] } | null> {
   const [workspaces, pools] = await Promise.allSettled([grantableWorkspaces(), grantablePools()]);
   if (workspaces.status === "rejected" && pools.status === "rejected") return null;
   const listed = pools.status === "fulfilled" ? pools.value : [];
@@ -275,6 +290,8 @@ async function grantable(project?: string | null): Promise<{ workspaces: Workspa
     workspaces: workspaces.status === "fulfilled" ? workspaces.value : [],
     // An app that asked for one project's pools is offered only those.
     pools: project ? listed.filter((p) => p.project === project) : listed,
+    // Repository access is granted per project; an app that asked for one project is offered only it.
+    projects: project ? [project] : await grantableRepositoryProjects(listed),
   };
 }
 
@@ -398,11 +415,23 @@ export async function authorizePost(request: Request) {
 
   const chosen = [...new Set(form.getAll("workspace"))];
   const chosenPools = [...new Set(form.getAll("pool"))];
-  if (!chosen.length && !chosenPools.length) return render(request, id, client, pending.redirect_uri, { project, error: "Select at least one workspace or pool." });
-  if (chosen.length > MAX_GRANT_WORKSPACES || chosen.length + chosenPools.length > MAX_GRANT_TARGETS)
-    return render(request, id, client, pending.redirect_uri, { project, error: "Select fewer workspaces and pools." });
+  // `repositories:<project>` = "" (none), "read" or "write".
+  const chosenRepositories: RepositoryGrant[] = [];
+  for (const [key, value] of form) {
+    if (!key.startsWith("repositories:") || value === "") continue;
+    const repoProject = key.slice("repositories:".length);
+    if (!PROJECT.test(repoProject) || (value !== "read" && value !== "write") || chosenRepositories.some((r) => r.project === repoProject))
+      return render(request, id, client, pending.redirect_uri, { project, error: "Choose read or write access for each project's repositories." });
+    chosenRepositories.push({ project: repoProject, access: value });
+  }
+  if (!chosen.length && !chosenPools.length && !chosenRepositories.length)
+    return render(request, id, client, pending.redirect_uri, { project, error: "Select at least one workspace or pool, or a project's repositories." });
+  if (chosen.length > MAX_GRANT_WORKSPACES || chosen.length + chosenPools.length + chosenRepositories.length > MAX_GRANT_TARGETS)
+    return render(request, id, client, pending.redirect_uri, { project, error: "Select fewer workspaces, pools and projects." });
   const available = await grantable(project);
   if (!available) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
+  if (chosenRepositories.some((r) => !available.projects.includes(r.project)))
+    return render(request, id, client, pending.redirect_uri, { project, error: "A selected project is not available." });
   const workspaces: WorkspaceGrant[] = [];
   for (const value of chosen) {
     const workspace = available.workspaces.find((w) => `${w.host}/${w.instance}` === value);
@@ -445,6 +474,7 @@ export async function authorizePost(request: Request) {
       user_id: user.id,
       workspaces,
       pools,
+      repositories: chosenRepositories,
       project,
       expires_at: now + CODE_SECONDS * 1000,
       used_at: null,
@@ -506,9 +536,11 @@ function authenticateClient(request: Request, form: URLSearchParams, state: Stat
  * (`{kind: "workspace", host, instance, profiles}`, the original shape plus
  * `kind`) and per pool (`{kind: "pool", pool, profile, profiles}`, where
  * `profile` is the pool's own profile and `profiles` repeats it as a list, and
- * `project` is the project the pool belonged to at consent).
+ * `project` is the project the pool belonged to at consent), and per project
+ * whose repositories it may use (`{kind: "repositories", project, access}`,
+ * `access` "read" or "write").
  */
-export function grantsView(grant: Pick<Grant, "workspaces" | "pools">) {
+export function grantsView(grant: Pick<Grant, "workspaces" | "pools" | "repositories">) {
   return [
     ...grant.workspaces.map((w) => ({ kind: "workspace" as const, host: w.host, instance: w.instance, profiles: w.profiles })),
     ...(grant.pools ?? []).map((p) => ({
@@ -518,9 +550,11 @@ export function grantsView(grant: Pick<Grant, "workspaces" | "pools">) {
       profile: p.profile,
       profiles: p.profile ? [p.profile] : [],
     })),
+    ...(grant.repositories ?? []).map((r) => ({ kind: "repositories" as const, project: r.project, access: r.access })),
   ];
 }
-function tokenResponse(minted: Minted, refresh: string, grant: Pick<Grant, "workspaces" | "pools">, callbackSecret?: string) {
+type GrantShape = Pick<Grant, "workspaces" | "pools" | "repositories">;
+function tokenResponse(minted: Minted, refresh: string, grant: GrantShape, callbackSecret?: string) {
   return oauthJson({
     access_token: minted.secret,
     token_type: "Bearer",
@@ -596,7 +630,7 @@ function graceReplay(grant: Grant, hash: string, now: number): GracePair | "clos
   if (!equalHash(grant.previous_refresh_hash, hash)) return "closed";
   return openGrace(grant.id, hash, grant.grace_pair) ?? "lost";
 }
-function graceResponse(pair: GracePair, grant: Pick<Grant, "workspaces" | "pools">) {
+function graceResponse(pair: GracePair, grant: GrantShape) {
   return tokenResponse({ id: pair.access_token_id, secret: pair.access_token, expires_at: pair.access_expires_at }, pair.refresh_token, grant);
 }
 
@@ -660,10 +694,11 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
   if (claimed.replay) throw new OAuthError("invalid_grant", "The authorization code was already used; its tokens are revoked.");
   const { record, client } = claimed;
   const pools = record.pools ?? [];
+  const repositories = record.repositories ?? [];
   const callbackSecret = randomToken(32);
   let minted: Minted;
   try {
-    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, callback_secret: callbackSecret, project: record.project }, ACCESS_TOKEN_SECONDS);
+    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project }, ACCESS_TOKEN_SECONDS);
   } catch (error) {
     if (error instanceof GrantRefused) throw new OAuthError("invalid_grant", error.message);
     throw error;
@@ -683,6 +718,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
       resource: record.resource,
       workspaces: record.workspaces,
       pools,
+      repositories,
       callback_secret: callbackSecret,
       project: record.project ?? null,
       created_at: now,
@@ -699,7 +735,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
     return true;
   });
   if (!stored) throw new OAuthError("invalid_grant", "The authorization code was already used; its tokens are revoked.");
-  return tokenResponse(minted, refreshToken, { workspaces: record.workspaces, pools }, callbackSecret);
+  return tokenResponse(minted, refreshToken, { workspaces: record.workspaces, pools, repositories }, callbackSecret);
 }
 
 function sha256b64(value: string) {
@@ -735,7 +771,7 @@ async function refresh(request: Request, form: URLSearchParams) {
   try {
     minted = await mintAccessToken(
       grant.id,
-      { workspaces: grant.workspaces, pools: grant.pools ?? [], callback_secret: grant.callback_secret, project: grant.project },
+      { workspaces: grant.workspaces, pools: grant.pools ?? [], repositories: grant.repositories ?? [], callback_secret: grant.callback_secret, project: grant.project },
       ACCESS_TOKEN_SECONDS,
     );
   } catch (error) {
@@ -743,7 +779,7 @@ async function refresh(request: Request, form: URLSearchParams) {
     // What the owner consented to is gone: end the connection so the app asks again.
     withState((state, now) => {
       const current = state.grants.find((g) => g.id === grant.id);
-      if (current) revokeGrantIn(state, current, "consented workspaces or pools no longer available", now);
+      if (current) revokeGrantIn(state, current, "consented workspaces, pools or repositories no longer available", now);
     });
     throw new OAuthError("invalid_grant", error.message);
   }
@@ -828,6 +864,9 @@ export async function revoke(request: Request) {
 const SEGMENT = "[A-Za-z0-9][A-Za-z0-9_-]{0,99}";
 /** The controller's pool names. */
 const POOL = "[a-z][a-z0-9-]{0,31}";
+/** The controller's project IDs and repository names. */
+const PROJECT_ID = "[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?";
+const REPOSITORY = "[a-z0-9][a-z0-9._-]{0,62}";
 export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["GET", /^v1\/agent-runs$/],
   ["GET", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}$`)],
@@ -836,6 +875,10 @@ export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["POST", new RegExp(`^v1/pools/${POOL}/agent-runs$`)],
   ["GET", new RegExp(`^v1/pools/${POOL}/agent-runs/${SEGMENT}$`)],
   ["POST", new RegExp(`^v1/pools/${POOL}/agent-runs/${SEGMENT}/cancel$`)],
+  ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/repositories$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/repositories$`)],
+  ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/repositories/${REPOSITORY}$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/repositories/${REPOSITORY}/tokens$`)],
 ];
 
 function challenge(error?: string, description?: string) {
@@ -906,7 +949,7 @@ export async function resourceProxy(request: Request, segments: string[]) {
   }
   if (response.status === 401) return unauthorized("invalid_token", "The access token is unknown, expired or revoked.");
   if (response.status === 403)
-    return json(result, 403, { "WWW-Authenticate": challenge("insufficient_scope", "The token is not granted that operation on that workspace or pool.") });
+    return json(result, 403, { "WWW-Authenticate": challenge("insufficient_scope", "The token is not granted that operation on that workspace, pool or project.") });
   // A full run queue answers 429 with Retry-After; clients need it to wait rather than back off blindly.
   const retryAfter = response.headers.get("retry-after");
   return json(result, response.status, retryAfter && /^\d{1,6}$/.test(retryAfter) ? { "Retry-After": retryAfter } : {});
@@ -932,6 +975,7 @@ export function listGrants(request: Request) {
         scope: g.scope,
         workspaces: grantsView({ workspaces: g.workspaces }),
         pools: (g.pools ?? []).map((p) => ({ pool: p.pool, profile: p.profile, project: p.project ?? DEFAULT_PROJECT })),
+        repositories: (g.repositories ?? []).map((r) => ({ project: r.project, access: r.access })),
         project: g.project ?? null,
         created_at: new Date(g.created_at).toISOString(),
         refreshed_at: new Date(g.refreshed_at).toISOString(),

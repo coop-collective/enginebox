@@ -84,6 +84,8 @@ pub const REASONS: &[&str] = &[
     "delegation_failed",
     "provider_not_delegable",
     "guest_launch_failed",
+    "repository_unavailable",
+    "guest_outdated",
 ];
 pub fn valid_reason(reason: &str) -> bool {
     REASONS.contains(&reason)
@@ -113,6 +115,15 @@ impl LaunchFailure {
     }
     /// The operator-facing run error: fixed text per stage, never error detail.
     pub fn run_error(&self) -> &'static str {
+        match self.reason {
+            "repository_unavailable" => {
+                return "Run could not start: its repository is unavailable or a repository token could not be issued.";
+            }
+            "guest_outdated" => {
+                return "Run could not start: the workspace's guest helper does not support repository runs; update enginebox-guest in its template.";
+            }
+            _ => {}
+        }
         match self.stage {
             Stage::Resolve => "Run could not start: its profile is no longer available.",
             Stage::Place => {

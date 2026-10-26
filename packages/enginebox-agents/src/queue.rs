@@ -192,6 +192,11 @@ pub struct Entry {
     pub finished_at: Option<String>,
     #[serde(default)]
     pub outcome: Option<String>,
+    /// `<project>/<name>` of the hosted repository the run uses. Only the
+    /// name: its token is minted at admission and never stored. Omitted when
+    /// unset so older releases still read the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 impl Entry {
     pub fn validate(&self) -> Result<()> {
@@ -216,6 +221,9 @@ impl Entry {
         }
         if let Some(p) = &self.profile {
             ensure!(crate::profile::valid_name(p), "Invalid queue profile.");
+        }
+        if let Some(r) = &self.repository {
+            crate::repository::parse_ref(r)?;
         }
         if self.state == EntryState::Queued {
             RunRequest::parse(self.request.clone())?;

@@ -1,9 +1,47 @@
 // Keep the public website and private controller on the same origin. The
 // service binding selects the existing dashboard edge; clients cannot pick an
 // upstream host, and the edge retains its authentication and VPC restrictions.
+
+// Repository backend (docs/REPOSITORIES.md): the controller's signed requests
+// to /_artifacts/<op> are forwarded over RPC to the Artifacts gateway Worker,
+// which verifies them. This Worker holds no secret and changes nothing.
+const ARTIFACTS_OPERATION = /^\/_artifacts\/(repos\.(?:create|get|list)|tokens\.(?:create|revoke))$/;
+const ARTIFACTS_MAX_BODY = 16384;
+const artifactsReply = (status, body) => new Response(JSON.stringify(body), {
+  status,
+  headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
+});
+async function artifacts(request, url, env) {
+  if (request.method !== 'POST') return artifactsReply(405, { error: 'method_not_allowed' });
+  const match = ARTIFACTS_OPERATION.exec(url.pathname);
+  if (!match || url.search) return artifactsReply(404, { error: 'not_found' });
+  if (request.headers.has('origin')) return artifactsReply(403, { error: 'forbidden' });
+  if (Number(request.headers.get('content-length') ?? 0) > ARTIFACTS_MAX_BODY) return artifactsReply(413, { error: 'too_large' });
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength > ARTIFACTS_MAX_BODY) return artifactsReply(413, { error: 'too_large' });
+  const header = (name) => request.headers.get(name) ?? '';
+  let result;
+  try {
+    result = await env.ARTIFACTS.invoke({
+      method: 'POST',
+      path: `/${match[1]}`,
+      timestamp: header('x-enginebox-timestamp'),
+      nonce: header('x-enginebox-nonce'),
+      signature: header('x-enginebox-signature'),
+      body: new TextDecoder().decode(bytes),
+    });
+  } catch {
+    console.error(JSON.stringify({ event: 'artifacts_gateway_unavailable' }));
+    return artifactsReply(503, { error: 'unavailable' });
+  }
+  const status = Number.isInteger(result?.status) && result.status >= 200 && result.status <= 599 ? result.status : 502;
+  return artifactsReply(status, result?.body ?? { error: 'upstream' });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === '/_artifacts' || url.pathname.startsWith('/_artifacts/')) return artifacts(request, url, env);
     if (url.pathname === '/dashboard') {
       return new Response(null, {
         status: 307,

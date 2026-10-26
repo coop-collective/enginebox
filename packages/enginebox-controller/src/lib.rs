@@ -6,6 +6,7 @@ pub mod contributors;
 mod environment;
 pub mod jobs;
 pub mod profiles;
+pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
 
@@ -57,6 +58,7 @@ struct Runtime {
     contributors: contributors::Contributors,
     service_tokens: service_tokens::ServiceTokens,
     profiles: profiles::Profiles,
+    repositories: repositories::Repositories,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -78,6 +80,8 @@ pub struct Controller {
     observations: Mutex<std::collections::BTreeMap<String, Value>>,
     // Last background reconcile failure (message, RFC 3339 time); cleared on success.
     reconcile_error: Mutex<Option<(String, String)>>,
+    /// Test harnesses stand in for the repository backend's API.
+    repository_transport: Mutex<Option<Arc<dyn repositories::Transport>>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -111,6 +115,7 @@ impl Controller {
             }),
             observations: Mutex::new(std::collections::BTreeMap::new()),
             reconcile_error: Mutex::new(None),
+            repository_transport: Mutex::new(None),
         }))
     }
     pub fn activate(self: &Arc<Self>) -> Result<Value> {
@@ -166,6 +171,12 @@ impl Controller {
             contributors: contributors::Contributors::open(&self.root)?,
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles: profiles::Profiles::open(&self.root)?,
+            repositories: match self.repository_transport.lock().unwrap().clone() {
+                Some(transport) => {
+                    repositories::Repositories::with_transport(&self.root, transport)?
+                }
+                None => repositories::Repositories::open(&self.root)?,
+            },
             ci: ci::Ci::open(
                 &self.root,
                 &self
@@ -183,6 +194,14 @@ impl Controller {
                 resolver.resolve(name, provider)
             }));
         callbacks::install(&runtime.agents);
+        let minter = runtime.repositories.clone();
+        let revoker = runtime.repositories.clone();
+        runtime.agents.set_repository_hooks(
+            Arc::new(move |reference, ttl| minter.run_credential(reference, ttl)),
+            Arc::new(move |reference, credential| {
+                revoker.revoke_run_credential(reference, credential)
+            }),
+        );
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
             let owner = owner_guard
@@ -211,6 +230,12 @@ impl Controller {
     /// The agent service of an active controller, for development harnesses
     /// that install a stand-in run executor (see
     /// `examples/dev_fake_executor.rs`). Not part of the HTTP API.
+    /// Use another transport for the repository backend (test harnesses).
+    /// Applies at the next activation. Not part of the HTTP API.
+    #[doc(hidden)]
+    pub fn set_repository_transport(&self, transport: Arc<dyn repositories::Transport>) {
+        *self.repository_transport.lock().unwrap() = Some(transport);
+    }
     #[doc(hidden)]
     pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
         Ok(self.runtime()?.agents)
@@ -423,6 +448,17 @@ fn service_allows(
         (&Method::POST, ["v1", "pools", pool, "agent-runs", _, "cancel"]) => {
             pool_ok(Operation::Cancel, pool)
         }
+        // Repositories: any grant on the project lists, reads and mints (a
+        // read grant only read tokens, checked by the handler); creating
+        // needs a write grant.
+        (&Method::GET, ["v1", "projects", project, "repositories"])
+        | (&Method::GET, ["v1", "projects", project, "repositories", _])
+        | (&Method::POST, ["v1", "projects", project, "repositories", _, "tokens"]) => {
+            token.repository_access(project).is_some()
+        }
+        (&Method::POST, ["v1", "projects", project, "repositories"]) => {
+            token.repository_access(project) == Some(repositories::Access::Write)
+        }
         _ => false,
     }
 }
@@ -608,7 +644,33 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             ),
         };
     }
-    if method != Method::POST {
+    // The owner-only backend configuration is the one PUT/DELETE resource.
+    let backend_route = path == "/v1/repository-backends/artifacts-worker";
+    if method == Method::DELETE && backend_route {
+        let admission = match controller.admit() {
+            Ok(a) => a,
+            Err(_) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Controller is draining; retry through the supervisor.",
+                );
+            }
+        };
+        let operation = controller.clone();
+        return match blocking(move || {
+            let _admission = admission;
+            operation.runtime()?.repositories.delete_worker()
+        })
+        .await
+        {
+            Ok(v) => reply(StatusCode::OK, v),
+            Err(_) => error(
+                StatusCode::CONFLICT,
+                "Backend configuration could not be removed.",
+            ),
+        };
+    }
+    if method != Method::POST && !(method == Method::PUT && backend_route) {
         return error(StatusCode::METHOD_NOT_ALLOWED, "Use GET or POST.");
     }
     if request
@@ -662,7 +724,19 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             );
         }
     };
-    let result = admitted(admission, write(controller, parts, body, principal)).await;
+    let result = if method == Method::PUT {
+        let operation = controller.clone();
+        admitted(admission, async move {
+            let repositories = operation.runtime()?.repositories;
+            Ok(repository_reply(
+                blocking(move || repositories.put_worker(&body)).await,
+                StatusCode::OK,
+            ))
+        })
+        .await
+    } else {
+        admitted(admission, write(controller, parts, body, principal)).await
+    };
     match result {
         Ok((StatusCode::TOO_MANY_REQUESTS, v)) => {
             let mut response = reply(StatusCode::TOO_MANY_REQUESTS, v.clone());
@@ -815,6 +889,15 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
             Ok(runtime
                 .service_tokens
                 .list_grouped(|pool| agents.pools().project_of(pool)))
+        }
+        ["v1", "repository-backends"] => Ok(c.runtime()?.repositories.backend_view()),
+        ["v1", "repository-backends", "artifacts-worker"] => {
+            Ok(c.runtime()?.repositories.get_worker())
+        }
+        ["v1", "repositories"] => Ok(c.runtime()?.repositories.list_all()),
+        ["v1", "projects", project, "repositories"] => c.runtime()?.repositories.list(project),
+        ["v1", "projects", project, "repositories", name] => {
+            c.runtime()?.repositories.get(project, name)
         }
         ["v1", "profiles"] => Ok(c.runtime()?.profiles.list()),
         ["v1", "profiles", name] => c.runtime()?.profiles.get(name),
@@ -1063,6 +1146,37 @@ async fn write(
             empty(&body)?;
             runtime.agents.delete_pool(pool)?
         }
+        ["v1", "projects", project, "repositories"] => {
+            let repositories = runtime.repositories.clone();
+            let project = project.to_string();
+            let outcome = blocking(move || repositories.create(&project, &body)).await;
+            return Ok(match outcome {
+                Ok((true, v)) => (StatusCode::CREATED, v),
+                Ok((false, v)) => (StatusCode::OK, v),
+                Err(e) => repository_reply(Err(e), StatusCode::OK),
+            });
+        }
+        ["v1", "projects", project, "repositories", name, "tokens"] => {
+            let (access, ttl) = match repositories::Repositories::token_request(&body) {
+                Ok(request) => request,
+                Err(e) => return Ok(repository_reply(Err(e), StatusCode::OK)),
+            };
+            if let Principal::Service(token) = &principal
+                && access == repositories::Access::Write
+                && token.repository_access(project) != Some(repositories::Access::Write)
+            {
+                return Ok((
+                    StatusCode::FORBIDDEN,
+                    json!({"error":"This service token may mint only read tokens for this project's repositories."}),
+                ));
+            }
+            let repositories = runtime.repositories.clone();
+            let (project, name) = (project.to_string(), name.to_string());
+            return Ok(repository_reply(
+                blocking(move || repositories.mint(&project, &name, access, ttl)).await,
+                StatusCode::CREATED,
+            ));
+        }
         ["v1", "profile-files"] => {
             code = StatusCode::CREATED;
             runtime.profiles.upload(&body)?
@@ -1160,6 +1274,19 @@ async fn write(
     };
     Ok((code, v))
 }
+/// A repository operation's reply: its refusal status and message, or `ok`.
+fn repository_reply(result: Result<Value>, ok: StatusCode) -> (StatusCode, Value) {
+    match result {
+        Ok(v) => (ok, v),
+        Err(e) => {
+            let (status, message) = repositories::status_of(&e);
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                json!({"error":message}),
+            )
+        }
+    }
+}
 enum RunTarget {
     Workspace(String, String),
     Pool(String),
@@ -1185,6 +1312,11 @@ async fn start_run(
         None | Some(Value::Null) => None,
         Some(Value::String(k)) => Some(k),
         Some(_) => anyhow::bail!("idempotency_key must be a string"),
+    };
+    let repository = match object.remove("repository") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(r)) => Some(r),
+        Some(_) => anyhow::bail!("repository must be a string"),
     };
     let callback_url = match object.remove("callback") {
         None | Some(Value::Null) => None,
@@ -1222,6 +1354,42 @@ async fn start_run(
             return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown profile."})));
         }
     }
+    if let Some(reference) = &repository {
+        let Ok((project, name)) = enginebox_agents::repository::parse_ref(reference) else {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                json!({"error":"repository must be <project>/<name>."}),
+            ));
+        };
+        if let Principal::Service(token) = principal
+            && token.repository_access(&project) != Some(repositories::Access::Write)
+        {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                json!({"error":"This service token is not granted write access to that project's repositories."}),
+            ));
+        }
+        if let RunTarget::Pool(pool) = &target
+            && runtime.agents.pools().project_of(pool).as_deref() != Some(project.as_str())
+        {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                json!({"error":"A pool run may use only a repository in the pool's project."}),
+            ));
+        }
+        if !runtime.repositories.exists(&project, &name) {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                json!({"error":"Unknown repository."}),
+            ));
+        }
+        if runtime.repositories.backend().is_err() {
+            return Ok((
+                StatusCode::CONFLICT,
+                json!({"error":"No repository backend is configured."}),
+            ));
+        }
+    }
     let resolved = match &profile_name {
         Some(profile) => Some(
             runtime
@@ -1250,6 +1418,7 @@ async fn start_run(
         profile: resolved,
         idempotency_key,
         callback,
+        repository,
     };
     let started_by = principal.started_by();
     let agents = runtime.agents.clone();
@@ -1776,7 +1945,9 @@ mod tests {
             );
         }
         // Unknown, tampered, revoked and expired tokens are unauthenticated.
-        let tampered = format!("{}0", &secret[..secret.len() - 1]);
+        // swap the last character for a different one (a fixed "0" equals the secret 1 time in 16)
+        let last = if secret.ends_with('0') { '1' } else { '0' };
+        let tampered = format!("{}{last}", &secret[..secret.len() - 1]);
         for token in [tampered.as_str(), "ebst_nope", "not-a-token"] {
             assert_eq!(
                 call(&app, bearer(Method::GET, "/v1/agent-runs", "", token))
@@ -2762,5 +2933,405 @@ mod tests {
         c.drain();
         let (_, runs) = call(&app, request(Method::GET, "/v1/agent-runs", "", true)).await;
         assert_eq!(runs["total"], 2);
+    }
+
+    fn files_contain(root: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut found = vec![];
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if std::fs::read(&path)
+                    .map(|b| String::from_utf8_lossy(&b).contains(needle))
+                    .unwrap_or(false)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn repositories_are_owner_configured_project_scoped_and_runs_get_tokens_at_admission() {
+        const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+        const API_TOKEN: &str = repositories::mock::SECRET;
+        let (temp, c) = setup();
+        let api = repositories::mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]);
+        c.set_repository_transport(api.clone());
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let backend = "/v1/repository-backends/artifacts-worker";
+        let config =
+            json!({"url":repositories::mock::URL,"namespace_prefix":"eb","secret":API_TOKEN})
+                .to_string();
+        // Owner-only, write-only backend configuration.
+        let (status, put) = call(&app, request(Method::PUT, backend, &config, true)).await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        assert_eq!(put["backend"]["secret"], "[redacted]");
+        let (status, got) = call(&app, request(Method::GET, backend, "", true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got["backend"]["url"], repositories::mock::URL);
+        let (_, selected) = call(
+            &app,
+            request(Method::GET, "/v1/repository-backends", "", true),
+        )
+        .await;
+        assert_eq!(selected["backend"]["kind"], "artifacts_worker");
+        assert!(!put.to_string().contains(API_TOKEN) && !got.to_string().contains(API_TOKEN));
+        let (status, _) = call(&app, request(Method::PATCH, backend, &config, true)).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        for pool in [
+            json!({"name":"alpha-w","project":"alpha","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}),
+            json!({"name":"beta-w","project":"beta","workspaces":[{"host_id":"worker","name":"ebox-p2"}]}),
+        ] {
+            let (status, body) = call(
+                &app,
+                request(Method::POST, "/v1/pools", &pool.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let repos = "/v1/projects/alpha/repositories";
+        let (status, created) = call(
+            &app,
+            request(Method::POST, repos, r#"{"name":"game"}"#, true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let remote = format!("https://{ACCOUNT}.artifacts.cloudflare.net/git/eb-alpha/game.git");
+        assert_eq!(created["repository"]["remote"], remote);
+        assert!(created["repository"].get("token").is_none());
+        let (status, _) = call(
+            &app,
+            request(Method::POST, repos, r#"{"name":"game"}"#, true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create is idempotent on name");
+        let (_, all) = call(&app, request(Method::GET, "/v1/repositories", "", true)).await;
+        assert_eq!(all["repositories"][0]["project"], "alpha");
+
+        let ops = json!(["agent_runs.start", "agent_runs.get"]);
+        let (_, none) = mint(&app, json!({"label":"none","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":ops})).await;
+        let (_, read) = mint(&app, json!({"label":"read","scopes":[],"operations":[],"repositories":[{"project":"alpha","access":"read"}]})).await;
+        let (_, write) = mint(&app, json!({"label":"write","scopes":[],"pools":["alpha-w","beta-w"],"operations":ops,
+            "repositories":[{"project":"alpha","access":"write"}],"callback_secret":"k".repeat(40)})).await;
+        let (_, pool_read) = mint(
+            &app,
+            json!({"label":"pool-read","scopes":[],"pools":["alpha-w"],"operations":ops,
+            "repositories":[{"project":"alpha","access":"read"}]}),
+        )
+        .await;
+        // No grant: 403 on every repository route and on the backend.
+        for (method, path, body) in [
+            (Method::GET, repos, ""),
+            (Method::POST, repos, r#"{"name":"x"}"#),
+            (Method::GET, "/v1/projects/alpha/repositories/game", ""),
+            (
+                Method::POST,
+                "/v1/projects/alpha/repositories/game/tokens",
+                r#"{"access":"read"}"#,
+            ),
+            (Method::GET, backend, ""),
+            (Method::PUT, backend, config.as_str()),
+            (Method::DELETE, backend, ""),
+            (Method::GET, "/v1/repositories", ""),
+        ] {
+            let (status, _) = call(&app, bearer(method.clone(), path, body, &none)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+            let (status, _) = call(&app, bearer(method.clone(), path, body, &write)).await;
+            if path.starts_with("/v1/projects/") {
+                assert_ne!(status, StatusCode::FORBIDDEN, "{method} {path}");
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "owner-only {method} {path}");
+            }
+        }
+        // Read grant: list, read, read tokens; never create or write tokens.
+        let (status, listed) = call(&app, bearer(Method::GET, repos, "", &read)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            listed["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["name"] == "game")
+        );
+        let (status, _) = call(
+            &app,
+            bearer(
+                Method::GET,
+                "/v1/projects/alpha/repositories/game",
+                "",
+                &read,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, repos, r#"{"name":"mine"}"#, &read),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let tokens = "/v1/projects/alpha/repositories/game/tokens";
+        let (status, minted) = call(
+            &app,
+            bearer(
+                Method::POST,
+                tokens,
+                r#"{"access":"read","ttl_seconds":300}"#,
+                &read,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{minted}");
+        assert_eq!(minted["remote"], remote);
+        assert_eq!(minted["access"], "read");
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, tokens, r#"{"access":"write"}"#, &read),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Wrong project.
+        for (method, path) in [
+            (Method::GET, "/v1/projects/beta/repositories"),
+            (Method::POST, "/v1/projects/beta/repositories"),
+        ] {
+            let (status, _) = call(&app, bearer(method, path, r#"{"name":"x"}"#, &write)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        // Write grant: create, write tokens; TTLs are bounded.
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, repos, r#"{"name":"tools"}"#, &write),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call(
+            &app,
+            bearer(
+                Method::POST,
+                tokens,
+                r#"{"access":"write","ttl_seconds":3600}"#,
+                &write,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call(
+            &app,
+            bearer(
+                Method::POST,
+                tokens,
+                r#"{"access":"write","ttl_seconds":86401}"#,
+                &write,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &app,
+            bearer(
+                Method::GET,
+                "/v1/projects/alpha/repositories/missing",
+                "",
+                &write,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Runs: a write grant on the repository's project, and for a pool
+        // run the pool's own project.
+        let run = |repository: &str, prompt: &str| {
+            json!({"provider":"claude","prompt":prompt,"repository":repository}).to_string()
+        };
+        let alpha_runs = "/v1/pools/alpha-w/agent-runs";
+        let (status, _) = call(
+            &app,
+            bearer(
+                Method::POST,
+                alpha_runs,
+                &run("alpha/game", "x"),
+                &pool_read,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a read grant cannot name a repository on a run"
+        );
+        let (status, body) = call(
+            &app,
+            bearer(
+                Method::POST,
+                "/v1/pools/beta-w/agent-runs",
+                &run("alpha/game", "x"),
+                &write,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, alpha_runs, &run("alpha/missing", "x"), &write),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, alpha_runs, &run("game", "x"), &write),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools/beta-w/agent-runs",
+                &run("alpha/game", "x"),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the owner too: pool and repository projects must match"
+        );
+
+        // Admission: the executor sees the minted access; nothing else does.
+        let agents = c.runtime().unwrap().agents;
+        let seen: Arc<Mutex<Vec<enginebox_agents::repository::Access>>> = Arc::default();
+        let finished: Arc<Mutex<Vec<Value>>> = Arc::default();
+        {
+            let seen = seen.clone();
+            agents.set_run_executor(Arc::new(move |run| {
+                let access = run.repository_access.clone().expect("minted at admission");
+                seen.lock().unwrap().push(access.clone());
+                if run.request.prompt == "fail" {
+                    return Err(enginebox_agents::launch_events::LaunchFailure::new(
+                        enginebox_agents::launch_events::Stage::Start,
+                        "guest_launch_failed",
+                        format!("git push failed for Bearer {}", access.token),
+                    )
+                    .into());
+                }
+                Ok(json!({"exit_code":0,"output":"{\"type\":\"result\"}","timed_out":false,"output_truncated":false}))
+            }));
+            let finished = finished.clone();
+            agents.set_finish_hook(Arc::new(move |f| finished.lock().unwrap().push(f.payload)));
+        }
+        agents.set_measure_hook(Arc::new(|_| {
+            Ok(enginebox_agents::queue::HostLoad {
+                cpu_total: 64,
+                reserve_cpu: 2,
+                memory_available_bytes: 1 << 40,
+                reserve_memory_bytes: 1 << 30,
+            })
+        }));
+        let mut ids = vec![];
+        for prompt in ["work", "fail"] {
+            let body = json!({"provider":"claude","prompt":prompt,"repository":"alpha/game",
+                "callback":{"url":"https://hooks.example.com/runs"}})
+            .to_string();
+            let (status, accepted) =
+                call(&app, bearer(Method::POST, alpha_runs, &body, &write)).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+            assert_eq!(accepted["run"]["repository"], "alpha/game");
+            let id = accepted["run"]["id"].as_str().unwrap().to_owned();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let (_, current) = call(
+                    &app,
+                    bearer(Method::GET, &format!("{alpha_runs}/{id}"), "", &write),
+                )
+                .await;
+                if !["queued", "running"].contains(&current["run"]["status"].as_str().unwrap_or(""))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "run did not finish: {current}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            ids.push(id);
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        {
+            let state = api.state.lock().unwrap();
+            for access in &seen {
+                assert_eq!(access.remote, remote);
+                assert_eq!(access.default_branch, "main");
+                let (id, token) = state
+                    .tokens
+                    .iter()
+                    .find(|(_, t)| t.3 == access.token)
+                    .unwrap();
+                assert_eq!(token.2, "write", "runs get write tokens");
+                assert!(token.4, "revoked at run end: {id}");
+                let (_, body) = state
+                    .calls
+                    .iter()
+                    .find(|(op, _)| op == "tokens.create")
+                    .unwrap();
+                assert_eq!(body["repo"], "game");
+                assert_eq!(body["namespace"], "eb-alpha");
+            }
+            // The run TTL is the run timeout (default 120 s) plus the margin.
+            assert!(state.calls.iter().any(|(op, b)| {
+                op == "tokens.create" && b["ttl"] == 720 && b["scope"] == "write"
+            }));
+            assert_eq!(
+                state.rejected, 0,
+                "every controller request was correctly signed"
+            );
+        }
+        let (_, run) = call(
+            &app,
+            bearer(Method::GET, &format!("{alpha_runs}/{}", ids[0]), "", &write),
+        )
+        .await;
+        assert_eq!(run["run"]["repository"], "alpha/game");
+        assert_eq!(run["run"]["status"], "succeeded");
+        let (_, failed) = call(
+            &app,
+            bearer(Method::GET, &format!("{alpha_runs}/{}", ids[1]), "", &write),
+        )
+        .await;
+        assert_eq!(failed["run"]["status"], "failed");
+        let (_, events) = call(&app, request(Method::GET, "/v1/launch-events", "", true)).await;
+        let (_, listing) = call(&app, request(Method::GET, "/v1/agent-runs", "", true)).await;
+        let payloads = finished.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["repository"], "alpha/game");
+        for access in &seen {
+            let secret = access.token.split_once("?expires=").unwrap().0;
+            for (what, value) in [
+                ("run", &run),
+                ("failed run", &failed),
+                ("launch events", &events),
+                ("listing", &listing),
+            ] {
+                assert!(
+                    !value.to_string().contains(secret),
+                    "token leaked into {what}: {value}"
+                );
+            }
+            assert!(
+                !json!(payloads).to_string().contains(secret),
+                "token leaked into a callback"
+            );
+            let leaks = files_contain(temp.path(), secret);
+            assert!(leaks.is_empty(), "token persisted in {leaks:?}");
+        }
+        assert!(events.to_string().contains("guest_launch_failed"));
     }
 }

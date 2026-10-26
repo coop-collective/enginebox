@@ -1,6 +1,6 @@
 import { config, HttpError } from "../server";
 import type { Fleet } from "../types";
-import type { PoolGrant, WorkspaceGrant } from "./store";
+import type { PoolGrant, RepositoryGrant, WorkspaceGrant } from "./store";
 
 /** Every agent-run operation; the `agent-runs` scope grants exactly these. */
 export const AGENT_RUN_OPERATIONS = ["agent_runs.start", "agent_runs.get", "agent_runs.list", "agent_runs.cancel"];
@@ -26,8 +26,14 @@ export type Minted = { id: string; secret: string; expires_at: number };
 /** The controller refused the grant itself (a workspace, pool or profile no longer exists). */
 export class GrantRefused extends Error {}
 
-/** Everything one access token carries: the consented workspaces and pools, and the grant's callback key. */
-export type TokenGrant = { workspaces: WorkspaceGrant[]; pools: PoolGrant[]; callback_secret?: string | null; project?: string | null };
+/** Everything one access token carries: the consented workspaces, pools and repository grants, and the grant's callback key. */
+export type TokenGrant = {
+  workspaces: WorkspaceGrant[];
+  pools: PoolGrant[];
+  repositories?: RepositoryGrant[];
+  callback_secret?: string | null;
+  project?: string | null;
+};
 
 /**
  * Mint a short-lived scoped service token: the OAuth access token. Profiles
@@ -36,6 +42,7 @@ export type TokenGrant = { workspaces: WorkspaceGrant[]; pools: PoolGrant[]; cal
  */
 export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSeconds: number): Promise<Minted> {
   const profiles = [...new Set(grant.workspaces.flatMap((w) => w.profiles))].sort();
+  const repositories = grant.repositories ?? [];
   const response = await call("v1/service-tokens", {
     method: "POST",
     body: {
@@ -46,9 +53,10 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
       // Optional fields only when used, so older controllers keep accepting workspace-only grants.
       ...(profiles.length ? { profiles } : {}),
       ...(grant.pools.length ? { pools: grant.pools.map((p) => p.pool) } : {}),
+      ...(repositories.length ? { repositories: repositories.map((r) => ({ project: r.project, access: r.access })) } : {}),
       ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
-      // Restricts the pool grants to one project; the controller re-checks it on every request.
-      ...(grant.project && grant.pools.length ? { project: grant.project } : {}),
+      // Restricts the pool and repository grants to one project; the controller re-checks it on every request.
+      ...(grant.project && (grant.pools.length || repositories.length) ? { project: grant.project } : {}),
     },
   });
   const body = (await response.json().catch(() => null)) as {
@@ -56,7 +64,7 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
     secret?: unknown;
   } | null;
   // 400: the controller validated the request and refused it, so this grant cannot be honoured any more.
-  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools or profiles are no longer available.");
+  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools, repositories or profiles are no longer available.");
   const id = body?.token?.id, secret = body?.secret, expires = Date.parse(String(body?.token?.expires_at));
   if (response.status !== 201 || typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id) || typeof secret !== "string" || !secret.startsWith(`ebst_${id}.`) || !Number.isFinite(expires))
     throw new HttpError(503, "The fleet service could not issue an access token.");
@@ -118,4 +126,20 @@ export async function profileNames(): Promise<string[]> {
   if (!response.ok) throw new HttpError(503, "The fleet service could not list profiles.");
   const body = (await response.json()) as { profiles?: { name?: unknown }[] };
   return (body.profiles ?? []).map((p) => p.name).filter((n): n is string => typeof n === "string");
+}
+
+/**
+ * Projects whose repositories the owner can grant: every project that has a pool or a repository.
+ * A controller without repositories (older release) contributes only its pool projects.
+ */
+export async function grantableRepositoryProjects(pools: Pool[]): Promise<string[]> {
+  const projects = new Set(pools.map((p) => p.project));
+  try {
+    const response = await call("v1/repositories", { method: "GET" });
+    if (response.ok) {
+      const body = (await response.json()) as { repositories?: { project?: unknown }[] };
+      for (const r of body.repositories ?? []) if (typeof r.project === "string" && PROJECT.test(r.project)) projects.add(r.project);
+    }
+  } catch {}
+  return [...projects].sort();
 }

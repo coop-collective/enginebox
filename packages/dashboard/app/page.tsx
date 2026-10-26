@@ -19,6 +19,7 @@ import { StoragePanel } from "@/components/storage-panel";
 import { ComputePanel, type Contributor } from "@/components/compute-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
+import { RepositoriesPanel } from "@/components/repositories-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -57,6 +58,11 @@ const sections = {
     title: "Storage",
     description: "Reuse project checkouts and prepared dependencies across agents.",
     icon: "server",
+  },
+  repositories: {
+    title: "Repositories",
+    description: "Host Git repositories per project for agents to clone and push.",
+    icon: "box",
   },
   apps: {
     title: "Connected apps",
@@ -932,7 +938,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates", "storage", "environments", "github", "apps"] as const)
+          {(["fleet", "agents", "templates", "storage", "environments", "repositories", "github", "apps"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1100,6 +1106,7 @@ export default function Dashboard() {
               )}
               {section === "environments" && <EnvironmentsPanel />}
               {section === "apps" && <ConnectedAppsPanel />}
+              {section === "repositories" && <RepositoriesPanel />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

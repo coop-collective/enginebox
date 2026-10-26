@@ -65,6 +65,9 @@ pub fn validate(detail: &Value) -> Result<()> {
             "Invalid native run profile."
         );
     }
+    if let Some(repository) = detail.get("repository") {
+        crate::repository::parse_ref(repository.as_str().unwrap_or(""))?;
+    }
     if let Some(idempotency) = detail.get("idempotency") {
         ensure!(
             ["key_digest", "request_digest"]
@@ -174,6 +177,10 @@ pub fn enrich(record: &Value, detail: Option<&Value>, now: chrono::DateTime<chro
     value["callback"] = detail
         .and_then(|d| d.get("callback").cloned())
         .unwrap_or(Value::Null);
+    // `<project>/<name>` only; a repository token never reaches a record.
+    value["repository"] = detail
+        .and_then(|d| d.get("repository").cloned())
+        .unwrap_or(Value::Null);
     // Why a launch stopped: `{stage, reason}` codes, null otherwise.
     value["failure"] = detail
         .and_then(|d| d.get("failure").cloned())
@@ -224,6 +231,7 @@ pub fn summary(record: &Value, detail: Option<&Value>) -> Value {
         "started_by",
         "env_keys",
         "profile",
+        "repository",
         "failure",
     ] {
         out.insert(key.into(), value[key].clone());

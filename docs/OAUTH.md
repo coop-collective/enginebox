@@ -4,14 +4,15 @@ Engine Box's dashboard is an OAuth 2.1 authorization server that follows the
 [MCP authorization specification](https://modelcontextprotocol.io/specification/draft/basic/authorization).
 Any app can register itself, send the owner to a consent screen, and receive a
 token that starts, reads, lists and cancels agent runs on the workspaces and
-[pools](QUEUE.md#pools) the owner picked, and nothing else. No app gets special treatment: there is no client-specific
+[pools](QUEUE.md#pools) the owner picked, and uses the [hosted repositories](REPOSITORIES.md)
+of the projects the owner picked, and nothing else. No app gets special treatment: there is no client-specific
 code or configuration.
 
 Everything runs in the dashboard process on its public origin (for the hosted
 install, `https://enginebox.coopcollective.dev` through the Cloudflare Tunnel and the
 pass-through `dashboard-edge` Worker). The fleet API stays on loopback; the
 dashboard calls it with the owner token only to mint and revoke service tokens and
-to list workspaces, pools and profiles for the consent screen.
+to list workspaces, pools, profiles and repository projects for the consent screen.
 
 ## Enabling it
 
@@ -39,16 +40,18 @@ read-modify-write with an atomic rename, and no network call happens under the l
 3. **Authorization.** The app sends the browser to `/oauth/authorize` with
    `response_type=code`, `client_id`, `redirect_uri`, `code_challenge` +
    `code_challenge_method=S256`, `resource=<origin>`, optional `scope=agent-runs`
-   and `state`, and optional `project=<id>` to ask for one project's pools only:
-   consent then offers only that project's pools, and the grant (and every access
-   token minted for it) is restricted to that project.
+   and `state`, and optional `project=<id>` to ask for one project only:
+   consent then offers only that project's pools and repositories, and the grant
+   (and every access token minted for it) is restricted to that project.
 4. **Sign-in and consent.** The owner signs in (if needed) and sees the app's
    self-chosen name, its redirect host and client ID, then ticks the pools and the
    workspaces (host/instance) it may use and, optionally, profile names per
    workspace. Pools come from the controller's owner-managed pool list, grouped by
    [project](QUEUE.md#pools); a pool's own profile is shown and is granted with the pool. Named profiles must exist on
    the controller. If one list cannot be read (for example, a host's inventory is
-   unreachable), the other is still offered.
+   unreachable), the other is still offered. Below the pools, "Manage repositories
+   in project X" offers no access, read or write for each project that has a pool or
+   a repository (see [repository grants](REPOSITORIES.md#grants)).
 5. **Code.** Engine Box redirects to the exact registered URI with `code`, the
    original `state` and `iss`. Denial returns `error=access_denied`.
 6. **Token.** `POST /oauth/token` with `grant_type=authorization_code`, `code`,
@@ -63,7 +66,8 @@ read-modify-write with an atomic rename, and no network call happens under the l
   "scope": "agent-runs",
   "enginebox_grants": [
     { "kind": "workspace", "host": "primary", "instance": "ebox-work", "profiles": ["review"] },
-    { "kind": "pool", "pool": "workers", "project": "default", "profile": "coder", "profiles": ["coder"] }
+    { "kind": "pool", "pool": "workers", "project": "default", "profile": "coder", "profiles": ["coder"] },
+    { "kind": "repositories", "project": "default", "access": "write" }
   ],
   "enginebox_callback_secret": "<43 characters>"
 }
@@ -74,7 +78,11 @@ read-modify-write with an atomic rename, and no network call happens under the l
 `profile` is the pool's own profile (or null) and `profiles` repeats it as a list,
 so clients that read `profiles` on every entry keep working. `project` is the
 project the pool belonged to at consent (`default` for grants made before pools had
-projects, or against a controller that does not report them).
+projects, or against a controller that does not report them). A `repositories`
+entry grants one project's hosted repositories: `write` creates, lists, reads,
+mints read or write tokens and names a repository on runs; `read` lists, reads
+and mints read tokens. The access token carries it as the controller's
+`repositories` grant.
 `enginebox_callback_secret` is returned only by the code exchange: it is the HMAC
 key the controller signs this connection's run [callbacks](FLEET.md#agent-runs-v2)
 with, and it stays the same across refreshes. A refresh response repeats
@@ -102,10 +110,14 @@ with, and it stays the same across refreshes. A refresh response repeats
 | `POST /v1/pools/{pool}/agent-runs` | Start a run on any free workspace of a granted pool |
 | `GET /v1/pools/{pool}/agent-runs/{id}` | Read a pool run, placed or not |
 | `POST /v1/pools/{pool}/agent-runs/{id}/cancel` | Cancel a pool run |
+| `GET /v1/projects/{project}/repositories` | List a granted project's repositories |
+| `POST /v1/projects/{project}/repositories` | Create one (`write` grant; idempotent on name) |
+| `GET /v1/projects/{project}/repositories/{name}` | Read one |
+| `POST /v1/projects/{project}/repositories/{name}/tokens` | Mint a short-lived repository token (`read` grants: read tokens only) |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 
 The dashboard's **Connected apps** section lists every live connection (app name,
-redirect hosts, workspaces, pools, profiles, last renewal) with a Disconnect button.
+redirect hosts, workspaces, pools, repository grants, profiles, last renewal) with a Disconnect button.
 
 ## Tokens and lifetimes
 
@@ -190,9 +202,10 @@ keep strict one-time refresh tokens.
   200 clients in total (the oldest unused clients over a day old are dropped first).
 - The `resource` parameter must be the origin (RFC 8707); it is required on
   authorization and checked on token requests when present.
-- The agent-run proxy ignores cookies, forwards only the presented scoped token,
-  allows only the seven agent-run route shapes (four workspace, three pool), and
-  rejects query strings.
+- The proxy ignores cookies, forwards only the presented scoped token, allows only
+  the seven agent-run route shapes (four workspace, three pool) and the four
+  repository route shapes, and rejects query strings. The repository backend
+  configuration and the owner's repository listing are never forwarded.
 - Logs never contain tokens, codes or secrets; a failed revocation logs only a count.
 
 ## End-to-end check
@@ -224,8 +237,9 @@ URL for the owner to open.
   profile named on one workspace may be used on the others in the same connection.
 - **The callback key is stored in `oauth.json`** (mode 0600), like the controller
   stores it with the service token, because every renewed token must carry it.
-- **A credential vault** for the app's own secrets (for example repository tokens);
-  apps pass those per run through `env` today.
+- **A credential vault** for the app's own secrets; apps pass those per run
+  through `env` today. (Engine Box-hosted repositories need none: runs that name
+  one receive a scoped token automatically.)
 - No browser CORS on the token endpoint (server and desktop clients only), no
   client-metadata-document clients, no scope narrowing on refresh, no consent memory
   (each authorization asks again), and no per-client registration management beyond

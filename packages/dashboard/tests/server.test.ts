@@ -252,6 +252,37 @@ test("allocation and template endpoints are allowed without widening other proxy
   assert.equal(fetch.mock.callCount(), 4);
 });
 
+test("repository proxy routes list and create only; tokens and backend configuration stay off the dashboard", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ repositories: [] }, { status: 200 }));
+  for (const [method, path] of [
+    ["GET", "v1/pools"],
+    ["GET", "v1/repositories"],
+    ["GET", "v1/repository-backends"],
+    ["GET", "v1/projects/alpha/repositories"],
+    ["GET", "v1/projects/alpha/repositories/game.v2"],
+    ["POST", "v1/projects/alpha/repositories"],
+  ]) {
+    const response = await proxy(request(undefined, method, method === "POST" ? {} : undefined), path.split("/"));
+    assert.equal(response.status, 200, `${method} ${path}`);
+  }
+  assert.equal(fetch.mock.callCount(), 6);
+  for (const [method, path] of [
+    ["POST", "v1/projects/alpha/repositories/game/tokens"],
+    ["POST", "v1/repository-backends/artifacts-worker"],
+    ["GET", "v1/repository-backends/artifacts-worker"],
+    ["POST", "v1/repositories"],
+    ["GET", "v1/projects/Alpha/repositories"],
+    ["GET", "v1/projects/alpha/repositories/game/tokens"],
+    ["POST", "v1/pools"],
+  ])
+    await assert.rejects(
+      proxy(request(undefined, method, method === "POST" ? {} : undefined), path.split("/")),
+      (err: unknown) => err instanceof HttpError && err.status === 404,
+      `${method} ${path}`,
+    );
+  assert.equal(fetch.mock.callCount(), 6);
+});
+
 test("template registration alone accepts larger manifests up to one MiB", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () =>
     Response.json({ ok: true }),

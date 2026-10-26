@@ -14,6 +14,7 @@ fieldset{border:1px solid var(--line);border-radius:8px;margin:16px 0;padding:8p
 .ws{display:block;padding:8px 0;border-bottom:1px solid var(--line)}.ws:last-child{border-bottom:0}
 label.field{display:block;margin:12px 0}input[type=text],input[type=password]{width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit;font:inherit}
 .profiles{margin:6px 0 0 24px}.profiles input{font-size:13px}
+select{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit}
 .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid var(--line);background:transparent;color:inherit;cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}`;
@@ -65,6 +66,8 @@ export function consentPage(opts: {
   redirectUri: string;
   workspaces: Workspace[];
   pools?: Pool[];
+  /** Projects whose repositories can be granted. */
+  repositoryProjects?: string[];
   /** The app asked for this project's pools only. */
   project?: string | null;
   error?: string;
@@ -97,7 +100,16 @@ export function consentPage(opts: {
   const poolLegend = opts.project
     ? `Pools in project <code>${escape(opts.project)}</code> it may run agents on (the app asked for this project only; Engine Box picks a free workspace)`
     : "Pools it may run agents on, by project (Engine Box picks a free workspace)";
-  const any = opts.workspaces.length > 0 || pools.length > 0;
+  const repositoryProjects = opts.repositoryProjects ?? [];
+  const repositoryList = repositoryProjects
+    .map(
+      (project) =>
+        `<label class="ws">Manage repositories in project <code>${escape(project)}</code> ` +
+        `<select name="repositories:${escape(project)}" aria-label="Repository access in project ${escape(project)}">` +
+        `<option value="">No access</option><option value="read">Read (clone, read-only tokens)</option><option value="write">Write (create, push, use on runs)</option></select></label>`,
+    )
+    .join("");
+  const any = opts.workspaces.length > 0 || pools.length > 0 || repositoryProjects.length > 0;
   return page(
     "Connect an app to Engine Box",
     `<h1>Connect “${escape(opts.clientName)}”?</h1>` +
@@ -106,8 +118,9 @@ export function consentPage(opts: {
       (opts.error ? `<p class="warn" role="alert">${escape(opts.error)}</p>` : "") +
       `<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escape(opts.request)}">` +
       (pools.length ? `<fieldset><legend>${poolLegend}</legend>${poolList}</fieldset>` : "") +
+      (repositoryProjects.length ? `<fieldset><legend>Hosted Git repositories it may use, by project</legend>${repositoryList}</fieldset>` : "") +
       `<fieldset><legend>Workspaces it may run agents on</legend>${list}</fieldset>` +
-      `<p class="muted">It can start, read, list and cancel agent runs in the workspaces and pools you select, and nothing else: no fleet, template, storage, provider sign-in or account settings. You can disconnect it at any time from the dashboard.</p>` +
+      `<p class="muted">It can start, read, list and cancel agent runs in the workspaces and pools you select, and use the repositories of the projects you choose, and nothing else: no fleet, template, storage, provider sign-in, repository backend or account settings. You can disconnect it at any time from the dashboard.</p>` +
       `<div class="actions"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="approve"${any ? "" : " disabled"}>Allow access</button></div></form>`,
     { formTarget: redirect.origin },
   );

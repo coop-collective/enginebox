@@ -461,7 +461,7 @@ pub fn execute_scoped(
     workspace: &Path,
     run_id: Option<&str>,
 ) -> Result<process::Output> {
-    execute_inner(r, home, workspace, run_id, None)
+    execute_inner(r, home, workspace, run_id, None, None)
 }
 
 /// Run under a profile: the envelope is re-validated here, its files are
@@ -480,6 +480,29 @@ pub fn execute_profiled(
         workspace,
         Some(run_id),
         Some((&envelope.block, &files)),
+        None,
+    )
+}
+
+/// Run with a hosted repository (and optionally a profile): the envelope is
+/// re-validated here, the run's scoped git config is written into its private
+/// directory, and that directory is removed again before the writer lease is
+/// released.
+pub fn execute_with_repository(
+    envelope: &crate::repository::Envelope,
+    home: &Path,
+    workspace: &Path,
+    run_id: &str,
+) -> Result<process::Output> {
+    let files = envelope.validate()?;
+    let profile = envelope.profile.as_ref().zip(files.as_ref());
+    execute_inner(
+        &envelope.request,
+        home,
+        workspace,
+        Some(run_id),
+        profile.map(|(p, files)| (&p.block, files)),
+        Some(&envelope.repository),
     )
 }
 
@@ -494,11 +517,12 @@ fn execute_inner(
     workspace: &Path,
     run_id: Option<&str>,
     profile: Option<ProfileInput<'_>>,
+    repository: Option<&crate::repository::Access>,
 ) -> Result<process::Output> {
     r.validate()?;
     ensure!(
-        profile.is_none() || run_id.is_some(),
-        "Profile runs require a controller run ID."
+        (profile.is_none() && repository.is_none()) || run_id.is_some(),
+        "Profile and repository runs require a controller run ID."
     );
     if let Some(id) = run_id {
         validate_run_id(id)?;
@@ -526,6 +550,13 @@ fn execute_inner(
         Some((block, _)) => crate::profile::merged_env(block, r)?,
         None => r.env.clone(),
     };
+    ensure!(
+        repository.is_none()
+            || !caller_env
+                .keys()
+                .any(|k| crate::repository::reserved_env_key(k)),
+        "env cannot set git configuration variables in a repository run."
+    );
     let mut run_env = env.clone();
     for (key, value) in &caller_env {
         ensure!(
@@ -566,6 +597,26 @@ fn execute_inner(
             run_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token);
         }
     }
+    if let (Some(access), Some(id)) = (repository, run_id) {
+        let variables = crate::repository::materialize(&home, id, access)
+            .and_then(|config| crate::repository::environment(access, &config));
+        let variables = match variables {
+            Ok(variables) => variables,
+            Err(error) => {
+                let _ = crate::repository::remove_run_dir(&home, id);
+                if profile.is_some() {
+                    let _ = crate::profile::remove_run_dir(&home, id);
+                }
+                return Err(error);
+            }
+        };
+        run_env.extend(variables);
+        // The token is in a file the agent can read; never let it reach output.
+        redacted.insert("ENGINEBOX_REPO_TOKEN".into(), access.token.clone());
+        if let Some((secret, _)) = access.token.split_once("?expires=") {
+            redacted.insert("ENGINEBOX_REPO_TOKEN_SECRET".into(), secret.to_owned());
+        }
+    }
     let cancelled = || match run_id {
         Some(id) => cancellation_requested(&home, &r.provider, id),
         None => Ok(false),
@@ -591,6 +642,9 @@ fn execute_inner(
         let _ = security::remove(&home, &cancel_path(id));
         if profile.is_some() {
             let _ = crate::profile::remove_run_dir(&home, id);
+        }
+        if repository.is_some() {
+            let _ = crate::repository::remove_run_dir(&home, id);
         }
     }
     drop(lease);
