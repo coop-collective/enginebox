@@ -31,9 +31,9 @@ You need a Cloudflare account on the **Workers Paid** plan (Artifacts is not ava
 
    ```sh
    pnpm --filter @enginebox/artifacts-gateway dry-run
-   pnpm --filter @enginebox/artifacts-gateway deploy
+   pnpm --filter @enginebox/artifacts-gateway run deploy
    openssl rand -hex 32 > /tmp/gateway-secret   # keep it private; delete after step 3
-   pnpm --filter @enginebox/artifacts-gateway secret < /tmp/gateway-secret
+   pnpm --filter @enginebox/artifacts-gateway run secret < /tmp/gateway-secret
    ```
 
 3. **Configure the controller** with the owner token (the same secret):
