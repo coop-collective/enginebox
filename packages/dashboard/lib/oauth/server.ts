@@ -793,7 +793,9 @@ export async function resourceProxy(request: Request, segments: string[]) {
   if (response.status === 401) return unauthorized("invalid_token", "The access token is unknown, expired or revoked.");
   if (response.status === 403)
     return json(result, 403, { "WWW-Authenticate": challenge("insufficient_scope", "The token is not granted that operation on that workspace or pool.") });
-  return json(result, response.status);
+  // A full run queue answers 429 with Retry-After; clients need it to wait rather than back off blindly.
+  const retryAfter = response.headers.get("retry-after");
+  return json(result, response.status, retryAfter && /^\d{1,6}$/.test(retryAfter) ? { "Retry-After": retryAfter } : {});
 }
 
 // ---------------------------------------------------------------- owner grant management

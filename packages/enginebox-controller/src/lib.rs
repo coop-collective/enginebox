@@ -208,6 +208,13 @@ impl Controller {
         gate.mode = Mode::Active;
         Ok(json!({"active":true,"state_schema":STATE_SCHEMA}))
     }
+    /// The agent service of an active controller, for development harnesses
+    /// that install a stand-in run executor (see
+    /// `examples/dev_fake_executor.rs`). Not part of the HTTP API.
+    #[doc(hidden)]
+    pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
+        Ok(self.runtime()?.agents)
+    }
     fn runtime(&self) -> Result<Runtime> {
         self.gate
             .lock()

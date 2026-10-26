@@ -152,6 +152,25 @@ owner again instead of retrying forever.
   rejects query strings.
 - Logs never contain tokens, codes or secrets; a failed revocation logs only a count.
 
+## End-to-end check
+
+`scripts/e2e-connected-app.mjs` drives the whole connected-app flow the way an
+OAuth client such as Ideator's dispatcher does: discovery, registration, sign-in
+and consent, the code exchange, pool runs with `env` and `idempotency_key`
+(queued, running, succeeded, replay, cancel, resume through the pool), a signed
+callback, refresh, revocation and the 401 afterwards. It never prints a token.
+The header of the script lists its environment variables.
+
+On a machine without Incus (for example macOS), run it against the
+development-only controller `cargo run -p enginebox-controller --example
+dev_fake_executor`, which replaces workspace preparation and the guest helper
+with a stand-in that sleeps and succeeds, and delivers callbacks (signed by the
+real delivery code) to a loopback sink instead of the run's public URL. Cancelling
+a run that is already running needs the guest helper, so the script cancels a
+queued one. Against a real Engine Box, point `EB_BASE` at the dashboard and
+`EB_POOL` at an existing pool; without `EB_PASSWORD` it prints the authorization
+URL for the owner to open.
+
 ## Not yet
 
 - **Per-tenant user accounts.** One owner today. With accounts, each tenant's

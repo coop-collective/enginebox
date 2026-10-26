@@ -127,6 +127,8 @@ function fakeController(t: TestContext, opts: { failRevoke?: boolean; fleetDown?
     if (parts[1] === "pools") {
       if (!(held.pools ?? []).includes(parts[2])) return reply({ error: "This service token is not granted that pool." }, 403);
       const placed = { host_id: null, name: null, pool: parts[2] };
+      if (method === "POST" && parts.length === 4 && body?.prompt === "queue full")
+        return Response.json({ error: "The run queue is full.", retry_after_seconds: 9 }, { status: 429, headers: { "Retry-After": "9" } });
       if (method === "POST" && parts.length === 4) return reply({ run: { id: "2".repeat(32), status: "queued", ...placed } }, 202);
       return reply({ run: { id: parts[4], status: parts[5] === "cancel" ? "cancelled" : "queued", ...placed } }, parts[5] === "cancel" ? 202 : 200);
     }
@@ -621,6 +623,9 @@ test("the pool routes reach the controller only for granted pools", async (t) =>
   assert.equal(run.host_id, null);
   assert.equal((await call(`v1/pools/workers/agent-runs/${run.id}`, tokens.access_token)).status, 200);
   assert.equal((await call(`v1/pools/workers/agent-runs/${run.id}/cancel`, tokens.access_token, "POST", {})).status, 202);
+  const full = await call("v1/pools/workers/agent-runs", tokens.access_token, "POST", { provider: "claude", prompt: "queue full" });
+  assert.equal(full.status, 429);
+  assert.equal(full.headers.get("retry-after"), "9", "Retry-After reaches the client");
   const other = await call("v1/pools/plain/agent-runs", tokens.access_token, "POST", { provider: "claude", prompt: "hi" });
   assert.equal(other.status, 403);
   assert.match(other.headers.get("www-authenticate")!, /error="insufficient_scope"/);
@@ -635,7 +640,7 @@ test("the pool routes reach the controller only for granted pools", async (t) =>
   ] as const)
     assert.equal((await call(path, tokens.access_token, method, method === "POST" ? {} : undefined)).status, 404, `${method} ${path}`);
   const forwarded = controller.calls.filter((c) => c.path.startsWith("/v1/pools/"));
-  assert.ok(forwarded.length === 4 && forwarded.every((c) => c.auth === `Bearer ${tokens.access_token}`));
+  assert.ok(forwarded.length === 5 && forwarded.every((c) => c.auth === `Bearer ${tokens.access_token}`));
 });
 
 test("a refresh after a consented pool was deleted ends the connection with invalid_grant", async (t) => {
