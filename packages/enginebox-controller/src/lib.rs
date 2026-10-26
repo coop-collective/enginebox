@@ -120,6 +120,9 @@ impl Controller {
         }
         if gate.mode == Mode::Draining && gate.owner.is_some() {
             gate.mode = Mode::Active;
+            if let Some(runtime) = &gate.runtime {
+                runtime.agents.resume_admission();
+            }
             return Ok(json!({"active":true,"state_schema":STATE_SCHEMA}));
         }
         ensure!(
@@ -173,6 +176,12 @@ impl Controller {
                     .collect::<Vec<_>>(),
             )?,
         };
+        let resolver = runtime.profiles.clone();
+        runtime
+            .agents
+            .set_profile_resolver(Arc::new(move |name, provider| {
+                resolver.resolve(name, provider)
+            }));
         callbacks::install(&runtime.agents);
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -193,6 +202,7 @@ impl Controller {
                 .context("Controller is shutting down")?;
             owner.runtime()?.agents.attach_after_start(host, name)
         }));
+        runtime.agents.start_scheduler();
         gate.runtime = Some(runtime);
         gate.owner = Some(owner);
         gate.mode = Mode::Active;
@@ -219,6 +229,11 @@ impl Controller {
         let mut g = self.gate.lock().unwrap();
         if g.mode == Mode::Active {
             g.mode = Mode::Draining;
+            // Queued runs stay durable for the next owner; only running ones
+            // hold the drain.
+            if let Some(runtime) = &g.runtime {
+                runtime.agents.pause_admission();
+            }
         }
         let pending = g
             .runtime
@@ -345,10 +360,14 @@ impl Principal {
             Self::Service(token) => token.principal(),
         }
     }
-    fn sees(&self, host: &str, name: &str) -> bool {
+    /// A run is visible by its workspace once placed, or by its pool.
+    fn sees_run(&self, host: Option<&str>, name: Option<&str>, pool: Option<&str>) -> bool {
         match self {
             Self::Owner => true,
-            Self::Service(token) => token.sees(host, name),
+            Self::Service(token) => {
+                host.zip(name).is_some_and(|(h, n)| token.sees(h, n))
+                    || pool.is_some_and(|p| token.sees_pool(p))
+            }
         }
     }
 }
@@ -379,6 +398,15 @@ fn service_allows(token: &service_tokens::Token, method: &Method, path: &str) ->
                 "cancel",
             ],
         ) => token.allows(Operation::Cancel, host, name),
+        (&Method::POST, ["v1", "pools", pool, "agent-runs"]) => {
+            token.allows_pool(Operation::Start, pool)
+        }
+        (&Method::GET, ["v1", "pools", pool, "agent-runs", _]) => {
+            token.allows_pool(Operation::Get, pool)
+        }
+        (&Method::POST, ["v1", "pools", pool, "agent-runs", _, "cancel"]) => {
+            token.allows_pool(Operation::Cancel, pool)
+        }
         _ => false,
     }
 }
@@ -585,7 +613,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         1536 * 1024
     } else if path == "/v1/profiles" {
         256 * 1024
-    } else if path == "/v1/ci/templates" {
+    } else if path == "/v1/ci/templates" || path == "/v1/pools" {
         65536
     } else {
         16384
@@ -614,6 +642,15 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     };
     let result = admitted(admission, write(controller, parts, body, principal)).await;
     match result {
+        Ok((StatusCode::TOO_MANY_REQUESTS, v)) => {
+            let mut response = reply(StatusCode::TOO_MANY_REQUESTS, v.clone());
+            if let Some(seconds) = v["retry_after_seconds"].as_u64() {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from(seconds));
+            }
+            response
+        }
         Ok((code, v)) => reply(code, v),
         Err(_) => error(
             StatusCode::BAD_REQUEST,
@@ -720,7 +757,12 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
         ["v1", "agent-runs"] => Ok(c
             .runtime()?
             .agents
-            .list_runs_where(|host, name| principal.sees(host, name))),
+            .list_runs_visible(|host, name, pool| principal.sees_run(host, name, pool))),
+        ["v1", "pools"] => Ok(c.runtime()?.agents.list_pools()),
+        ["v1", "pools", pool] => c.runtime()?.agents.pool_status(pool),
+        ["v1", "pools", pool, "agent-runs", id] => {
+            Ok(json!({"run":c.runtime()?.agents.get_pool_run(pool,id)?}))
+        }
         ["v1", "service-tokens"] => Ok(c.runtime()?.service_tokens.list()),
         ["v1", "profiles"] => Ok(c.runtime()?.profiles.list()),
         ["v1", "profiles", name] => c.runtime()?.profiles.get(name),
@@ -940,85 +982,34 @@ async fn write(
             json!({"run":blocking(move||runtime.agents.cancel_run(&host,&name,&id)).await?})
         }
         ["v1", "hosts", host, "instances", name, "agent-runs"] => {
-            let host = host.to_string();
-            let name = name.to_string();
-            identifier(&host, false)?;
-            identifier(&name, true)?;
-            let mut body = body;
-            let object = body.as_object_mut().context("Expected object")?;
-            // v2 fields are controller-side; the native request stays as before.
-            let profile_name = match object.remove("profile") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(p)) => Some(p),
-                Some(_) => anyhow::bail!("profile must be a string"),
-            };
-            let idempotency_key = match object.remove("idempotency_key") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(k)) => Some(k),
-                Some(_) => anyhow::bail!("idempotency_key must be a string"),
-            };
-            let callback_url = match object.remove("callback") {
-                None | Some(Value::Null) => None,
-                Some(callback) => {
-                    keys(&callback, &["url"], &["url"])?;
-                    Some(string(&callback, "url")?.to_owned())
-                }
-            };
-            if let Some(profile) = &profile_name {
-                if let Principal::Service(token) = &principal
-                    && !token.allows_profile(profile)
-                {
-                    return Ok((
-                        StatusCode::FORBIDDEN,
-                        json!({"error":"This service token is not granted that profile."}),
-                    ));
-                }
-                if !runtime.profiles.exists(profile) {
-                    return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown profile."})));
-                }
+            identifier(host, false)?;
+            identifier(name, true)?;
+            let target = RunTarget::Workspace(host.to_string(), name.to_string());
+            return start_run(&runtime, target, body, &principal).await;
+        }
+        ["v1", "pools", pool, "agent-runs"] => {
+            let target = RunTarget::Pool(pool.to_string());
+            return start_run(&runtime, target, body, &principal).await;
+        }
+        ["v1", "pools", pool, "agent-runs", id, "cancel"] => {
+            empty(&body)?;
+            let (pool, id) = (pool.to_string(), id.to_string());
+            code = StatusCode::ACCEPTED;
+            json!({"run":blocking(move||runtime.agents.cancel_pool_run(&pool,&id)).await?})
+        }
+        ["v1", "pools"] => {
+            let fleet = c.fleet.clone();
+            if let Some(profile) = body.get("profile").and_then(Value::as_str) {
+                ensure!(runtime.profiles.exists(profile), "Unknown profile");
             }
-            let resolved = match &profile_name {
-                Some(profile) => Some(
-                    runtime
-                        .profiles
-                        .resolve(profile, string(&body, "provider")?)?,
-                ),
-                None => None,
-            };
-            let callback = match callback_url {
-                Some(url) => {
-                    callbacks::validate_url(&url)?;
-                    // A service token signs with its own key; the owner signs
-                    // with the profile's. Keys are never taken from the request.
-                    let secret = match &principal {
-                        Principal::Service(token) => token.callback_secret().map(str::to_owned),
-                        Principal::Owner => profile_name
-                            .as_deref()
-                            .and_then(|p| runtime.profiles.callback_secret(p)),
-                    }
-                    .context("No callback key is configured for this caller")?;
-                    Some(enginebox_agents::service::Callback { url, secret })
-                }
-                None => None,
-            };
-            let options = enginebox_agents::service::LaunchOptions {
-                profile: resolved,
-                idempotency_key,
-                callback,
-            };
-            let started_by = principal.started_by();
-            let (run, replayed) = blocking(move || {
-                runtime
-                    .agents
-                    .launch_with(&host, &name, body, &started_by, options)
-            })
-            .await?;
-            if replayed {
-                json!({"run":run,"replayed":true})
-            } else {
-                code = StatusCode::ACCEPTED;
-                json!({"run":run})
-            }
+            runtime
+                .agents
+                .pools()
+                .put(body, &|h| fleet.hosts().iter().any(|x| x.id == h))?
+        }
+        ["v1", "pools", pool, "delete"] => {
+            empty(&body)?;
+            runtime.agents.delete_pool(pool)?
         }
         ["v1", "profile-files"] => {
             code = StatusCode::CREATED;
@@ -1034,10 +1025,12 @@ async fn write(
             let fleet = c.fleet.clone();
             code = StatusCode::CREATED;
             let profiles = runtime.profiles.clone();
+            let agents = runtime.agents.clone();
             runtime.service_tokens.mint(
                 request,
                 |host| fleet.hosts().iter().any(|h| h.id == host),
                 |profile| profiles.exists(profile),
+                |pool| agents.pools().exists(pool),
             )?
         }
         ["v1", "service-tokens", id, "revoke"] => {
@@ -1115,6 +1108,121 @@ async fn write(
     };
     Ok((code, v))
 }
+enum RunTarget {
+    Workspace(String, String),
+    Pool(String),
+}
+
+/// Accept a native run into the durable queue: HTTP 202 (`queued`), 200 for
+/// a replayed idempotency key, 403/404 for profile or pool refusals, and 429
+/// with `Retry-After` only when a hard queue bound is reached.
+async fn start_run(
+    runtime: &Runtime,
+    target: RunTarget,
+    mut body: Value,
+    principal: &Principal,
+) -> Result<(StatusCode, Value)> {
+    let object = body.as_object_mut().context("Expected object")?;
+    // v2 fields are controller-side; the native request stays as before.
+    let mut profile_name = match object.remove("profile") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) => Some(p),
+        Some(_) => anyhow::bail!("profile must be a string"),
+    };
+    let idempotency_key = match object.remove("idempotency_key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(k)) => Some(k),
+        Some(_) => anyhow::bail!("idempotency_key must be a string"),
+    };
+    let callback_url = match object.remove("callback") {
+        None | Some(Value::Null) => None,
+        Some(callback) => {
+            keys(&callback, &["url"], &["url"])?;
+            Some(string(&callback, "url")?.to_owned())
+        }
+    };
+    // A pool's profile applies to every run in it; granting the pool grants
+    // its profile.
+    let mut pool_profile = false;
+    if let RunTarget::Pool(pool) = &target {
+        let Some(definition) = runtime.agents.pools().get(pool) else {
+            return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown pool."})));
+        };
+        if let Some(fixed) = definition.profile {
+            if profile_name.as_ref().is_some_and(|p| *p != fixed) {
+                anyhow::bail!("Runs in this pool use the pool's profile");
+            }
+            profile_name = Some(fixed);
+            pool_profile = true;
+        }
+    }
+    if let Some(profile) = &profile_name {
+        if let Principal::Service(token) = principal
+            && !pool_profile
+            && !token.allows_profile(profile)
+        {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                json!({"error":"This service token is not granted that profile."}),
+            ));
+        }
+        if !runtime.profiles.exists(profile) {
+            return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown profile."})));
+        }
+    }
+    let resolved = match &profile_name {
+        Some(profile) => Some(
+            runtime
+                .profiles
+                .resolve(profile, string(&body, "provider")?)?,
+        ),
+        None => None,
+    };
+    let callback = match callback_url {
+        Some(url) => {
+            callbacks::validate_url(&url)?;
+            // A service token signs with its own key; the owner signs with
+            // the profile's. Keys are never taken from the request.
+            let secret = match principal {
+                Principal::Service(token) => token.callback_secret().map(str::to_owned),
+                Principal::Owner => profile_name
+                    .as_deref()
+                    .and_then(|p| runtime.profiles.callback_secret(p)),
+            }
+            .context("No callback key is configured for this caller")?;
+            Some(enginebox_agents::service::Callback { url, secret })
+        }
+        None => None,
+    };
+    let options = enginebox_agents::service::LaunchOptions {
+        profile: resolved,
+        idempotency_key,
+        callback,
+    };
+    let started_by = principal.started_by();
+    let agents = runtime.agents.clone();
+    let outcome = blocking(move || {
+        Ok(match target {
+            RunTarget::Workspace(host, name) => {
+                agents.launch_with(&host, &name, body, &started_by, options)
+            }
+            RunTarget::Pool(pool) => agents.launch_pool(&pool, body, &started_by, options),
+        })
+    })
+    .await?;
+    match outcome {
+        Ok((run, true)) => Ok((StatusCode::OK, json!({"run":run,"replayed":true}))),
+        Ok((run, false)) => Ok((StatusCode::ACCEPTED, json!({"run":run}))),
+        Err(error) => match error.downcast_ref::<enginebox_agents::queue::QueueFull>() {
+            Some(full) => Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error":full.to_string(),"retry_after_seconds":full.retry_after_seconds}),
+            )),
+            None => Err(error),
+        },
+    }
+}
+
 fn submit(
     c: &Controller,
     jobs: &jobs::Jobs,
@@ -2273,5 +2381,227 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
         }
+    }
+
+    /// An active controller with a connected agent and no measurable host,
+    /// so accepted runs stay queued.
+    fn queue_fixture(c: &Arc<Controller>) {
+        c.activate().unwrap();
+        let home = c.root.join("agents/homes/claude");
+        enginebox_agents::security::private_dir(&home).unwrap();
+        enginebox_agents::security::write_json(
+            &home,
+            ".config/enginebox/controller-token.json",
+            &json!({"kind":"setup_token","value":"controller-token-fixture","expires_at":null}),
+        )
+        .unwrap();
+        c.runtime()
+            .unwrap()
+            .agents
+            .set_measure_hook(Arc::new(|_| anyhow::bail!("fixture host is offline")));
+    }
+
+    #[tokio::test]
+    async fn pools_are_owner_managed_and_pool_runs_need_a_pool_grant() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let workers =
+            json!({"name":"workers","workspaces":[{"host_id":"worker","name":"ebox-p1"}]});
+        for bad in [
+            json!({"name":"workers","workspaces":[{"host_id":"unknown","name":"ebox-p1"}]}),
+            json!({"name":"Bad","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}),
+            json!({"name":"workers"}),
+            json!({"name":"workers","autoscale":{"hosts":["worker"],"max_workspaces":2}}),
+            json!({"name":"workers","profile":"missing","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}),
+            json!({"name":"workers","workspaces":[{"host_id":"worker","name":"ebox-p1"}],"created":[]}),
+        ] {
+            let (status, _) = call(
+                &app,
+                request(Method::POST, "/v1/pools", &bad.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (status, created) = call(
+            &app,
+            request(Method::POST, "/v1/pools", &workers.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["pool"]["revision"], 1);
+        // Grants must name existing pools; a pool-only token needs no workspace scope.
+        let grant = |pools: Value| {
+            json!({"label":"pool-client","scopes":[],"pools":pools,
+                "operations":["agent_runs.start","agent_runs.get","agent_runs.list","agent_runs.cancel"]})
+        };
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/service-tokens",
+                &grant(json!(["missing"])).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, secret) = mint(&app, grant(json!(["workers"]))).await;
+        let (_, list) = call(&app, request(Method::GET, "/v1/service-tokens", "", true)).await;
+        assert_eq!(list["tokens"][0]["pools"], json!(["workers"]));
+        let (_, other_secret) = mint(
+            &app,
+            json!({"label":"workspace-client","scopes":[{"host_id":"worker","name":"ebox-a"}],
+                "operations":["agent_runs.list"]}),
+        )
+        .await;
+        // Pool management is owner-only; ungranted pools and workspaces are 403.
+        let start = r#"{"provider":"claude","prompt":"work","idempotency_key":"job-1"}"#;
+        for (method, path, body) in [
+            (Method::POST, "/v1/pools".to_string(), workers.to_string()),
+            (Method::GET, "/v1/pools".to_string(), String::new()),
+            (Method::GET, "/v1/pools/workers".to_string(), String::new()),
+            (
+                Method::POST,
+                "/v1/pools/workers/delete".to_string(),
+                "{}".into(),
+            ),
+            (
+                Method::POST,
+                "/v1/pools/other/agent-runs".to_string(),
+                start.into(),
+            ),
+            (
+                Method::GET,
+                format!("/v1/pools/other/agent-runs/{}", "1".repeat(32)),
+                String::new(),
+            ),
+            (Method::POST, RUNS_A.to_string(), start.into()),
+        ] {
+            let (status, _) = call(&app, bearer(method, &path, &body, &secret)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        let (status, _) = call(
+            &app,
+            bearer(
+                Method::POST,
+                "/v1/pools/workers/agent-runs",
+                start,
+                &other_secret,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A pool start is queued with its landing workspace still unknown.
+        let (status, started) = call(
+            &app,
+            bearer(Method::POST, "/v1/pools/workers/agent-runs", start, &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let run = &started["run"];
+        assert_eq!(run["status"], "queued");
+        assert!(run["host_id"].is_null() && run["name"].is_null());
+        assert_eq!(run["pool"], "workers");
+        let id = run["id"].as_str().unwrap().to_owned();
+        let (status, replayed) = call(
+            &app,
+            bearer(Method::POST, "/v1/pools/workers/agent-runs", start, &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed["replayed"], true);
+        assert_eq!(replayed["run"]["id"], id.as_str());
+        let path = format!("/v1/pools/workers/agent-runs/{id}");
+        let mut polled = Value::Null;
+        for _ in 0..200 {
+            polled = call(&app, bearer(Method::GET, &path, "", &secret)).await.1;
+            if polled["run"]["waiting_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("host worker"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            polled["run"]["waiting_reason"]
+                .as_str()
+                .unwrap()
+                .contains("waiting for capacity on host worker"),
+            "{polled}"
+        );
+        assert_eq!(polled["run"]["queue_position"], 1);
+        let (_, runs) = call(&app, bearer(Method::GET, "/v1/agent-runs", "", &secret)).await;
+        assert_eq!(runs["total"], 1);
+        let (_, runs) = call(
+            &app,
+            bearer(Method::GET, "/v1/agent-runs", "", &other_secret),
+        )
+        .await;
+        assert_eq!(runs["total"], 0);
+        let (_, pool) = call(&app, request(Method::GET, "/v1/pools/workers", "", true)).await;
+        assert_eq!(pool["pool"]["queued_runs"], 1);
+        // The pool cannot be deleted while it has queued runs.
+        let (status, _) = call(
+            &app,
+            request(Method::POST, "/v1/pools/workers/delete", "{}", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, cancelled) = call(
+            &app,
+            bearer(Method::POST, &format!("{path}/cancel"), "{}", &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(cancelled["run"]["status"], "cancelled");
+        let (status, _) = call(
+            &app,
+            request(Method::POST, "/v1/pools/workers/delete", "{}", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_answers_429_with_retry_after() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        queue_fixture(&c);
+        c.runtime()
+            .unwrap()
+            .agents
+            .set_limits(enginebox_agents::queue::QueueLimits {
+                max_queued_per_principal: 1,
+                retry_after_seconds: 9,
+                ..Default::default()
+            });
+        let start = r#"{"provider":"claude","prompt":"work"}"#;
+        let (status, first) = call(&app, request(Method::POST, RUNS_A, start, true)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(first["run"]["status"], "queued");
+        // A busy workspace queues rather than refusing.
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, RUNS_A, start, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "9");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["retry_after_seconds"], 9);
+        c.runtime()
+            .unwrap()
+            .agents
+            .set_limits(enginebox_agents::queue::QueueLimits::default());
+        let (status, second) = call(&app, request(Method::POST, RUNS_A, start, true)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(second["run"]["status"], "queued");
+        // Draining pauses admission without dropping the queue.
+        c.drain();
+        let (_, runs) = call(&app, request(Method::GET, "/v1/agent-runs", "", true)).await;
+        assert_eq!(runs["total"], 2);
     }
 }

@@ -57,6 +57,10 @@ pub struct Token {
     /// must sign; never returned after minting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     callback_secret: Option<String>,
+    /// Pools whose runs this token may start, read and cancel (by its
+    /// operations). Omitted when empty so older releases still read it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pools: BTreeSet<String>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,6 +85,12 @@ impl Token {
     pub fn callback_secret(&self) -> Option<&str> {
         self.callback_secret.as_deref()
     }
+    pub fn allows_pool(&self, operation: Operation, pool: &str) -> bool {
+        self.operations.contains(&operation) && self.sees_pool(pool)
+    }
+    pub fn sees_pool(&self, pool: &str) -> bool {
+        self.pools.contains(pool)
+    }
     pub fn sees(&self, host_id: &str, name: &str) -> bool {
         self.scopes
             .iter()
@@ -103,6 +113,7 @@ impl Token {
             "expires_at":self.expires_at,
             "revoked_at":self.revoked_at,
             "profiles":self.profiles,
+            "pools":self.pools,
             "has_callback_secret":self.callback_secret.is_some(),
             "active":self.revoked_at.is_none() && !self.expired(now),
         })
@@ -122,6 +133,8 @@ pub struct MintRequest {
     pub profiles: Vec<String>,
     #[serde(default)]
     pub callback_secret: Option<String>,
+    #[serde(default)]
+    pub pools: Vec<String>,
 }
 
 fn secret_hash(secret: &str) -> String {
@@ -173,12 +186,14 @@ impl ServiceTokens {
         )
     }
     /// Mint a token. `known_host` rejects scopes naming unregistered hosts.
-    /// `known_profile` rejects grants naming profiles that do not exist.
+    /// `known_profile` and `known_pool` reject grants naming profiles or
+    /// pools that do not exist.
     pub fn mint(
         &self,
         request: MintRequest,
         known_host: impl Fn(&str) -> bool,
         known_profile: impl Fn(&str) -> bool,
+        known_pool: impl Fn(&str) -> bool,
     ) -> Result<Value> {
         let label = request.label.trim().to_owned();
         ensure!(
@@ -186,8 +201,17 @@ impl ServiceTokens {
             "label must contain 1-128 printable characters"
         );
         ensure!(
-            !request.scopes.is_empty() && request.scopes.len() <= MAX_SCOPES,
-            "scopes must name 1-256 workspaces"
+            (!request.scopes.is_empty() || !request.pools.is_empty())
+                && request.scopes.len() <= MAX_SCOPES,
+            "scopes must name 1-256 workspaces, or pools at least one pool"
+        );
+        ensure!(
+            request.pools.len() <= MAX_SCOPES
+                && request
+                    .pools
+                    .iter()
+                    .all(|p| enginebox_agents::pools::valid_name(p) && known_pool(p)),
+            "pools must name at most 256 existing pools"
         );
         for scope in &request.scopes {
             identifier(&scope.host_id, false)?;
@@ -242,6 +266,7 @@ impl ServiceTokens {
             revoked_at: None,
             profiles: request.profiles.into_iter().collect(),
             callback_secret: request.callback_secret,
+            pools: request.pools.into_iter().collect(),
         };
         self.save(&token)?;
         let public = token.public();
@@ -306,6 +331,7 @@ mod tests {
             expires_at,
             profiles: vec![],
             callback_secret: None,
+            pools: vec![],
         }
     }
     #[test]
@@ -313,7 +339,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let tokens = ServiceTokens::open(temp.path()).unwrap();
         let minted = tokens
-            .mint(request(None), |h| h == "worker", |_| false)
+            .mint(request(None), |h| h == "worker", |_| false, |_| false)
             .unwrap();
         let secret = minted["secret"].as_str().unwrap().to_owned();
         let id = minted["token"]["id"].as_str().unwrap().to_owned();
@@ -350,15 +376,21 @@ mod tests {
         let tokens = ServiceTokens::open(temp.path()).unwrap();
         let mut unknown = request(None);
         unknown.profiles = vec!["verifier".into()];
-        assert!(tokens.mint(unknown, |_| true, |_| false).is_err());
+        assert!(
+            tokens
+                .mint(unknown, |_| true, |_| false, |_| false)
+                .is_err()
+        );
         let mut weak = request(None);
         weak.callback_secret = Some("short".into());
-        assert!(tokens.mint(weak, |_| true, |_| true).is_err());
+        assert!(tokens.mint(weak, |_| true, |_| true, |_| false).is_err());
         let mut granted = request(None);
         granted.profiles = vec!["verifier".into()];
         let key = "k".repeat(40);
         granted.callback_secret = Some(key.clone());
-        let minted = tokens.mint(granted, |_| true, |p| p == "verifier").unwrap();
+        let minted = tokens
+            .mint(granted, |_| true, |p| p == "verifier", |_| false)
+            .unwrap();
         assert_eq!(minted["token"]["profiles"], json!(["verifier"]));
         assert_eq!(minted["token"]["has_callback_secret"], true);
         assert!(!minted.to_string().contains(&key));
@@ -370,7 +402,9 @@ mod tests {
         assert!(!token.allows_profile("coder"));
         assert_eq!(token.callback_secret(), Some(key.as_str()));
         // A token without grants or a key keeps the original record shape.
-        let plain = tokens.mint(request(None), |_| true, |_| true).unwrap();
+        let plain = tokens
+            .mint(request(None), |_| true, |_| true, |_| false)
+            .unwrap();
         let id = plain["token"]["id"].as_str().unwrap();
         let stored = std::fs::read_to_string(
             temp.path()
@@ -384,22 +418,27 @@ mod tests {
     fn minting_rejects_unknown_hosts_empty_grants_and_past_expiry() {
         let temp = tempfile::tempdir().unwrap();
         let tokens = ServiceTokens::open(temp.path()).unwrap();
-        assert!(tokens.mint(request(None), |_| false, |_| false).is_err());
+        assert!(
+            tokens
+                .mint(request(None), |_| false, |_| false, |_| false)
+                .is_err()
+        );
         let mut empty = request(None);
         empty.operations.clear();
-        assert!(tokens.mint(empty, |_| true, |_| true).is_err());
+        assert!(tokens.mint(empty, |_| true, |_| true, |_| false).is_err());
         assert!(
             tokens
                 .mint(
                     request(Some("2000-01-01T00:00:00Z".into())),
                     |_| true,
-                    |_| true
+                    |_| true,
+                    |_| false
                 )
                 .is_err()
         );
         let mut bad = request(None);
         bad.scopes[0].name = "../other".into();
-        assert!(tokens.mint(bad, |_| true, |_| true).is_err());
+        assert!(tokens.mint(bad, |_| true, |_| true, |_| false).is_err());
         assert!(
             serde_json::from_value::<MintRequest>(
                 json!({"label":"x","scopes":[],"operations":["hosts.admin"]})

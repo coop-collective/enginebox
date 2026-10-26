@@ -156,6 +156,11 @@ pub struct Host {
     pub warm_pools: Vec<WarmPolicy>,
     pub contribution_cpu: Option<u64>,
     pub contribution_memory_gib: Option<u64>,
+    /// Concurrent native agent runs admitted on this host (1-256). Unset uses
+    /// the controller default; omitted from serialization when unset so older
+    /// releases still read generated configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_agent_runs: Option<u64>,
 }
 impl Default for Host {
     fn default() -> Self {
@@ -176,6 +181,7 @@ impl Default for Host {
             warm_pools: vec![],
             contribution_cpu: None,
             contribution_memory_gib: None,
+            max_agent_runs: None,
         }
     }
 }
@@ -201,7 +207,8 @@ impl Host {
                 && self.reserve_memory_gib <= 4096
                 && self.reserve_disk_gib <= 4096
                 && (8..=4096).contains(&self.disk_gib)
-                && (1..=256).contains(&self.max_instances),
+                && (1..=256).contains(&self.max_instances)
+                && self.max_agent_runs.is_none_or(|n| (1..=256).contains(&n)),
             "Invalid host resource bounds"
         );
         match (self.contribution_cpu, self.contribution_memory_gib) {

@@ -4,6 +4,8 @@ A profile is a named, owner-managed description of how a native CLI runs in a wo
 
 A run names a profile with `"profile":"<name>"` on `POST /v1/hosts/{host}/instances/{name}/agent-runs` (see [FLEET.md](FLEET.md#agent-runs-v2)). A run without a profile behaves exactly as before.
 
+A [pool](QUEUE.md#pools) may name a profile: every run started on `POST /v1/pools/{pool}/agent-runs` then uses it (a run may omit `profile` or repeat the same name; another name is refused), and a service token granted the pool may use that profile without a separate `profiles` grant. A pool's `template`, when the profile also names one, must be the same. The profile is resolved again at admission if the controller restarted while the run was queued, so a queued run uses the profile's revision current when it starts; a profile deleted meanwhile fails the run without starting it.
+
 ## Model
 
 - **Owner-managed.** Only the owner token can create, replace, read or delete profiles and upload profile files. Every record carries `"owner":"owner"`; when tenants exist this field becomes the tenant, as an additive change.

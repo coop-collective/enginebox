@@ -91,8 +91,8 @@ workspaces using the advertised `sessionTarget` extension:
 Those targets are immutable for the conversation. Normal controller workspace
 authorization, capacity and writer leases still apply. Different sessions can
 execute in parallel; only one run per provider per workspace can own the native
-home at once. Engine Box's current controller runs up to four native tasks at
-once with a bounded queue. ACP allows up to 64 conversation bindings and 16
+home at once. Engine Box admits native tasks by host capacity
+from a durable queue ([QUEUE.md](QUEUE.md)). ACP allows up to 64 conversation bindings and 16
 concurrent requests per connection.
 
 A follow-up prompt uses the exact `native_session_id` returned by the previous

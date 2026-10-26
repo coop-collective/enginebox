@@ -863,3 +863,24 @@ fn a_profile_run_gets_exactly_its_profile_and_leaves_nothing_behind() {
         native::execute_profiled(&envelope("claude", json!({})), &home, &workspace, "bad").is_err()
     );
 }
+
+#[test]
+fn a_bypass_permission_mode_is_refused_inside_any_argument() {
+    for arg in [
+        "bypassPermissions",
+        "--permission-mode=bypassPermissions",
+        "--permission-mode=BYPASSPERMISSIONS",
+        "mode:bypasspermissions",
+    ] {
+        assert!(profile::forbidden_flag(arg), "{arg}");
+    }
+    for arg in [
+        "--permission-mode",
+        "acceptEdits",
+        "dontAsk",
+        "bypass",
+        "permissions",
+    ] {
+        assert!(!profile::forbidden_flag(arg), "{arg}");
+    }
+}

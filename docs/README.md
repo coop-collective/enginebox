@@ -21,6 +21,7 @@ Engine Box is in early development; each guide states what is implemented, quali
 - [Browser access](BROWSER.md): per-workspace headless Chromium over Playwright MCP.
 - [ACP and fleet tasks](ACP.md): ACP adapter and the `ebox tasks` CLI.
 - [Native agent state](TENANT-AGENT-STATE.md): private sessions and native run launching/resume.
+- [Native run queue and pools](QUEUE.md): durable queue, capacity-aware admission, fairness and workspace pools.
 - [Agent usage](AGENT-USAGE.md): provider allowance and billing visibility.
 - [Project tasks](TASK-WORKFLOW.md) and [task assistant](TASK-ASSISTANT.md): roadmap tasks and native assistant bindings.
 - [Integration and CI](INTEGRATION-CI.md): batching, candidate validation and protected CI evidence.

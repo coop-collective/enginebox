@@ -52,8 +52,10 @@ named `agent`. Claude runs with unattended permission prompts disabled; Codex an
 Cursor retain their workspace sandbox. Missing approvals fail through the native
 client rather than enabling a global permission bypass.
 
-The controller admits at most 16 queued/running jobs and executes at most four
-simultaneously. Each workspace/provider permits one writer at a time, covering
+Accepted runs wait in a durable queue and are admitted by host capacity
+(a per-host run limit plus measured CPU and memory headroom), FIFO per
+principal and round-robin across principals; see [the run queue](QUEUE.md).
+Each workspace/provider permits one writer at a time, covering
 new conversations as well as explicit resumes. A guest file lock independently
 protects native state if another controller process or a restarted controller
 tries to launch into that same home. This lease covers Engine Box launches;

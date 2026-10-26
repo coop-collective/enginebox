@@ -958,7 +958,7 @@ pub fn forbidden_flag(arg: &str) -> bool {
         || lower == "--force"
         || lower == "-f"
         || lower == "--approve-mcps"
-        || lower == "bypasspermissions"
+        || lower.contains("bypasspermissions")
         || lower.contains("danger-full-access")
         || lower == "--bare"
 }
