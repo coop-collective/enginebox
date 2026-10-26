@@ -6,7 +6,83 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 pub const MAX_OUTPUT: usize = 262144;
 /// Longest native run: a day, so build and verify tasks are not cut off; callers still choose a timeout per run.
 pub const MAX_RUN_SECONDS: u64 = 86400;
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Most caller-supplied environment variables one run may carry.
+pub const MAX_ENV_VARS: usize = 32;
+/// Largest total of caller-supplied variable names plus values, in bytes. The whole
+/// request (prompt included) must still fit the 16 KiB native launch bound.
+pub const MAX_ENV_BYTES: usize = 8192;
+/// Shortest value that is scrubbed from a run's returned output.
+pub const MIN_REDACTED_VALUE: usize = 8;
+/// Replacement for scrubbed values; never longer than MIN_REDACTED_VALUE, so
+/// scrubbing cannot grow bounded output.
+pub const REDACTED: &str = "[secret]";
+/// Variables Engine Box sets itself, credential/provider selectors, loader,
+/// proxy/TLS trust and shell start-up hooks. A caller can never set these.
+const DENIED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "DISPLAY",
+    "BROWSER",
+    "NO_OPEN_BROWSER",
+    "DISABLE_AUTOUPDATER",
+    "PWD",
+    "OLDPWD",
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "CDPATH",
+    "GLOBIGNORE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "FTP_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "DEBUG",
+    "SSH_AUTH_SOCK",
+];
+const DENIED_ENV_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "OPENAI_",
+    "AZURE_OPENAI_",
+    "CODEX_",
+    "CURSOR_",
+    "ENGINEBOX_",
+    "XDG_",
+    "NPM_CONFIG_",
+    "RUST_",
+];
+/// True when a caller may set this variable for one native run.
+pub fn env_key_allowed(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_uppercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+        && !DENIED_ENV.contains(&key)
+        && !DENIED_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
     pub provider: String,
@@ -19,6 +95,24 @@ pub struct RunRequest {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub model: Option<String>,
+    /// Per-run variables for the native CLI process. Values are secrets: they are
+    /// never persisted, logged or echoed; records keep only the key names.
+    /// Omitted from serialization when empty so older guest helpers still accept it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+impl std::fmt::Debug for RunRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunRequest")
+            .field("provider", &self.provider)
+            .field("prompt", &self.prompt)
+            .field("resume_id", &self.resume_id)
+            .field("workdir", &self.workdir)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("model", &self.model)
+            .field("env_keys", &self.env_keys())
+            .finish()
+    }
 }
 fn default_workdir() -> String {
     ".".into()
@@ -65,12 +159,65 @@ impl RunRequest {
                 "Invalid native model identifier."
             );
         }
+        self.validate_env()?;
         ensure!(
             serde_json::to_vec(self)?.len() <= 16384,
             "Native launch request is too large."
         );
         Ok(())
     }
+    // Messages name the rule, never a value.
+    fn validate_env(&self) -> Result<()> {
+        ensure!(
+            self.env.len() <= MAX_ENV_VARS,
+            "env accepts at most {MAX_ENV_VARS} variables."
+        );
+        ensure!(
+            self.env
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                <= MAX_ENV_BYTES,
+            "env names and values must total at most {MAX_ENV_BYTES} bytes."
+        );
+        for (key, value) in &self.env {
+            ensure!(
+                env_key_allowed(key),
+                "env names must match ^[A-Z][A-Z0-9_]{{0,63}}$ and cannot replace a variable Engine Box controls."
+            );
+            ensure!(!value.contains('\0'), "env values cannot contain NUL.");
+        }
+        Ok(())
+    }
+    /// The caller-supplied variable names, which are safe to record.
+    pub fn env_keys(&self) -> Vec<String> {
+        self.env.keys().cloned().collect()
+    }
+}
+/// Best-effort removal of caller-supplied secret values (raw and JSON-escaped)
+/// from returned output. A native tool can still transform a value before
+/// printing it, so callers must treat run output as private.
+pub fn redact(output: &str, env: &BTreeMap<String, String>) -> String {
+    let mut values: Vec<String> = Vec::new();
+    for value in env.values().filter(|v| v.len() >= MIN_REDACTED_VALUE) {
+        values.push(value.clone());
+        let quoted = serde_json::to_string(value).unwrap_or_default();
+        if let Some(escaped) = quoted.get(1..quoted.len().saturating_sub(1))
+            && escaped != value
+            && escaped.len() >= MIN_REDACTED_VALUE
+        {
+            values.push(escaped.to_owned());
+        }
+    }
+    // Longest first, so a value containing another is removed whole.
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let mut out = output.to_owned();
+    for value in values {
+        if out.contains(&value) {
+            out = out.replace(&value, REDACTED);
+        }
+    }
+    out
 }
 pub fn binary(provider: &str) -> &str {
     match provider {
@@ -335,13 +482,23 @@ pub fn execute_scoped(
     let exe = find_binary(binary(&r.provider), &env)
         .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
     verify_client(&exe, &r.provider, &env, &cwd)?;
+    // The version preflight uses only Engine Box's environment; caller variables
+    // reach the native run alone and can never replace a controlled variable.
+    let mut run_env = env.clone();
+    for (key, value) in &r.env {
+        ensure!(
+            env_key_allowed(key) && !env.contains_key(key),
+            "env cannot replace a variable Engine Box controls."
+        );
+        run_env.insert(key.clone(), value.clone());
+    }
     let cancelled = || match run_id {
         Some(id) => cancellation_requested(&home, &r.provider, id),
         None => Ok(false),
     };
     let result = process::bounded_controlled(
         &native_command_with_config(r, &exe, &home, &cwd),
-        Some(&env),
+        Some(&run_env),
         Some(&cwd),
         if r.provider == "cursor" {
             b""
@@ -360,6 +517,12 @@ pub fn execute_scoped(
         let _ = security::remove(&home, &cancel_path(id));
     }
     drop(lease);
+    let result = result.map(|mut output| {
+        if !r.env.is_empty() {
+            output.output = redact(&output.output, &r.env);
+        }
+        output
+    });
     if result
         .as_ref()
         .is_ok_and(|output| output.exit_code == process::CANCELLED_EXIT_CODE)

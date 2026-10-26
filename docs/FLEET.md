@@ -60,7 +60,7 @@ The controller root defaults to `~/.local/state/enginebox`; override it with `--
 
 ## Endpoints
 
-Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must be JSON objects and cannot exceed 16 KiB, except template registration which accepts up to 1 MiB. Additional payload fields are rejected.
+Every `/v1/` request requires `Authorization: Bearer <token>`. The owner token reaches every endpoint below. A scoped service token (`ebst_…`, minted by the owner) reaches only the agent-run endpoints it was granted, on the workspaces it names; every other route answers 403, and an unknown, revoked or expired service token answers 401. POST bodies must be JSON objects and cannot exceed 16 KiB, except template registration which accepts up to 1 MiB. Additional payload fields are rejected.
 
 | Request | Result |
 |---|---|
@@ -75,8 +75,13 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `GET /v1/jobs/{job_id}` | Poll the job's `queued`, `running`, `succeeded` or `failed` state. |
 | `GET /v1/agents` | Controller Codex, Claude and Cursor connection/delegation status. |
 | `GET /v1/agents/{provider}/usage` | Sanitized native allowance observation or explicit unavailable result; billing renewal is not inferred. |
-| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs` | Launch the official native CLI with `provider`, `prompt` and optional exact `resume_id`, relative `workdir`, `model` and bounded `timeout_seconds`. |
-| `GET /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}` | Private bounded output, run state and native session ID; scoped to the named workspace. |
+| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs` | Launch the official native CLI with `provider`, `prompt` and optional exact `resume_id`, relative `workdir`, `model`, bounded `timeout_seconds` (1–86400) and `env`. Service token operation: `agent_runs.start`. |
+| `GET /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}` | Private bounded output, run state, native session ID, `started_by` and `env_keys`; scoped to the named workspace. Service token operation: `agent_runs.get`. |
+| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}/cancel` | Request cancellation using `{}`. Service token operation: `agent_runs.cancel`. |
+| `GET /v1/agent-runs` | Run summaries, newest active first. A service token sees only runs on its own workspaces. Service token operation: `agent_runs.list`. |
+| `POST /v1/service-tokens` | Owner only. Mint `{"label":"ci","scopes":[{"host_id":"primary","name":"ebox-work"}],"operations":["agent_runs.start","agent_runs.get","agent_runs.list","agent_runs.cancel"],"expires_at":"2026-12-31T00:00:00Z"}` (`expires_at` optional). HTTP 201 returns the token's public record and its `secret`, which is shown only this once. |
+| `GET /v1/service-tokens` | Owner only. Token IDs, labels, scopes, operations, expiry, revocation and `active`; never secrets or digests. |
+| `POST /v1/service-tokens/{id}/revoke` | Owner only. Revoke using `{}`; the token is refused (401) on its next request. |
 | `POST /v1/agents/{provider}/login` | Start native controller sign-in using `{}`; HTTP 202 with a session. |
 | `GET /v1/agents/{provider}/sessions/{id}` | Poll the in-memory sign-in session. |
 | `POST /v1/agents/{provider}/sessions/{id}/input` | Submit the one-time authorization code as `{"text":"…"}`. |
@@ -85,6 +90,12 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `GET /v1/hosts/{host_id}/instances/{name}/accounts` | Legacy native workspace status for diagnostics; workspace login creation returns 409. |
 
 Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no raw shell-command, snapshot-restore or deletion endpoint. Native agent runs can execute tools under the configured native CLI policy and consume provider allowance; they are operator-authorized operations, not guest-accessible infrastructure tools.
+
+### Per-run environment
+
+`env` is an optional object of string names to string values passed to that run's native CLI process only. Names must match `^[A-Z][A-Z0-9_]{0,63}$`; at most 32 variables totalling 8 KiB of names plus values are accepted, and the whole request must still fit the 16 KiB launch bound. Names Engine Box controls are refused: everything the launcher sets (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TERM`, `DISPLAY`, `BROWSER`, …), provider credentials and selectors (`ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, `AZURE_OPENAI_*`, `CODEX_*`, `CURSOR_*`), loader variables (`LD_*`, `DYLD_*`), proxy and TLS trust (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `SSL_CERT_*`, `NODE_EXTRA_CA_CERTS`, …), shell and runtime start-up hooks (`BASH_ENV`, `ENV`, `NODE_OPTIONS`, `RUST_*`, `XDG_*`, …) and `ENGINEBOX_*`. The full list is `DENIED_ENV` in `packages/enginebox-agents/src/native.rs`.
+
+**Treat values as secrets.** They travel to the guest helper on stdin (never argv), are absent from the version preflight, and are never written to run records, sidecars, logs or job output; records keep only `env_keys`. Values of 8 or more bytes are scrubbed (raw and JSON-escaped) from the returned output as `[secret]`, but this is best effort: a native tool that transforms a value before printing it defeats it, and anything the agent writes into the workspace stays there. A guest helper older than this field rejects requests that carry `env`; requests without it are unchanged.
 
 Use `size: "minimum"` or `size: "recommended"` for template-defined resources, or replace `size` with `resources: {"cpu":4,"memory_gib":8,"disk_gib":40}`. All three custom values must be integers at or above the registered minimum. Registered templates become allocatable only after the current manifest revision is installed on that exact host/project/pool/guest binding.
 

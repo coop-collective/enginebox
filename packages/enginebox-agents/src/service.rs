@@ -933,10 +933,20 @@ impl AgentService {
         ))
     }
     pub fn list_runs(&self) -> Value {
+        self.list_runs_where(|_, _| true)
+    }
+    /// List only runs whose (host, workspace) the caller may see.
+    pub fn list_runs_where(&self, visible: impl Fn(&str, &str) -> bool) -> Value {
         let records = self.inner.records.lock().unwrap();
         let details = self.inner.details.lock().unwrap();
         let mut summaries: Vec<_> = records
             .iter()
+            .filter(|(_, record)| {
+                visible(
+                    record["host_id"].as_str().unwrap_or(""),
+                    record["name"].as_str().unwrap_or(""),
+                )
+            })
             .map(|(id, record)| run_details::summary(record, details.get(id)))
             .collect();
         summaries.sort_by(|a, b| {
@@ -1002,6 +1012,18 @@ impl AgentService {
         self.get_run(host_id, name, id)
     }
     pub fn launch(&self, host_id: &str, name: &str, value: Value) -> Result<Value> {
+        self.launch_as(host_id, name, value, run_details::OWNER)
+    }
+    /// Launch on behalf of a principal: `owner` or `service-token:<id>`. The
+    /// principal and the caller's env key names (never values) are recorded.
+    pub fn launch_as(
+        &self,
+        host_id: &str,
+        name: &str,
+        value: Value,
+        started_by: &str,
+    ) -> Result<Value> {
+        run_details::validate_principal(started_by)?;
         let request = native::RunRequest::parse(value)?;
         let pending = self.pending_guard()?;
         let host = self.inner.fleet.account_workspace(host_id, name)?;
@@ -1039,8 +1061,7 @@ impl AgentService {
         );
         ensure!(leases.len() < 16, "Native run queue is full.");
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let value = json!({"id":id,"host_id":host_id,"name":name,"provider":request.provider,"scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":request.workdir,"resume_id":request.resume_id,"created_at":crate::now()});
-        let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false});
+        let (value, detail) = new_run_entries(&id, host_id, name, &request, started_by);
         self.save_detail(&id, &detail)?;
         self.save_record(&value)?;
         self.inner
@@ -1196,6 +1217,20 @@ fn host_binding(host: &Host) -> Result<String> {
     Ok(security::legacy_digest(
         &json!({"target":host.target,"project":host.project,"pool":host.pool,"guest":host.guest}),
     ))
+}
+/// The durable record and sidecar for a new run. The record keeps its legacy
+/// shape so retained releases can still read it; the principal and env key
+/// names live in the sidecar. Env values never enter either.
+pub fn new_run_entries(
+    id: &str,
+    host_id: &str,
+    name: &str,
+    request: &native::RunRequest,
+    started_by: &str,
+) -> (Value, Value) {
+    let record = json!({"id":id,"host_id":host_id,"name":name,"provider":request.provider,"scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":request.workdir,"resume_id":request.resume_id,"created_at":crate::now()});
+    let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false,"started_by":started_by,"env_keys":request.env_keys()});
+    (record, detail)
 }
 pub fn guest_command(host: &Host, name: &str, args: &[String]) -> Result<Vec<String>> {
     let mut argv = vec![

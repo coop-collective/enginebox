@@ -32,8 +32,10 @@ fn rejects_unsafe_prompts_workdirs_and_resume() {
 #[test]
 fn accepts_long_runs_up_to_a_day() {
     for t in [301, 3600, native::MAX_RUN_SECONDS] {
-        let r = native::RunRequest::parse(json!({"provider":"claude","prompt":"x","timeout_seconds":t}))
-            .unwrap();
+        let r = native::RunRequest::parse(
+            json!({"provider":"claude","prompt":"x","timeout_seconds":t}),
+        )
+        .unwrap();
         assert_eq!(r.timeout_seconds, t);
     }
 }

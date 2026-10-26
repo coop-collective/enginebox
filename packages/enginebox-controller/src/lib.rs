@@ -4,6 +4,7 @@ mod ci_templates;
 pub mod contributors;
 mod environment;
 pub mod jobs;
+pub mod service_tokens;
 pub mod storage;
 
 use anyhow::{Context, Result, ensure};
@@ -52,6 +53,7 @@ struct Runtime {
     github: enginebox_github::GitHub,
     ci: ci::Ci,
     contributors: contributors::Contributors,
+    service_tokens: service_tokens::ServiceTokens,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -156,6 +158,7 @@ impl Controller {
                 .with_github(github.clone()),
             github,
             contributors: contributors::Contributors::open(&self.root)?,
+            service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             ci: ci::Ci::open(
                 &self.root,
                 &self
@@ -287,6 +290,92 @@ impl Controller {
             .unwrap_or_default();
         expected.as_bytes().ct_eq(supplied).into()
     }
+    /// The owner token keeps its original check; anything else must be an
+    /// active scoped service token held by the active controller.
+    fn principal(
+        &self,
+        request: &Request<Body>,
+    ) -> std::result::Result<Principal, (StatusCode, &'static str)> {
+        if self.authorized(request) {
+            return Ok(Principal::Owner);
+        }
+        let presented = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .filter(|v| v.starts_with(service_tokens::PREFIX) && v.len() <= 256);
+        let Some(presented) = presented else {
+            return Err((StatusCode::UNAUTHORIZED, "Authentication required."));
+        };
+        let Ok(runtime) = self.runtime() else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Controller is not active; retry through the supervisor.",
+            ));
+        };
+        runtime
+            .service_tokens
+            .authenticate(presented)
+            .map(|token| Principal::Service(Box::new(token)))
+            .map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Service token is unknown, expired or revoked.",
+                )
+            })
+    }
+}
+
+/// Who is calling: the controller owner, or a scoped service token.
+#[derive(Clone)]
+enum Principal {
+    Owner,
+    Service(Box<service_tokens::Token>),
+}
+impl Principal {
+    fn started_by(&self) -> String {
+        match self {
+            Self::Owner => enginebox_agents::run_details::OWNER.into(),
+            Self::Service(token) => token.principal(),
+        }
+    }
+    fn sees(&self, host: &str, name: &str) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Service(token) => token.sees(host, name),
+        }
+    }
+}
+
+/// A service token may reach only the agent-run routes it was granted, on its
+/// own workspaces. Every other route, including token minting, is refused.
+fn service_allows(token: &service_tokens::Token, method: &Method, path: &str) -> bool {
+    use service_tokens::Operation;
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match (method, parts.as_slice()) {
+        (&Method::GET, ["v1", "agent-runs"]) => token.operations.contains(&Operation::List),
+        (&Method::GET, ["v1", "hosts", host, "instances", name, "agent-runs", _]) => {
+            token.allows(Operation::Get, host, name)
+        }
+        (&Method::POST, ["v1", "hosts", host, "instances", name, "agent-runs"]) => {
+            token.allows(Operation::Start, host, name)
+        }
+        (
+            &Method::POST,
+            [
+                "v1",
+                "hosts",
+                host,
+                "instances",
+                name,
+                "agent-runs",
+                _,
+                "cancel",
+            ],
+        ) => token.allows(Operation::Cancel, host, name),
+        _ => false,
+    }
 }
 
 fn reply(code: StatusCode, value: Value) -> Response {
@@ -356,8 +445,17 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     if method == Method::POST && path.starts_with("/v1/github/webhook/") {
         return github_webhook(controller, request).await;
     }
-    if !controller.authorized(&request) {
-        return error(StatusCode::UNAUTHORIZED, "Authentication required.");
+    let principal = match controller.principal(&request) {
+        Ok(principal) => principal,
+        Err((code, message)) => return error(code, message),
+    };
+    if let Principal::Service(token) = &principal
+        && !service_allows(token, &method, &path)
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "This service token is not granted that operation on that workspace.",
+        );
     }
     if request.uri().query().is_some() {
         return error(
@@ -432,9 +530,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             None
         };
         let operation = controller.clone();
+        let reader = principal.clone();
         let result = blocking(move || {
             let _admission = admission;
-            read(&operation, &parts)
+            read(&operation, &parts, &reader)
         })
         .await;
         if let Ok(value) = &result
@@ -503,7 +602,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             );
         }
     };
-    let result = admitted(admission, write(controller, parts, body)).await;
+    let result = admitted(admission, write(controller, parts, body, principal)).await;
     match result {
         Ok((code, v)) => reply(code, v),
         Err(_) => error(
@@ -589,7 +688,7 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
     }
 }
 
-fn read(c: &Controller, p: &[String]) -> Result<Value> {
+fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
         ["v1", "github"] => Ok(c.runtime()?.github.status()),
@@ -608,7 +707,11 @@ fn read(c: &Controller, p: &[String]) -> Result<Value> {
                 .status(&format!("{owner}/{repo}"), run.parse()?)
         }
         ["v1", "agents"] => c.runtime()?.agents.status(),
-        ["v1", "agent-runs"] => Ok(c.runtime()?.agents.list_runs()),
+        ["v1", "agent-runs"] => Ok(c
+            .runtime()?
+            .agents
+            .list_runs_where(|host, name| principal.sees(host, name))),
+        ["v1", "service-tokens"] => Ok(c.runtime()?.service_tokens.list()),
         ["v1", "agents", provider, "usage"] => {
             Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
         }
@@ -648,7 +751,12 @@ fn string<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
     body[key].as_str().context("Expected string field")
 }
 
-async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(StatusCode, Value)> {
+async fn write(
+    c: Arc<Controller>,
+    parts: Vec<String>,
+    body: Value,
+    principal: Principal,
+) -> Result<(StatusCode, Value)> {
     if parts.get(1).is_some_and(|p| p == "github") {
         let github = c.runtime()?.github;
         let value = blocking(move || -> Result<Value> {
@@ -825,7 +933,20 @@ async fn write(c: Arc<Controller>, parts: Vec<String>, body: Value) -> Result<(S
             identifier(&host, false)?;
             identifier(&name, true)?;
             code = StatusCode::ACCEPTED;
-            json!({"run":blocking(move||runtime.agents.launch(&host,&name,body)).await?})
+            let started_by = principal.started_by();
+            json!({"run":blocking(move||runtime.agents.launch_as(&host,&name,body,&started_by)).await?})
+        }
+        ["v1", "service-tokens"] => {
+            let request: service_tokens::MintRequest = serde_json::from_value(body)?;
+            let fleet = c.fleet.clone();
+            code = StatusCode::CREATED;
+            runtime
+                .service_tokens
+                .mint(request, |host| fleet.hosts().iter().any(|h| h.id == host))?
+        }
+        ["v1", "service-tokens", id, "revoke"] => {
+            empty(&body)?;
+            runtime.service_tokens.revoke(id)?
         }
         ["v1", "templates"] => {
             let fleet = c.fleet.clone();
@@ -1214,6 +1335,367 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn bearer(method: Method, path: &str, body: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+    async fn call(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+    async fn mint(app: &Router, body: Value) -> (String, String) {
+        let (status, minted) = call(
+            app,
+            request(Method::POST, "/v1/service-tokens", &body.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{minted}");
+        assert!(minted["token"].get("secret_hash").is_none());
+        (
+            minted["token"]["id"].as_str().unwrap().to_owned(),
+            minted["secret"].as_str().unwrap().to_owned(),
+        )
+    }
+    const RUNS_A: &str = "/v1/hosts/worker/instances/ebox-a/agent-runs";
+    const RUNS_B: &str = "/v1/hosts/worker/instances/ebox-b/agent-runs";
+
+    #[tokio::test]
+    async fn service_tokens_reach_only_granted_agent_run_operations_on_their_workspaces() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        let all = json!({"label":"tenant-a","scopes":[{"host_id":"worker","name":"ebox-a"}],
+            "operations":["agent_runs.start","agent_runs.get","agent_runs.list","agent_runs.cancel"]});
+        // Minting needs the active controller; a standby refuses service tokens.
+        assert_eq!(
+            call(
+                &app,
+                request(Method::POST, "/v1/service-tokens", &all.to_string(), true)
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        c.activate().unwrap();
+        for bad in [
+            json!({"label":"x","scopes":[{"host_id":"unknown","name":"ebox-a"}],"operations":["agent_runs.get"]}),
+            json!({"label":"x","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["hosts.admin"]}),
+            json!({"label":"x","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":[]}),
+            json!({"label":"x","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.get"],"expires_at":"2000-01-01T00:00:00Z"}),
+            json!({"label":"x","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.get"],"admin":true}),
+        ] {
+            assert_eq!(
+                call(
+                    &app,
+                    request(Method::POST, "/v1/service-tokens", &bad.to_string(), true)
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
+        let (id, secret) = mint(&app, all.clone()).await;
+        let (_, list) = call(&app, request(Method::GET, "/v1/service-tokens", "", true)).await;
+        assert_eq!(list["tokens"][0]["id"], id);
+        assert!(!list.to_string().contains(secret.split_once('.').unwrap().1));
+        // A scoped token cannot mint, list or revoke tokens, nor reach admin,
+        // login, lifecycle, storage, CI or controller-internal routes.
+        for (method, path, body) in [
+            (Method::POST, "/v1/service-tokens", all.to_string()),
+            (Method::GET, "/v1/service-tokens", String::new()),
+            (
+                Method::POST,
+                &format!("/v1/service-tokens/{id}/revoke"),
+                "{}".into(),
+            ),
+            (Method::GET, "/v1/fleet", String::new()),
+            (Method::GET, "/v1/agents", String::new()),
+            (Method::POST, "/v1/agents/codex/login", "{}".into()),
+            (
+                Method::POST,
+                "/v1/hosts/worker/instances",
+                r#"{"name":"ebox-c","template":"t"}"#.into(),
+            ),
+            (
+                Method::POST,
+                "/v1/hosts/worker/instances/ebox-a/actions",
+                r#"{"action":"stop"}"#.into(),
+            ),
+            (
+                Method::GET,
+                "/v1/hosts/worker/instances/ebox-a/accounts",
+                String::new(),
+            ),
+            (Method::POST, "/v1/ci/runs", "{}".into()),
+            (Method::GET, "/internal/status", String::new()),
+            (Method::POST, "/internal/drain", "{}".into()),
+            // Wrong workspace for every agent-run operation.
+            (
+                Method::POST,
+                RUNS_B,
+                r#"{"provider":"codex","prompt":"x"}"#.into(),
+            ),
+            (
+                Method::GET,
+                &format!("{RUNS_B}/{}", "1".repeat(32)),
+                String::new(),
+            ),
+            (
+                Method::POST,
+                &format!("{RUNS_B}/{}/cancel", "1".repeat(32)),
+                "{}".into(),
+            ),
+            (
+                Method::POST,
+                "/v1/hosts/other/instances/ebox-a/agent-runs",
+                r#"{"provider":"codex","prompt":"x"}"#.into(),
+            ),
+        ] {
+            assert_eq!(
+                call(&app, bearer(method.clone(), path, &body, &secret))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+        }
+        // The granted workspace passes authorization and reaches validation:
+        // missing fields and denylisted or malformed env are rejected (400).
+        for body in [
+            json!({"provider":"codex"}),
+            json!({"provider":"codex","prompt":"x","env":{"CLAUDE_CODE_OAUTH_TOKEN":"steal"}}),
+            json!({"provider":"codex","prompt":"x","env":{"PATH":"/tmp"}}),
+            json!({"provider":"codex","prompt":"x","env":{"LD_PRELOAD":"/tmp/x.so"}}),
+            json!({"provider":"codex","prompt":"x","env":{"lower":"v"}}),
+            json!({"provider":"codex","prompt":"x","env":{"BIG":"v".repeat(9000)}}),
+        ] {
+            let (status, value) = call(
+                &app,
+                bearer(Method::POST, RUNS_A, &body.to_string(), &secret),
+            )
+            .await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE,
+                "{body}: {status}"
+            );
+            assert!(!value.to_string().contains("steal"));
+        }
+        let (status, runs) = call(&app, bearer(Method::GET, "/v1/agent-runs", "", &secret)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(runs["total"], 0);
+        // Operations are enforced separately from workspaces.
+        let (_, read_only) = mint(
+            &app,
+            json!({"label":"reader","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.get"]}),
+        )
+        .await;
+        for (method, path, body) in [
+            (
+                Method::POST,
+                RUNS_A.to_string(),
+                r#"{"provider":"codex","prompt":"x"}"#,
+            ),
+            (Method::GET, "/v1/agent-runs".to_string(), ""),
+            (
+                Method::POST,
+                format!("{RUNS_A}/{}/cancel", "1".repeat(32)),
+                "{}",
+            ),
+        ] {
+            assert_eq!(
+                call(&app, bearer(method, &path, body, &read_only)).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Unknown, tampered, revoked and expired tokens are unauthenticated.
+        let tampered = format!("{}0", &secret[..secret.len() - 1]);
+        for token in [tampered.as_str(), "ebst_nope", "not-a-token"] {
+            assert_eq!(
+                call(&app, bearer(Method::GET, "/v1/agent-runs", "", token))
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let (status, revoked) = call(
+            &app,
+            request(
+                Method::POST,
+                &format!("/v1/service-tokens/{id}/revoke"),
+                "{}",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(revoked["token"]["active"], false);
+        assert_eq!(
+            call(&app, bearer(Method::GET, "/v1/agent-runs", "", &secret))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let soon = (chrono::Utc::now() + chrono::Duration::milliseconds(1500)).to_rfc3339();
+        let (_, expiring) = mint(
+            &app,
+            json!({"label":"short","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.list"],"expires_at":soon}),
+        )
+        .await;
+        assert_eq!(
+            call(&app, bearer(Method::GET, "/v1/agent-runs", "", &expiring))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert_eq!(
+            call(&app, bearer(Method::GET, "/v1/agent-runs", "", &expiring))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // The owner token is unchanged.
+        assert_eq!(
+            call(&app, request(Method::GET, "/v1/agent-runs", "", true))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Revocation survives a controller handoff.
+        assert_eq!(c.drain()["drained"], true);
+        c.activate().unwrap();
+        assert_eq!(
+            call(&app, bearer(Method::GET, "/v1/agent-runs", "", &secret))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn service_tokens_see_and_cancel_only_runs_on_their_workspaces() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let (token_id, secret) = mint(
+            &app,
+            json!({"label":"tenant-a","scopes":[{"host_id":"worker","name":"ebox-a"}],
+                "operations":["agent_runs.get","agent_runs.list","agent_runs.cancel"]}),
+        )
+        .await;
+        assert_eq!(c.drain()["drained"], true);
+        // Durable runs as the agent service writes them; reloaded on activation.
+        let principal = format!("service-token:{token_id}");
+        let (run_a, run_b) = ("a".repeat(32), "b".repeat(32));
+        for (id, name, started_by, keys) in [
+            (
+                &run_a,
+                "ebox-a",
+                principal.as_str(),
+                json!(["API_BASE_URL"]),
+            ),
+            (&run_b, "ebox-b", "owner", json!([])),
+        ] {
+            enginebox_core::state::write_json(
+                &c.root.join("agent-runs").join(format!("{id}.json")),
+                &json!({"id":id,"host_id":"worker","name":name,"provider":"codex","scope":"controller-owner","state_scope":"private-workspace","status":"succeeded","workdir":".","resume_id":null,"created_at":chrono::Utc::now().to_rfc3339(),"finished_at":chrono::Utc::now().to_rfc3339(),"result":{"exit_code":0,"output":"","timed_out":false,"output_truncated":false}}),
+            )
+            .unwrap();
+            enginebox_core::state::write_json(
+                &c.root.join("agent-run-details").join(format!("{id}.json")),
+                &json!({"schema":1,"task":"fixture","started_at":null,"cancel_requested":false,"cancelled":false,"started_by":started_by,"env_keys":keys}),
+            )
+            .unwrap();
+        }
+        c.activate().unwrap();
+        let (status, runs) = call(&app, bearer(Method::GET, "/v1/agent-runs", "", &secret)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(runs["total"], 1);
+        assert_eq!(runs["runs"][0]["id"], run_a.as_str());
+        assert_eq!(runs["runs"][0]["started_by"], principal.as_str());
+        assert_eq!(runs["runs"][0]["env_keys"], json!(["API_BASE_URL"]));
+        let (_, owner_runs) = call(&app, request(Method::GET, "/v1/agent-runs", "", true)).await;
+        assert_eq!(owner_runs["total"], 2);
+        let (status, run) = call(
+            &app,
+            bearer(Method::GET, &format!("{RUNS_A}/{run_a}"), "", &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(run["run"]["started_by"], principal.as_str());
+        // Another workspace's run is invisible: refused by scope, or unknown
+        // when addressed through the token's own workspace.
+        assert_eq!(
+            call(
+                &app,
+                bearer(Method::GET, &format!("{RUNS_B}/{run_b}"), "", &secret)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &app,
+                bearer(Method::GET, &format!("{RUNS_A}/{run_b}"), "", &secret)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(
+                &app,
+                bearer(
+                    Method::POST,
+                    &format!("{RUNS_B}/{run_b}/cancel"),
+                    "{}",
+                    &secret
+                )
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &app,
+                bearer(
+                    Method::POST,
+                    &format!("{RUNS_A}/{run_b}/cancel"),
+                    "{}",
+                    &secret
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // A finished run's cancel returns its state without contacting the host.
+        let (status, cancelled) = call(
+            &app,
+            bearer(
+                Method::POST,
+                &format!("{RUNS_A}/{run_a}/cancel"),
+                "{}",
+                &secret,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(cancelled["run"]["id"], run_a.as_str());
     }
 
     #[tokio::test]
