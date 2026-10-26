@@ -52,15 +52,18 @@ public static class EngineboxNativeStderrFixture {
   try { Invoke-Wsl -Arguments @('fail') | Out-Null } catch { $rejected=$_.Exception.Message -like '*exit 7*' -and $_.Exception.Message -like '*systemd user session*' }
   if (-not $rejected) { throw 'Nonzero native exits must still stop setup with their error output' }
   $savedEncoding=$OutputEncoding
+  $savedConsoleInput=[Console]::InputEncoding
   try {
     $OutputEncoding=[Text.UnicodeEncoding]::new()
+    [Console]::InputEncoding=[Text.UTF8Encoding]::new($true)
     $value='fixture-'+[char]0x00e9
     $encoded=Invoke-WslNative -Arguments @('stdin') -InputText $value
     $bytes=[Convert]::FromBase64String(($encoded.Stdout -join '').Trim())
     $expected=[Text.UTF8Encoding]::new($false).GetBytes($value+[Environment]::NewLine)
     if ($encoded.ExitCode -ne 0 -or [Convert]::ToBase64String($bytes) -ne [Convert]::ToBase64String($expected)) { throw ('Native stdin fixture bytes differ: actual='+[BitConverter]::ToString($bytes)+' expected='+[BitConverter]::ToString($expected)) }
     if ($OutputEncoding.CodePage -ne 1200) { throw 'Native stdin changed the caller encoding' }
-  } finally { $OutputEncoding=$savedEncoding }
+    if ([Console]::InputEncoding.CodePage -ne 65001 -or [Console]::InputEncoding.GetPreamble().Length -ne 3) { throw 'Native stdin changed the caller console encoding' }
+  } finally { $OutputEncoding=$savedEncoding; [Console]::InputEncoding=$savedConsoleInput }
   $env:PATH=$savedPath
   Write-Output 'PowerShell 5.1 parsing, controller validation and resource bounds passed.'
 } finally {

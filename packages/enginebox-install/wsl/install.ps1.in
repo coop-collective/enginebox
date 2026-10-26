@@ -53,11 +53,16 @@ function Invoke-WslNative([string[]]$Arguments,[AllowNull()][string]$InputText=$
   # Linux expects UTF-8 without a BOM, even if the parent PowerShell session
   # has selected another native-pipeline encoding.
   $OutputEncoding=[Text.UTF8Encoding]::new($false)
+  $previousConsoleInput=[Console]::InputEncoding
   try {
+    # .NET Framework creates and flushes Process.StandardInput using the
+    # console encoding before PowerShell attaches its own writer. A UTF-8
+    # console with a BOM would prepend it even with OutputEncoding above.
+    [Console]::InputEncoding=$OutputEncoding
     $ErrorActionPreference='Continue'
     $items=if ($PSBoundParameters.ContainsKey('InputText')) { @($InputText | & wsl.exe @Arguments 2>&1) } else { @(& wsl.exe @Arguments 2>&1) }
     $code=$LASTEXITCODE
-  } finally { $ErrorActionPreference=$previous }
+  } finally { $ErrorActionPreference=$previous; [Console]::InputEncoding=$previousConsoleInput }
   $stdout=@(); $stderr=@()
   foreach ($item in $items) {
     if ($item -is [System.Management.Automation.ErrorRecord]) { $stderr+=@($item.ToString()) }

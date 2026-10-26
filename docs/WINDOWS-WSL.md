@@ -90,6 +90,9 @@ or full install command was pasted. A rejected registration offers to retry with
 another code without repeating Linux import or runtime configuration. If a pending
 machine ID exists, renew that exact card's code. Input is sent to Linux as UTF-8
 without a BOM, regardless of the calling PowerShell session's output encoding.
+The helper also temporarily sets the console input encoding: Windows PowerShell
+5.1 can otherwise prepend a BOM when .NET Framework opens a native stdin pipe.
+The caller's console encoding is restored after each command.
 To resume an installer that has already exited, use the saved copy:
 
 ```powershell
