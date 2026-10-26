@@ -1945,7 +1945,9 @@ mod tests {
             );
         }
         // Unknown, tampered, revoked and expired tokens are unauthenticated.
-        let tampered = format!("{}0", &secret[..secret.len() - 1]);
+        // swap the last character for a different one (a fixed "0" equals the secret 1 time in 16)
+        let last = if secret.ends_with('0') { '1' } else { '0' };
+        let tampered = format!("{}{last}", &secret[..secret.len() - 1]);
         for token in [tampered.as_str(), "ebst_nope", "not-a-token"] {
             assert_eq!(
                 call(&app, bearer(Method::GET, "/v1/agent-runs", "", token))
