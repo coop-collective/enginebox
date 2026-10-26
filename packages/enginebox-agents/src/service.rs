@@ -1,4 +1,10 @@
-use crate::{auth, delegation, native, process, run_details, security, usage};
+use crate::{
+    auth, delegation,
+    launch_events::{self, LaunchEvent, LaunchEvents, LaunchFailure, Stage},
+    native, pools, process, profile,
+    queue::{self, Entry, EntryState, HostLoad, Placement, QueueLimits, StoredCallback, Target},
+    run_details, security, usage,
+};
 use anyhow::{Result, bail, ensure};
 use enginebox_core::{Fleet, Host};
 use serde_json::{Value, json};
@@ -11,7 +17,14 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
+/// Largest private queue entry: a 16 KiB request plus callback and bookkeeping.
+const QUEUE_ENTRY_LIMIT: usize = 128 * 1024;
+/// Finished runs retained (records and unplaced pool runs each).
+const RETAINED_FINISHED: usize = 100;
+/// Wait after a failed pool workspace creation before trying again.
+const CREATE_BACKOFF: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<Inner>,
@@ -26,12 +39,163 @@ struct Inner {
     sessions: Mutex<BTreeMap<String, Session>>,
     records: Mutex<BTreeMap<String, Value>>,
     leases: Mutex<BTreeSet<(String, String, String)>>,
-    workers: (Mutex<usize>, Condvar),
     pending: AtomicUsize,
     closed: AtomicBool,
     usage: usage::Cache,
     status_cache: Mutex<BTreeMap<String, (std::time::Instant, Value)>>,
     receipt_lock: Mutex<()>,
+    /// Callback targets and keys of runs still in flight. Memory only: the
+    /// key never reaches a record, and a restart ends delivery for that run.
+    callbacks: Mutex<BTreeMap<String, Callback>>,
+    finish_hook: Mutex<Option<FinishHook>>,
+    queue_root: PathBuf,
+    limits: Mutex<QueueLimits>,
+    pools: pools::Pools,
+    /// Scheduler state. Lock order: `sched`, then `leases`, `records`,
+    /// `details`, `callbacks`. Nothing takes `sched` while holding another.
+    sched: Mutex<Sched>,
+    wake: Condvar,
+    admitting: AtomicBool,
+    dispatcher: AtomicBool,
+    measures: Mutex<BTreeMap<String, Measure>>,
+    hooks: Hooks,
+    /// Runs interrupted by a restart whose callback is still owed.
+    owed_callbacks: Mutex<Vec<String>>,
+    /// Bounded history of launch failures and pool member creations.
+    launch_events: LaunchEvents,
+}
+
+#[derive(Default)]
+struct Sched {
+    entries: BTreeMap<String, Queued>,
+    next_seq: u64,
+    cursor: Option<String>,
+    /// Admitted runs and where they run.
+    running: BTreeMap<String, Placement>,
+    /// Per host: runs admitted since its last measurement and still running.
+    admitted_since: BTreeMap<String, BTreeSet<String>>,
+    creating: BTreeMap<String, usize>,
+    backoff: BTreeMap<String, (Instant, String)>,
+    waiting: BTreeMap<String, (usize, String)>,
+    dirty: bool,
+}
+struct Queued {
+    entry: Entry,
+    /// The profile resolved at acceptance. After a restart it is resolved
+    /// again at admission through the profile resolver.
+    resolved: Option<ResolvedProfile>,
+}
+struct Measure {
+    at: Instant,
+    load: Option<HostLoad>,
+}
+
+/// Measures one host's free resources (default: the fleet inventory).
+pub type MeasureHook = Arc<dyn Fn(&Host) -> Result<HostLoad> + Send + Sync>;
+/// Creates one pool workspace: (host, name, template, size).
+pub type CreateHook = Arc<dyn Fn(&str, &str, &str, Option<&str>) -> Result<()> + Send + Sync>;
+/// Resolves a profile by name for a provider at admission.
+pub type ProfileResolver = Arc<dyn Fn(&str, &str) -> Result<ResolvedProfile> + Send + Sync>;
+/// Replaces workspace preparation and the guest helper (tests only).
+pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
+#[derive(Default)]
+struct Hooks {
+    measure: Mutex<Option<MeasureHook>>,
+    create: Mutex<Option<CreateHook>>,
+    resolver: Mutex<Option<ProfileResolver>>,
+    executor: Mutex<Option<RunExecutor>>,
+}
+/// A run the scheduler admitted, as handed to its executor.
+#[derive(Debug, Clone)]
+pub struct AdmittedRun {
+    pub id: String,
+    pub host_id: String,
+    pub name: String,
+    pub pool: Option<String>,
+    pub request: native::RunRequest,
+    pub profile: Option<String>,
+    /// Milliseconds between acceptance and admission.
+    pub queue_wait_ms: u64,
+}
+
+/// A profile resolved by the controller for one launch: the provider block and
+/// every referenced file's bytes (base64) keyed by digest.
+#[derive(Clone)]
+pub struct ResolvedProfile {
+    pub name: String,
+    pub revision: u64,
+    pub template: Option<String>,
+    pub block: profile::ProviderProfile,
+    pub files: BTreeMap<String, String>,
+}
+/// Where to POST a run's terminal summary, and the HMAC key that signs it.
+#[derive(Clone)]
+pub struct Callback {
+    pub url: String,
+    pub secret: String,
+}
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Callback")
+            .field("origin", &callback_origin(&self.url))
+            .finish()
+    }
+}
+/// Optional v2 launch features. `Default` is exactly the original launch.
+#[derive(Clone, Default)]
+pub struct LaunchOptions {
+    pub profile: Option<ResolvedProfile>,
+    pub idempotency_key: Option<String>,
+    pub callback: Option<Callback>,
+}
+/// Handed to the finish hook once a run with a callback reaches a terminal state.
+#[derive(Debug, Clone)]
+pub struct FinishedRun {
+    pub id: String,
+    pub callback: Callback,
+    pub payload: Value,
+}
+pub type FinishHook = Arc<dyn Fn(FinishedRun) + Send + Sync>;
+
+/// Scheme, host and port only: a callback path or query may carry a token.
+pub fn callback_origin(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| "invalid".into())
+}
+pub fn valid_idempotency_key(key: &str) -> bool {
+    (1..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+}
+fn idempotency_key_digest(started_by: &str, key: &str) -> String {
+    profile::sha256_hex(format!("{started_by}\n{key}").as_bytes())
+}
+/// Workspace runs keep the original digest; pool runs scope the key to the
+/// pool as well, so one key names one run per principal and pool.
+fn scoped_key_digest(started_by: &str, target: &Target, key: &str) -> String {
+    match target {
+        Target::Workspace { .. } => idempotency_key_digest(started_by, key),
+        Target::Pool { pool, .. } => {
+            profile::sha256_hex(format!("{started_by}\npool:{pool}\n{key}").as_bytes())
+        }
+    }
+}
+/// What a replay must match: the request with env values replaced by names
+/// (values are secrets and are never hashed to disk), plus the v2 choices.
+fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOptions) -> String {
+    security::digest(&json!({
+        "provider":request.provider,
+        "prompt":request.prompt,
+        "resume_id":request.resume_id,
+        "workdir":request.workdir,
+        "timeout_seconds":request.timeout_seconds,
+        "model":request.model,
+        "env_keys":request.env_keys(),
+        "profile":options.profile.as_ref().map(|p| &p.name),
+        "callback":options.callback.as_ref().map(|c| &c.url),
+    }))
 }
 struct Session {
     public: Value,
@@ -55,6 +219,14 @@ impl AgentService {
         fleet: Fleet,
         provided: BTreeMap<String, String>,
     ) -> Result<Self> {
+        Self::with_limits(root, fleet, provided, QueueLimits::from_env()?)
+    }
+    pub fn with_limits(
+        root: &Path,
+        fleet: Fleet,
+        provided: BTreeMap<String, String>,
+        limits: QueueLimits,
+    ) -> Result<Self> {
         let controller_root = if root.is_absolute() {
             root.to_path_buf()
         } else {
@@ -65,6 +237,24 @@ impl AgentService {
         security::private_dir(&runs_root)?;
         let details_root = controller_root.join("agent-run-details");
         security::private_dir(&details_root)?;
+        let queue_root = controller_root.join("agent-run-queue");
+        security::private_dir(&queue_root)?;
+        let pools = pools::Pools::open(&controller_root)?;
+        let launch_events = LaunchEvents::open(&controller_root)?;
+        let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+        for item in std::fs::read_dir(&queue_root)? {
+            let filename = item?.file_name().to_string_lossy().into_owned();
+            let Some(id) = filename.strip_suffix(".json") else {
+                continue;
+            };
+            native::validate_run_id(id)?;
+            let raw = security::read_bytes(&queue_root, &filename, QUEUE_ENTRY_LIMIT, true)?
+                .ok_or_else(|| anyhow::anyhow!("Queue entry vanished."))?;
+            let entry: Entry = serde_json::from_slice(&raw)?;
+            ensure!(entry.id == id, "Invalid queue entry.");
+            entry.validate()?;
+            entries.insert(id.to_owned(), entry);
+        }
         let root = controller_root.join("agents");
         security::private_dir(&root)?;
         for dir in ["homes", "attachments"] {
@@ -112,7 +302,12 @@ impl AgentService {
             let mut v: Value = serde_json::from_slice(&raw)?;
             let id = filename.trim_end_matches(".json");
             validate_record(&v, id)?;
-            if ["running", "queued"].contains(&v["status"].as_str().unwrap_or("")) {
+            let still_queued = v["status"] == "queued"
+                && entries.get(id).is_some_and(|e| {
+                    e.state == EntryState::Queued && matches!(e.target, Target::Workspace { .. })
+                });
+            if !still_queued && ["running", "queued"].contains(&v["status"].as_str().unwrap_or(""))
+            {
                 v["status"] = json!("failed");
                 v["execution_uncertain"] = json!(true);
                 v["error"] = json!(
@@ -127,8 +322,44 @@ impl AgentService {
             }
             records.insert(id.into(), v);
         }
+        // Reconcile entries with records: a queued workspace entry needs its
+        // queued record; an admitted entry's run was interrupted and may still
+        // owe its callback; queued pool entries and finished ones stand alone.
+        let mut owed = Vec::new();
+        let mut callbacks = BTreeMap::new();
+        entries.retain(|id, e| {
+            let keep = match (e.state, &e.target) {
+                (EntryState::Queued, Target::Workspace { .. }) => {
+                    records.get(id).is_some_and(|r| r["status"] == "queued")
+                }
+                (EntryState::Queued, Target::Pool { .. }) => !records.contains_key(id),
+                (EntryState::Admitted, _) => {
+                    if records.contains_key(id) && e.callback.is_some() {
+                        owed.push(id.clone());
+                        true
+                    } else {
+                        false
+                    }
+                }
+                (EntryState::Finished, _) => true,
+            };
+            if !keep {
+                let _ = std::fs::remove_file(queue_root.join(format!("{id}.json")));
+            } else if let Some(c) = &e.callback
+                && e.state != EntryState::Finished
+            {
+                callbacks.insert(
+                    id.clone(),
+                    Callback {
+                        url: c.url.clone(),
+                        secret: c.secret.clone(),
+                    },
+                );
+            }
+            keep
+        });
         let mut details = BTreeMap::new();
-        for id in records.keys() {
+        for id in records.keys().chain(entries.keys()) {
             if let Some(raw) =
                 security::read_bytes(&details_root, &format!("{id}.json"), security::LIMIT, true)?
             {
@@ -148,12 +379,41 @@ impl AgentService {
                 sessions: Mutex::new(BTreeMap::new()),
                 records: Mutex::new(records),
                 leases: Mutex::new(BTreeSet::new()),
-                workers: (Mutex::new(0), Condvar::new()),
                 pending: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
                 usage: usage::Cache::default(),
                 status_cache: Mutex::new(BTreeMap::new()),
                 receipt_lock: Mutex::new(()),
+                callbacks: Mutex::new(callbacks),
+                finish_hook: Mutex::new(None),
+                queue_root,
+                limits: Mutex::new(limits),
+                pools,
+                sched: Mutex::new(Sched {
+                    next_seq: entries.values().map(|e| e.seq + 1).max().unwrap_or(1),
+                    entries: entries
+                        .into_iter()
+                        .filter(|(_, e)| e.state != EntryState::Admitted)
+                        .map(|(id, entry)| {
+                            (
+                                id,
+                                Queued {
+                                    entry,
+                                    resolved: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                    dirty: true,
+                    ..Default::default()
+                }),
+                wake: Condvar::new(),
+                admitting: AtomicBool::new(true),
+                dispatcher: AtomicBool::new(false),
+                measures: Mutex::new(BTreeMap::new()),
+                hooks: Hooks::default(),
+                owed_callbacks: Mutex::new(owed),
+                launch_events,
             }),
         })
     }
@@ -921,24 +1181,106 @@ impl AgentService {
             regex::Regex::new(r"^[a-f0-9]{32}$")?.is_match(id),
             "Invalid native run ID."
         );
+        let waiting = self.waiting_for(id);
         let records = self.inner.records.lock().unwrap();
         let record = records
             .get(id)
             .filter(|v| v["host_id"] == host_id && v["name"] == name)
             .ok_or_else(|| anyhow::anyhow!("Unknown native run for this workspace."))?;
-        Ok(run_details::enrich(
-            record,
-            self.inner.details.lock().unwrap().get(id),
-            chrono::Utc::now(),
-        ))
+        let details = self.inner.details.lock().unwrap();
+        let mut view = run_details::enrich(record, details.get(id), chrono::Utc::now());
+        view["pool"] = details.get(id).map_or(Value::Null, |d| d["pool"].clone());
+        queue::decorate(&mut view, waiting.as_ref());
+        Ok(view)
     }
-    pub fn list_runs(&self) -> Value {
+    /// A run started on `pool`, whether or not it has been placed yet.
+    pub fn get_pool_run(&self, pool: &str, id: &str) -> Result<Value> {
+        native::validate_run_id(id)?;
+        let waiting = self.waiting_for(id);
+        let entry = self
+            .inner
+            .sched
+            .lock()
+            .unwrap()
+            .entries
+            .get(id)
+            .map(|q| q.entry.clone());
         let records = self.inner.records.lock().unwrap();
         let details = self.inner.details.lock().unwrap();
+        let detail = details
+            .get(id)
+            .filter(|d| d["pool"] == pool)
+            .ok_or_else(|| anyhow::anyhow!("Unknown run for this pool."))?;
+        let mut view = match records.get(id) {
+            Some(record) => run_details::enrich(record, Some(detail), chrono::Utc::now()),
+            None => {
+                let entry = entry.ok_or_else(|| anyhow::anyhow!("Unknown run for this pool."))?;
+                entry_view(&entry, Some(detail))
+            }
+        };
+        view["pool"] = json!(pool);
+        queue::decorate(&mut view, waiting.as_ref());
+        Ok(view)
+    }
+    fn waiting_for(&self, id: &str) -> Option<(usize, String)> {
+        self.inner.sched.lock().unwrap().waiting.get(id).cloned()
+    }
+    pub fn list_runs(&self) -> Value {
+        self.list_runs_visible(|_, _, _| true)
+    }
+    /// List only runs whose (host, workspace) the caller may see.
+    pub fn list_runs_where(&self, visible: impl Fn(&str, &str) -> bool) -> Value {
+        self.list_runs_visible(|host, name, _| match (host, name) {
+            (Some(h), Some(n)) => visible(h, n),
+            _ => false,
+        })
+    }
+    /// List runs the caller may see by (host, workspace) once placed, or by
+    /// pool. Unplaced pool runs have neither host nor workspace.
+    pub fn list_runs_visible(
+        &self,
+        visible: impl Fn(Option<&str>, Option<&str>, Option<&str>) -> bool,
+    ) -> Value {
+        let (waiting, unplaced) = {
+            let sched = self.inner.sched.lock().unwrap();
+            (
+                sched.waiting.clone(),
+                sched
+                    .entries
+                    .values()
+                    .map(|q| q.entry.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let records = self.inner.records.lock().unwrap();
+        let details = self.inner.details.lock().unwrap();
+        let summarize = |id: &str, mut summary: Value| {
+            let pool = details.get(id).map_or(Value::Null, |d| d["pool"].clone());
+            summary["pool"] = pool;
+            queue::decorate(&mut summary, waiting.get(id));
+            summary
+        };
         let mut summaries: Vec<_> = records
             .iter()
-            .map(|(id, record)| run_details::summary(record, details.get(id)))
+            .filter(|(id, record)| {
+                visible(
+                    record["host_id"].as_str(),
+                    record["name"].as_str(),
+                    details.get(*id).and_then(|d| d["pool"].as_str()),
+                )
+            })
+            .map(|(id, record)| summarize(id, run_details::summary(record, details.get(id))))
             .collect();
+        for entry in unplaced
+            .iter()
+            .filter(|e| !records.contains_key(&e.id) && visible(None, None, e.pool()))
+        {
+            let view = entry_view(entry, details.get(&entry.id));
+            let mut summary = run_details::summary(&view, details.get(&entry.id));
+            summary["host_id"] = Value::Null;
+            summary["name"] = Value::Null;
+            summaries.push(summarize(&entry.id, summary));
+        }
         summaries.sort_by(|a, b| {
             let active =
                 |v: &Value| ["queued", "running"].contains(&v["status"].as_str().unwrap_or(""));
@@ -953,9 +1295,48 @@ impl AgentService {
     fn save_detail(&self, id: &str, detail: &Value) -> Result<()> {
         security::write_json(&self.inner.details_root, &format!("{id}.json"), detail)
     }
+    fn save_entry(&self, entry: &Entry) -> Result<()> {
+        security::write_bytes(
+            &self.inner.queue_root,
+            &format!("{}.json", entry.id),
+            &serde_json::to_vec(entry)?,
+            QUEUE_ENTRY_LIMIT,
+        )
+    }
+    fn remove_entry_file(&self, id: &str) {
+        let _ = std::fs::remove_file(self.inner.queue_root.join(format!("{id}.json")));
+    }
     pub fn cancel_run(&self, host_id: &str, name: &str, id: &str) -> Result<Value> {
         native::validate_run_id(id)?;
         let _pending = self.pending_guard()?;
+        // A run still in the durable queue leaves it at once, never starting.
+        let dequeued = {
+            let mut sched = self.inner.sched.lock().unwrap();
+            let queued_here = sched.entries.get(id).is_some_and(|q| {
+                q.entry.state == EntryState::Queued
+                    && q.entry.target
+                        == Target::Workspace {
+                            host_id: host_id.into(),
+                            name: name.into(),
+                        }
+            });
+            if queued_here {
+                sched.entries.remove(id);
+                sched.waiting.remove(id);
+                sched.dirty = true;
+                self.inner.wake.notify_all();
+            }
+            queued_here
+        };
+        if dequeued {
+            self.remove_entry_file(id);
+            self.mark_cancelled(id)?;
+            self.finish(id, |v| {
+                v["status"] = json!("failed");
+                v["result"] = cancelled_result();
+            });
+            return self.get_run(host_id, name, id);
+        }
         let (provider, running) = {
             let records = self.inner.records.lock().unwrap();
             let record = records
@@ -980,15 +1361,9 @@ impl AgentService {
                 record["status"] == "running",
             )
         };
-        {
-            // Pair notification with the queue mutex so a cancellation between
-            // the worker's predicate check and wait cannot be lost.
-            let _workers = self.inner.workers.0.lock().unwrap();
-            self.inner.workers.1.notify_all();
-        }
-        // The same records mutex guards queued->running. A queued cancellation
-        // is observed before launch; a running cancellation may arrive before
-        // the remote helper and remains recorded until that exact run observes it.
+        // An admitted run that has not started observes the request before
+        // launch; a running cancellation may arrive before the remote helper
+        // and remains recorded until that exact run observes it.
         if running {
             let host = self.inner.fleet.account_workspace(host_id, name)?;
             let command = guest_command(&host, name, &["cancel".into(), provider, id.into()])?;
@@ -1001,93 +1376,1197 @@ impl AgentService {
         }
         self.get_run(host_id, name, id)
     }
-    pub fn launch(&self, host_id: &str, name: &str, value: Value) -> Result<Value> {
-        let request = native::RunRequest::parse(value)?;
-        let pending = self.pending_guard()?;
-        let host = self.inner.fleet.account_workspace(host_id, name)?;
-        let _hostlock = enginebox_core::operation_lock(&host)?;
-        let key = (
-            host_id.to_owned(),
-            name.to_owned(),
-            request.provider.clone(),
-        );
-        let uncertain = self.inner.records.lock().unwrap().values().any(|v| {
-            v["execution_uncertain"] == true && v["host_id"] == host_id && v["name"] == name
-        });
-        if uncertain && self.active(host_id, name) {
-            bail!("Previous native run must release its guest lease.")
+    /// Cancel a run started on `pool`: an unplaced run ends at once; a
+    /// placed one is cancelled on its workspace.
+    pub fn cancel_pool_run(&self, pool: &str, id: &str) -> Result<Value> {
+        native::validate_run_id(id)?;
+        let _pending = self.pending_guard()?;
+        let ended = {
+            let mut sched = self.inner.sched.lock().unwrap();
+            match sched.entries.get_mut(id) {
+                Some(q)
+                    if q.entry.state == EntryState::Queued
+                        && q.entry.pool() == Some(pool)
+                        && !self.inner.records.lock().unwrap().contains_key(id) =>
+                {
+                    q.entry.state = EntryState::Finished;
+                    q.entry.outcome = Some("cancelled".into());
+                    q.entry.finished_at = Some(crate::now());
+                    strip_env(&mut q.entry.request);
+                    q.entry.callback = None;
+                    q.resolved = None;
+                    let entry = q.entry.clone();
+                    sched.waiting.remove(id);
+                    sched.dirty = true;
+                    self.inner.wake.notify_all();
+                    Some(entry)
+                }
+                _ => None,
+            }
+        };
+        if let Some(entry) = ended {
+            self.save_entry(&entry)?;
+            self.mark_cancelled(id)?;
+            self.finish_unplaced(&entry);
+            return self.get_pool_run(pool, id);
         }
-        let attached = self.attach_locked(
-            host_id,
-            name,
-            Some(vec![request.provider.clone()]),
-            None,
-            None,
-        )?;
+        let placement = {
+            let records = self.inner.records.lock().unwrap();
+            let details = self.inner.details.lock().unwrap();
+            details
+                .get(id)
+                .filter(|d| d["pool"] == pool)
+                .and_then(|_| records.get(id))
+                .map(|r| {
+                    (
+                        r["host_id"].as_str().unwrap_or("").to_owned(),
+                        r["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+        };
+        match placement {
+            Some((host_id, name)) => {
+                self.cancel_run(&host_id, &name, id)?;
+                self.get_pool_run(pool, id)
+            }
+            None => self.get_pool_run(pool, id),
+        }
+    }
+    fn mark_cancelled(&self, id: &str) -> Result<()> {
+        let mut details = self.inner.details.lock().unwrap();
+        if let Some(detail) = details.get_mut(id) {
+            detail["cancel_requested"] = json!(true);
+            detail["cancelled"] = json!(true);
+            self.save_detail(id, detail)?;
+        }
+        Ok(())
+    }
+    pub fn launch(&self, host_id: &str, name: &str, value: Value) -> Result<Value> {
+        self.launch_as(host_id, name, value, run_details::OWNER)
+    }
+    /// Launch on behalf of a principal: `owner` or `service-token:<id>`. The
+    /// principal and the caller's env key names (never values) are recorded.
+    pub fn launch_as(
+        &self,
+        host_id: &str,
+        name: &str,
+        value: Value,
+        started_by: &str,
+    ) -> Result<Value> {
+        Ok(self
+            .launch_with(host_id, name, value, started_by, LaunchOptions::default())?
+            .0)
+    }
+    /// Register the controller's callback deliverer. Callbacks owed by runs a
+    /// restart interrupted are handed to it now, once.
+    pub fn set_finish_hook(&self, hook: FinishHook) {
+        *self.inner.finish_hook.lock().unwrap() = Some(hook.clone());
+        let owed = std::mem::take(&mut *self.inner.owed_callbacks.lock().unwrap());
+        for id in owed {
+            let finished = {
+                let records = self.inner.records.lock().unwrap();
+                let details = self.inner.details.lock().unwrap();
+                let callback = self.inner.callbacks.lock().unwrap().get(&id).cloned();
+                let pending = details
+                    .get(&id)
+                    .is_some_and(|d| d["callback"]["state"] == "pending");
+                match (records.get(&id), callback) {
+                    (Some(record), Some(callback)) if pending => Some(FinishedRun {
+                        id: id.clone(),
+                        callback,
+                        payload: callback_payload(record, details.get(&id)),
+                    }),
+                    _ => None,
+                }
+            };
+            if let Some(finished) = finished {
+                let _ = self.record_callback(&id, "delivering", 0, None);
+                hook(finished);
+            } else {
+                self.inner.callbacks.lock().unwrap().remove(&id);
+            }
+            self.remove_entry_file(&id);
+        }
+    }
+    pub fn set_measure_hook(&self, hook: MeasureHook) {
+        *self.inner.hooks.measure.lock().unwrap() = Some(hook);
+        self.inner.measures.lock().unwrap().clear();
+        self.kick();
+    }
+    pub fn set_create_hook(&self, hook: CreateHook) {
+        *self.inner.hooks.create.lock().unwrap() = Some(hook);
+    }
+    pub fn set_profile_resolver(&self, hook: ProfileResolver) {
+        *self.inner.hooks.resolver.lock().unwrap() = Some(hook);
+    }
+    /// Replace workspace preparation and the guest helper. For tests that
+    /// exercise scheduling without a live workspace.
+    #[doc(hidden)]
+    pub fn set_run_executor(&self, hook: RunExecutor) {
+        *self.inner.hooks.executor.lock().unwrap() = Some(hook);
+    }
+    pub fn limits(&self) -> QueueLimits {
+        self.inner.limits.lock().unwrap().clone()
+    }
+    /// Replace the queue bounds and admission defaults at runtime.
+    pub fn set_limits(&self, limits: QueueLimits) {
+        *self.inner.limits.lock().unwrap() = limits;
+        self.kick();
+    }
+    pub fn pools(&self) -> &pools::Pools {
+        &self.inner.pools
+    }
+    /// Stop admitting queued runs (controller drain). Queued runs stay
+    /// durable; running ones finish.
+    pub fn pause_admission(&self) {
+        self.inner.admitting.store(false, Ordering::SeqCst);
+        self.kick();
+    }
+    pub fn resume_admission(&self) {
+        self.inner.admitting.store(true, Ordering::SeqCst);
+        self.kick();
+    }
+    /// Start the scheduler. Launches start it too; the controller starts it
+    /// after installing its hooks so restored runs see them.
+    pub fn start_scheduler(&self) {
+        if self.inner.dispatcher.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        thread::spawn(move || {
+            loop {
+                let Some(inner) = weak.upgrade() else { break };
+                let service = AgentService { inner };
+                if service.inner.closed.load(Ordering::SeqCst) {
+                    break;
+                }
+                service.dispatch();
+                let sched = service.inner.sched.lock().unwrap();
+                if !sched.dirty {
+                    let _ = service
+                        .inner
+                        .wake
+                        .wait_timeout(sched, Duration::from_secs(2))
+                        .unwrap();
+                }
+            }
+        });
+    }
+    fn kick(&self) {
+        self.inner.sched.lock().unwrap().dirty = true;
+        self.inner.wake.notify_all();
+    }
+    /// The run an idempotency key already names for this principal, if any.
+    fn replay(&self, key_digest: &str, request_digest: &str) -> Result<Option<String>> {
+        let details = self.inner.details.lock().unwrap();
+        let Some((id, detail)) = details
+            .iter()
+            .find(|(_, d)| d["idempotency"]["key_digest"] == key_digest)
+        else {
+            return Ok(None);
+        };
         ensure!(
-            attached["providers"]
-                .as_array()
-                .is_some_and(|items| items.len() == 1
-                    && items.iter().all(|item| ["attached", "unchanged"]
-                        .contains(&item["status"].as_str().unwrap_or("")))),
+            detail["idempotency"]["request_digest"] == request_digest,
+            "idempotency_key was already used with a different request."
+        );
+        Ok(Some(id.clone()))
+    }
+    /// Launch with the optional v2 features. Returns the run and whether it is
+    /// an existing run returned for a repeated idempotency key. The run is
+    /// accepted into the durable queue (`queued`) and starts when its
+    /// workspace and host have room.
+    pub fn launch_with(
+        &self,
+        host_id: &str,
+        name: &str,
+        value: Value,
+        started_by: &str,
+        options: LaunchOptions,
+    ) -> Result<(Value, bool)> {
+        enginebox_core::identifier(host_id, false)?;
+        enginebox_core::identifier(name, true)?;
+        let template = options.profile.as_ref().and_then(|p| p.template.clone());
+        self.enqueue(
+            Target::Workspace {
+                host_id: host_id.into(),
+                name: name.into(),
+            },
+            value,
+            started_by,
+            options,
+            template,
+        )
+    }
+    /// Launch on any free workspace of `pool`. A `resume_id` lands on the
+    /// workspace that holds that session.
+    pub fn launch_pool(
+        &self,
+        pool: &str,
+        value: Value,
+        started_by: &str,
+        options: LaunchOptions,
+    ) -> Result<(Value, bool)> {
+        let definition = self
+            .inner
+            .pools
+            .get(pool)
+            .ok_or_else(|| anyhow::anyhow!("Unknown pool."))?;
+        ensure!(
+            definition.profile.is_none()
+                || options.profile.as_ref().map(|p| &p.name) == definition.profile.as_ref(),
+            "Runs in this pool use the pool's profile."
+        );
+        let profile_template = options.profile.as_ref().and_then(|p| p.template.clone());
+        ensure!(
+            definition.template.is_none()
+                || profile_template.is_none()
+                || definition.template == profile_template,
+            "The profile's template differs from the pool's."
+        );
+        let request = native::RunRequest::parse(value.clone())?;
+        let pinned = match &request.resume_id {
+            None => None,
+            Some(session) => Some(self.pool_session_home(pool, session).ok_or_else(|| {
+                anyhow::anyhow!("resume_id is not a session started in this pool.")
+            })?),
+        };
+        self.enqueue(
+            Target::Pool {
+                pool: pool.into(),
+                pinned,
+            },
+            value,
+            started_by,
+            options,
+            definition.template.or(profile_template),
+        )
+    }
+    fn pool_session_home(&self, pool: &str, session: &str) -> Option<Placement> {
+        if let Some(home) = self.inner.pools.session_home(session, pool) {
+            return Some(home);
+        }
+        let records = self.inner.records.lock().unwrap();
+        let details = self.inner.details.lock().unwrap();
+        records
+            .iter()
+            .filter(|(id, r)| {
+                r["native_session_id"] == session
+                    && details.get(*id).is_some_and(|d| d["pool"] == pool)
+            })
+            .max_by_key(|(_, r)| r["created_at"].as_str().unwrap_or("").to_owned())
+            .map(|(_, r)| Placement {
+                host_id: r["host_id"].as_str().unwrap_or("").to_owned(),
+                name: r["name"].as_str().unwrap_or("").to_owned(),
+            })
+    }
+    fn enqueue(
+        &self,
+        target: Target,
+        value: Value,
+        started_by: &str,
+        options: LaunchOptions,
+        template: Option<String>,
+    ) -> Result<(Value, bool)> {
+        run_details::validate_principal(started_by)?;
+        let request = native::RunRequest::parse(value)?;
+        if let Some(resolved) = &options.profile {
+            ensure!(profile::valid_name(&resolved.name), "Invalid profile name.");
+            let envelope = profile::Envelope {
+                request: request.clone(),
+                profile: resolved.name.clone(),
+                block: resolved.block.clone(),
+                files: resolved.files.clone(),
+            };
+            envelope.validate()?;
+        }
+        if let Some(key) = &options.idempotency_key {
+            ensure!(
+                valid_idempotency_key(key),
+                "idempotency_key must be 1-128 characters of A-Z a-z 0-9 . _ : -"
+            );
+        }
+        let request_digest = idempotency_request_digest(&request, &options);
+        // Acceptance is serialized by the scheduler lock, so two concurrent
+        // launches with one key cannot both create a run.
+        let mut sched = self.inner.sched.lock().unwrap();
+        if let Some(key) = &options.idempotency_key
+            && let Some(id) = self.replay(
+                &scoped_key_digest(started_by, &target, key),
+                &request_digest,
+            )?
+        {
+            drop(sched);
+            let view = match &target {
+                Target::Workspace { host_id, name } => self.get_run(host_id, name, &id),
+                Target::Pool { pool, .. } => self.get_pool_run(pool, &id),
+            };
+            return Ok((
+                view.map_err(|_| {
+                    anyhow::anyhow!("idempotency_key was already used with a different request.")
+                })?,
+                true,
+            ));
+        }
+        ensure!(
+            !self.inner.closed.load(Ordering::SeqCst),
+            "Agent service is draining."
+        );
+        let queued = |principal: Option<&str>| {
+            sched
+                .entries
+                .values()
+                .filter(|q| {
+                    q.entry.state == EntryState::Queued
+                        && principal.is_none_or(|p| q.entry.principal == p)
+                })
+                .count()
+        };
+        if queued(None) >= self.limits().max_queued_total {
+            return Err(queue::QueueFull {
+                scope: "controller",
+                retry_after_seconds: self.limits().retry_after_seconds,
+            }
+            .into());
+        }
+        if queued(Some(started_by)) >= self.limits().max_queued_per_principal {
+            return Err(queue::QueueFull {
+                scope: "caller's",
+                retry_after_seconds: self.limits().retry_after_seconds,
+            }
+            .into());
+        }
+        match &target {
+            Target::Workspace { host_id, .. } => {
+                self.inner.fleet.host(host_id)?;
+            }
+            Target::Pool {
+                pinned: Some(p), ..
+            } => {
+                self.inner.fleet.host(&p.host_id)?;
+            }
+            Target::Pool { .. } => {}
+        }
+        ensure!(
+            self.material(&request.provider).is_ok(),
             "Connect this agent on the controller before launching a session."
         );
-        let mut leases = self.inner.leases.lock().unwrap();
-        ensure!(
-            !leases.contains(&key),
-            "This workspace provider already has an active native run."
-        );
-        ensure!(leases.len() < 16, "Native run queue is full.");
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let value = json!({"id":id,"host_id":host_id,"name":name,"provider":request.provider,"scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":request.workdir,"resume_id":request.resume_id,"created_at":crate::now()});
-        let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false});
+        let seq = sched.next_seq;
+        sched.next_seq += 1;
+        let (record, mut detail) = match &target {
+            Target::Workspace { host_id, name } => {
+                new_run_entries(&id, host_id, name, &request, started_by)
+            }
+            // Placeholder workspace; the record is written at placement.
+            Target::Pool { .. } => {
+                new_run_entries(&id, "unplaced", "ebox-unplaced", &request, started_by)
+            }
+        };
+        if let Target::Pool { pool, .. } = &target {
+            detail["pool"] = json!(pool);
+        }
+        if let Some(resolved) = &options.profile {
+            detail["profile"] = json!({"name":resolved.name,"revision":resolved.revision});
+        }
+        if let Some(key) = &options.idempotency_key {
+            detail["idempotency"] = json!({
+                "key_digest":scoped_key_digest(started_by, &target, key),
+                "request_digest":request_digest,
+            });
+        }
+        if let Some(callback) = &options.callback {
+            detail["callback"] = json!({
+                "origin":callback_origin(&callback.url),
+                "state":"pending",
+                "attempts":0,
+                "last_status":null,
+                "updated_at":crate::now(),
+            });
+        }
+        let entry = Entry {
+            schema: 1,
+            id: id.clone(),
+            seq,
+            principal: started_by.into(),
+            created_at: record["created_at"].as_str().unwrap_or("").into(),
+            target: target.clone(),
+            state: EntryState::Queued,
+            request: serde_json::to_value(&request)?,
+            profile: options.profile.as_ref().map(|p| p.name.clone()),
+            template,
+            callback: options.callback.as_ref().map(|c| StoredCallback {
+                url: c.url.clone(),
+                secret: c.secret.clone(),
+            }),
+            placement: None,
+            finished_at: None,
+            outcome: None,
+        };
+        // Order: sidecar, record, queue entry. A crash before the entry leaves
+        // a queued record that the next start marks failed, never a lost run.
         self.save_detail(&id, &detail)?;
-        self.save_record(&value)?;
         self.inner
             .details
             .lock()
             .unwrap()
             .insert(id.clone(), detail);
-        leases.insert(key.clone());
-        self.inner
-            .records
-            .lock()
-            .unwrap()
-            .insert(id.clone(), value.clone());
+        if matches!(target, Target::Workspace { .. }) {
+            self.save_record(&record)?;
+            self.inner
+                .records
+                .lock()
+                .unwrap()
+                .insert(id.clone(), record);
+        }
+        self.save_entry(&entry)?;
+        if let Some(callback) = &options.callback {
+            self.inner
+                .callbacks
+                .lock()
+                .unwrap()
+                .insert(id.clone(), callback.clone());
+        }
+        sched.entries.insert(
+            id.clone(),
+            Queued {
+                entry,
+                resolved: options.profile,
+            },
+        );
+        sched.dirty = true;
+        drop(sched);
+        self.inner.wake.notify_all();
+        self.start_scheduler();
+        let view = match &target {
+            Target::Workspace { host_id, name } => self.get_run(host_id, name, &id)?,
+            Target::Pool { pool, .. } => self.get_pool_run(pool, &id)?,
+        };
+        Ok((view, false))
+    }
+    /// One scheduler pass: refresh stale host measurements, plan, admit.
+    fn dispatch(&self) {
+        let needed: BTreeSet<String> = {
+            let mut sched = self.inner.sched.lock().unwrap();
+            sched.dirty = false;
+            let queued: Vec<&Entry> = sched
+                .entries
+                .values()
+                .map(|q| &q.entry)
+                .filter(|e| e.state == EntryState::Queued)
+                .collect();
+            if queued.is_empty() {
+                sched.waiting.clear();
+                return;
+            }
+            let mut hosts = BTreeSet::new();
+            for e in queued {
+                match &e.target {
+                    Target::Workspace { host_id, .. } => {
+                        hosts.insert(host_id.clone());
+                    }
+                    Target::Pool {
+                        pinned: Some(p), ..
+                    } => {
+                        hosts.insert(p.host_id.clone());
+                    }
+                    Target::Pool { pool, pinned: None } => {
+                        if let Some(def) = self.inner.pools.get(pool) {
+                            hosts.extend(def.members().into_iter().map(|m| m.host_id));
+                            if let Some(a) = def.autoscale {
+                                hosts.extend(a.hosts);
+                            }
+                        }
+                    }
+                }
+            }
+            hosts
+        };
+        self.refresh_measurements(&needed);
+        let mut sched = self.inner.sched.lock().unwrap();
+        let leases = self.inner.leases.lock().unwrap().clone();
+        let mut busy: BTreeSet<(String, String)> = leases
+            .iter()
+            .map(|(h, n, _)| (h.clone(), n.clone()))
+            .collect();
+        busy.extend(
+            sched
+                .running
+                .values()
+                .map(|p| (p.host_id.clone(), p.name.clone())),
+        );
+        busy.extend(
+            self.inner
+                .records
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|v| v["execution_uncertain"] == true)
+                .map(|v| {
+                    (
+                        v["host_id"].as_str().unwrap_or("").to_owned(),
+                        v["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                }),
+        );
+        let measures = self.inner.measures.lock().unwrap();
+        let mut hosts = BTreeMap::new();
+        for host in self.inner.fleet.hosts() {
+            hosts.insert(
+                host.id.clone(),
+                queue::HostState {
+                    max_runs: host
+                        .max_agent_runs
+                        .map_or(self.limits().default_host_max_runs, |n| n as usize),
+                    running: sched
+                        .running
+                        .values()
+                        .filter(|p| p.host_id == host.id)
+                        .count(),
+                    load: measures.get(&host.id).and_then(|m| m.load),
+                    admitted_since: sched.admitted_since.get(&host.id).map_or(0, BTreeSet::len),
+                },
+            );
+        }
+        drop(measures);
+        let now = Instant::now();
+        let mut pool_states = BTreeMap::new();
+        for def in self.inner.pools.all() {
+            pool_states.insert(
+                def.name.clone(),
+                queue::PoolState {
+                    members: def.members(),
+                    creating: sched.creating.get(&def.name).copied().unwrap_or(0),
+                    create_hosts: def
+                        .autoscale
+                        .as_ref()
+                        .map(|a| a.hosts.clone())
+                        .unwrap_or_default(),
+                    max_workspaces: def.max_workspaces(),
+                    backoff: sched
+                        .backoff
+                        .get(&def.name)
+                        .is_some_and(|(until, _)| *until > now),
+                },
+            );
+        }
+        let candidates: Vec<queue::Candidate> = sched
+            .entries
+            .values()
+            .filter(|q| q.entry.state == EntryState::Queued)
+            .map(|q| queue::Candidate {
+                id: q.entry.id.clone(),
+                principal: q.entry.principal.clone(),
+                seq: q.entry.seq,
+                provider: q.entry.provider().to_owned(),
+                target: q.entry.target.clone(),
+            })
+            .collect();
+        let plan = queue::plan(queue::PlanInput {
+            candidates: &candidates,
+            cursor: sched.cursor.as_deref(),
+            hosts,
+            leases,
+            busy_workspaces: busy,
+            pools: pool_states,
+            headroom_bytes: self.limits().run_memory_headroom_bytes,
+            admitting: self.inner.admitting.load(Ordering::SeqCst)
+                && !self.inner.closed.load(Ordering::SeqCst),
+        });
+        sched.waiting = plan.waiting;
+        sched.cursor = plan.cursor;
+        for (id, placement) in plan.admit {
+            let started = Instant::now();
+            if let Err(error) = self.admit(&mut sched, &id, placement.clone()) {
+                // The run stays queued and is retried on a later pass.
+                let entry = sched.entries.get(&id).map(|q| q.entry.clone());
+                self.record_launch(LaunchEvent {
+                    kind: "run_admission_failed".into(),
+                    outcome: "failed".into(),
+                    run_id: Some(id.clone()),
+                    pool: entry.as_ref().and_then(|e| e.pool().map(str::to_owned)),
+                    host_id: Some(placement.host_id.clone()),
+                    workspace: Some(placement.name.clone()),
+                    template: entry.as_ref().and_then(|e| e.template.clone()),
+                    profile: entry.as_ref().and_then(|e| e.profile.clone()),
+                    provider: entry.as_ref().map(|e| e.provider().to_owned()),
+                    stage: Stage::Place.as_str().into(),
+                    reason: "admission_error".into(),
+                    message: format!("{error:#}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    ..Default::default()
+                });
+            }
+        }
+        for (pool, host) in plan.create {
+            *sched.creating.entry(pool.clone()).or_default() += 1;
+            self.spawn_create(pool, host);
+        }
+    }
+    fn refresh_measurements(&self, hosts: &BTreeSet<String>) {
+        let ttl = Duration::from_secs(self.limits().measure_ttl_seconds);
+        let stale: Vec<Host> = {
+            let measures = self.inner.measures.lock().unwrap();
+            hosts
+                .iter()
+                .filter(|h| measures.get(*h).is_none_or(|m| m.at.elapsed() >= ttl))
+                .filter_map(|h| self.inner.fleet.host(h).ok())
+                .collect()
+        };
+        if stale.is_empty() {
+            return;
+        }
+        let hook = self.inner.hooks.measure.lock().unwrap().clone();
+        let results: Vec<(String, Option<HostLoad>)> = thread::scope(|scope| {
+            stale
+                .iter()
+                .map(|host| {
+                    let hook = hook.clone();
+                    scope.spawn(move || {
+                        let load = match hook {
+                            Some(measure) => measure(host),
+                            None => enginebox_core::capacity::inventory(host)
+                                .and_then(|facts| HostLoad::from_inventory(host, &facts)),
+                        };
+                        (host.id.clone(), load.ok())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|j| j.join().ok())
+                .collect()
+        });
+        let mut sched = self.inner.sched.lock().unwrap();
+        let mut measures = self.inner.measures.lock().unwrap();
+        for (host, load) in results {
+            if load.is_some() {
+                sched.admitted_since.remove(&host);
+            }
+            measures.insert(
+                host,
+                Measure {
+                    at: Instant::now(),
+                    load,
+                },
+            );
+        }
+    }
+    /// Move one queued run to running on `placement` and start its worker.
+    fn admit(&self, sched: &mut Sched, id: &str, placement: Placement) -> Result<()> {
+        let pending = self.pending_guard()?;
+        let queued = sched
+            .entries
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("Queued run vanished."))?;
+        let request = native::RunRequest::parse(queued.entry.request.clone())?;
+        if let Target::Pool { .. } = queued.entry.target {
+            let (record, _) = new_run_entries(
+                id,
+                &placement.host_id,
+                &placement.name,
+                &request,
+                &queued.entry.principal,
+            );
+            let mut record = record;
+            record["created_at"] = json!(queued.entry.created_at);
+            self.save_record(&record)?;
+            self.inner
+                .records
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), record);
+        }
+        let mut admitted = queued.entry.clone();
+        admitted.state = EntryState::Admitted;
+        admitted.placement = Some(placement.clone());
+        // Env values leave the queue file once the run is handed to its worker.
+        strip_env(&mut admitted.request);
+        self.save_entry(&admitted)?;
+        queued.entry = admitted;
+        let resolved = queued.resolved.take();
+        let queue_wait_ms = chrono::DateTime::parse_from_rfc3339(&queued.entry.created_at)
+            .map(|at| {
+                chrono::Utc::now()
+                    .signed_duration_since(at)
+                    .num_milliseconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(0);
+        let run = AdmittedRun {
+            id: id.to_owned(),
+            host_id: placement.host_id.clone(),
+            name: placement.name.clone(),
+            pool: queued.entry.pool().map(str::to_owned),
+            request,
+            profile: queued.entry.profile.clone(),
+            queue_wait_ms,
+        };
+        let template = queued.entry.template.clone();
+        let lease = (
+            placement.host_id.clone(),
+            placement.name.clone(),
+            run.request.provider.clone(),
+        );
+        self.inner.leases.lock().unwrap().insert(lease.clone());
+        sched.running.insert(id.to_owned(), placement.clone());
+        sched
+            .admitted_since
+            .entry(placement.host_id.clone())
+            .or_default()
+            .insert(id.to_owned());
+        sched.waiting.remove(id);
         let this = self.clone();
-        let name = name.to_owned();
         thread::spawn(move || {
             let _pending = pending;
-            let mut workers = this.inner.workers.0.lock().unwrap();
-            while *workers >= 4 && !this.cancel_requested(&id) {
-                workers = this.inner.workers.1.wait(workers).unwrap();
+            let id = run.id.clone();
+            let pool = run.pool.clone();
+            this.execute(run, resolved, template);
+            this.inner.leases.lock().unwrap().remove(&lease);
+            let session = this
+                .inner
+                .records
+                .lock()
+                .unwrap()
+                .get(&id)
+                .and_then(|r| r["native_session_id"].as_str().map(str::to_owned));
+            if let (Some(pool), Some(session)) = (pool, session) {
+                let _ = this
+                    .inner
+                    .pools
+                    .remember_session(&session, &pool, &placement);
             }
-            let admitted = !this.cancel_requested(&id);
-            if admitted {
-                *workers += 1;
+            {
+                let mut sched = this.inner.sched.lock().unwrap();
+                sched.running.remove(&id);
+                sched.entries.remove(&id);
+                for reserved in sched.admitted_since.values_mut() {
+                    reserved.remove(&id);
+                }
+                sched.dirty = true;
             }
-            drop(workers);
-            this.run_worker(host, &name, request, &id);
-            this.inner.leases.lock().unwrap().remove(&key);
-            if admitted {
-                let mut workers = this.inner.workers.0.lock().unwrap();
-                *workers -= 1;
-            }
-            this.inner.workers.1.notify_one();
+            this.remove_entry_file(&id);
+            this.inner.wake.notify_all();
         });
-        self.get_run(
-            host_id,
-            value["name"].as_str().unwrap_or(""),
-            value["id"].as_str().unwrap_or(""),
-        )
+        Ok(())
     }
-    fn cancel_requested(&self, id: &str) -> bool {
-        self.inner
-            .details
-            .lock()
-            .unwrap()
-            .get(id)
-            .is_some_and(|detail| detail["cancel_requested"] == true)
+    /// Prepare the workspace and run the native CLI, or fail the run cleanly
+    /// (and log a launch event) when it cannot start.
+    fn execute(
+        &self,
+        run: AdmittedRun,
+        resolved: Option<ResolvedProfile>,
+        template: Option<String>,
+    ) {
+        let started = Instant::now();
+        let resolved = match (&run.profile, resolved) {
+            (None, _) => None,
+            (Some(_), Some(r)) => Some(r),
+            (Some(name), None) => {
+                let resolver = self.inner.hooks.resolver.lock().unwrap().clone();
+                match resolver.map(|r| r(name, &run.request.provider)) {
+                    Some(Ok(r)) => Some(r),
+                    other => {
+                        let message = match other {
+                            Some(Err(error)) => format!("{error:#}"),
+                            _ => "No profile resolver is installed.".into(),
+                        };
+                        let failure =
+                            LaunchFailure::new(Stage::Resolve, "profile_unavailable", message);
+                        self.launch_failed(&run, template.as_deref(), None, &failure, started);
+                        return;
+                    }
+                }
+            }
+        };
+        if let Some(r) = &resolved {
+            self.inner
+                .details
+                .lock()
+                .unwrap()
+                .entry(run.id.clone())
+                .and_modify(|d| {
+                    d["profile"] = json!({"name":r.name,"revision":r.revision});
+                    let _ = security::write_json(
+                        &self.inner.details_root,
+                        &format!("{}.json", run.id),
+                        d,
+                    );
+                });
+        }
+        let template = template.or_else(|| resolved.as_ref().and_then(|p| p.template.clone()));
+        let executor = self.inner.hooks.executor.lock().unwrap().clone();
+        if let Some(executor) = executor {
+            let request = run.request.clone();
+            let outcome = self.run_with(&run.id, &request, || executor(&run));
+            if let Err(failure) = outcome {
+                self.launch_failed(
+                    &run,
+                    template.as_deref(),
+                    resolved.as_ref(),
+                    &failure,
+                    started,
+                );
+            }
+            return;
+        }
+        match self.prepare(&run, template.as_deref()) {
+            Ok(host) => {
+                let request = run.request.clone();
+                if let Err(failure) =
+                    self.run_worker_with(host, &run.name, request, &run.id, resolved.clone())
+                {
+                    self.launch_failed(
+                        &run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                }
+            }
+            Err(failure) => self.launch_failed(
+                &run,
+                template.as_deref(),
+                resolved.as_ref(),
+                &failure,
+                started,
+            ),
+        }
+    }
+    /// Check each launch step in order; the first that fails names its stage.
+    fn prepare(
+        &self,
+        run: &AdmittedRun,
+        template: Option<&str>,
+    ) -> std::result::Result<Host, LaunchFailure> {
+        let (host_id, name) = (run.host_id.as_str(), run.name.as_str());
+        let host = self
+            .inner
+            .fleet
+            .account_workspace(host_id, name)
+            .map_err(|e| LaunchFailure::from_error(Stage::Place, "workspace_unavailable", &e))?;
+        if let Some(template) = template {
+            let actual = self
+                .inner
+                .fleet
+                .workspace_template(host_id, name)
+                .map_err(|e| {
+                    LaunchFailure::from_error(Stage::Place, "workspace_unavailable", &e)
+                })?;
+            if actual.as_deref() != Some(template) {
+                return Err(LaunchFailure::new(
+                    Stage::Place,
+                    "template_mismatch",
+                    format!(
+                        "Workspace template is {}; the run requires {template}.",
+                        actual.as_deref().unwrap_or("unrecorded")
+                    ),
+                ));
+            }
+        }
+        let _hostlock = enginebox_core::operation_lock(&host)
+            .map_err(|e| LaunchFailure::from_error(Stage::Bootstrap, "workspace_locked", &e))?;
+        let uncertain = self.inner.records.lock().unwrap().values().any(|v| {
+            v["execution_uncertain"] == true && v["host_id"] == host_id && v["name"] == name
+        });
+        if uncertain && self.active(host_id, name) {
+            return Err(LaunchFailure::new(
+                Stage::Place,
+                "lease_unresolved",
+                "Previous native run must release its guest lease.",
+            ));
+        }
+        let attached = self
+            .attach_locked(
+                host_id,
+                name,
+                Some(vec![run.request.provider.clone()]),
+                None,
+                None,
+            )
+            .map_err(|e| LaunchFailure::from_error(Stage::Delegate, "delegation_failed", &e))?;
+        if !attached["providers"].as_array().is_some_and(|items| {
+            items.len() == 1
+                && items.iter().all(|item| {
+                    ["attached", "unchanged"].contains(&item["status"].as_str().unwrap_or(""))
+                })
+        }) {
+            return Err(LaunchFailure::new(
+                Stage::Delegate,
+                "provider_not_delegable",
+                "The provider could not be delegated to this workspace.",
+            ));
+        }
+        Ok(host)
+    }
+    /// Record a launch failure: a structured log line and event, the run's
+    /// `failure` (stage and reason code), and its terminal state. A failure
+    /// before the guest started is not `execution_uncertain`; a guest launch
+    /// failure keeps the original uncertain handling.
+    fn launch_failed(
+        &self,
+        run: &AdmittedRun,
+        template: Option<&str>,
+        resolved: Option<&ResolvedProfile>,
+        failure: &LaunchFailure,
+        started: Instant,
+    ) {
+        let mut secrets = run.request.env.clone();
+        if let Some(p) = resolved {
+            secrets.extend(p.block.env.clone());
+        }
+        let profile_name = resolved
+            .map(|p| p.name.clone())
+            .or_else(|| run.profile.clone());
+        self.record_launch(LaunchEvent {
+            kind: "run_admission_failed".into(),
+            outcome: "failed".into(),
+            run_id: Some(run.id.clone()),
+            pool: run.pool.clone(),
+            host_id: Some(run.host_id.clone()),
+            workspace: Some(run.name.clone()),
+            template: template.map(str::to_owned),
+            template_revision: template.and_then(|t| self.template_revision(&run.host_id, t)),
+            profile: profile_name,
+            profile_revision: resolved.map(|p| p.revision),
+            provider: Some(run.request.provider.clone()),
+            stage: failure.stage.as_str().into(),
+            reason: failure.reason.into(),
+            message: launch_events::clip_message(&failure.message, &secrets),
+            duration_ms: started.elapsed().as_millis() as u64,
+            queue_wait_ms: Some(run.queue_wait_ms),
+            ..Default::default()
+        });
+        if let Some(detail) = self.inner.details.lock().unwrap().get_mut(&run.id) {
+            detail["failure"] = json!({"stage":failure.stage.as_str(),"reason":failure.reason});
+            let _ = self.save_detail(&run.id, detail);
+        }
+        let uncertain = failure.stage == Stage::Start;
+        let message = failure.run_error();
+        self.finish(&run.id, |v| {
+            v["status"] = json!("failed");
+            v["error"] = json!(message);
+            if uncertain {
+                v["execution_uncertain"] = json!(true);
+            }
+        });
+    }
+    /// Fill in the pool's project, then log and retain the event.
+    fn record_launch(&self, mut event: LaunchEvent) {
+        if event.project.is_none()
+            && let Some(pool) = &event.pool
+        {
+            event.project = self.inner.pools.get(pool).map(|p| p.project);
+        }
+        self.inner.launch_events.record(event);
+    }
+    /// The installed revision of `template` on `host`, when the registry knows it.
+    fn template_revision(&self, host: &str, template: &str) -> Option<Value> {
+        let host = self.inner.fleet.host(host).ok()?;
+        let record = self.inner.fleet.template(&host, template).ok()?;
+        let revision = record.get("revision").cloned().unwrap_or(Value::Null);
+        (!revision.is_null()).then_some(revision)
+    }
+    /// Owner view of the launch history (newest first).
+    pub fn launch_events(&self, filter: &launch_events::Filter) -> Value {
+        self.inner.launch_events.list(filter)
+    }
+    fn spawn_create(&self, pool: String, host: String) {
+        let this = self.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let mut event = LaunchEvent {
+                kind: "pool_member_created".into(),
+                outcome: "succeeded".into(),
+                pool: Some(pool.clone()),
+                host_id: Some(host.clone()),
+                stage: Stage::Create.as_str().into(),
+                reason: "ok".into(),
+                ..Default::default()
+            };
+            let result = (|| -> std::result::Result<(), LaunchFailure> {
+                let _pending = this
+                    .pending_guard()
+                    .map_err(|e| LaunchFailure::from_error(Stage::Create, "create_failed", &e))?;
+                let def = this.inner.pools.get(&pool).ok_or_else(|| {
+                    LaunchFailure::new(Stage::Resolve, "pool_unavailable", "Unknown pool.")
+                })?;
+                event.project = Some(def.project.clone());
+                event.profile = def.profile.clone();
+                let template = def.template.clone().ok_or_else(|| {
+                    LaunchFailure::new(
+                        Stage::Create,
+                        "pool_has_no_template",
+                        "Pool has no template.",
+                    )
+                })?;
+                event.template = Some(template.clone());
+                event.template_revision = this.template_revision(&host, &template);
+                let size = def.autoscale.as_ref().and_then(|a| a.size.clone());
+                let name = this.inner.pools.reserve_name(&pool).map_err(|e| {
+                    LaunchFailure::from_error(Stage::Create, "name_unavailable", &e)
+                })?;
+                event.workspace = Some(name.clone());
+                let hook = this.inner.hooks.create.lock().unwrap().clone();
+                match hook {
+                    Some(create) => create(&host, &name, &template, size.as_deref()),
+                    None => {
+                        let mut params = json!({"name":name,"template":template});
+                        if let Some(size) = &size {
+                            params["size"] = json!(size);
+                        }
+                        this.inner
+                            .fleet
+                            .operate(&host, "create", &params)
+                            .map(|_| ())
+                    }
+                }
+                .map_err(|e| match e.downcast::<LaunchFailure>() {
+                    Ok(failure) => failure,
+                    Err(e) => LaunchFailure::from_error(Stage::Create, "create_failed", &e),
+                })?;
+                this.inner
+                    .pools
+                    .add_created(
+                        &pool,
+                        Placement {
+                            host_id: host.clone(),
+                            name,
+                        },
+                    )
+                    .map_err(|e| {
+                        LaunchFailure::from_error(Stage::Bootstrap, "member_record_failed", &e)
+                    })
+            })();
+            event.duration_ms = started.elapsed().as_millis() as u64;
+            if let Err(failure) = &result {
+                event.kind = "pool_member_create_failed".into();
+                event.outcome = "failed".into();
+                event.stage = failure.stage.as_str().into();
+                event.reason = failure.reason.into();
+                event.message = launch_events::clip_message(&failure.message, &BTreeMap::new());
+            }
+            let backoff_message = event.message.clone();
+            this.record_launch(event);
+            let mut sched = this.inner.sched.lock().unwrap();
+            if let Some(n) = sched.creating.get_mut(&pool) {
+                *n = n.saturating_sub(1);
+            }
+            match result {
+                Ok(()) => {
+                    sched.backoff.remove(&pool);
+                }
+                Err(_) => {
+                    sched.backoff.insert(
+                        pool.clone(),
+                        (Instant::now() + CREATE_BACKOFF, backoff_message),
+                    );
+                }
+            }
+            sched.dirty = true;
+            drop(sched);
+            this.inner.wake.notify_all();
+        });
+    }
+    /// Owner view of a pool: definition, members and their state, queue.
+    pub fn pool_status(&self, name: &str) -> Result<Value> {
+        let def = self
+            .inner
+            .pools
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown pool."))?;
+        let sched = self.inner.sched.lock().unwrap();
+        let leases = self.inner.leases.lock().unwrap();
+        let members: Vec<Value> = def
+            .members()
+            .into_iter()
+            .map(|m| {
+                let busy = leases
+                    .iter()
+                    .any(|(h, n, _)| *h == m.host_id && *n == m.name);
+                json!({"host_id":m.host_id,"name":m.name,"busy":busy})
+            })
+            .collect();
+        let in_pool = |state: EntryState| {
+            sched
+                .entries
+                .values()
+                .filter(|q| q.entry.state == state && q.entry.pool() == Some(name))
+                .count()
+        };
+        let mut view = def.public();
+        view["member_status"] = json!(members);
+        view["queued_runs"] = json!(in_pool(EntryState::Queued));
+        view["running_runs"] = json!(in_pool(EntryState::Admitted));
+        view["creating"] = json!(sched.creating.get(name).copied().unwrap_or(0));
+        view["last_create_error"] = json!(sched.backoff.get(name).map(|(_, m)| m));
+        Ok(json!({"pool":view}))
+    }
+    /// Every pool, plus `projects`: pool names grouped by project.
+    pub fn list_pools(&self) -> Value {
+        Self::pool_listing(self.inner.pools.all())
+    }
+    /// The pools of one project, in the same shape as [`Self::list_pools`].
+    pub fn list_project_pools(&self, project: &str) -> Result<Value> {
+        ensure!(pools::valid_project(project), "Invalid project.");
+        let mut listing = Self::pool_listing(self.inner.pools.in_project(project));
+        listing["project"] = json!(project);
+        Ok(listing)
+    }
+    fn pool_listing(all: Vec<pools::Pool>) -> Value {
+        let mut projects: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for pool in &all {
+            projects
+                .entry(pool.project.clone())
+                .or_default()
+                .push(pool.name.clone());
+        }
+        json!({
+            "pools":all.iter().map(pools::Pool::public).collect::<Vec<_>>(),
+            "projects":projects
+                .into_iter()
+                .map(|(project, pools)| json!({"project":project,"pools":pools}))
+                .collect::<Vec<_>>(),
+        })
+    }
+    /// Delete a pool with no queued or running runs. Its workspaces are kept.
+    pub fn delete_pool(&self, name: &str) -> Result<Value> {
+        let sched = self.inner.sched.lock().unwrap();
+        ensure!(
+            !sched
+                .entries
+                .values()
+                .any(|q| q.entry.state != EntryState::Finished && q.entry.pool() == Some(name)),
+            "This pool still has queued or running runs."
+        );
+        self.inner.pools.delete(name)?;
+        Ok(json!({"deleted":name}))
+    }
+    /// Record a callback delivery attempt on the run's sidecar.
+    pub fn record_callback(
+        &self,
+        id: &str,
+        state: &str,
+        attempts: u32,
+        last_status: Option<u16>,
+    ) -> Result<()> {
+        ensure!(
+            ["pending", "delivering", "delivered", "failed"].contains(&state),
+            "Invalid callback state."
+        );
+        let mut details = self.inner.details.lock().unwrap();
+        let detail = details
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown native run."))?;
+        ensure!(detail["callback"].is_object(), "Run has no callback.");
+        detail["callback"]["state"] = json!(state);
+        detail["callback"]["attempts"] = json!(attempts);
+        detail["callback"]["last_status"] = json!(last_status);
+        detail["callback"]["updated_at"] = json!(crate::now());
+        self.save_detail(id, detail)?;
+        if ["delivered", "failed"].contains(&state) {
+            self.inner.callbacks.lock().unwrap().remove(id);
+        }
+        Ok(())
     }
     fn save_record(&self, value: &Value) -> Result<()> {
         security::write_bytes(
@@ -1097,7 +2576,65 @@ impl AgentService {
             native::MAX_OUTPUT * 7,
         )
     }
+    #[cfg(test)]
     fn run_worker(&self, host: Host, name: &str, request: native::RunRequest, id: &str) {
+        let _ = self.run_worker_with(host, name, request, id, None);
+    }
+    /// Run the guest helper. A guest launch failure is returned (stage
+    /// `start`) after the run is marked failed and uncertain.
+    fn run_worker_with(
+        &self,
+        host: Host,
+        name: &str,
+        request: native::RunRequest,
+        id: &str,
+        resolved: Option<ResolvedProfile>,
+    ) -> std::result::Result<(), LaunchFailure> {
+        let guest = || -> Result<Value> {
+            // Runs without a profile keep the original guest command and
+            // payload, so older guest helpers still serve them.
+            let (mode, input) = match &resolved {
+                None => ("run", serde_json::to_vec(&request)?),
+                Some(p) => (
+                    "run-profile",
+                    serde_json::to_vec(&profile::Envelope {
+                        request: request.clone(),
+                        profile: p.name.clone(),
+                        block: p.block.clone(),
+                        files: p.files.clone(),
+                    })?,
+                ),
+            };
+            let command = guest_command(
+                &host,
+                name,
+                &[mode.into(), host.guest.workspace.clone(), id.into()],
+            )?;
+            let output = process::checked(
+                &command,
+                None,
+                None,
+                &input,
+                request.timeout_seconds + 20,
+                native::MAX_OUTPUT * 7,
+            )?;
+            let result: Value = serde_json::from_str(&output)?;
+            native::validate_result(&result)?;
+            Ok(result)
+        };
+        self.run_with(id, &request, guest)
+    }
+    /// Mark the run running (unless cancelled first), execute it, and record
+    /// its terminal state. An execution error is returned as a launch failure
+    /// for the caller to record: a [`LaunchFailure`] from the executor as is,
+    /// anything else as a guest launch failure (stage `start`). The run is
+    /// left unfinished in that case; the caller finishes it.
+    fn run_with(
+        &self,
+        id: &str,
+        request: &native::RunRequest,
+        exec: impl FnOnce() -> Result<Value>,
+    ) -> std::result::Result<(), LaunchFailure> {
         let outcome = (|| -> Result<Value> {
             if let Some(v) = self.inner.records.lock().unwrap().get_mut(id) {
                 let mut details = self.inner.details.lock().unwrap();
@@ -1105,75 +2642,130 @@ impl AgentService {
                     .get_mut(id)
                     .ok_or_else(|| anyhow::anyhow!("Missing run metadata."))?;
                 if detail["cancel_requested"] == true {
-                    return Ok(
-                        json!({"exit_code":process::CANCELLED_EXIT_CODE,"output":"","timed_out":false,"output_truncated":false}),
-                    );
+                    return Ok(cancelled_result());
                 }
                 detail["started_at"] = json!(crate::now());
                 self.save_detail(id, detail)?;
                 v["status"] = json!("running");
                 self.save_record(v)?;
             }
-            let command = guest_command(
-                &host,
-                name,
-                &["run".into(), host.guest.workspace.clone(), id.into()],
-            )?;
-            let output = process::checked(
-                &command,
-                None,
-                None,
-                &serde_json::to_vec(&request)?,
-                request.timeout_seconds + 20,
-                native::MAX_OUTPUT * 7,
-            )?;
-            let result: Value = serde_json::from_str(&output)?;
-            native::validate_result(&result)?;
-            Ok(result)
+            exec()
         })();
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(match error.downcast::<LaunchFailure>() {
+                    Ok(failure) => failure,
+                    Err(error) => {
+                        LaunchFailure::from_error(Stage::Start, "guest_launch_failed", &error)
+                    }
+                });
+            }
+        };
+        self.finish(id, |v| {
+            v["status"] = json!(if result["exit_code"] == 0
+                && result["timed_out"] == false
+                && result["output_truncated"] == false
+            {
+                "succeeded"
+            } else {
+                "failed"
+            });
+            if let Some(session) = native::session_id(result["output"].as_str().unwrap_or(""))
+                .or_else(|| request.resume_id.clone())
+            {
+                v["native_session_id"] = json!(session);
+            }
+            if result["exit_code"] == process::CANCELLED_EXIT_CODE
+                && let Some(detail) = self.inner.details.lock().unwrap().get_mut(id)
+            {
+                detail["cancelled"] = json!(detail["cancel_requested"] == true);
+                let _ = self.save_detail(id, detail);
+            }
+            v["result"] = result;
+        });
+        Ok(())
+    }
+    /// Apply the terminal state, persist, retain the newest finished runs and
+    /// hand the run's callback (if any) to the deliverer, once.
+    fn finish(&self, id: &str, terminal: impl FnOnce(&mut Value)) {
         let mut records = self.inner.records.lock().unwrap();
         if let Some(v) = records.get_mut(id) {
             v["finished_at"] = json!(crate::now());
-            match outcome {
-                Ok(result) => {
-                    v["status"] = json!(if result["exit_code"] == 0
-                        && result["timed_out"] == false
-                        && result["output_truncated"] == false
-                    {
-                        "succeeded"
-                    } else {
-                        "failed"
-                    });
-                    if let Some(session) =
-                        native::session_id(result["output"].as_str().unwrap_or(""))
-                            .or_else(|| request.resume_id.clone())
-                    {
-                        v["native_session_id"] = json!(session);
-                    }
-                    if result["exit_code"] == process::CANCELLED_EXIT_CODE
-                        && let Some(detail) = self.inner.details.lock().unwrap().get_mut(id)
-                    {
-                        detail["cancelled"] = json!(detail["cancel_requested"] == true);
-                        let _ = self.save_detail(id, detail);
-                    }
-                    v["result"] = result;
-                }
-                Err(_) => {
-                    v["status"] = json!("failed");
-                    v["execution_uncertain"] = json!(true);
-                    v["error"] = json!(
-                        "Native launch failed; inspect installation and the workspace session lease."
-                    );
-                }
-            }
+            terminal(v);
             let _ = self.save_record(v);
         }
-        while records.len() > 100 {
+        let finished = records.get(id).and_then(|record| {
+            let callback = self.inner.callbacks.lock().unwrap().get(id).cloned()?;
+            let details = self.inner.details.lock().unwrap();
+            Some(FinishedRun {
+                id: id.to_owned(),
+                callback,
+                payload: callback_payload(record, details.get(id)),
+            })
+        });
+        self.prune(&mut records, id);
+        drop(records);
+        if let Some(finished) = finished {
+            self.deliver(finished);
+        }
+    }
+    fn deliver(&self, finished: FinishedRun) {
+        let hook = self.inner.finish_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            let _ = self.record_callback(&finished.id, "delivering", 0, None);
+            hook(finished);
+        }
+    }
+    /// An unplaced pool run ended: deliver its callback from the entry view.
+    fn finish_unplaced(&self, entry: &Entry) {
+        let callback = self.inner.callbacks.lock().unwrap().get(&entry.id).cloned();
+        if let Some(callback) = callback {
+            let details = self.inner.details.lock().unwrap();
+            let view = entry_view(entry, details.get(&entry.id));
+            let payload = callback_payload(&view, details.get(&entry.id));
+            drop(details);
+            self.deliver(FinishedRun {
+                id: entry.id.clone(),
+                callback,
+                payload,
+            });
+        }
+        // Retain the newest finished unplaced runs only.
+        let stale: Vec<String> = {
+            let mut sched = self.inner.sched.lock().unwrap();
+            let mut finished: Vec<(String, String)> = sched
+                .entries
+                .values()
+                .filter(|q| q.entry.state == EntryState::Finished)
+                .map(|q| (q.entry.created_at.clone(), q.entry.id.clone()))
+                .collect();
+            finished.sort();
+            let excess = finished.len().saturating_sub(RETAINED_FINISHED);
+            let stale: Vec<String> = finished
+                .into_iter()
+                .take(excess)
+                .map(|(_, id)| id)
+                .collect();
+            for id in &stale {
+                sched.entries.remove(id);
+            }
+            stale
+        };
+        for id in stale {
+            self.remove_entry_file(&id);
+            self.inner.details.lock().unwrap().remove(&id);
+            let _ = std::fs::remove_file(self.inner.details_root.join(format!("{id}.json")));
+        }
+    }
+    fn prune(&self, records: &mut BTreeMap<String, Value>, keep: &str) {
+        let terminal =
+            |v: &Value| !["queued", "running"].contains(&v["status"].as_str().unwrap_or(""));
+        while records.values().filter(|v| terminal(v)).count() > RETAINED_FINISHED {
             let oldest = records
                 .iter()
-                .filter(|(_, v)| {
-                    !["queued", "running"].contains(&v["status"].as_str().unwrap_or(""))
-                        && v["execution_uncertain"] != true
+                .filter(|(k, v)| {
+                    terminal(v) && v["execution_uncertain"] != true && k.as_str() != keep
                 })
                 .min_by_key(|(_, v)| v["created_at"].as_str().unwrap_or(""))
                 .map(|(k, _)| k.clone());
@@ -1184,6 +2776,67 @@ impl AgentService {
             let _ = std::fs::remove_file(self.inner.runs_root.join(format!("{key}.json")));
         }
     }
+}
+
+fn cancelled_result() -> Value {
+    json!({"exit_code":process::CANCELLED_EXIT_CODE,"output":"","timed_out":false,"output_truncated":false})
+}
+fn strip_env(request: &mut Value) {
+    if let Some(object) = request.as_object_mut() {
+        object.remove("env");
+    }
+}
+/// The public view of a pool run that has no workspace record.
+fn entry_view(entry: &Entry, detail: Option<&Value>) -> Value {
+    let status = match entry.state {
+        EntryState::Finished => "failed",
+        EntryState::Admitted => "running",
+        EntryState::Queued => "queued",
+    };
+    let mut record = json!({
+        "id":entry.id,
+        "host_id":entry.placement.as_ref().map(|p| &p.host_id),
+        "name":entry.placement.as_ref().map(|p| &p.name),
+        "provider":entry.provider(),
+        "scope":"controller-owner",
+        "state_scope":"private-workspace",
+        "status":status,
+        "workdir":entry.request["workdir"],
+        "resume_id":entry.request["resume_id"],
+        "created_at":entry.created_at,
+    });
+    if let Some(at) = &entry.finished_at {
+        record["finished_at"] = json!(at);
+    }
+    if entry.outcome.as_deref() == Some("failed") {
+        record["error"] = json!("The run could not be placed.");
+    }
+    run_details::enrich(&record, detail, chrono::Utc::now())
+}
+
+/// The signed callback body: identity, status and timing only. Never output,
+/// prompts, env names or values, or error text.
+pub fn callback_payload(record: &Value, detail: Option<&Value>) -> Value {
+    let run = run_details::enrich(record, detail, chrono::Utc::now());
+    json!({
+        "schema":1,
+        "event":"agent_run.finished",
+        "run_id":run["id"],
+        "host_id":run["host_id"],
+        "name":run["name"],
+        "provider":run["provider"],
+        "profile":detail.and_then(|d| d["profile"]["name"].as_str()),
+        "pool":detail.and_then(|d| d["pool"].as_str()),
+        "status":run["status"],
+        "exit_code":run["result"]["exit_code"],
+        "timed_out":run["result"]["timed_out"],
+        "execution_uncertain":run["execution_uncertain"] == true,
+        // Codes only (`{stage, reason}`), never the failure message.
+        "failure":detail.and_then(|d| d.get("failure")).map(|f| json!({"stage":f["stage"],"reason":f["reason"]})),
+        "created_at":run["created_at"],
+        "started_at":run["started_at"],
+        "finished_at":run["finished_at"],
+    })
 }
 fn active_session(v: &Value) -> bool {
     ["starting", "waiting"].contains(&v["status"].as_str().unwrap_or(""))
@@ -1196,6 +2849,20 @@ fn host_binding(host: &Host) -> Result<String> {
     Ok(security::legacy_digest(
         &json!({"target":host.target,"project":host.project,"pool":host.pool,"guest":host.guest}),
     ))
+}
+/// The durable record and sidecar for a new run. The record keeps its legacy
+/// shape so retained releases can still read it; the principal and env key
+/// names live in the sidecar. Env values never enter either.
+pub fn new_run_entries(
+    id: &str,
+    host_id: &str,
+    name: &str,
+    request: &native::RunRequest,
+    started_by: &str,
+) -> (Value, Value) {
+    let record = json!({"id":id,"host_id":host_id,"name":name,"provider":request.provider,"scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":request.workdir,"resume_id":request.resume_id,"created_at":crate::now()});
+    let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false,"started_by":started_by,"env_keys":request.env_keys()});
+    (record, detail)
 }
 pub fn guest_command(host: &Host, name: &str, args: &[String]) -> Result<Vec<String>> {
     let mut argv = vec![
@@ -1356,5 +3023,195 @@ mod run_control_tests {
             "cancelled"
         );
         assert_eq!(restarted.list_runs()["runs"][0]["task"], "fixture task");
+    }
+
+    fn fixture() -> (tempfile::TempDir, AgentService, Host) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let host = Host {
+            id: "test-node".into(),
+            target: "offline.invalid".into(),
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host.clone()], &root).unwrap();
+        (temp, AgentService::new(&root, fleet).unwrap(), host)
+    }
+    fn insert(service: &AgentService, id: &str, detail: Value) {
+        let record = json!({"id":id,"host_id":"test-node","name":"ebox-private","provider":"codex","scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":".","resume_id":null,"created_at":crate::now()});
+        service
+            .inner
+            .records
+            .lock()
+            .unwrap()
+            .insert(id.into(), record);
+        service
+            .inner
+            .details
+            .lock()
+            .unwrap()
+            .insert(id.into(), detail);
+    }
+
+    #[test]
+    fn a_repeated_idempotency_key_returns_the_same_run_for_the_same_principal_only() {
+        let (_t, service, _host) = fixture();
+        let id = "22222222222222222222222222222222";
+        let body = json!({"provider":"codex","prompt":"build it","env":{"TOKEN":"secret-value-1"}});
+        let request = native::RunRequest::parse(body.clone()).unwrap();
+        let options = LaunchOptions {
+            idempotency_key: Some("job-42".into()),
+            ..Default::default()
+        };
+        let (_, mut detail) = new_run_entries(id, "test-node", "ebox-private", &request, "owner");
+        detail["idempotency"] = json!({
+            "key_digest":idempotency_key_digest("owner", "job-42"),
+            "request_digest":idempotency_request_digest(&request, &options),
+        });
+        run_details::validate(&detail).unwrap();
+        // The stored digests never contain env values.
+        assert!(!detail.to_string().contains("secret-value-1"));
+        insert(&service, id, detail);
+        // Same principal, key and request: the existing run, no new launch
+        // (the offline fixture host would refuse a real one).
+        let (run, replayed) = service
+            .launch_with(
+                "test-node",
+                "ebox-private",
+                body.clone(),
+                "owner",
+                options.clone(),
+            )
+            .unwrap();
+        assert!(replayed);
+        assert_eq!(run["id"], id);
+        // A changed env value is the same request (values are never hashed).
+        let same = json!({"provider":"codex","prompt":"build it","env":{"TOKEN":"rotated-value"}});
+        assert!(
+            service
+                .launch_with("test-node", "ebox-private", same, "owner", options.clone())
+                .unwrap()
+                .1
+        );
+        // The same key with a different request is refused.
+        let changed = json!({"provider":"codex","prompt":"something else"});
+        let error = service
+            .launch_with(
+                "test-node",
+                "ebox-private",
+                changed,
+                "owner",
+                options.clone(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("different request"));
+        // Another workspace with the same key is refused, not silently replayed.
+        assert!(
+            service
+                .launch_with(
+                    "test-node",
+                    "ebox-other",
+                    body.clone(),
+                    "owner",
+                    options.clone()
+                )
+                .is_err()
+        );
+        // Another principal's identical key is a different key: it reaches the
+        // real launch path (which fails offline) instead of replaying.
+        let other = format!("service-token:{}", "a".repeat(32));
+        let error = service
+            .launch_with(
+                "test-node",
+                "ebox-private",
+                body.clone(),
+                &other,
+                options.clone(),
+            )
+            .unwrap_err();
+        assert!(!error.to_string().contains("different request"));
+        assert_eq!(service.inner.records.lock().unwrap().len(), 1);
+        for bad in ["", "has space", &"k".repeat(129), "semi;colon"] {
+            let options = LaunchOptions {
+                idempotency_key: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(
+                service
+                    .launch_with("test-node", "ebox-private", body.clone(), "owner", options)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_run_hands_its_callback_a_summary_without_output_or_env() {
+        let (_t, service, host) = fixture();
+        let id = "33333333333333333333333333333333";
+        let request = native::RunRequest::parse(
+            json!({"provider":"codex","prompt":"private prompt text","env":{"TOKEN":"secret-value-2"}}),
+        )
+        .unwrap();
+        let (_, mut detail) = new_run_entries(id, "test-node", "ebox-private", &request, "owner");
+        detail["cancel_requested"] = json!(true);
+        detail["profile"] = json!({"name":"verifier","revision":3});
+        detail["callback"] = json!({"origin":"https://hooks.example.com","state":"pending","attempts":0,"last_status":null,"updated_at":crate::now()});
+        run_details::validate(&detail).unwrap();
+        insert(&service, id, detail);
+        let key = "k".repeat(40);
+        service.inner.callbacks.lock().unwrap().insert(
+            id.into(),
+            Callback {
+                url: "https://hooks.example.com/runs?token=abc".into(),
+                secret: key.clone(),
+            },
+        );
+        let seen: Arc<Mutex<Vec<FinishedRun>>> = Arc::default();
+        let sink = seen.clone();
+        service.set_finish_hook(Arc::new(move |finished| {
+            sink.lock().unwrap().push(finished)
+        }));
+        service.run_worker(host, "ebox-private", request, id);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let payload = &seen[0].payload;
+        assert_eq!(payload["run_id"], id);
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["profile"], "verifier");
+        assert_eq!(payload["exit_code"], process::CANCELLED_EXIT_CODE);
+        let text = payload.to_string();
+        for forbidden in [
+            "secret-value-2",
+            "TOKEN",
+            "private prompt",
+            "output",
+            key.as_str(),
+            "token=abc",
+        ] {
+            assert!(!text.contains(forbidden), "payload leaked {forbidden}");
+        }
+        assert!(text.len() < 1024);
+        assert!(!format!("{:?}", seen[0]).contains(&key));
+        // The run records the delivery state and only the callback origin.
+        let run = service.get_run("test-node", "ebox-private", id).unwrap();
+        assert_eq!(run["callback"]["state"], "delivering");
+        assert_eq!(run["callback"]["origin"], "https://hooks.example.com");
+        service
+            .record_callback(id, "delivered", 1, Some(204))
+            .unwrap();
+        let run = service.get_run("test-node", "ebox-private", id).unwrap();
+        assert_eq!(run["callback"]["state"], "delivered");
+        assert_eq!(run["callback"]["last_status"], 204);
+        assert!(service.inner.callbacks.lock().unwrap().is_empty());
+        assert!(!run.to_string().contains(&key));
+        let raw =
+            std::fs::read_to_string(service.inner.details_root.join(format!("{id}.json"))).unwrap();
+        assert!(
+            !raw.contains(&key) && !raw.contains("token=abc") && !raw.contains("secret-value-2")
+        );
     }
 }

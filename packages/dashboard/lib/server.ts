@@ -193,8 +193,8 @@ export async function bodyJson(request: Request, maxBytes = 8192) {
 // A small global limit suits this single-operator service without trusting
 // user-controlled proxy address headers. Restarting the process resets it.
 let attempts: number[] = [];
-export async function login(request: Request) {
-  requireOrigin(request);
+/** Counts one sign-in attempt against the shared limit, then checks the password. */
+export function verifyOperatorPassword(password: unknown) {
   const now = Date.now();
   attempts = attempts.filter((time) => time > now - 5 * 60 * 1000);
   if (attempts.length >= 20)
@@ -203,13 +203,14 @@ export async function login(request: Request) {
       "Too many sign-in attempts. Try again in five minutes.",
     );
   attempts.push(now);
-  const body = await bodyJson(request);
-  if (
-    typeof body?.password !== "string" ||
-    !equal(body.password, config().password)
-  ) {
+  if (typeof password !== "string" || !equal(password, config().password)) {
     throw new HttpError(401, "That operator password was not accepted.");
   }
+}
+export async function login(request: Request) {
+  requireOrigin(request);
+  const body = await bodyJson(request);
+  verifyOperatorPassword(body?.password);
   return json({ authenticated: true }, 200, { "Set-Cookie": sessionCookie() });
 }
 

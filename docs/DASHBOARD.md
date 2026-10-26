@@ -62,7 +62,7 @@ ENGINEBOX_DASHBOARD_PASSWORD=<a separate random operator password, at least 16 c
 ENGINEBOX_SESSION_SECRET=<a separate random signing secret, at least 32 characters>
 ```
 
-The placeholders above must be replaced; they are not usable credentials. `openssl rand -hex 32` generates a suitable random value. The API token must match the configured fleet service. The operator types only `ENGINEBOX_DASHBOARD_PASSWORD` into the login page; the browser never receives the API token or signing secret.
+To let other apps connect over OAuth, also set `ENGINEBOX_OAUTH_STATE_DIR` to an absolute private directory (see [OAuth](OAUTH.md)); without it the OAuth endpoints answer 404. The placeholders above must be replaced; they are not usable credentials. `openssl rand -hex 32` generates a suitable random value. The API token must match the configured fleet service. The operator types only `ENGINEBOX_DASHBOARD_PASSWORD` into the login page; the browser never receives the API token or signing secret.
 
 ```sh
 pnpm start

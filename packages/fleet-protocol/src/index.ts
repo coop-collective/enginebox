@@ -481,7 +481,8 @@ export function validateJob(value: unknown): JobSpec {
         !value.prompt.includes("\0"),
       "Prompt must contain 1–8000 UTF-8 bytes without NUL",
     );
-    integer(value.timeoutSeconds, 1, 300);
+    // matches the native runner's MAX_RUN_SECONDS (enginebox-agents/src/native.rs)
+    integer(value.timeoutSeconds, 1, 86400);
     return {
       id: value.id,
       project: value.project,

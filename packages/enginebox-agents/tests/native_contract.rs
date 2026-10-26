@@ -21,11 +21,22 @@ fn rejects_unsafe_prompts_workdirs_and_resume() {
         json!({"provider":"codex","prompt":"x","workdir":"../other"}),
         json!({"provider":"claude","prompt":"x","resume_id":"latest"}),
         json!({"provider":"cursor","prompt":"x","timeout_seconds":0}),
+        json!({"provider":"codex","prompt":"x","timeout_seconds":native::MAX_RUN_SECONDS + 1}),
         json!({"provider":"codex","prompt":"x","model":"--dangerously-bypass"}),
         json!({"provider":"claude","prompt":"x","extra":true}),
         json!({"provider":"codex","prompt":"\u{0000}"}),
     ] {
         assert!(native::RunRequest::parse(v).is_err())
+    }
+}
+#[test]
+fn accepts_long_runs_up_to_a_day() {
+    for t in [301, 3600, native::MAX_RUN_SECONDS] {
+        let r = native::RunRequest::parse(
+            json!({"provider":"claude","prompt":"x","timeout_seconds":t}),
+        )
+        .unwrap();
+        assert_eq!(r.timeout_seconds, t);
     }
 }
 #[test]

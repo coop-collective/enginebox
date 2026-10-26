@@ -20,6 +20,9 @@ reserve_memory_gib = 4
 reserve_disk_gib = 10
 disk_gib = 30
 max_instances = 16
+# Optional: concurrent native agent runs on this host (1–256, default 8).
+# Older controller releases reject this key; set it only after upgrading.
+max_agent_runs = 8
 
 [hosts.guest]
 uid = 1001
@@ -60,7 +63,9 @@ The controller root defaults to `~/.local/state/enginebox`; override it with `--
 
 ## Endpoints
 
-Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must be JSON objects and cannot exceed 16 KiB, except template registration which accepts up to 1 MiB. Additional payload fields are rejected.
+Every `/v1/` request requires `Authorization: Bearer <token>`. The owner token reaches every endpoint below. A scoped service token (`ebst_…`, minted by the owner) reaches only the agent-run endpoints it was granted, on the workspaces it names; every other route answers 403, and an unknown, revoked or expired service token answers 401. POST bodies must be JSON objects and cannot exceed 16 KiB, except template registration (1 MiB), profile files (1.5 MiB, one base64-encoded file of up to 1 MiB) and profiles (256 KiB). Additional payload fields are rejected.
+
+Third-party apps get service tokens through OAuth instead of from the owner by hand: the dashboard is an OAuth 2.1 authorization server that mints an hour-long service token per consented connection and proxies the agent-run endpoints on its public origin. The owner's service-token store prunes records revoked or expired for over a day when it reaches its limit. See [OAuth for connected apps](OAUTH.md).
 
 | Request | Result |
 |---|---|
@@ -75,8 +80,23 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `GET /v1/jobs/{job_id}` | Poll the job's `queued`, `running`, `succeeded` or `failed` state. |
 | `GET /v1/agents` | Controller Codex, Claude and Cursor connection/delegation status. |
 | `GET /v1/agents/{provider}/usage` | Sanitized native allowance observation or explicit unavailable result; billing renewal is not inferred. |
-| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs` | Launch the official native CLI with `provider`, `prompt` and optional exact `resume_id`, relative `workdir`, `model` and bounded `timeout_seconds`. |
-| `GET /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}` | Private bounded output, run state and native session ID; scoped to the named workspace. |
+| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs` | Launch the official native CLI with `provider`, `prompt` and optional exact `resume_id`, relative `workdir`, `model`, bounded `timeout_seconds` (1–86400) and `env`, plus the optional v2 fields `profile`, `idempotency_key` and `callback` (see [agent runs v2](#agent-runs-v2)). HTTP 202 with the new run (status `queued` until the scheduler admits it), or HTTP 200 with `"replayed":true` for a repeated idempotency key. HTTP 429 with `Retry-After` only when a hard queue bound is reached (see [the run queue](QUEUE.md)). Service token operation: `agent_runs.start`. |
+| `GET /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}` | Private bounded output, run state, native session ID, `started_by`, `env_keys`, `profile` (`{name,revision}` or null), `callback` (`{origin,state,attempts,last_status,updated_at}` or null) and `failure` (`{stage,reason}` or null; see [launch events](QUEUE.md#launch-events)); scoped to the named workspace. Service token operation: `agent_runs.get`. |
+| `POST /v1/hosts/{host_id}/instances/{name}/agent-runs/{run_id}/cancel` | Request cancellation using `{}`. Service token operation: `agent_runs.cancel`. |
+| `GET /v1/agent-runs` | Run summaries, newest active first, each with `pool`, `queue_position` and `waiting_reason`. A service token sees only runs on its own workspaces or in its granted pools. Service token operation: `agent_runs.list`. |
+| `POST /v1/pools/{pool}/agent-runs` | Start a run on any free workspace of a [pool](QUEUE.md#pools); same body, statuses and v2 fields as the workspace route. The run's `host_id` and `name` are null until it is placed. A `resume_id` lands on the workspace holding that session. Service token: `agent_runs.start` plus the pool in `pools`. |
+| `GET /v1/pools/{pool}/agent-runs/{run_id}` | The run, placed or not. Once placed it is also readable on its workspace route. Service token: `agent_runs.get` plus the pool. |
+| `POST /v1/pools/{pool}/agent-runs/{run_id}/cancel` | Cancel using `{}`: an unplaced run ends at once; a placed one is cancelled on its workspace. Service token: `agent_runs.cancel` plus the pool. |
+| `POST /v1/pools` | Owner only. Create or replace a pool `{"name","description","profile","template","workspaces":[{"host_id","name"}],"autoscale":{"hosts":[…],"max_workspaces":N,"size":"recommended"}}`. |
+| `GET /v1/pools`, `GET /v1/pools/{pool}` | Owner only. Pool definitions; the single read adds member busy state, queued/running counts, creations in progress and the last creation error. |
+| `POST /v1/pools/{pool}/delete` | Owner only. Delete using `{}` when no run is queued or running in it; its workspaces are kept. |
+| `POST /v1/service-tokens` | Owner only. Mint `{"label":"ci","scopes":[{"host_id":"primary","name":"ebox-work"}],"operations":["agent_runs.start","agent_runs.get","agent_runs.list","agent_runs.cancel"],"expires_at":"2026-12-31T00:00:00Z","profiles":["coder"],"pools":["workers"],"project":"default","callback_secret":"…"}` (`expires_at`, `profiles`, `pools`, `project` and `callback_secret` optional; `project` restricts the pool grants to that project's pools, checked at mint and again on every request, so a pool moved to another project stops being reachable with the token; `scopes` may be empty when `pools` is not). `pools` names existing pools whose runs the token may start, read and cancel, by its operations; a pool grant includes the pool's profile. `profiles` names existing profiles the token may run; without it the token may only start runs without a profile. `callback_secret` (32–256 printable ASCII characters) signs callbacks for the token's runs and is never returned. HTTP 201 returns the token's public record and its `secret`, which is shown only this once. |
+| `GET /v1/service-tokens` | Owner only. Token IDs, labels, scopes, operations, `profiles`, `pools`, `project`, `pool_grants` (the pools grouped by their current project), `has_callback_secret`, expiry, revocation and `active`; never secrets, callback keys or digests. |
+| `POST /v1/profile-files` | Owner only. Store one file `{"content_base64":"…"}` (1 byte–1 MiB) under its SHA-256; HTTP 201 returns `{"sha256","size"}`. Re-uploading identical bytes is a no-op. See [profiles](PROFILES.md). |
+| `POST /v1/profiles` | Owner only. Create or replace a profile `{"name","description","template","providers","callback_secret"}`; every referenced file must already be uploaded. Returns the public record with its new `revision`. |
+| `GET /v1/profiles`, `GET /v1/profiles/{name}` | Owner only. Public profile records: env names (`env_keys`) instead of values, `has_callback_secret` instead of the key. |
+| `POST /v1/profiles/{name}/delete` | Owner only. Delete using `{}`. Uploaded files are kept. |
+| `POST /v1/service-tokens/{id}/revoke` | Owner only. Revoke using `{}`; the token is refused (401) on its next request. |
 | `POST /v1/agents/{provider}/login` | Start native controller sign-in using `{}`; HTTP 202 with a session. |
 | `GET /v1/agents/{provider}/sessions/{id}` | Poll the in-memory sign-in session. |
 | `POST /v1/agents/{provider}/sessions/{id}/input` | Submit the one-time authorization code as `{"text":"…"}`. |
@@ -85,6 +105,20 @@ Every `/v1/` request requires `Authorization: Bearer <token>`. POST bodies must 
 | `GET /v1/hosts/{host_id}/instances/{name}/accounts` | Legacy native workspace status for diagnostics; workspace login creation returns 409. |
 
 Creation/lifecycle requests return HTTP 202 with a job. Poll that job before treating the operation as complete. Instance names must use the `ebox-` prefix. Lifecycle actions are limited to fleet-created VMs in the configured project and pool; original workspaces are not implicitly adopted. The API has no raw shell-command, snapshot-restore or deletion endpoint. Native agent runs can execute tools under the configured native CLI policy and consume provider allowance; they are operator-authorized operations, not guest-accessible infrastructure tools.
+
+### Per-run environment
+
+`env` is an optional object of string names to string values passed to that run's native CLI process only. Names must match `^[A-Z][A-Z0-9_]{0,63}$`; at most 32 variables totalling 8 KiB of names plus values are accepted, and the whole request must still fit the 16 KiB launch bound. Names Engine Box controls are refused: everything the launcher sets (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TERM`, `DISPLAY`, `BROWSER`, …), provider credentials and selectors (`ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, `AZURE_OPENAI_*`, `CODEX_*`, `CURSOR_*`), loader variables (`LD_*`, `DYLD_*`), proxy and TLS trust (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `SSL_CERT_*`, `NODE_EXTRA_CA_CERTS`, …), shell and runtime start-up hooks (`BASH_ENV`, `ENV`, `NODE_OPTIONS`, `RUST_*`, `XDG_*`, …) and `ENGINEBOX_*`. The full list is `DENIED_ENV` in `packages/enginebox-agents/src/native.rs`.
+
+**Treat values as secrets.** They travel to the guest helper on stdin (never argv), are absent from the version preflight, and are never written to run records, sidecars, logs or job output; records keep only `env_keys`. Values of 8 or more bytes are scrubbed (raw and JSON-escaped) from the returned output as `[secret]`, but this is best effort: a native tool that transforms a value before printing it defeats it, and anything the agent writes into the workspace stays there. A guest helper older than this field rejects requests that carry `env`; requests without it are unchanged.
+
+### Agent runs v2
+
+All three fields are optional; a request without them is handled exactly as before (same native argv, same guest helper command and payload).
+
+- **`profile`** — the name of an owner-managed [profile](PROFILES.md). The profile must configure the requested `provider`, and when it names a `template` the workspace must have been created from it. A service token may name only profiles it was granted (`profiles` at mint); any other profile answers 403, an unknown profile 404. The profile's default `env` is merged under the run's `env` (the run wins) and the merged set must stay within the [per-run environment](#per-run-environment) bounds. Profile runs need a guest helper that supports `run-profile`; runs without a profile work with older helpers.
+- **`idempotency_key`** — 1–128 characters of `A-Z a-z 0-9 . _ : -`. The same key from the same principal (owner, or one service token) — and, for pool starts, the same pool — returns the existing run, whether it is still queued, running or finished, with HTTP 200 and `"replayed":true` instead of starting another. The key is bound to its first request (provider, prompt, resume ID, workdir, timeout, model, env names, profile and callback URL; env values are never hashed) and workspace; reusing it with a different request is refused. Keys are remembered for as long as the run is retained (the newest 100 finished runs).
+- **`callback`** — `{"url":"https://…"}`. When the run reaches a terminal state the controller POSTs a JSON summary: `schema`, `event` (`agent_run.finished`), `run_id`, `host_id`, `name`, `provider`, `profile`, `status`, `exit_code`, `timed_out`, `execution_uncertain`, `created_at`, `started_at`, `finished_at`. It never contains output, prompts, env names or values, or errors. Headers: `X-EngineBox-Event`, `X-EngineBox-Delivery` (one ID across retries, for deduplication) and `X-EngineBox-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`. The key is never taken from the request: a service token's runs are signed with that token's `callback_secret`, owner runs with the named profile's `callback_secret`; without one the launch is refused. Delivery succeeds on 2xx; 408, 429, 5xx and network errors are retried after 2, 10, 60 and 300 seconds; any other status stops. The run records only the URL's origin and the delivery state. The URL must be HTTPS without credentials or fragment; `localhost` names and IP literals in private, loopback, link-local, CGNAT or other non-public ranges are refused at launch, and the host is resolved before every attempt with every answer required to be public, then pinned for that connection (no proxy, no redirects). The callback target and key are kept with the run's private queue entry (mode 0600) from acceptance until the run finishes, so a restart keeps delivery: a queued run's callback fires when it later ends, and a run a restart interrupted fires once with `"execution_uncertain":true`. The payload also carries `pool` (null for workspace runs) and `failure`: `{"stage","reason"}` codes when the launch stopped before or while the guest started the run (see [launch events](QUEUE.md#launch-events)), otherwise null. It carries codes only, never the failure message. Delivery that was already in progress when the controller stopped is not retried.
 
 Use `size: "minimum"` or `size: "recommended"` for template-defined resources, or replace `size` with `resources: {"cpu":4,"memory_gib":8,"disk_gib":40}`. All three custom values must be integers at or above the registered minimum. Registered templates become allocatable only after the current manifest revision is installed on that exact host/project/pool/guest binding.
 
@@ -117,7 +151,7 @@ The model is deliberately conservative about copy-on-write storage: inexpensive 
 
 One in-process operation runs per host. A root-owned `/run/lock/enginebox-host.lock` also coordinates fleet mutations with bootstrap and other cooperating Engine Box controllers. The controller holds that lock across its SSH calls. Independent Incus administrators do not participate in this lock, and a broken SSH connection is not a distributed transaction guarantee.
 
-There are four background workers and at most 32 admitted queued/running jobs per service. This is a bounded operation queue, not a fair cluster scheduler. Templates and workloads remain on the selected host; automatic placement and cross-host migration are not implemented.
+There are four background workers and at most 32 admitted queued/running jobs per service. This is a bounded operation queue, not a fair cluster scheduler. Templates and workloads remain on the selected host; cross-host migration is not implemented. Native agent runs are scheduled separately, with placement only within a [pool](QUEUE.md#pools).
 
 Inventory uses Incus metadata and bridge leases rather than asking frozen guests for state. Its IP addresses are lease observations, not a claim that a suspended guest is reachable.
 
@@ -150,7 +184,7 @@ export ENGINEBOX_API_TOKEN_FILE="$HOME/.local/state/enginebox/api.token"
 enginebox-fleet-mcp
 ```
 
-Register that command through your client's ordinary MCP configuration. The current stdio implementation supports handshake revisions through `2025-11-25`; it does not advertise the separate `2026-07-28` discovery/per-request versioning protocol. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch`, `agent_runs`, `agent_run` and `agent_cancel`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate bounded run queue and private result endpoint; see [native runs and state](TENANT-AGENT-STATE.md).
+Register that command through your client's ordinary MCP configuration. The current stdio implementation supports handshake revisions through `2025-11-25`; it does not advertise the separate `2026-07-28` discovery/per-request versioning protocol. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch`, `agent_runs`, `agent_run` and `agent_cancel`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate durable run queue and private result endpoint; see [the run queue](QUEUE.md) and [native runs and state](TENANT-AGENT-STATE.md).
 
 The MCP client only permits HTTP for loopback origins, requires HTTPS for remote origins, rejects URL credentials and disables redirects and ambient forward proxies. A redirect must not forward the bearer token to another service. Use a direct API connection or SSH tunnel. Do not install fleet API tokens or operator SSH authority inside agent guests; guest computer/browser MCP is a separate interface.
 

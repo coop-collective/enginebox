@@ -15,7 +15,7 @@ fn run() -> Result<()> {
     let mode = args.first().map(String::as_str).unwrap_or("--help");
     if matches!(mode, "--help" | "-h") {
         println!(
-            "enginebox-guest {}\nNative workspace helper\n\nCommands:\n  run WORKSPACE [ID]  Execute bounded native CLI request from JSON stdin\n  cancel PROVIDER ID  Request cancellation of one controller run\n  lease PROVIDER      Report the native session writer lease\n  transfer            Deliver access-only native credentials from JSON stdin\n  status PROVIDER|all  Read native connection status\n  browser [OPTIONS]   Run the official Playwright MCP with a private profile\n  cursor-sandbox --home HOME --user USER --workspace PATH [--apply]",
+            "enginebox-guest {}\nNative workspace helper\n\nCommands:\n  run WORKSPACE [ID]  Execute bounded native CLI request from JSON stdin\n  run-profile WORKSPACE ID  Execute a native CLI request under a profile envelope from JSON stdin\n  cancel PROVIDER ID  Request cancellation of one controller run\n  lease PROVIDER      Report the native session writer lease\n  transfer            Deliver access-only native credentials from JSON stdin\n  status PROVIDER|all  Read native connection status\n  browser [OPTIONS]   Run the official Playwright MCP with a private profile\n  cursor-sandbox --home HOME --user USER --workspace PATH [--apply]",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -48,6 +48,17 @@ fn run() -> Result<()> {
                 home,
                 Path::new(workspace),
                 args.get(2).map(String::as_str),
+            )?)?
+        }
+        "run-profile" => {
+            ensure!(args.len() == 3, "Expected workspace and run ID.");
+            let envelope: agents::profile::Envelope =
+                serde_json::from_value(input(agents::profile::MAX_ENVELOPE_BYTES)?)?;
+            serde_json::to_value(native::execute_profiled(
+                &envelope,
+                home,
+                Path::new(&args[1]),
+                &args[2],
             )?)?
         }
         "cancel" => {

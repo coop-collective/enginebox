@@ -404,6 +404,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "enginebox-agents",
@@ -418,10 +419,12 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "tokio",
  "tower",
+ "url",
  "uuid",
 ]
 

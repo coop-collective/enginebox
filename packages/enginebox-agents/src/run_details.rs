@@ -13,6 +13,25 @@ pub fn task_preview(prompt: &str) -> String {
         .collect()
 }
 
+/// Principal recorded for runs started with the controller owner credential.
+pub const OWNER: &str = "owner";
+const SERVICE_TOKEN: &str = "service-token:";
+
+/// `owner`, or `service-token:` followed by a 32-character lowercase hex token ID.
+pub fn validate_principal(principal: &str) -> Result<()> {
+    ensure!(
+        principal == OWNER
+            || principal.strip_prefix(SERVICE_TOKEN).is_some_and(|id| {
+                id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }),
+        "Invalid native run principal."
+    );
+    Ok(())
+}
+
 pub fn validate(detail: &Value) -> Result<()> {
     ensure!(
         detail["schema"] == 1
@@ -23,6 +42,63 @@ pub fn validate(detail: &Value) -> Result<()> {
             && detail["cancelled"].is_boolean(),
         "Invalid native run details."
     );
+    // Optional: sidecars written before scoped tokens and run env omit these.
+    if let Some(principal) = detail.get("started_by") {
+        validate_principal(principal.as_str().unwrap_or(""))?;
+    }
+    if let Some(keys) = detail.get("env_keys") {
+        ensure!(
+            keys.as_array()
+                .is_some_and(|keys| keys.len() <= crate::native::MAX_ENV_VARS
+                    && keys
+                        .iter()
+                        .all(|k| k.as_str().is_some_and(crate::native::env_key_allowed))),
+            "Invalid native run env keys."
+        );
+    }
+    if let Some(profile) = detail.get("profile") {
+        ensure!(
+            profile["name"]
+                .as_str()
+                .is_some_and(crate::profile::valid_name)
+                && profile["revision"].is_u64(),
+            "Invalid native run profile."
+        );
+    }
+    if let Some(idempotency) = detail.get("idempotency") {
+        ensure!(
+            ["key_digest", "request_digest"]
+                .iter()
+                .all(|k| idempotency[*k]
+                    .as_str()
+                    .is_some_and(crate::profile::valid_sha256)),
+            "Invalid native run idempotency record."
+        );
+    }
+    if let Some(callback) = detail.get("callback") {
+        ensure!(
+            callback["origin"]
+                .as_str()
+                .is_some_and(|o| o.len() <= 2048 && o.starts_with("https://"))
+                && ["pending", "delivering", "delivered", "failed"]
+                    .contains(&callback["state"].as_str().unwrap_or(""))
+                && callback["attempts"].is_u64()
+                && (callback["last_status"].is_null() || callback["last_status"].is_u64()),
+            "Invalid native run callback record."
+        );
+    }
+    if let Some(failure) = detail.get("failure") {
+        ensure!(
+            failure["stage"]
+                .as_str()
+                .is_some_and(|s| crate::launch_events::Stage::parse(s).is_some())
+                && failure["reason"]
+                    .as_str()
+                    .is_some_and(crate::launch_events::valid_reason)
+                && failure.as_object().is_some_and(|m| m.len() == 2),
+            "Invalid native run failure."
+        );
+    }
     if !detail["started_at"].is_null() {
         chrono::DateTime::parse_from_rfc3339(
             detail["started_at"]
@@ -85,6 +161,23 @@ pub fn enrich(record: &Value, detail: Option<&Value>, now: chrono::DateTime<chro
     value["task"] = detail.map(|d| d["task"].clone()).unwrap_or(Value::Null);
     value["started_at"] = json!(start);
     value["cancel_requested"] = json!(detail.is_some_and(|d| d["cancel_requested"] == true));
+    // Legacy runs predate principals; only the owner credential existed then.
+    value["started_by"] = detail
+        .and_then(|d| d.get("started_by").cloned())
+        .unwrap_or_else(|| json!(OWNER));
+    value["env_keys"] = detail
+        .and_then(|d| d.get("env_keys").cloned())
+        .unwrap_or_else(|| json!([]));
+    value["profile"] = detail
+        .and_then(|d| d.get("profile").cloned())
+        .unwrap_or(Value::Null);
+    value["callback"] = detail
+        .and_then(|d| d.get("callback").cloned())
+        .unwrap_or(Value::Null);
+    // Why a launch stopped: `{stage, reason}` codes, null otherwise.
+    value["failure"] = detail
+        .and_then(|d| d.get("failure").cloned())
+        .unwrap_or(Value::Null);
     if detail.is_some_and(|d| d["cancelled"] == true) {
         value["status"] = json!("cancelled");
     }
@@ -128,6 +221,10 @@ pub fn summary(record: &Value, detail: Option<&Value>) -> Value {
         "native_session_id",
         "cancel_requested",
         "execution_uncertain",
+        "started_by",
+        "env_keys",
+        "profile",
+        "failure",
     ] {
         out.insert(key.into(), value[key].clone());
     }
