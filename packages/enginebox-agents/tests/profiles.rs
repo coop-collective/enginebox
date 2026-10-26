@@ -688,6 +688,8 @@ fn bootstrap_writes_only_the_runs_private_directory_and_is_removed() {
                         .contains("enginebox-browser")
                 );
                 assert!(codex.join("auth.json").is_file());
+                // the sessions link is Unix-only (profile.rs)
+                #[cfg(unix)]
                 assert!(
                     std::fs::symlink_metadata(codex.join("sessions"))
                         .unwrap()

@@ -160,9 +160,9 @@ fn a_start_is_queued_then_runs_then_succeeds() {
     gate.install(&service);
     measure(&service, Some(roomy()));
     let run = start(&service, "ebox-a", "owner", "build");
-    assert_eq!(run["status"], "queued");
-    // The scheduler may admit the run before the start's view is built; it
-    // then has no waiting reason (and no queue position) any more.
+    // The scheduler may admit the run before the start's view is built: it is
+    // then already running, with no waiting reason (and no queue position).
+    assert!(run["status"] == "queued" || run["status"] == "running");
     assert!(
         run["waiting_reason"].is_string()
             || (run["waiting_reason"].is_null() && run["queue_position"].is_null())
