@@ -3,7 +3,7 @@ use crate::{
     launch_events::{self, LaunchEvent, LaunchEvents, LaunchFailure, Stage},
     native, pools, process, profile,
     queue::{self, Entry, EntryState, HostLoad, Placement, QueueLimits, StoredCallback, Target},
-    run_details, security, usage,
+    repository, run_details, security, usage,
 };
 use anyhow::{Result, bail, ensure};
 use enginebox_core::{Fleet, Host};
@@ -98,12 +98,18 @@ pub type CreateHook = Arc<dyn Fn(&str, &str, &str, Option<&str>) -> Result<()> +
 pub type ProfileResolver = Arc<dyn Fn(&str, &str) -> Result<ResolvedProfile> + Send + Sync>;
 /// Replaces workspace preparation and the guest helper (tests only).
 pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
+/// Mints a run's repository write token at admission: (`<project>/<name>`,
+/// lifetime in seconds).
+pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential> + Send + Sync>;
+/// Revokes a run's repository token when the run ends (best effort).
+pub type RepositoryRevoke = Arc<dyn Fn(&str, &repository::Credential) + Send + Sync>;
 #[derive(Default)]
 struct Hooks {
     measure: Mutex<Option<MeasureHook>>,
     create: Mutex<Option<CreateHook>>,
     resolver: Mutex<Option<ProfileResolver>>,
     executor: Mutex<Option<RunExecutor>>,
+    repository: Mutex<Option<(RepositoryMint, RepositoryRevoke)>>,
 }
 /// A run the scheduler admitted, as handed to its executor.
 #[derive(Debug, Clone)]
@@ -116,6 +122,11 @@ pub struct AdmittedRun {
     pub profile: Option<String>,
     /// Milliseconds between acceptance and admission.
     pub queue_wait_ms: u64,
+    /// `<project>/<name>` of the run's hosted repository.
+    pub repository: Option<String>,
+    /// The repository access minted at admission (set before the executor
+    /// runs). `Debug` never prints the token.
+    pub repository_access: Option<repository::Access>,
 }
 
 /// A profile resolved by the controller for one launch: the provider block and
@@ -147,6 +158,9 @@ pub struct LaunchOptions {
     pub profile: Option<ResolvedProfile>,
     pub idempotency_key: Option<String>,
     pub callback: Option<Callback>,
+    /// `<project>/<name>` of a hosted repository. The controller checks the
+    /// caller's grant; a write token is minted at admission.
+    pub repository: Option<String>,
 }
 /// Handed to the finish hook once a run with a callback reaches a terminal state.
 #[derive(Debug, Clone)]
@@ -195,6 +209,7 @@ fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOpti
         "env_keys":request.env_keys(),
         "profile":options.profile.as_ref().map(|p| &p.name),
         "callback":options.callback.as_ref().map(|c| &c.url),
+        "repository":options.repository,
     }))
 }
 struct Session {
@@ -1502,6 +1517,10 @@ impl AgentService {
     /// Replace workspace preparation and the guest helper. For tests that
     /// exercise scheduling without a live workspace.
     #[doc(hidden)]
+    /// Install the controller's repository token minter and revoker.
+    pub fn set_repository_hooks(&self, mint: RepositoryMint, revoke: RepositoryRevoke) {
+        *self.inner.hooks.repository.lock().unwrap() = Some((mint, revoke));
+    }
     pub fn set_run_executor(&self, hook: RunExecutor) {
         *self.inner.hooks.executor.lock().unwrap() = Some(hook);
     }
@@ -1679,6 +1698,18 @@ impl AgentService {
             };
             envelope.validate()?;
         }
+        if let Some(r) = &options.repository {
+            repository::parse_ref(r)?;
+            let profile_env = options.profile.as_ref().map(|p| &p.block.env);
+            ensure!(
+                !request
+                    .env
+                    .keys()
+                    .chain(profile_env.into_iter().flat_map(|e| e.keys()))
+                    .any(|k| repository::reserved_env_key(k)),
+                "env cannot set git configuration variables in a repository run."
+            );
+        }
         if let Some(key) = &options.idempotency_key {
             ensure!(
                 valid_idempotency_key(key),
@@ -1768,6 +1799,9 @@ impl AgentService {
         if let Some(resolved) = &options.profile {
             detail["profile"] = json!({"name":resolved.name,"revision":resolved.revision});
         }
+        if let Some(r) = &options.repository {
+            detail["repository"] = json!(r);
+        }
         if let Some(key) = &options.idempotency_key {
             detail["idempotency"] = json!({
                 "key_digest":scoped_key_digest(started_by, &target, key),
@@ -1801,6 +1835,7 @@ impl AgentService {
             placement: None,
             finished_at: None,
             outcome: None,
+            repository: options.repository.clone(),
         };
         // Order: sidecar, record, queue entry. A crash before the entry leaves
         // a queued record that the next start marks failed, never a lost run.
@@ -2099,6 +2134,8 @@ impl AgentService {
             request,
             profile: queued.entry.profile.clone(),
             queue_wait_ms,
+            repository: queued.entry.repository.clone(),
+            repository_access: None,
         };
         let template = queued.entry.template.clone();
         let lease = (
@@ -2193,13 +2230,69 @@ impl AgentService {
                 });
         }
         let template = template.or_else(|| resolved.as_ref().and_then(|p| p.template.clone()));
+        // The repository token is minted now, at admission (never at
+        // acceptance), and revoked when the run ends.
+        let mut run = run;
+        let credential = match &run.repository {
+            None => None,
+            Some(r) => match self.mint_repository(r, run.request.timeout_seconds) {
+                Ok(credential) => Some(credential),
+                Err(failure) => {
+                    self.launch_failed(
+                        &run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                    return;
+                }
+            },
+        };
+        run.repository_access = credential.as_ref().map(repository::Credential::access);
+        self.execute_admitted(&run, resolved, template, started);
+        if let (Some(r), Some(credential)) = (&run.repository, &credential) {
+            let revoke = self.inner.hooks.repository.lock().unwrap().clone();
+            if let Some((_, revoke)) = revoke {
+                revoke(r, credential);
+            }
+        }
+    }
+    fn mint_repository(
+        &self,
+        r: &str,
+        timeout_seconds: u64,
+    ) -> std::result::Result<repository::Credential, LaunchFailure> {
+        let hooks = self.inner.hooks.repository.lock().unwrap().clone();
+        let Some((mint, _)) = hooks else {
+            return Err(LaunchFailure::new(
+                Stage::Resolve,
+                "repository_unavailable",
+                "No repository backend is installed.",
+            ));
+        };
+        let credential = mint(r, repository::run_token_ttl(timeout_seconds))
+            .map_err(|e| LaunchFailure::from_error(Stage::Resolve, "repository_unavailable", &e))?;
+        credential
+            .access()
+            .validate()
+            .map_err(|e| LaunchFailure::from_error(Stage::Resolve, "repository_unavailable", &e))?;
+        Ok(credential)
+    }
+    fn execute_admitted(
+        &self,
+        run: &AdmittedRun,
+        resolved: Option<ResolvedProfile>,
+        template: Option<String>,
+        started: Instant,
+    ) {
         let executor = self.inner.hooks.executor.lock().unwrap().clone();
         if let Some(executor) = executor {
             let request = run.request.clone();
-            let outcome = self.run_with(&run.id, &request, || executor(&run));
+            let outcome = self.run_with(&run.id, &request, || executor(run));
             if let Err(failure) = outcome {
                 self.launch_failed(
-                    &run,
+                    run,
                     template.as_deref(),
                     resolved.as_ref(),
                     &failure,
@@ -2208,14 +2301,25 @@ impl AgentService {
             }
             return;
         }
-        match self.prepare(&run, template.as_deref()) {
+        let prepared = self.prepare(run, template.as_deref()).and_then(|host| {
+            if run.repository_access.is_some() {
+                self.check_guest_supports_repository(&host, &run.name)?;
+            }
+            Ok(host)
+        });
+        match prepared {
             Ok(host) => {
                 let request = run.request.clone();
-                if let Err(failure) =
-                    self.run_worker_with(host, &run.name, request, &run.id, resolved.clone())
-                {
+                if let Err(failure) = self.run_worker_with(
+                    host,
+                    &run.name,
+                    request,
+                    &run.id,
+                    resolved.clone(),
+                    run.repository_access.clone(),
+                ) {
                     self.launch_failed(
-                        &run,
+                        run,
                         template.as_deref(),
                         resolved.as_ref(),
                         &failure,
@@ -2224,12 +2328,32 @@ impl AgentService {
                 }
             }
             Err(failure) => self.launch_failed(
-                &run,
+                run,
                 template.as_deref(),
                 resolved.as_ref(),
                 &failure,
                 started,
             ),
+        }
+    }
+    /// Older guest helpers do not know `run-repository`; refuse the run with
+    /// a clear reason before anything starts instead of a generic failure.
+    fn check_guest_supports_repository(
+        &self,
+        host: &Host,
+        name: &str,
+    ) -> std::result::Result<(), LaunchFailure> {
+        let help = guest_command(host, name, &["--help".into()])
+            .and_then(|command| process::checked(&command, None, None, b"", 20, 65536))
+            .map_err(|e| LaunchFailure::from_error(Stage::Bootstrap, "guest_outdated", &e))?;
+        if repository::guest_supports(&help) {
+            Ok(())
+        } else {
+            Err(LaunchFailure::new(
+                Stage::Bootstrap,
+                "guest_outdated",
+                "The workspace's guest helper does not list run-repository; update enginebox-guest.",
+            ))
         }
     }
     /// Check each launch step in order; the first that fails names its stage.
@@ -2313,6 +2437,9 @@ impl AgentService {
         let mut secrets = run.request.env.clone();
         if let Some(p) = resolved {
             secrets.extend(p.block.env.clone());
+        }
+        if let Some(access) = &run.repository_access {
+            secrets.insert("ENGINEBOX_REPO_TOKEN".into(), access.token.clone());
         }
         let profile_name = resolved
             .map(|p| p.name.clone())
@@ -2578,7 +2705,7 @@ impl AgentService {
     }
     #[cfg(test)]
     fn run_worker(&self, host: Host, name: &str, request: native::RunRequest, id: &str) {
-        let _ = self.run_worker_with(host, name, request, id, None);
+        let _ = self.run_worker_with(host, name, request, id, None, None);
     }
     /// Run the guest helper. A guest launch failure is returned (stage
     /// `start`) after the run is marked failed and uncertain.
@@ -2589,13 +2716,26 @@ impl AgentService {
         request: native::RunRequest,
         id: &str,
         resolved: Option<ResolvedProfile>,
+        repository: Option<repository::Access>,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
             // Runs without a profile keep the original guest command and
             // payload, so older guest helpers still serve them.
-            let (mode, input) = match &resolved {
-                None => ("run", serde_json::to_vec(&request)?),
-                Some(p) => (
+            let (mode, input) = match (&resolved, repository) {
+                (p, Some(access)) => (
+                    repository::GUEST_MODE,
+                    serde_json::to_vec(&repository::Envelope {
+                        request: request.clone(),
+                        profile: p.as_ref().map(|p| repository::ProfilePart {
+                            profile: p.name.clone(),
+                            block: p.block.clone(),
+                            files: p.files.clone(),
+                        }),
+                        repository: access,
+                    })?,
+                ),
+                (None, None) => ("run", serde_json::to_vec(&request)?),
+                (Some(p), None) => (
                     "run-profile",
                     serde_json::to_vec(&profile::Envelope {
                         request: request.clone(),
@@ -2827,6 +2967,7 @@ pub fn callback_payload(record: &Value, detail: Option<&Value>) -> Value {
         "provider":run["provider"],
         "profile":detail.and_then(|d| d["profile"]["name"].as_str()),
         "pool":detail.and_then(|d| d["pool"].as_str()),
+        "repository":detail.and_then(|d| d["repository"].as_str()),
         "status":run["status"],
         "exit_code":run["result"]["exit_code"],
         "timed_out":run["result"]["timed_out"],

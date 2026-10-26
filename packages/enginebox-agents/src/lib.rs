@@ -9,6 +9,7 @@ pub mod pools;
 pub mod process;
 pub mod profile;
 pub mod queue;
+pub mod repository;
 pub mod run_details;
 pub mod security;
 pub mod service;

@@ -46,6 +46,7 @@ export type FakeToken = {
   profiles?: string[];
   callback_secret?: string;
   project?: string;
+  repositories?: { project: string; access: "read" | "write" }[];
 };
 export type FakePool = { name: string; description: string; profile: string | null; members: { host_id: string; name: string }[]; project?: string };
 export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fleetDown?: boolean } = {}) {
@@ -69,6 +70,8 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     const parts = url.pathname.split("/").filter(Boolean);
     if (auth === `Bearer ${ownerToken}`) {
       if (method === "GET" && url.pathname === "/v1/pools") return reply({ pools: [...pools.values()] });
+      // Repositories exist in a project that has no pool.
+      if (method === "GET" && url.pathname === "/v1/repositories") return reply({ repositories: [{ project: "gamma", name: "tools" }] });
       if (method === "GET" && url.pathname === "/v1/profiles") return reply({ profiles: profiles.map((name) => ({ name })) });
       if (method === "GET" && url.pathname === "/v1/fleet" && opts.fleetDown) return reply({ error: "host unreachable" }, 500);
       if (method === "GET" && url.pathname === "/v1/fleet")
@@ -95,6 +98,8 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           return reply({ error: "pools must name at most 256 existing pools" }, 400);
         if (body.project && (body.pools ?? []).some((p: string) => (pools.get(p)!.project ?? "default") !== body.project))
           return reply({ error: "Every granted pool must belong to the token's project" }, 400);
+        if (body.project && (body.repositories ?? []).some((r: { project: string }) => r.project !== body.project))
+          return reply({ error: "Every repository grant must name the token's project" }, 400);
         const id = randomBytes(16).toString("hex");
         const secret = `ebst_${id}.${randomBytes(32).toString("hex")}`;
         tokens.set(id, {
@@ -108,6 +113,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           profiles: body.profiles,
           callback_secret: body.callback_secret,
           project: body.project,
+          repositories: body.repositories,
         });
         return reply({ token: { id, expires_at: body.expires_at }, secret, secret_shown_once: true }, 201);
       }
@@ -126,6 +132,17 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     if (!held) return reply({ error: "Service token is unknown, expired or revoked." }, 401);
     const sees = (h: string, n: string) => held.scopes.some((s) => s.host_id === h && s.name === n);
     if (url.pathname === "/v1/agent-runs") return reply({ runs: [] });
+    if (parts[1] === "projects" && parts[3] === "repositories") {
+      const access = (held.repositories ?? []).find((r) => r.project === parts[2])?.access;
+      const refused = () => reply({ error: "This service token is not granted that operation on that project." }, 403);
+      if (!access) return refused();
+      const repository = { project: parts[2], name: parts[4] ?? body?.name, backend: "artifacts", remote: `https://acct.artifacts.cloudflare.net/git/eb-${parts[2]}/${parts[4] ?? body?.name}.git`, default_branch: "main" };
+      if (method === "GET" && parts.length === 4) return reply({ project: parts[2], repositories: [] });
+      if (method === "GET") return reply({ repository });
+      if (parts.length === 4) return access === "write" ? reply({ repository }, 201) : refused();
+      if (body?.access === "write" && access !== "write") return refused();
+      return reply({ token: "art_v1_fake", expires_at: "2026-10-26T01:00:00Z", remote: repository.remote, access: body?.access }, 201);
+    }
     if (parts[1] === "pools") {
       if (!(held.pools ?? []).includes(parts[2])) return reply({ error: "This service token is not granted that pool." }, 403);
       const placed = { host_id: null, name: null, pool: parts[2] };

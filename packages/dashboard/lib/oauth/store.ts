@@ -20,6 +20,11 @@ export type WorkspaceGrant = { host: string; instance: string; profiles: string[
  * `project` is the pool's project at consent (absent in state written before pools had projects: "default").
  */
 export type PoolGrant = { pool: string; profile: string | null; project?: string };
+/**
+ * Consented access to one project's hosted repositories. `write`: create, list, read, mint read or write
+ * tokens and name a repository on a run. `read`: list, read and mint read tokens.
+ */
+export type RepositoryGrant = { project: string; access: "read" | "write" };
 
 export type Client = {
   client_id: string;
@@ -55,6 +60,8 @@ export type Code = {
   workspaces: WorkspaceGrant[];
   /** Absent in state written before pool grants existed. */
   pools?: PoolGrant[];
+  /** Absent in state written before repository grants existed. */
+  repositories?: RepositoryGrant[];
   /** Restricts the grant's pools to one project (absent or null: no restriction). */
   project?: string | null;
   expires_at: number;
@@ -73,6 +80,8 @@ export type Grant = {
   workspaces: WorkspaceGrant[];
   /** Absent in state written before pool grants existed. */
   pools?: PoolGrant[];
+  /** Absent in state written before repository grants existed. */
+  repositories?: RepositoryGrant[];
   /**
    * HMAC key the controller signs this grant's run callbacks with. Passed to
    * every access token minted for the grant, returned to the client once at

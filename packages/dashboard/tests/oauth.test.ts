@@ -431,3 +431,94 @@ test("a refresh after a consented pool was deleted ends the connection with inva
   assert.ok([...controller.tokens.values()].every((x) => x.revoked));
 });
 
+
+// ------------------------------------------------------------ repositories
+
+test("consent offers repository access per project; the grant, token response and access token carry it", async (t) => {
+  const controller = fakeController(t);
+  const client = await newClient();
+  const { verifier, challenge } = pkce();
+  const page = await authorize(new Request(authorizeUrl(standardParams(client, challenge)), { headers: { cookie: cookie() } }));
+  const html = await page.text();
+  // Projects with pools (alpha, beta, default) and with repositories only (gamma).
+  for (const project of ["alpha", "beta", "default", "gamma"]) {
+    assert.match(html, new RegExp(`Manage repositories in project <code>${project}</code> <select name="repositories:${project}"`));
+  }
+  const id = requestId(html);
+  const bad = await consentPost([["request", id], ["action", "approve"], ["repositories:alpha", "admin"]]);
+  assert.match(await bad.text(), /Choose read or write access/);
+  const unknown = await consentPost([["request", id], ["action", "approve"], ["repositories:delta", "read"]]);
+  assert.match(await unknown.text(), /selected project is not available/);
+  const ok = await consentPost([
+    ["request", id],
+    ["action", "approve"],
+    ["repositories:alpha", "write"],
+    ["repositories:gamma", "read"],
+    ["repositories:beta", ""],
+  ]);
+  assert.equal(ok.status, 303);
+  const response = await exchange(client, new URL(ok.headers.get("location")!).searchParams.get("code")!, verifier);
+  const tokens = await response.json();
+  assert.deepEqual(tokens.enginebox_grants, [
+    { kind: "repositories", project: "alpha", access: "write" },
+    { kind: "repositories", project: "gamma", access: "read" },
+  ]);
+  const [minted] = [...controller.tokens.values()];
+  assert.deepEqual(minted.repositories, [
+    { project: "alpha", access: "write" },
+    { project: "gamma", access: "read" },
+  ]);
+  assert.deepEqual(minted.scopes, []);
+  assert.equal(minted.pools, undefined);
+  assert.equal(minted.project, undefined);
+  // The repository routes reach the controller, which enforces the grant.
+  assert.equal((await call("v1/projects/alpha/repositories", tokens.access_token)).status, 200);
+  assert.equal((await call("v1/projects/alpha/repositories", tokens.access_token, "POST", { name: "game" })).status, 201);
+  assert.equal((await call("v1/projects/alpha/repositories/game", tokens.access_token)).status, 200);
+  const writeToken = await call("v1/projects/alpha/repositories/game/tokens", tokens.access_token, "POST", { access: "write", ttl_seconds: 600 });
+  assert.equal(writeToken.status, 201);
+  assert.equal((await call("v1/projects/gamma/repositories/tools/tokens", tokens.access_token, "POST", { access: "read" })).status, 201);
+  const readOnly = await call("v1/projects/gamma/repositories/tools/tokens", tokens.access_token, "POST", { access: "write" });
+  assert.equal(readOnly.status, 403);
+  assert.match(readOnly.headers.get("www-authenticate")!, /error="insufficient_scope"/);
+  assert.equal((await call("v1/projects/gamma/repositories", tokens.access_token, "POST", { name: "x" })).status, 403);
+  assert.equal((await call("v1/projects/beta/repositories", tokens.access_token)).status, 403);
+  // Owner-only and unserved shapes stay unknown at the edge.
+  for (const [method, path] of [
+    ["GET", "v1/repositories"],
+    ["GET", "v1/repository-backends/artifacts"],
+    ["POST", "v1/repository-backends/artifacts"],
+    ["POST", "v1/projects/alpha/repositories/game/delete"],
+    ["GET", "v1/projects/Alpha/repositories"],
+    ["GET", "v1/projects/alpha/repositories/game/tokens"],
+    ["GET", "v1/projects/alpha/repositories/Game"],
+  ] as const)
+    assert.equal((await call(path, tokens.access_token, method, method === "POST" ? {} : undefined)).status, 404, `${method} ${path}`);
+  // Refresh keeps the grant; the owner sees it on the connection.
+  const refreshed = await (await refreshWith(client, tokens.refresh_token)).json();
+  assert.deepEqual(refreshed.enginebox_grants, tokens.enginebox_grants);
+  assert.deepEqual(controller.tokens.get(refreshed.access_token.slice(5, 37))!.repositories, minted.repositories);
+  const listed = await listGrants(new Request(`${origin}/api/oauth/grants`, { headers: { cookie: cookie() } })).json();
+  assert.deepEqual(listed.grants[0].repositories, [
+    { project: "alpha", access: "write" },
+    { project: "gamma", access: "read" },
+  ]);
+});
+
+test("an app that asks for one project is offered only that project's repositories, and the token is restricted to it", async (t) => {
+  const controller = fakeController(t);
+  const client = await newClient();
+  const { verifier, challenge } = pkce();
+  const page = await (await authorize(new Request(authorizeUrl(standardParams(client, challenge, { project: "alpha" })), { headers: { cookie: cookie() } }))).text();
+  assert.match(page, /name="repositories:alpha"/);
+  assert.doesNotMatch(page, /name="repositories:gamma"/);
+  const id = requestId(page);
+  const outside = await consentPost([["request", id], ["action", "approve"], ["repositories:gamma", "read"]]);
+  assert.match(await outside.text(), /selected project is not available/);
+  const ok = await consentPost([["request", id], ["action", "approve"], ["repositories:alpha", "read"]]);
+  assert.equal(ok.status, 303);
+  const tokens = await (await exchange(client, new URL(ok.headers.get("location")!).searchParams.get("code")!, verifier)).json();
+  assert.deepEqual(tokens.enginebox_grants, [{ kind: "repositories", project: "alpha", access: "read" }]);
+  const [minted] = [...controller.tokens.values()];
+  assert.equal(minted.project, "alpha", "a repository-only grant still carries the project restriction");
+});

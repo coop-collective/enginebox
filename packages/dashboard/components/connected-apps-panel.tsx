@@ -9,6 +9,7 @@ type Connection = {
   redirect_hosts: string[];
   workspaces: { host: string; instance: string; profiles: string[] }[];
   pools?: { pool: string; profile: string | null; project?: string }[];
+  repositories?: { project: string; access: "read" | "write" }[];
   /** The connection is restricted to this project's pools. */
   project?: string | null;
   created_at: string;
@@ -83,6 +84,11 @@ export function ConnectedAppsPanel() {
                     {p.profile ? ` · profile: ${p.profile}` : ""}
                   </li>
                 ))}
+              {(c.repositories ?? []).map((r) => (
+                <li key={`repositories:${r.project}`}>
+                  repositories in project <code>{r.project}</code> · {r.access === "write" ? "read and write" : "read only"}
+                </li>
+              ))}
             </ul>
             <button className="button small" disabled={busy === c.id} onClick={() => void disconnect(c)}>Disconnect</button>
           </article>
