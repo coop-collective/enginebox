@@ -37,7 +37,7 @@ public static class EngineboxNativeStderrFixture {
   $reproduced=$false
   try { $null=(& $nativeFixturePath ok 2>&1) } catch { $reproduced=$true }
   if (-not $reproduced) { throw 'Native stderr fixture did not reproduce the PowerShell 5.1 failure' }
-  function global:wsl.exe { & $nativeFixturePath @args }
+  function global:wsl.exe { $input | & $nativeFixturePath @args }
   $result=Invoke-WslNative -Arguments @('ok')
   if ($result.ExitCode -ne 0 -or -not (($result.Stdout -join "`n") | ConvertFrom-Json).ok -or -not ($result.Stderr -join "`n").Contains('systemd user session')) { throw 'Native stdout and stderr must stay separate' }
   $json=Invoke-Wsl -Arguments @('ok') | Out-String | ConvertFrom-Json
@@ -52,7 +52,7 @@ public static class EngineboxNativeStderrFixture {
     $encoded=Invoke-WslNative -Arguments @('stdin') -InputText $value
     $bytes=[Convert]::FromBase64String(($encoded.Stdout -join '').Trim())
     $expected=[Text.UTF8Encoding]::new($false).GetBytes($value+[Environment]::NewLine)
-    if ($encoded.ExitCode -ne 0 -or [Convert]::ToBase64String($bytes) -ne [Convert]::ToBase64String($expected)) { throw 'Native stdin must use exact UTF-8 bytes without a BOM' }
+    if ($encoded.ExitCode -ne 0 -or [Convert]::ToBase64String($bytes) -ne [Convert]::ToBase64String($expected)) { throw ('Native stdin fixture bytes differ: actual='+[BitConverter]::ToString($bytes)+' expected='+[BitConverter]::ToString($expected)) }
     if ($OutputEncoding.CodePage -ne 1200) { throw 'Native stdin changed the caller encoding' }
   } finally { $OutputEncoding=$savedEncoding }
   Remove-Item Function:\global:wsl.exe
