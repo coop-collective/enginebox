@@ -12,7 +12,7 @@ export type Repository = {
   created_at: string;
   last_push_at?: string | null;
 };
-type Backend = { kind: string; configured: boolean; account_id?: string; namespace_prefix?: string };
+type Backend = { kind: string | null; configured: boolean; url?: string; namespace_prefix?: string };
 
 const PROJECT = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
 const NAME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
@@ -40,7 +40,7 @@ export function RepositoriesPanel() {
   const refresh = useCallback(async () => {
     try {
       const [state, pools, all] = await Promise.all([
-        api<{ backend: Backend }>("/api/control/v1/repository-backends/artifacts"),
+        api<{ backend: Backend }>("/api/control/v1/repository-backends"),
         api<{ pools?: { project?: unknown }[] }>("/api/control/v1/pools").catch(() => ({ pools: [] })),
         api<{ repositories: Repository[] }>("/api/control/v1/repositories"),
       ]);
@@ -106,12 +106,12 @@ export function RepositoriesPanel() {
       {notice && <p className="catalog-notice" role="status">{notice}</p>}
       {backend && !backend.configured && (
         <p>
-          No repository backend is configured. The owner sets one with <code>PUT /v1/repository-backends/artifacts</code> (see docs/REPOSITORIES.md).
+          No repository backend is configured. Deploy the Artifacts gateway Worker, then the owner sets it with <code>PUT /v1/repository-backends/artifacts-worker</code> (see docs/REPOSITORIES.md).
         </p>
       )}
       {backend?.configured && (
         <p>
-          Backend: Cloudflare Artifacts · account <code>{backend.account_id}</code> · namespaces <code>{backend.namespace_prefix}-&lt;project&gt;</code>
+          Backend: Cloudflare Artifacts through the gateway <code>{backend.url}</code> · namespaces <code>{backend.namespace_prefix}-&lt;project&gt;</code>
         </p>
       )}
       <form className="template-import" onSubmit={create} aria-label="Create a repository">

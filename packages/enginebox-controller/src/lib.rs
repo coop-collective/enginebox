@@ -81,7 +81,7 @@ pub struct Controller {
     // Last background reconcile failure (message, RFC 3339 time); cleared on success.
     reconcile_error: Mutex<Option<(String, String)>>,
     /// Test harnesses stand in for the repository backend's API.
-    repository_transport: Mutex<Option<(String, Arc<dyn repositories::Transport>)>>,
+    repository_transport: Mutex<Option<Arc<dyn repositories::Transport>>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -172,8 +172,8 @@ impl Controller {
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles: profiles::Profiles::open(&self.root)?,
             repositories: match self.repository_transport.lock().unwrap().clone() {
-                Some((api_base, transport)) => {
-                    repositories::Repositories::with_transport(&self.root, &api_base, transport)?
+                Some(transport) => {
+                    repositories::Repositories::with_transport(&self.root, transport)?
                 }
                 None => repositories::Repositories::open(&self.root)?,
             },
@@ -230,15 +230,11 @@ impl Controller {
     /// The agent service of an active controller, for development harnesses
     /// that install a stand-in run executor (see
     /// `examples/dev_fake_executor.rs`). Not part of the HTTP API.
-    /// Use another API base and transport for the repository backend (test
-    /// harnesses). Applies at the next activation. Not part of the HTTP API.
+    /// Use another transport for the repository backend (test harnesses).
+    /// Applies at the next activation. Not part of the HTTP API.
     #[doc(hidden)]
-    pub fn set_repository_transport(
-        &self,
-        api_base: &str,
-        transport: Arc<dyn repositories::Transport>,
-    ) {
-        *self.repository_transport.lock().unwrap() = Some((api_base.to_owned(), transport));
+    pub fn set_repository_transport(&self, transport: Arc<dyn repositories::Transport>) {
+        *self.repository_transport.lock().unwrap() = Some(transport);
     }
     #[doc(hidden)]
     pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
@@ -649,7 +645,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         };
     }
     // The owner-only backend configuration is the one PUT/DELETE resource.
-    let backend_route = path == "/v1/repository-backends/artifacts";
+    let backend_route = path == "/v1/repository-backends/artifacts-worker";
     if method == Method::DELETE && backend_route {
         let admission = match controller.admit() {
             Ok(a) => a,
@@ -663,7 +659,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         let operation = controller.clone();
         return match blocking(move || {
             let _admission = admission;
-            operation.runtime()?.repositories.delete_artifacts()
+            operation.runtime()?.repositories.delete_worker()
         })
         .await
         {
@@ -733,7 +729,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         admitted(admission, async move {
             let repositories = operation.runtime()?.repositories;
             Ok(repository_reply(
-                blocking(move || repositories.put_artifacts(&body)).await,
+                blocking(move || repositories.put_worker(&body)).await,
                 StatusCode::OK,
             ))
         })
@@ -894,7 +890,10 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
                 .service_tokens
                 .list_grouped(|pool| agents.pools().project_of(pool)))
         }
-        ["v1", "repository-backends", "artifacts"] => Ok(c.runtime()?.repositories.get_artifacts()),
+        ["v1", "repository-backends"] => Ok(c.runtime()?.repositories.backend_view()),
+        ["v1", "repository-backends", "artifacts-worker"] => {
+            Ok(c.runtime()?.repositories.get_worker())
+        }
         ["v1", "repositories"] => Ok(c.runtime()?.repositories.list_all()),
         ["v1", "projects", project, "repositories"] => c.runtime()?.repositories.list(project),
         ["v1", "projects", project, "repositories", name] => {
@@ -2956,22 +2955,29 @@ mod tests {
     #[tokio::test]
     async fn repositories_are_owner_configured_project_scoped_and_runs_get_tokens_at_admission() {
         const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
-        const API_TOKEN: &str = "cf-test-api-token-0123456789abcdef";
+        const API_TOKEN: &str = repositories::mock::SECRET;
         let (temp, c) = setup();
-        let api = repositories::mock::MockArtifacts::new(ACCOUNT);
-        c.set_repository_transport("https://api.example.test/client/v4", api.clone());
+        let api = repositories::mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]);
+        c.set_repository_transport(api.clone());
         let app = router(c.clone());
         queue_fixture(&c);
-        let backend = "/v1/repository-backends/artifacts";
+        let backend = "/v1/repository-backends/artifacts-worker";
         let config =
-            json!({"account_id":ACCOUNT,"namespace_prefix":"eb","api_token":API_TOKEN}).to_string();
+            json!({"url":repositories::mock::URL,"namespace_prefix":"eb","secret":API_TOKEN})
+                .to_string();
         // Owner-only, write-only backend configuration.
         let (status, put) = call(&app, request(Method::PUT, backend, &config, true)).await;
         assert_eq!(status, StatusCode::OK, "{put}");
-        assert_eq!(put["backend"]["api_token"], "[redacted]");
+        assert_eq!(put["backend"]["secret"], "[redacted]");
         let (status, got) = call(&app, request(Method::GET, backend, "", true)).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(got["backend"]["account_id"], ACCOUNT);
+        assert_eq!(got["backend"]["url"], repositories::mock::URL);
+        let (_, selected) = call(
+            &app,
+            request(Method::GET, "/v1/repository-backends", "", true),
+        )
+        .await;
+        assert_eq!(selected["backend"]["kind"], "artifacts_worker");
         assert!(!put.to_string().contains(API_TOKEN) && !got.to_string().contains(API_TOKEN));
         let (status, _) = call(&app, request(Method::PATCH, backend, &config, true)).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
@@ -3269,18 +3275,22 @@ mod tests {
                     .unwrap();
                 assert_eq!(token.2, "write", "runs get write tokens");
                 assert!(token.4, "revoked at run end: {id}");
-                let (_, _, _, body) = state
+                let (_, body) = state
                     .calls
                     .iter()
-                    .find(|(m, u, _, b)| m == "POST" && u.ends_with("/tokens") && b.is_some())
+                    .find(|(op, _)| op == "tokens.create")
                     .unwrap();
-                assert_eq!(body.as_ref().unwrap()["repo"], "game");
+                assert_eq!(body["repo"], "game");
+                assert_eq!(body["namespace"], "eb-alpha");
             }
             // The run TTL is the run timeout (default 120 s) plus the margin.
-            assert!(state.calls.iter().any(|(_, _, _, b)| {
-                b.as_ref()
-                    .is_some_and(|b| b["ttl"] == 720 && b["scope"] == "write")
+            assert!(state.calls.iter().any(|(op, b)| {
+                op == "tokens.create" && b["ttl"] == 720 && b["scope"] == "write"
             }));
+            assert_eq!(
+                state.rejected, 0,
+                "every controller request was correctly signed"
+            );
         }
         let (_, run) = call(
             &app,

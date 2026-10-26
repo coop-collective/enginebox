@@ -486,8 +486,8 @@ test("consent offers repository access per project; the grant, token response an
   // Owner-only and unserved shapes stay unknown at the edge.
   for (const [method, path] of [
     ["GET", "v1/repositories"],
-    ["GET", "v1/repository-backends/artifacts"],
-    ["POST", "v1/repository-backends/artifacts"],
+    ["GET", "v1/repository-backends"],
+    ["POST", "v1/repository-backends/artifacts-worker"],
     ["POST", "v1/projects/alpha/repositories/game/delete"],
     ["GET", "v1/projects/Alpha/repositories"],
     ["GET", "v1/projects/alpha/repositories/game/tokens"],

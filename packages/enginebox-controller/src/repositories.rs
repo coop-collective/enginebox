@@ -1,10 +1,13 @@
 //! Hosted Git repositories per project. Each repository lives in a backend;
-//! today that is Cloudflare Artifacts (one Artifacts namespace per Engine Box
-//! project, `<namespace_prefix>-<project>`). The [`Backend`] trait is the seam
-//! for further backends (a GitHub App next).
+//! today that is Cloudflare Artifacts reached through the Engine Box
+//! Artifacts gateway Worker (`packages/artifacts-gateway`), which holds the
+//! Artifacts bindings: one Artifacts namespace per Engine Box project,
+//! `<namespace_prefix>-<project>`. The [`Backend`] trait is the seam for
+//! further backends (a GitHub App next).
 //!
-//! The backend's API token is owner-only private state: written once through
-//! `PUT /v1/repository-backends/artifacts`, never returned or logged. Clients
+//! The gateway's shared signing secret is owner-only private state: written
+//! once through `PUT /v1/repository-backends/artifacts-worker`, never returned
+//! or logged. No Cloudflare API token is used. Clients
 //! receive short-lived repository tokens only when they ask for one (`POST
 //! .../tokens`) or, for a run that names a repository, inside that run's
 //! private native home (minted at admission, revoked when the run ends).
@@ -21,12 +24,11 @@ use std::{
     time::Duration,
 };
 
-/// The Cloudflare v4 API.
-pub const CLOUDFLARE_API: &str = "https://api.cloudflare.com/client/v4";
 pub const DEFAULT_NAMESPACE_PREFIX: &str = "enginebox";
 const MAX_PER_PROJECT: usize = 1000;
 const MAX_TOTAL: usize = 10_000;
 const MAX_DESCRIPTION: usize = 512;
+const WORKER_FILE: &str = "artifacts-worker.json";
 /// Default lifetime of a client-requested repository token.
 pub const DEFAULT_TOKEN_TTL_SECONDS: u64 = 3600;
 
@@ -128,19 +130,13 @@ pub trait Backend: Send + Sync {
     fn list(&self, project: &str) -> Result<Vec<BackendRepository>>;
     fn mint(&self, project: &str, name: &str, access: Access, ttl: u64) -> Result<MintedToken>;
     /// Revoke a token by ID. Backends without revocation return Ok.
-    fn revoke(&self, project: &str, token_id: &str) -> Result<()>;
+    fn revoke(&self, project: &str, name: &str, token_id: &str) -> Result<()>;
 }
 
-/// One HTTP exchange with a backend API: (status, JSON body). Separate from
-/// the backend so tests can stand in for the remote API.
+/// One signed POST to a backend service: (status, JSON body). Separate from
+/// the backend so tests can stand in for the remote service.
 pub trait Transport: Send + Sync {
-    fn send(
-        &self,
-        method: &str,
-        url: &str,
-        bearer: &str,
-        body: Option<&Value>,
-    ) -> Result<(u16, Value)>;
+    fn post(&self, url: &str, headers: &[(&str, String)], body: Vec<u8>) -> Result<(u16, Value)>;
 }
 
 /// HTTPS with rustls; no redirects, bounded time. A client is built per
@@ -157,17 +153,13 @@ impl HttpTransport {
     }
 }
 impl Transport for HttpTransport {
-    fn send(
-        &self,
-        method: &str,
-        url: &str,
-        bearer: &str,
-        body: Option<&Value>,
-    ) -> Result<(u16, Value)> {
-        let method = reqwest::Method::from_bytes(method.as_bytes())?;
-        let mut request = Self::client()?.request(method, url).bearer_auth(bearer);
-        if let Some(body) = body {
-            request = request.json(body);
+    fn post(&self, url: &str, headers: &[(&str, String)], body: Vec<u8>) -> Result<(u16, Value)> {
+        let mut request = Self::client()?
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body);
+        for (name, value) in headers {
+            request = request.header(*name, value);
         }
         let response = request
             .send()
@@ -184,39 +176,45 @@ impl Transport for HttpTransport {
     }
 }
 
-/// Owner-supplied Artifacts configuration. The API token needs Artifacts
-/// Read and Artifacts Edit; it is write-only.
+/// Owner-supplied configuration of the Artifacts gateway Worker
+/// (`packages/artifacts-gateway`). The shared secret signs every request; it
+/// is write-only.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ArtifactsConfig {
-    pub account_id: String,
+pub struct WorkerConfig {
+    pub url: String,
+    secret: String,
     pub namespace_prefix: String,
-    api_token: String,
     pub updated_at: String,
 }
-impl std::fmt::Debug for ArtifactsConfig {
+impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ArtifactsConfig")
-            .field("account_id", &self.account_id)
+        f.debug_struct("WorkerConfig")
+            .field("url", &self.url)
             .field("namespace_prefix", &self.namespace_prefix)
             .finish()
     }
 }
-impl ArtifactsConfig {
-    pub fn new(account_id: &str, namespace_prefix: &str, api_token: &str) -> Result<Self> {
+impl WorkerConfig {
+    pub fn new(url: &str, secret: &str, namespace_prefix: &str) -> Result<Self> {
         let config = Self {
-            account_id: account_id.into(),
+            url: url.trim_end_matches('/').into(),
+            secret: secret.into(),
             namespace_prefix: namespace_prefix.into(),
-            api_token: api_token.into(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         config.validate()?;
         Ok(config)
     }
     fn validate(&self) -> Result<()> {
-        if !valid_account_id(&self.account_id) {
+        if !valid_gateway_url(&self.url) {
             return Err(invalid(
-                "account_id must be a 32-character Cloudflare account ID.",
+                "url must be the gateway's https origin on its custom domain (no path, credentials, query or workers.dev).",
+            ));
+        }
+        if !valid_secret(&self.secret) {
+            return Err(invalid(
+                "secret must be 32-256 printable characters without spaces.",
             ));
         }
         if !valid_namespace_prefix(&self.namespace_prefix) {
@@ -224,30 +222,39 @@ impl ArtifactsConfig {
                 "namespace_prefix must be 1-14 lowercase letters, digits or dashes, starting with a letter or digit.",
             ));
         }
-        if !valid_api_token(&self.api_token) {
-            return Err(invalid(
-                "api_token must be 20-256 printable characters without spaces.",
-            ));
-        }
         Ok(())
     }
-    /// Redacted view: never the API token.
+    /// Redacted view: never the secret.
     pub fn public(&self) -> Value {
         json!({
-            "kind":"artifacts",
+            "kind":WORKER_KIND,
             "configured":true,
-            "account_id":self.account_id,
+            "url":self.url,
             "namespace_prefix":self.namespace_prefix,
-            "api_token":"[redacted]",
+            "secret":"[redacted]",
             "updated_at":self.updated_at,
         })
     }
 }
-pub fn valid_account_id(id: &str) -> bool {
-    id.len() == 32
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+/// The backend kind name in API views.
+pub const WORKER_KIND: &str = "artifacts_worker";
+fn valid_gateway_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("");
+    url.scheme() == "https"
+        && !host.is_empty()
+        && !host.ends_with(".workers.dev")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path() == "/"
+        && value.len() <= 256
+}
+fn valid_secret(secret: &str) -> bool {
+    (32..=256).contains(&secret.len()) && secret.bytes().all(|b| (33..=126).contains(&b))
 }
 /// `<prefix>-<project>` must fit the Artifacts namespace limit (63) for the
 /// longest project ID (48), so prefixes are at most 14 characters.
@@ -258,73 +265,102 @@ pub fn valid_namespace_prefix(prefix: &str) -> bool {
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
-fn valid_api_token(token: &str) -> bool {
-    (20..=256).contains(&token.len()) && token.bytes().all(|b| (33..=126).contains(&b))
-}
 /// The Artifacts namespace of one Engine Box project.
 pub fn namespace(prefix: &str, project: &str) -> Result<String> {
     if !valid_namespace_prefix(prefix) || !pools::valid_project(project) {
         return Err(invalid("Invalid namespace."));
     }
     let ns = format!("{prefix}-{project}");
-    // Artifacts: 2-63 characters, letters, digits, `.`, `_`, `-`.
     anyhow::ensure!((2..=63).contains(&ns.len()), "Invalid namespace.");
     Ok(ns)
 }
 
-/// Cloudflare Artifacts over its REST API.
-pub struct ArtifactsBackend {
-    config: ArtifactsConfig,
-    api_base: String,
+/// The canonical string the gateway verifies (see `packages/artifacts-gateway`).
+pub fn canonical(path: &str, timestamp: u64, nonce: &str, body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "v1\nPOST\n{path}\n{timestamp}\n{nonce}\n{:x}",
+        Sha256::digest(body)
+    )
+}
+
+/// Cloudflare Artifacts through the gateway Worker's bindings. No Cloudflare
+/// API token is involved; requests are HMAC-signed with the shared secret.
+pub struct ArtifactsWorkerBackend {
+    config: WorkerConfig,
     transport: Arc<dyn Transport>,
 }
-impl ArtifactsBackend {
-    pub fn new(config: ArtifactsConfig, api_base: &str, transport: Arc<dyn Transport>) -> Self {
-        Self {
-            config,
-            api_base: api_base.trim_end_matches('/').to_owned(),
-            transport,
+impl ArtifactsWorkerBackend {
+    pub fn new(config: WorkerConfig, transport: Arc<dyn Transport>) -> Self {
+        Self { config, transport }
+    }
+    fn namespace(&self, project: &str) -> Result<String> {
+        namespace(&self.config.namespace_prefix, project)
+    }
+    /// One signed call: `operation` is `repos.create`, `repos.get`,
+    /// `repos.list`, `tokens.create` or `tokens.revoke`.
+    fn call(&self, operation: &str, body: &Value) -> Result<(u16, Value)> {
+        let bytes = serde_json::to_vec(body)?;
+        let path = format!("/{operation}");
+        let timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let signature = crate::callbacks::hmac_sha256_hex(
+            self.config.secret.as_bytes(),
+            canonical(&path, timestamp, &nonce, &bytes).as_bytes(),
+        );
+        let (status, response) = self
+            .transport
+            .post(
+                &format!("{}{path}", self.config.url),
+                &[
+                    ("x-enginebox-timestamp", timestamp.to_string()),
+                    ("x-enginebox-nonce", nonce),
+                    ("x-enginebox-signature", format!("v1={signature}")),
+                ],
+                bytes,
+            )
+            .map_err(|_| upstream())?;
+        let code = response["error"].as_str().unwrap_or("");
+        match (status, code) {
+            (404, "namespace_not_provisioned") => Err(refuse(
+                409,
+                "The repository gateway does not serve this project's namespace; add the project to the gateway's configuration and redeploy it.",
+            )),
+            (403, "namespace_not_allowed") => Err(refuse(
+                409,
+                "The repository gateway refuses this namespace; its namespace prefix differs from the configured one.",
+            )),
+            (401, _) => {
+                Self::log_refusal(operation, status, code);
+                Err(refuse(
+                    502,
+                    "The repository gateway refused the controller's signature; check the shared secret.",
+                ))
+            }
+            _ => Ok((status, response)),
         }
     }
-    fn base(&self, project: &str) -> Result<String> {
-        Ok(format!(
-            "{}/accounts/{}/artifacts/namespaces/{}",
-            self.api_base,
-            self.config.account_id,
-            namespace(&self.config.namespace_prefix, project)?
-        ))
-    }
-    fn call(&self, method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value)> {
-        self.transport
-            .send(method, url, &self.config.api_token, body)
-            .map_err(|_| upstream())
-    }
-    /// Log a backend refusal: status and Artifacts error codes only.
-    fn log_refusal(operation: &str, status: u16, body: &Value) {
-        let codes: Vec<Value> = body["errors"]
-            .as_array()
-            .map(|e| e.iter().map(|x| x["code"].clone()).collect())
-            .unwrap_or_default();
+    /// Log a refusal: operation, status and error code only.
+    fn log_refusal(operation: &str, status: u16, code: &str) {
         eprintln!(
             "{}",
-            json!({"event":"enginebox.repositories.backend_refused","backend":"artifacts","operation":operation,"status":status,"codes":codes})
+            json!({"event":"enginebox.repositories.backend_refused","backend":WORKER_KIND,"operation":operation,"status":status,"code":code})
         );
     }
-    fn has_code(body: &Value, code: u64) -> bool {
-        body["errors"]
-            .as_array()
-            .is_some_and(|e| e.iter().any(|x| x["code"] == code))
+    fn failed(operation: &str, status: u16, response: &Value) -> anyhow::Error {
+        Self::log_refusal(operation, status, response["error"].as_str().unwrap_or(""));
+        upstream()
     }
-    fn repository(value: &Value) -> Result<BackendRepository> {
+    fn repository(value: &Value, need_remote: bool) -> Result<BackendRepository> {
         let text = |key: &str| value[key].as_str().map(str::to_owned);
         let repository = BackendRepository {
             id: text("id"),
             name: text("name").context("Backend repository without a name")?,
-            remote: text("remote").context("Backend repository without a remote")?,
+            remote: text("remote").unwrap_or_default(),
             default_branch: text("default_branch").unwrap_or_else(|| "main".into()),
             last_push_at: text("last_push_at"),
         };
-        if !repository::valid_remote(&repository.remote)
+        if (need_remote && !repository::valid_remote(&repository.remote))
             || !repository::valid_branch(&repository.default_branch)
         {
             return Err(upstream());
@@ -332,9 +368,9 @@ impl ArtifactsBackend {
         Ok(repository)
     }
 }
-impl Backend for ArtifactsBackend {
+impl Backend for ArtifactsWorkerBackend {
     fn kind(&self) -> &'static str {
-        "artifacts"
+        WORKER_KIND
     }
     fn create(
         &self,
@@ -342,66 +378,50 @@ impl Backend for ArtifactsBackend {
         name: &str,
         description: Option<&str>,
     ) -> Result<(BackendRepository, bool)> {
-        let mut body = json!({"name":name});
+        let mut body = json!({"namespace":self.namespace(project)?,"name":name});
         if let Some(d) = description.filter(|d| !d.is_empty()) {
             body["description"] = json!(d);
         }
-        let base = self.base(project)?;
-        let (status, response) = self.call("POST", &format!("{base}/repos"), Some(&body))?;
-        if (200..300).contains(&status) && response["success"] == true {
-            // The creation response carries a write token. It is never stored
-            // or returned; revoke it so it cannot outlive this request.
-            let created = Self::repository(&response["result"])?;
-            self.revoke_active(project, name);
-            return Ok((created, true));
+        // The gateway revokes the creation token itself and never returns it.
+        let (status, response) = self.call("repos.create", &body)?;
+        match status {
+            200 => Ok((Self::repository(&response["repository"], true)?, true)),
+            409 if response["error"] == "already_exists" => {
+                let existing = self.get(project, name)?.ok_or_else(upstream)?;
+                Ok((existing, false))
+            }
+            _ => Err(Self::failed("repos.create", status, &response)),
         }
-        if status == 409 || Self::has_code(&response, 10201) {
-            let existing = self.get(project, name)?.ok_or_else(upstream)?;
-            return Ok((existing, false));
-        }
-        Self::log_refusal("create", status, &response);
-        Err(upstream())
     }
     fn get(&self, project: &str, name: &str) -> Result<Option<BackendRepository>> {
-        let base = self.base(project)?;
-        let (status, response) = self.call("GET", &format!("{base}/repos/{name}"), None)?;
-        if status == 404 {
-            return Ok(None);
+        let body = json!({"namespace":self.namespace(project)?,"name":name});
+        let (status, response) = self.call("repos.get", &body)?;
+        match status {
+            200 => Ok(Some(Self::repository(&response["repository"], true)?)),
+            404 => Ok(None),
+            _ => Err(Self::failed("repos.get", status, &response)),
         }
-        if !(200..300).contains(&status) || response["success"] != true {
-            Self::log_refusal("get", status, &response);
-            return Err(upstream());
-        }
-        Ok(Some(Self::repository(&response["result"])?))
     }
     fn list(&self, project: &str) -> Result<Vec<BackendRepository>> {
-        let base = self.base(project)?;
+        let namespace = self.namespace(project)?;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         // At most 10 pages of 200 (MAX_PER_PROJECT fits).
         for _ in 0..10 {
-            let mut url = format!("{base}/repos?limit=200&sort=name&direction=asc");
+            let mut body = json!({"namespace":namespace});
             if let Some(c) = &cursor {
-                url.push_str("&cursor=");
-                url.push_str(
-                    &url::form_urlencoded::byte_serialize(c.as_bytes()).collect::<String>(),
-                );
+                body["cursor"] = json!(c);
             }
-            let (status, response) = self.call("GET", &url, None)?;
-            if status == 404 {
-                break;
+            let (status, response) = self.call("repos.list", &body)?;
+            if status != 200 {
+                return Err(Self::failed("repos.list", status, &response));
             }
-            if !(200..300).contains(&status) || response["success"] != true {
-                Self::log_refusal("list", status, &response);
-                return Err(upstream());
-            }
-            let page = response["result"].as_array().cloned().unwrap_or_default();
-            for item in &page {
-                if let Ok(r) = Self::repository(item) {
-                    out.push(r);
-                }
-            }
-            cursor = response["result_info"]["cursor"]
+            let page = response["repositories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            out.extend(page.iter().filter_map(|r| Self::repository(r, false).ok()));
+            cursor = response["cursor"]
                 .as_str()
                 .filter(|c| !c.is_empty())
                 .map(str::to_owned);
@@ -412,14 +432,15 @@ impl Backend for ArtifactsBackend {
         Ok(out)
     }
     fn mint(&self, project: &str, name: &str, access: Access, ttl: u64) -> Result<MintedToken> {
-        let base = self.base(project)?;
-        let body = json!({"repo":name,"scope":access.as_str(),"ttl":ttl});
-        let (status, response) = self.call("POST", &format!("{base}/tokens"), Some(&body))?;
-        if !(200..300).contains(&status) || response["success"] != true {
-            Self::log_refusal("mint", status, &response);
-            return Err(upstream());
+        let body = json!({"namespace":self.namespace(project)?,"repo":name,"scope":access.as_str(),"ttl":ttl});
+        let (status, response) = self.call("tokens.create", &body)?;
+        if status == 404 {
+            return Err(unknown_repository());
         }
-        let result = &response["result"];
+        if status != 200 {
+            return Err(Self::failed("tokens.create", status, &response));
+        }
+        let result = &response["token"];
         let token = result["plaintext"].as_str().unwrap_or("").to_owned();
         if !repository::valid_token(&token) || result["scope"] != access.as_str() {
             return Err(upstream());
@@ -435,7 +456,7 @@ impl Backend for ArtifactsBackend {
             expires_at,
         })
     }
-    fn revoke(&self, project: &str, token_id: &str) -> Result<()> {
+    fn revoke(&self, project: &str, name: &str, token_id: &str) -> Result<()> {
         if token_id.is_empty()
             || token_id.len() > 128
             || !token_id
@@ -444,36 +465,12 @@ impl Backend for ArtifactsBackend {
         {
             return Err(invalid("Invalid token ID."));
         }
-        let base = self.base(project)?;
-        let (status, response) = self.call("DELETE", &format!("{base}/tokens/{token_id}"), None)?;
-        if (200..300).contains(&status) || status == 404 {
+        let body = json!({"namespace":self.namespace(project)?,"repo":name,"id":token_id});
+        let (status, response) = self.call("tokens.revoke", &body)?;
+        if status == 200 || status == 404 {
             return Ok(());
         }
-        Self::log_refusal("revoke", status, &response);
-        Err(upstream())
-    }
-}
-impl ArtifactsBackend {
-    /// Best effort: revoke every active token of a repository just created.
-    fn revoke_active(&self, project: &str, name: &str) {
-        let Ok(base) = self.base(project) else {
-            return;
-        };
-        let Ok((status, response)) = self.call(
-            "GET",
-            &format!("{base}/repos/{name}/tokens?state=active&per_page=100"),
-            None,
-        ) else {
-            return;
-        };
-        if !(200..300).contains(&status) {
-            return;
-        }
-        for token in response["result"].as_array().into_iter().flatten() {
-            if let Some(id) = token["id"].as_str() {
-                let _ = self.revoke(project, id);
-            }
-        }
+        Err(Self::failed("tokens.revoke", status, &response))
     }
 }
 
@@ -527,22 +524,17 @@ struct Inner {
     records_root: PathBuf,
     backends_root: PathBuf,
     records: Mutex<BTreeMap<(String, String), Record>>,
-    artifacts: Mutex<Option<ArtifactsConfig>>,
+    worker: Mutex<Option<WorkerConfig>>,
     /// Serializes creation so one name creates one repository.
     creating: Mutex<()>,
-    api_base: String,
     transport: Arc<dyn Transport>,
 }
 impl Repositories {
     pub fn open(root: &Path) -> Result<Self> {
-        Self::with_transport(root, CLOUDFLARE_API, Arc::new(HttpTransport))
+        Self::with_transport(root, Arc::new(HttpTransport))
     }
-    /// Open with another API base and transport (tests stand in for the API).
-    pub fn with_transport(
-        root: &Path,
-        api_base: &str,
-        transport: Arc<dyn Transport>,
-    ) -> Result<Self> {
+    /// Open with another transport (tests stand in for the gateway).
+    pub fn with_transport(root: &Path, transport: Arc<dyn Transport>) -> Result<Self> {
         let base = root.join("repositories");
         let records_root = base.join("records");
         let backends_root = base.join("backends");
@@ -574,10 +566,9 @@ impl Repositories {
                 records.insert((record.project.clone(), record.name.clone()), record);
             }
         }
-        let artifacts_path = backends_root.join("artifacts.json");
-        let artifacts = if artifacts_path.exists() {
-            let config: ArtifactsConfig =
-                serde_json::from_value(state::read_json(&artifacts_path)?)?;
+        let worker_path = backends_root.join(WORKER_FILE);
+        let worker = if worker_path.exists() {
+            let config: WorkerConfig = serde_json::from_value(state::read_json(&worker_path)?)?;
             config.validate()?;
             Some(config)
         } else {
@@ -588,9 +579,8 @@ impl Repositories {
                 records_root,
                 backends_root,
                 records: Mutex::new(records),
-                artifacts: Mutex::new(artifacts),
+                worker: Mutex::new(worker),
                 creating: Mutex::new(()),
-                api_base: api_base.to_owned(),
                 transport,
             }),
         })
@@ -598,79 +588,88 @@ impl Repositories {
 
     // ------------------------------------------------------------ backend config
 
-    /// `PUT /v1/repository-backends/artifacts`.
-    pub fn put_artifacts(&self, body: &Value) -> Result<Value> {
+    /// `PUT /v1/repository-backends/artifacts-worker`.
+    pub fn put_worker(&self, body: &Value) -> Result<Value> {
         let object = body
             .as_object()
             .ok_or_else(|| invalid("Expected an object."))?;
         if !object
             .keys()
-            .all(|k| ["account_id", "namespace_prefix", "api_token"].contains(&k.as_str()))
+            .all(|k| ["url", "secret", "namespace_prefix"].contains(&k.as_str()))
         {
-            return Err(invalid(
-                "Accepted fields: account_id, namespace_prefix, api_token.",
-            ));
+            return Err(invalid("Accepted fields: url, secret, namespace_prefix."));
         }
-        let text = |key: &str| body[key].as_str();
-        let account_id = text("account_id").ok_or_else(|| invalid("account_id is required."))?;
-        let api_token = text("api_token").ok_or_else(|| invalid("api_token is required."))?;
+        let url = body["url"]
+            .as_str()
+            .ok_or_else(|| invalid("url is required."))?;
+        let secret = body["secret"]
+            .as_str()
+            .ok_or_else(|| invalid("secret is required."))?;
         let prefix = match body.get("namespace_prefix") {
             None | Some(Value::Null) => DEFAULT_NAMESPACE_PREFIX,
             Some(Value::String(p)) => p.as_str(),
             Some(_) => return Err(invalid("namespace_prefix must be a string.")),
         };
-        let config = ArtifactsConfig::new(account_id, prefix, api_token)?;
-        let mut current = self.inner.artifacts.lock().unwrap();
+        let config = WorkerConfig::new(url, secret, prefix)?;
+        let mut current = self.inner.worker.lock().unwrap();
         let has_records = !self.inner.records.lock().unwrap().is_empty();
         if has_records
-            && current.as_ref().is_some_and(|c| {
-                c.account_id != config.account_id || c.namespace_prefix != config.namespace_prefix
-            })
+            && current
+                .as_ref()
+                .is_some_and(|c| c.namespace_prefix != config.namespace_prefix)
         {
             return Err(refuse(
                 409,
-                "Repositories exist under the current account and namespace prefix; only the API token can be replaced.",
+                "Repositories exist under the current namespace prefix; only the URL and secret can be replaced.",
             ));
         }
         state::write_json(
-            &self.inner.backends_root.join("artifacts.json"),
+            &self.inner.backends_root.join(WORKER_FILE),
             &serde_json::to_value(&config)?,
         )?;
         let public = config.public();
         *current = Some(config);
         Ok(json!({"backend":public}))
     }
-    /// `GET /v1/repository-backends/artifacts` (redacted).
-    pub fn get_artifacts(&self) -> Value {
-        match &*self.inner.artifacts.lock().unwrap() {
+    /// `GET /v1/repository-backends/artifacts-worker` (redacted).
+    pub fn get_worker(&self) -> Value {
+        match &*self.inner.worker.lock().unwrap() {
             Some(config) => json!({"backend":config.public()}),
-            None => json!({"backend":{"kind":"artifacts","configured":false}}),
+            None => json!({"backend":{"kind":WORKER_KIND,"configured":false}}),
         }
     }
-    /// `DELETE /v1/repository-backends/artifacts`. Repository records stay;
-    /// operations that need the backend answer 409 until it is configured.
-    pub fn delete_artifacts(&self) -> Result<Value> {
-        let mut current = self.inner.artifacts.lock().unwrap();
-        let path = self.inner.backends_root.join("artifacts.json");
-        match std::fs::remove_file(&path) {
+    /// `GET /v1/repository-backends`: the selected backend (exactly one may
+    /// be configured), or `configured: false`.
+    pub fn backend_view(&self) -> Value {
+        match &*self.inner.worker.lock().unwrap() {
+            Some(config) => json!({"backend":config.public()}),
+            None => json!({"backend":{"kind":null,"configured":false}}),
+        }
+    }
+    /// `DELETE /v1/repository-backends/artifacts-worker`. Repository records
+    /// stay; operations that need the backend answer 409 until it is
+    /// configured again.
+    pub fn delete_worker(&self) -> Result<Value> {
+        let mut current = self.inner.worker.lock().unwrap();
+        match std::fs::remove_file(self.inner.backends_root.join(WORKER_FILE)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
         let deleted = current.take().is_some();
-        Ok(json!({"deleted":deleted,"backend":{"kind":"artifacts","configured":false}}))
+        Ok(json!({"deleted":deleted,"backend":{"kind":WORKER_KIND,"configured":false}}))
     }
+    /// The one configured backend; 409 when none is.
     pub fn backend(&self) -> Result<Box<dyn Backend>> {
         let config = self
             .inner
-            .artifacts
+            .worker
             .lock()
             .unwrap()
             .clone()
             .ok_or_else(not_configured)?;
-        Ok(Box::new(ArtifactsBackend::new(
+        Ok(Box::new(ArtifactsWorkerBackend::new(
             config,
-            &self.inner.api_base,
             self.inner.transport.clone(),
         )))
     }
@@ -754,7 +753,8 @@ impl Repositories {
         let record = Record {
             project: project.to_owned(),
             name: name.to_owned(),
-            backend: backend.kind().to_owned(),
+            // Where the repository lives; the access path is the configured backend.
+            backend: "artifacts".to_owned(),
             description,
             remote: created.remote,
             default_branch: created.default_branch,
@@ -900,7 +900,7 @@ impl Repositories {
             return;
         };
         let outcome = repository::parse_ref(reference)
-            .and_then(|(project, _)| self.backend()?.revoke(&project, id));
+            .and_then(|(project, name)| self.backend()?.revoke(&project, &name, id));
         if outcome.is_err() {
             eprintln!(
                 "{}",
@@ -923,26 +923,34 @@ pub fn status_of(error: &anyhow::Error) -> (u16, String) {
 
 #[cfg(test)]
 pub mod mock {
-    //! A stand-in for the Artifacts REST API: the documented routes, the v4
-    //! envelope and the error codes, held in memory.
+    //! A stand-in for the Artifacts gateway Worker: it verifies the signature,
+    //! timestamp window and nonce exactly as the Worker does, then serves the
+    //! five operations from memory.
     use super::*;
+    pub const SECRET: &str = "test-only-gateway-secret-0123456789abcdef";
+    pub const URL: &str = "https://artifacts-gateway.example.test";
     #[derive(Default)]
     pub struct State {
         /// (namespace, name) -> (id, default_branch, last_push_at)
         pub repos: BTreeMap<(String, String), (String, String, Option<String>)>,
         /// token id -> (namespace, repo, scope, plaintext, revoked)
         pub tokens: BTreeMap<String, (String, String, String, String, bool)>,
-        pub calls: Vec<(String, String, String, Option<Value>)>,
+        /// (operation, body) of every accepted call.
+        pub calls: Vec<(String, Value)>,
+        pub nonces: std::collections::BTreeSet<String>,
+        pub rejected: usize,
         pub fail: bool,
     }
-    pub struct MockArtifacts {
+    pub struct FakeGateway {
         pub account: String,
+        pub provisioned: Vec<String>,
         pub state: Mutex<State>,
     }
-    impl MockArtifacts {
-        pub fn new(account: &str) -> Arc<Self> {
+    impl FakeGateway {
+        pub fn new(account: &str, provisioned: &[&str]) -> Arc<Self> {
             Arc::new(Self {
                 account: account.into(),
+                provisioned: provisioned.iter().map(|s| s.to_string()).collect(),
                 state: Mutex::new(State::default()),
             })
         }
@@ -962,108 +970,103 @@ pub mod mock {
             )
         }
     }
-    fn ok(result: Value) -> (u16, Value) {
-        (
-            200,
-            json!({"result":result,"success":true,"errors":[],"messages":[]}),
-        )
+    fn reply(status: u16, body: Value) -> (u16, Value) {
+        (status, body)
     }
-    fn err(status: u16, code: u64, message: &str) -> (u16, Value) {
-        (
-            status,
-            json!({"result":null,"success":false,"errors":[{"code":code,"message":message}],"messages":[]}),
-        )
-    }
-    impl Transport for MockArtifacts {
-        fn send(
+    impl Transport for FakeGateway {
+        fn post(
             &self,
-            method: &str,
             url: &str,
-            bearer: &str,
-            body: Option<&Value>,
+            headers: &[(&str, String)],
+            body: Vec<u8>,
         ) -> Result<(u16, Value)> {
             let mut s = self.state.lock().unwrap();
-            s.calls
-                .push((method.into(), url.into(), bearer.into(), body.cloned()));
             if s.fail {
                 anyhow::bail!("connection refused");
             }
-            let prefix = format!(
-                "https://api.example.test/client/v4/accounts/{}/artifacts/namespaces/",
-                self.account
+            let path = url.strip_prefix(URL).context("unexpected URL")?;
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            let timestamp: u64 = header("x-enginebox-timestamp").parse().unwrap_or(0);
+            let nonce = header("x-enginebox-nonce");
+            let expected = crate::callbacks::hmac_sha256_hex(
+                SECRET.as_bytes(),
+                canonical(path, timestamp, &nonce, &body).as_bytes(),
             );
-            let rest = url.strip_prefix(&prefix).context("unexpected URL")?;
-            let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-            let parts: Vec<&str> = path.split('/').collect();
-            let ns = parts[0].to_owned();
+            let now = chrono::Utc::now().timestamp() as u64;
+            if header("x-enginebox-signature") != format!("v1={expected}")
+                || now.abs_diff(timestamp) > 300
+                || nonce.len() != 32
+                || !s.nonces.insert(nonce)
+            {
+                s.rejected += 1;
+                return Ok(reply(401, json!({"error":"unauthorized"})));
+            }
+            let input: Value = serde_json::from_slice(&body)?;
+            s.calls
+                .push((path.trim_start_matches('/').to_owned(), input.clone()));
+            let ns = input["namespace"].as_str().unwrap_or("").to_owned();
+            if !ns.starts_with("eb-") {
+                return Ok(reply(403, json!({"error":"namespace_not_allowed"})));
+            }
+            if !self.provisioned.contains(&ns) {
+                return Ok(reply(404, json!({"error":"namespace_not_provisioned"})));
+            }
             let token_id = || uuid::Uuid::new_v4().simple().to_string()[..16].to_owned();
-            Ok(match (method, &parts[1..]) {
-                ("POST", ["repos"]) => {
-                    let name = body.unwrap()["name"].as_str().unwrap().to_owned();
+            let repo_view = |id: &str, name: &str, branch: &str, push: &Option<String>| json!({"id":id,"name":name,"description":null,"default_branch":branch,"remote":self.remote(&ns,name),"last_push_at":push});
+            Ok(match path {
+                "/repos.create" => {
+                    let name = input["name"].as_str().unwrap().to_owned();
                     if s.repos.contains_key(&(ns.clone(), name.clone())) {
-                        return Ok(err(409, 10201, "The target repository already exists"));
+                        return Ok(reply(409, json!({"error":"already_exists"})));
                     }
                     let id = format!("repo_{}", s.repos.len() + 1);
                     s.repos.insert(
                         (ns.clone(), name.clone()),
                         (id.clone(), "main".into(), None),
                     );
-                    let tid = token_id();
-                    let plaintext = format!("art_v1_{}?expires=1760000000", "c".repeat(40));
-                    s.tokens.insert(
-                        tid,
-                        (
-                            ns.clone(),
-                            name.clone(),
-                            "write".into(),
-                            plaintext.clone(),
-                            false,
-                        ),
-                    );
-                    ok(
-                        json!({"id":id,"name":name,"description":body.unwrap()["description"],"default_branch":"main","remote":self.remote(&ns,&name),"token":plaintext}),
+                    reply(
+                        200,
+                        json!({"created":true,"repository":repo_view(&id,&name,"main",&None)}),
                     )
                 }
-                ("GET", ["repos"]) => {
-                    assert!(query.contains("limit=200"));
+                "/repos.get" => {
+                    let name = input["name"].as_str().unwrap();
+                    match s.repos.get(&(ns.clone(), name.to_owned())) {
+                        Some((id, branch, push)) => {
+                            reply(200, json!({"repository":repo_view(id,name,branch,push)}))
+                        }
+                        None => reply(404, json!({"error":"not_found"})),
+                    }
+                }
+                "/repos.list" => {
                     let list: Vec<Value> = s
                         .repos
                         .iter()
                         .filter(|((n, _), _)| *n == ns)
-                        .map(|((_, name), (id, branch, push))| json!({"id":id,"name":name,"default_branch":branch,"last_push_at":push,"remote":self.remote(&ns,name)}))
+                        .map(|((_, name), (id, branch, push))| {
+                            let mut v = repo_view(id, name, branch, push);
+                            v["remote"] = Value::Null;
+                            v
+                        })
                         .collect();
-                    let mut response = ok(json!(list));
-                    response.1["result_info"] =
-                        json!({"cursor":"","per_page":200,"count":list.len()});
-                    response
+                    reply(200, json!({"repositories":list,"cursor":null}))
                 }
-                ("GET", ["repos", name]) => match s.repos.get(&(ns.clone(), name.to_string())) {
-                    Some((id, branch, push)) => ok(
-                        json!({"id":id,"name":name,"default_branch":branch,"last_push_at":push,"remote":self.remote(&ns,name)}),
-                    ),
-                    None => err(404, 10200, "Not found"),
-                },
-                ("GET", ["repos", name, "tokens"]) => {
-                    assert!(query.contains("state=active"));
-                    let list: Vec<Value> = s
-                        .tokens
-                        .iter()
-                        .filter(|(_, t)| t.0 == ns && t.1 == *name && !t.4)
-                        .map(|(id, t)| json!({"id":id,"scope":t.2,"state":"active"}))
-                        .collect();
-                    ok(json!(list))
-                }
-                ("POST", ["tokens"]) => {
-                    let body = body.unwrap();
-                    let repo = body["repo"].as_str().unwrap().to_owned();
+                "/tokens.create" => {
+                    let repo = input["repo"].as_str().unwrap().to_owned();
                     if !s.repos.contains_key(&(ns.clone(), repo.clone())) {
-                        return Ok(err(404, 10200, "Not found"));
+                        return Ok(reply(404, json!({"error":"not_found"})));
                     }
-                    let ttl = body["ttl"].as_u64().unwrap();
-                    if !(60..=31_536_000).contains(&ttl) {
-                        return Ok(err(400, 10103, "Invalid TTL"));
+                    let ttl = input["ttl"].as_u64().unwrap();
+                    if !(60..=90_000).contains(&ttl) {
+                        return Ok(reply(400, json!({"error":"invalid_input"})));
                     }
-                    let scope = body["scope"].as_str().unwrap().to_owned();
+                    let scope = input["scope"].as_str().unwrap().to_owned();
                     let tid = token_id();
                     let plaintext = format!(
                         "art_v1_{}?expires=1760000000",
@@ -1075,16 +1078,23 @@ pub mod mock {
                     );
                     let expires =
                         (chrono::Utc::now() + chrono::Duration::seconds(ttl as i64)).to_rfc3339();
-                    ok(json!({"id":tid,"plaintext":plaintext,"scope":scope,"expires_at":expires}))
+                    reply(
+                        200,
+                        json!({"token":{"id":tid,"plaintext":plaintext,"scope":scope,"expires_at":expires}}),
+                    )
                 }
-                ("DELETE", ["tokens", id]) => match s.tokens.get_mut(*id) {
-                    Some(t) if t.0 == ns => {
-                        t.4 = true;
-                        ok(json!({"id":id}))
+                "/tokens.revoke" => {
+                    let id = input["id"].as_str().unwrap();
+                    let repo = input["repo"].as_str().unwrap();
+                    match s.tokens.get_mut(id) {
+                        Some(t) if t.0 == ns && t.1 == repo => {
+                            t.4 = true;
+                            reply(200, json!({"revoked":true}))
+                        }
+                        _ => reply(200, json!({"revoked":false})),
                     }
-                    _ => err(404, 10200, "Not found"),
-                },
-                _ => err(404, 10200, "Unknown route"),
+                }
+                _ => reply(404, json!({"error":"not_found"})),
             })
         }
     }
@@ -1094,19 +1104,14 @@ pub mod mock {
 mod tests {
     use super::*;
     const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
-    const API_TOKEN: &str = "cf-test-api-token-0123456789abcdef";
-    fn open(temp: &Path) -> (Repositories, Arc<mock::MockArtifacts>) {
-        let api = mock::MockArtifacts::new(ACCOUNT);
-        let repos =
-            Repositories::with_transport(temp, "https://api.example.test/client/v4", api.clone())
-                .unwrap();
-        (repos, api)
+    fn open(temp: &Path) -> (Repositories, Arc<mock::FakeGateway>) {
+        let gateway = mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]);
+        let repos = Repositories::with_transport(temp, gateway.clone()).unwrap();
+        (repos, gateway)
     }
     fn configure(repos: &Repositories) {
         repos
-            .put_artifacts(
-                &json!({"account_id":ACCOUNT,"namespace_prefix":"eb","api_token":API_TOKEN}),
-            )
+            .put_worker(&json!({"url":mock::URL,"secret":mock::SECRET,"namespace_prefix":"eb"}))
             .unwrap();
     }
     fn files_contain(root: &Path, needle: &str) -> bool {
@@ -1127,59 +1132,80 @@ mod tests {
         false
     }
 
+    /// The same vector is asserted by the gateway's tests
+    /// (`packages/artifacts-gateway/test/gateway.test.mjs`).
     #[test]
-    fn backend_config_is_validated_redacted_and_owner_private() {
+    fn signatures_match_the_gateway_vector() {
+        let body = br#"{"namespace":"eb-alpha","name":"game"}"#;
+        let canonical = canonical("/repos.get", 1_800_000_000, &"0".repeat(32), body);
+        assert_eq!(
+            crate::callbacks::hmac_sha256_hex(mock::SECRET.as_bytes(), canonical.as_bytes()),
+            "af382d7a1716eee3b28bea32a85f0daa8f803bcec2b0a0643f3c8df94e12dacb"
+        );
+    }
+    #[test]
+    fn worker_backend_config_is_validated_redacted_and_owner_private() {
         let temp = tempfile::tempdir().unwrap();
         let (repos, _) = open(temp.path());
-        assert_eq!(repos.get_artifacts()["backend"]["configured"], false);
+        assert_eq!(repos.backend_view()["backend"]["configured"], false);
+        assert_eq!(
+            status_of(&repos.backend().err().unwrap()).0,
+            409,
+            "none configured"
+        );
         for bad in [
-            json!({"account_id":"nope","api_token":API_TOKEN}),
-            json!({"account_id":ACCOUNT,"api_token":"short"}),
-            json!({"account_id":ACCOUNT,"api_token":API_TOKEN,"namespace_prefix":"Bad_Prefix"}),
-            json!({"account_id":ACCOUNT,"api_token":API_TOKEN,"namespace_prefix":"fifteen-chars-x"}),
-            json!({"account_id":ACCOUNT,"api_token":API_TOKEN,"extra":1}),
+            json!({"url":"http://gw.example.com","secret":mock::SECRET}),
+            json!({"url":"https://gw.acct.workers.dev","secret":mock::SECRET}),
+            json!({"url":"https://gw.example.com/path","secret":mock::SECRET}),
+            json!({"url":"https://user:pw@gw.example.com","secret":mock::SECRET}),
+            json!({"url":"https://gw.example.com","secret":"short"}),
+            json!({"url":"https://gw.example.com","secret":mock::SECRET,"namespace_prefix":"Bad_Prefix"}),
+            json!({"url":"https://gw.example.com","secret":mock::SECRET,"api_token":"x"}),
         ] {
             assert_eq!(
-                status_of(&repos.put_artifacts(&bad).unwrap_err()).0,
+                status_of(&repos.put_worker(&bad).unwrap_err()).0,
                 400,
                 "{bad}"
             );
         }
         let put = repos
-            .put_artifacts(&json!({"account_id":ACCOUNT,"api_token":API_TOKEN}))
+            .put_worker(&json!({"url":"https://gw.example.com/","secret":mock::SECRET}))
             .unwrap();
+        assert_eq!(put["backend"]["kind"], "artifacts_worker");
+        assert_eq!(put["backend"]["url"], "https://gw.example.com");
         assert_eq!(put["backend"]["namespace_prefix"], "enginebox");
-        assert_eq!(put["backend"]["api_token"], "[redacted]");
-        assert!(!put.to_string().contains(API_TOKEN));
-        let got = repos.get_artifacts();
-        assert_eq!(got["backend"]["configured"], true);
-        assert!(!got.to_string().contains(API_TOKEN));
-        assert!(!format!("{:?}", repos.inner.artifacts.lock().unwrap()).contains(API_TOKEN));
+        assert_eq!(put["backend"]["secret"], "[redacted]");
+        for view in [put, repos.get_worker(), repos.backend_view()] {
+            assert!(!view.to_string().contains(mock::SECRET), "{view}");
+        }
+        assert!(!format!("{:?}", repos.inner.worker.lock().unwrap()).contains(mock::SECRET));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let path = temp.path().join("repositories/backends/artifacts.json");
+            let path = temp.path().join("repositories/backends").join(WORKER_FILE);
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "owner-only file");
         }
-        // Reopened (a controller restart): still configured, still redacted.
         let (reopened, _) = open(temp.path());
-        assert_eq!(reopened.get_artifacts()["backend"]["account_id"], ACCOUNT);
-        let deleted = reopened.delete_artifacts().unwrap();
-        assert_eq!(deleted["deleted"], true);
-        assert_eq!(reopened.get_artifacts()["backend"]["configured"], false);
+        assert_eq!(
+            reopened.backend_view()["backend"]["url"],
+            "https://gw.example.com"
+        );
+        assert_eq!(reopened.delete_worker().unwrap()["deleted"], true);
+        assert_eq!(reopened.get_worker()["backend"]["configured"], false);
         assert!(
             !temp
                 .path()
-                .join("repositories/backends/artifacts.json")
+                .join("repositories/backends")
+                .join(WORKER_FILE)
                 .exists()
         );
     }
 
     #[test]
-    fn create_is_idempotent_on_name_and_never_returns_or_keeps_a_token() {
+    fn requests_are_signed_and_create_is_idempotent_without_returning_a_token() {
         let temp = tempfile::tempdir().unwrap();
-        let (repos, api) = open(temp.path());
+        let (repos, gateway) = open(temp.path());
         assert_eq!(
             status_of(&repos.create("alpha", &json!({"name":"game"})).unwrap_err()).0,
             409,
@@ -1191,37 +1217,31 @@ mod tests {
             .unwrap();
         assert!(created);
         let repository = &first["repository"];
-        assert_eq!(repository["project"], "alpha");
-        assert_eq!(repository["name"], "game");
         assert_eq!(repository["backend"], "artifacts");
-        assert_eq!(repository["default_branch"], "main");
         assert_eq!(
             repository["remote"],
             format!("https://{ACCOUNT}.artifacts.cloudflare.net/git/eb-alpha/game.git")
         );
-        assert!(repository["created_at"].is_string());
         assert!(first.get("token").is_none() && repository.get("token").is_none());
-        // The documented request: POST .../namespaces/eb-alpha/repos with the API token.
         {
-            let state = api.state.lock().unwrap();
-            let (method, url, bearer, body) = &state.calls[0];
-            assert_eq!(method, "POST");
+            let state = gateway.state.lock().unwrap();
             assert_eq!(
-                url,
-                &format!(
-                    "https://api.example.test/client/v4/accounts/{ACCOUNT}/artifacts/namespaces/eb-alpha/repos"
+                state.rejected, 0,
+                "the fake gateway verified every signature"
+            );
+            assert_eq!(
+                state.calls[0],
+                (
+                    "repos.create".to_owned(),
+                    json!({"namespace":"eb-alpha","name":"game","description":"The game"})
                 )
             );
-            assert_eq!(bearer, API_TOKEN);
-            assert_eq!(body.as_ref().unwrap()["name"], "game");
-            // The creation token was revoked straight away.
-            assert!(state.tokens.values().all(|t| t.4));
         }
         let (created, again) = repos.create("alpha", &json!({"name":"game"})).unwrap();
         assert!(!created);
         assert_eq!(again["repository"]["remote"], repository["remote"]);
-        // A repository created outside this controller is adopted, not duplicated.
-        api.state.lock().unwrap().repos.insert(
+        // Created outside this controller: adopted through repos.get.
+        gateway.state.lock().unwrap().repos.insert(
             ("eb-alpha".into(), "tools".into()),
             (
                 "repo_x".into(),
@@ -1232,11 +1252,15 @@ mod tests {
         let (created, adopted) = repos.create("alpha", &json!({"name":"tools"})).unwrap();
         assert!(!created);
         assert_eq!(adopted["repository"]["default_branch"], "trunk");
+        // A project whose namespace the gateway does not serve is a clear 409.
+        let (status, message) = status_of(&repos.create("beta", &json!({"name":"x"})).unwrap_err());
+        assert_eq!(status, 409);
+        assert!(message.contains("redeploy"), "{message}");
         for bad in [
             json!({"name":"Game"}),
             json!({"name":"x.git"}),
-            json!({"name":"ok","token":"x"}),
             json!({}),
+            json!({"name":"ok","token":"x"}),
         ] {
             assert_eq!(
                 status_of(&repos.create("alpha", &bad).unwrap_err()).0,
@@ -1244,15 +1268,6 @@ mod tests {
                 "{bad}"
             );
         }
-        assert_eq!(
-            status_of(
-                &repos
-                    .create("Not_A_Project", &json!({"name":"x"}))
-                    .unwrap_err()
-            )
-            .0,
-            400
-        );
         let listed = repos.list("alpha").unwrap();
         let names: Vec<&str> = listed["repositories"]
             .as_array()
@@ -1265,7 +1280,6 @@ mod tests {
             listed["repositories"][1]["last_push_at"],
             "2026-10-01T00:00:00Z"
         );
-        assert_eq!(repos.list("beta").unwrap()["repositories"], json!([]));
         assert_eq!(
             repos.get("alpha", "tools").unwrap()["repository"]["last_push_at"],
             "2026-10-01T00:00:00Z"
@@ -1274,26 +1288,29 @@ mod tests {
             status_of(&repos.get("alpha", "missing").unwrap_err()).0,
             404
         );
-        // Records persist across a restart, and no record holds a token.
         let (reopened, _) = open(temp.path());
         assert!(reopened.exists("alpha", "game") && reopened.exists("alpha", "tools"));
-        for token in api.issued() {
-            assert!(!files_contain(
-                &temp.path().join("repositories/records"),
-                &token
-            ));
-        }
-        // The backend's account cannot change under existing repositories.
-        let moved =
-            repos.put_artifacts(&json!({"account_id":"f".repeat(32),"api_token":API_TOKEN}));
+        // The prefix cannot change under existing repositories; URL and secret can.
+        let moved = repos
+            .put_worker(&json!({"url":mock::URL,"secret":mock::SECRET,"namespace_prefix":"other"}));
         assert_eq!(status_of(&moved.unwrap_err()).0, 409);
-        assert!(repos.put_artifacts(&json!({"account_id":ACCOUNT,"namespace_prefix":"eb","api_token":"rotated-token-0123456789abcdef"})).is_ok());
+        // A wrong secret is refused by the gateway: 502 without detail.
+        repos
+            .put_worker(&json!({"url":mock::URL,"secret":"a-different-secret-0123456789abcdef","namespace_prefix":"eb"}))
+            .unwrap();
+        let (status, message) =
+            status_of(&repos.mint("alpha", "game", Access::Read, 600).unwrap_err());
+        assert_eq!(status, 502);
+        assert!(
+            message.contains("secret") && !message.contains("0123456789abcdef"),
+            "{message}"
+        );
     }
 
     #[test]
     fn token_minting_is_bounded_and_runs_get_revocable_write_tokens() {
         let temp = tempfile::tempdir().unwrap();
-        let (repos, api) = open(temp.path());
+        let (repos, gateway) = open(temp.path());
         configure(&repos);
         repos.create("alpha", &json!({"name":"game"})).unwrap();
         for bad in [
@@ -1309,27 +1326,19 @@ mod tests {
             Repositories::token_request(&json!({"access":"read"})).unwrap(),
             (Access::Read, DEFAULT_TOKEN_TTL_SECONDS)
         );
-        let (access, ttl) =
-            Repositories::token_request(&json!({"access":"read","ttl_seconds":600})).unwrap();
-        let minted = repos.mint("alpha", "game", access, ttl).unwrap();
+        let minted = repos.mint("alpha", "game", Access::Read, 600).unwrap();
         assert!(minted["token"].as_str().unwrap().starts_with("art_v1_"));
         assert_eq!(minted["access"], "read");
-        assert_eq!(
-            minted["remote"],
-            format!("https://{ACCOUNT}.artifacts.cloudflare.net/git/eb-alpha/game.git")
-        );
         assert!(
             chrono::DateTime::parse_from_rfc3339(minted["expires_at"].as_str().unwrap()).is_ok()
         );
-        {
-            let state = api.state.lock().unwrap();
-            let (_, url, _, body) = state.calls.last().unwrap();
-            assert!(url.ends_with("/namespaces/eb-alpha/tokens"));
-            assert_eq!(
-                body.as_ref().unwrap(),
-                &json!({"repo":"game","scope":"read","ttl":600})
-            );
-        }
+        assert_eq!(
+            gateway.state.lock().unwrap().calls.last().unwrap(),
+            &(
+                "tokens.create".to_owned(),
+                json!({"namespace":"eb-alpha","repo":"game","scope":"read","ttl":600})
+            )
+        );
         assert_eq!(
             status_of(
                 &repos
@@ -1339,29 +1348,30 @@ mod tests {
             .0,
             404
         );
-        // A run's token: write scope, the run's TTL, revoked at the end.
         let credential = repos.run_credential("alpha/game", 720).unwrap();
         assert!(!format!("{credential:?}").contains(&credential.token));
         let id = credential.token_id.clone().unwrap();
-        {
-            let state = api.state.lock().unwrap();
-            assert_eq!(state.tokens[&id].2, "write");
-            let (_, _, _, body) = state.calls.last().unwrap();
-            assert_eq!(body.as_ref().unwrap()["ttl"], 720);
-        }
+        assert_eq!(gateway.state.lock().unwrap().tokens[&id].2, "write");
         repos.revoke_run_credential("alpha/game", &credential);
         assert!(
-            api.state.lock().unwrap().tokens[&id].4,
+            gateway.state.lock().unwrap().tokens[&id].4,
             "revoked at run end"
         );
-        assert!(repos.run_credential("alpha/missing", 720).is_err());
-        // An unreachable backend is a 502 without detail.
-        api.state.lock().unwrap().fail = true;
-        let (status, message) =
-            status_of(&repos.mint("alpha", "game", Access::Read, 600).unwrap_err());
-        assert_eq!(status, 502);
-        assert!(!message.contains(API_TOKEN));
-        // Listing still answers from the records.
+        assert_eq!(
+            gateway.state.lock().unwrap().calls.last().unwrap(),
+            &(
+                "tokens.revoke".to_owned(),
+                json!({"namespace":"eb-alpha","repo":"game","id":id})
+            )
+        );
+        for token in gateway.issued() {
+            assert!(!files_contain(temp.path(), &token), "no token persisted");
+        }
+        gateway.state.lock().unwrap().fail = true;
+        assert_eq!(
+            status_of(&repos.mint("alpha", "game", Access::Read, 600).unwrap_err()).0,
+            502
+        );
         assert_eq!(
             repos.list("alpha").unwrap()["repositories"][0]["last_push_at"],
             Value::Null

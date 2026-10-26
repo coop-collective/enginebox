@@ -257,7 +257,7 @@ test("repository proxy routes list and create only; tokens and backend configura
   for (const [method, path] of [
     ["GET", "v1/pools"],
     ["GET", "v1/repositories"],
-    ["GET", "v1/repository-backends/artifacts"],
+    ["GET", "v1/repository-backends"],
     ["GET", "v1/projects/alpha/repositories"],
     ["GET", "v1/projects/alpha/repositories/game.v2"],
     ["POST", "v1/projects/alpha/repositories"],
@@ -268,7 +268,8 @@ test("repository proxy routes list and create only; tokens and backend configura
   assert.equal(fetch.mock.callCount(), 6);
   for (const [method, path] of [
     ["POST", "v1/projects/alpha/repositories/game/tokens"],
-    ["POST", "v1/repository-backends/artifacts"],
+    ["POST", "v1/repository-backends/artifacts-worker"],
+    ["GET", "v1/repository-backends/artifacts-worker"],
     ["POST", "v1/repositories"],
     ["GET", "v1/projects/Alpha/repositories"],
     ["GET", "v1/projects/alpha/repositories/game/tokens"],
