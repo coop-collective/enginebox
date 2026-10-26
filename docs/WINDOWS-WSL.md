@@ -8,7 +8,7 @@ No provider account is signed in or included in the reusable image.
 
 ## Install and register
 
-Open **Worker machines** in the dashboard and create an install command. Paste
+Open **Compute** in the dashboard, choose **Add machine**, and create an install command. Paste
 that one line into Windows PowerShell. The release installer and Linux image are
 SHA-256 pinned. The same installer can run without a code: it defaults to
 `https://enginebox.coopcollective.dev` and asks for a registration code after setup.
@@ -59,7 +59,7 @@ The installer updates WSL to at least 2.5.7 when needed. Enabling WSL can trigge
 Windows UAC and require a reboot. It saves non-secret setup state and schedules
 resumption under the original Windows user. It does not force a reboot. A code
 that expires while the image downloads can be renewed on the existing machine
-card in the dashboard; there is a separate registration-code field for an installer
+row under **Pending registrations** in the dashboard; there is a separate registration-code field for an installer
 that is already open. The installed distribution is retained.
 
 If registration fails after saving a pending identity, keep its state. Read only
@@ -69,7 +69,7 @@ the non-secret identity fields in PowerShell:
 wsl -d Enginebox -u root -- jq '{id, enrolled, controller, budget}' /var/lib/enginebox/private/worker.json
 ```
 
-In **Worker machines**, match that `id` to the existing card and select **Renew
+In **Compute → Pending registrations**, match that `id` to the existing row and select **Renew
 registration code**. Run its new install command and choose **N** at **Override
 existing?**, or paste the code into an
 installer already waiting for it. Renewal keeps the same ID and owner allowances,
@@ -194,6 +194,14 @@ inside the trusted distro. Automatic migration of existing controller projects,
 remote template catalog synchronization and provider delegation are not supplied
 by successful machine registration. Do not advertise those paths as qualified
 until they have their own end-to-end proof.
+
+Compute shows this backend as **Windows · WSL2 templates**. **Online** means the
+node is heartbeating; **Templates ready** means its Linux workspace preparation
+passed. Neither establishes GPU access or Unreal rendering. The default template
+does not expose GPU devices or a native Windows desktop and does not include
+Unreal. Native GPU supervision is a [separate runtime](NATIVE-GPU-NODES.md), and
+the current WSL job API cannot launch the Windows Unreal installation. A GPU
+profile needs its own device, engine, encoder and browser playback qualification.
 
 ## Build and test
 

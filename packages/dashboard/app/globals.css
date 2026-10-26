@@ -1622,6 +1622,12 @@ input::placeholder {
 @media (max-width: 640px) { .contributor-resources { grid-template-columns: 1fr; } }
 
 .contributor-panel { display: grid; gap: 20px; }
+.compute-host-details summary { cursor: pointer; font-size: 13px; }
+.compute-host-details[open] { grid-column: 1 / -1; }
+.compute-host-details[open] > summary { margin-bottom: 14px; }
+.compute-host-details .host-card { max-width: 100%; }
+.compute-host-error { color: #9a422c !important; }
+.contributor-panel + .workspaces-section { margin-top: 32px; }
 .contributor-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
 .contributor-panel p { color: var(--muted); font-size: 13px; line-height: 1.6; }
 .contributor-panel h2 { font-size: 18px; }

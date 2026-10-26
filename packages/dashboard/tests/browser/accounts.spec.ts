@@ -7,7 +7,7 @@ async function signIn(page: Page) {
   await page.getByLabel("Operator password").fill("fixture-dashboard-password");
   await page.getByRole("button", { name: "Open dashboard" }).click();
   await expect(
-    page.getByRole("heading", { name: "Fleet overview." }),
+    page.getByRole("heading", { name: "Compute." }),
   ).toBeVisible();
 }
 const provider = (page: Page, name: string) =>
@@ -157,7 +157,7 @@ test("global agent connections need no host or running workspace and never resum
   await request.post(`${fixture}/__test/mode`, { data: { mode: "empty" } });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "Add your first host" }),
+    page.getByText("No machines connected yet", { exact: true }),
   ).toBeVisible();
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(provider(page, "Codex (ChatGPT)")).toBeVisible();

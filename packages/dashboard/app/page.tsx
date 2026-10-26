@@ -16,7 +16,7 @@ import { GitHubPanel } from "@/components/github-panel";
 import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
-import { ContributorsPanel } from "@/components/contributors-panel";
+import { ComputePanel, type Contributor } from "@/components/compute-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
 import { RepositoriesPanel } from "@/components/repositories-panel";
@@ -33,11 +33,6 @@ const bytes = (value?: number) =>
     : "—";
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
-  machines: {
-    title: "Worker machines",
-    description: "Register Windows workers; choose resources in the installer.",
-    icon: "server",
-  },
   github: { title: "GitHub", description: "Connect repositories and run GitHub Actions on your infrastructure.", icon: "terminal" },
   environments: {
     title: "Environments",
@@ -45,8 +40,8 @@ const sections = {
     icon: "server",
   },
   fleet: {
-    title: "Fleet overview",
-    description: "Manage your machines and give every workspace room to build.",
+    title: "Compute",
+    description: "Manage your servers, workstations and workspace capacity in one place.",
     icon: "server",
   },
   agents: {
@@ -700,6 +695,10 @@ export default function Dashboard() {
   );
   const [password, setPassword] = useState("");
   const [fleet, setFleet] = useState<Fleet | null>(null);
+  const [workers, setWorkers] = useState<Contributor[]>([]);
+  const [workersLoaded, setWorkersLoaded] = useState(false);
+  const [workersError, setWorkersError] = useState("");
+  const workerRequest = useRef(0);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -719,10 +718,29 @@ export default function Dashboard() {
         setSession("login");
       });
   }, []);
+  const refreshWorkers = useCallback(async () => {
+    const request = ++workerRequest.current;
+    try {
+      const result = await api<{ nodes: Contributor[] }>("/api/contributors");
+      if (request !== workerRequest.current) return;
+      setWorkers(result.nodes);
+      setWorkersLoaded(true);
+      setWorkersError("");
+    } catch (err) {
+      if (request !== workerRequest.current) return;
+      if (err instanceof RequestError && err.status === 401) {
+        setSession("login");
+        setWorkers([]);
+        setWorkersLoaded(false);
+      }
+      setWorkersError(`Worker inventory: ${errorMessage(err)}`);
+    }
+  }, []);
   const refresh = useCallback(async () => {
     if (loading.current) return;
     loading.current = true;
     setRefreshing(true);
+    const workerRefresh = refreshWorkers();
     try {
       setFleet(await api<Fleet>("/api/control/v1/fleet"));
       setUpdated(new Date());
@@ -734,10 +752,11 @@ export default function Dashboard() {
       }
       setError(errorMessage(err));
     } finally {
+      await workerRefresh;
       loading.current = false;
       setRefreshing(false);
     }
-  }, []);
+  }, [refreshWorkers]);
   const visible = usePageVisible();
   useEffect(() => {
     if (session !== "ready") return;
@@ -798,6 +817,10 @@ export default function Dashboard() {
       await api("/api/session", { method: "DELETE" });
       setSession("login");
       setFleet(null);
+      ++workerRequest.current;
+      setWorkers([]);
+      setWorkersLoaded(false);
+      setWorkersError("");
       setJobs([]);
       setPendingInstances([]);
       setSection("fleet");
@@ -861,6 +884,9 @@ export default function Dashboard() {
     window.scrollTo({ top: 0 });
   }
   const online = fleet?.hosts.filter((host) => host.online) ?? [];
+  const registeredWorkers = workers.filter(worker => worker.enrolled && !worker.revoked);
+  const onlineMachines = online.length + registeredWorkers.filter(worker => worker.online).length;
+  const machineCount = (fleet?.hosts.length ?? 0) + registeredWorkers.length;
   const instances =
     fleet?.hosts.flatMap((host) =>
       host.instances.map((instance) => ({ host, instance })),
@@ -912,7 +938,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "machines", "agents", "templates", "storage", "environments", "repositories", "github", "apps"] as const)
+          {(["fleet", "agents", "templates", "storage", "environments", "repositories", "github", "apps"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -950,7 +976,7 @@ export default function Dashboard() {
           <div>
             <span className="breadcrumb">Infrastructure</span>
             <span className="slash">/</span>
-            {section === "fleet" ? "Fleet" : sections[section].title}
+            {sections[section].title}
           </div>
           <div className="topbar-right">
             <span className="private-label">
@@ -1033,14 +1059,14 @@ export default function Dashboard() {
                   <p>{sections[section].description}</p>
                 </div>
                 <div className="heading-actions">
-                  {section !== "machines" && <button
+                  <button
                     className="button"
                     onClick={refresh}
                     disabled={refreshing}
                   >
                     <Icon name="refresh" size={16} />
                     {refreshing ? "Refreshing" : "Refresh"}
-                  </button>}
+                  </button>
                   {section === "fleet" && (
                     <button
                       className="button primary"
@@ -1079,7 +1105,6 @@ export default function Dashboard() {
                 <StoragePanel refreshToken={updated?.getTime() ?? 0} />
               )}
               {section === "environments" && <EnvironmentsPanel />}
-              {section === "machines" && <ContributorsPanel />}
               {section === "apps" && <ConnectedAppsPanel />}
               {section === "repositories" && <RepositoriesPanel />}
               {section === "fleet" && (
@@ -1087,15 +1112,15 @@ export default function Dashboard() {
                   <div className="stat-grid">
                     {[
                       {
-                        label: "Connected hosts",
-                        value: fleet ? `${online.length}` : "—",
-                        note: fleet
-                          ? `${fleet.hosts.length} configured`
-                          : "Loading fleet",
+                        label: "Online machines",
+                        value: fleet && workersLoaded ? `${onlineMachines}` : "—",
+                        note: fleet && workersLoaded
+                          ? `${machineCount} registered · ${workersError || error ? "refresh needed" : "servers and workstations"}`
+                          : "Loading machine inventories",
                         icon: "server",
                       },
                       {
-                        label: "CPU allocated",
+                        label: "VM CPU allocated",
                         value: fleet ? (
                           <>
                             {cpuAllocated}{" "}
@@ -1104,11 +1129,11 @@ export default function Dashboard() {
                         ) : (
                           "—"
                         ),
-                        note: `${percent(cpuAllocated, cpuTotal)} allocated · logical cores`,
+                        note: `${percent(cpuAllocated, cpuTotal)} allocated · VM hosts`,
                         icon: "cpu",
                       },
                       {
-                        label: "Host memory used",
+                        label: "VM host memory used",
                         value: fleet ? (
                           <>
                             {bytes(memoryUsed)}{" "}
@@ -1119,11 +1144,11 @@ export default function Dashboard() {
                         ) : (
                           "—"
                         ),
-                        note: `${percent(memoryUsed, memoryTotal)} used · across online hosts`,
+                        note: `${percent(memoryUsed, memoryTotal)} used · online VM hosts`,
                         icon: "memory",
                       },
                       {
-                        label: "Assigned workspaces",
+                        label: "VM workspaces",
                         value: fleet ? `${assigned.length}` : "—",
                         note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
                         icon: "box",
@@ -1147,59 +1172,19 @@ export default function Dashboard() {
                       create={create}
                     />
                   )}
-                  <section className="hosts-section">
-                    <div className="section-title">
-                      <div className="section-heading">
-                        <h2>Hosts</h2>
-                        <span className="count">{fleet?.hosts.length ?? 0}</span>
-                      </div>
-                      <span className="update-label">
-                        <span className={`live-dot ${error ? "stale" : ""}`} />
-                        {updated
-                          ? `Updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-                          : "Waiting for fleet"}
-                      </span>
-                    </div>
-                    {!fleet ? (
-                      <div className="empty-state">
-                        {refreshing ? (
-                          <>
-                            <span className="spinner" />
-                            <h3>Connecting to your fleet</h3>
-                            <p>Reading host capacity and workspace status.</p>
-                          </>
-                        ) : (
-                          <>
-                            <Icon name="server" size={32} />
-                            <h3>Fleet connection unavailable</h3>
-                            <p>
-                              Check the service connection, then refresh to try
-                              again.
-                            </p>
-                          </>
-                        )}
-                      </div>
-                    ) : !fleet.hosts.length ? (
-                      <div className="empty-state">
-                        <Icon name="server" size={32} />
-                        <h3>Add your first host</h3>
-                        <p>
-                          Configure a host in your Engine Box fleet inventory. It
-                          will appear here after refresh.
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="host-grid">
-                        {fleet.hosts.map((host) => (
-                          <HostCard key={host.id} host={host} />
-                        ))}
-                      </div>
-                    )}
-                  </section>
+                  <ComputePanel
+                    hosts={fleet?.hosts ?? []}
+                    hostsLoaded={fleet !== null}
+                    nodes={workers}
+                    loaded={workersLoaded}
+                    loadError={workersError}
+                    refresh={refreshWorkers}
+                    hostDetails={(host) => <HostCard host={host} />}
+                  />
                   <section className="workspaces-section">
                     <div className="section-title">
                       <div className="section-heading">
-                        <h2>Instance inventory</h2>
+                        <h2>VM instance inventory</h2>
                         <span className="count">{instances.length}</span>
                       </div>
                       <span className="section-caption">
