@@ -87,6 +87,13 @@ impl Fleet {
         );
         Ok(host)
     }
+    /// The template a running private workspace was created from, if recorded.
+    pub fn workspace_template(&self, id: &str, name: &str) -> Result<Option<String>> {
+        let host = self.host(id)?;
+        let facts = inventory(&host)?;
+        let vm = private_workspace(&host, name, &facts)?;
+        Ok(vm["template"].as_str().map(str::to_owned))
+    }
     /// Explicit, resumable v0.2 guest migration. No provider homes or native CLIs change.
     pub fn sync_guest_tools(&self, id: &str, name: &str) -> Result<Value> {
         let host = self.host(id)?;

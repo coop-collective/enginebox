@@ -41,7 +41,9 @@ unknown hosts, and workspaces outside the registered storage pool. Relative
 `workdir` values must stay inside the workspace after symlink resolution.
 The request cannot replace HOME, executable, permissions flags, tenant identity or
 any environment variable Engine Box controls; it may add per-run variables through
-`env` (see below). A model name is optional; plan/model eligibility and
+`env` (see below) and name an owner-managed [profile](PROFILES.md), which selects
+turn limits, a permission profile from a fixed set, tools, plugins, skills and MCP
+servers without ever naming a CLI flag. A model name is optional; plan/model eligibility and
 charges remain provider decisions.
 
 A bounded `--version` preflight verifies the expected native product before a
@@ -57,12 +59,12 @@ protects native state if another controller process or a restarted controller
 tries to launch into that same home. This lease covers Engine Box launches;
 direct terminal processes do not participate automatically.
 
-The normal supervised run has a 300-second maximum and returns at most 256 KiB of
+A supervised run's `timeout_seconds` is 1-86400 (default 120) and it returns at most 256 KiB of
 combined native output. Timeout or excessive output terminates its process group and reports a
 failed run. Lifecycle actions wait for an admitted run to finish. Conversation
 history remains under the native home; it can be resumed in another bounded run.
-This API does not yet offer interactive approvals, streaming, cancellation or
-indefinite sessions. Direct native terminals remain available for those workflows.
+This API does not yet offer interactive approvals, streaming or indefinite
+sessions; cancellation and signed completion callbacks are available. Direct native terminals remain available for those workflows.
 
 Private controller records use mode 0600 in a mode 0700 directory, keep at most
 100 completed outputs, and never enter fleet inventory or lifecycle-job output.

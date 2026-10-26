@@ -1,9 +1,11 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
+pub mod callbacks;
 pub mod ci;
 mod ci_templates;
 pub mod contributors;
 mod environment;
 pub mod jobs;
+pub mod profiles;
 pub mod service_tokens;
 pub mod storage;
 
@@ -54,6 +56,7 @@ struct Runtime {
     ci: ci::Ci,
     contributors: contributors::Contributors,
     service_tokens: service_tokens::ServiceTokens,
+    profiles: profiles::Profiles,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -159,6 +162,7 @@ impl Controller {
             github,
             contributors: contributors::Contributors::open(&self.root)?,
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
+            profiles: profiles::Profiles::open(&self.root)?,
             ci: ci::Ci::open(
                 &self.root,
                 &self
@@ -169,6 +173,7 @@ impl Controller {
                     .collect::<Vec<_>>(),
             )?,
         };
+        callbacks::install(&runtime.agents);
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
             let owner = owner_guard
@@ -575,6 +580,11 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     }
     let maximum = if path == "/v1/templates" {
         1024 * 1024
+    } else if path == "/v1/profile-files" {
+        // One file of up to 1 MiB, base64-encoded.
+        1536 * 1024
+    } else if path == "/v1/profiles" {
+        256 * 1024
     } else if path == "/v1/ci/templates" {
         65536
     } else {
@@ -712,6 +722,8 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
             .agents
             .list_runs_where(|host, name| principal.sees(host, name))),
         ["v1", "service-tokens"] => Ok(c.runtime()?.service_tokens.list()),
+        ["v1", "profiles"] => Ok(c.runtime()?.profiles.list()),
+        ["v1", "profiles", name] => c.runtime()?.profiles.get(name),
         ["v1", "agents", provider, "usage"] => {
             Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
         }
@@ -932,17 +944,101 @@ async fn write(
             let name = name.to_string();
             identifier(&host, false)?;
             identifier(&name, true)?;
-            code = StatusCode::ACCEPTED;
+            let mut body = body;
+            let object = body.as_object_mut().context("Expected object")?;
+            // v2 fields are controller-side; the native request stays as before.
+            let profile_name = match object.remove("profile") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(p)) => Some(p),
+                Some(_) => anyhow::bail!("profile must be a string"),
+            };
+            let idempotency_key = match object.remove("idempotency_key") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(k)) => Some(k),
+                Some(_) => anyhow::bail!("idempotency_key must be a string"),
+            };
+            let callback_url = match object.remove("callback") {
+                None | Some(Value::Null) => None,
+                Some(callback) => {
+                    keys(&callback, &["url"], &["url"])?;
+                    Some(string(&callback, "url")?.to_owned())
+                }
+            };
+            if let Some(profile) = &profile_name {
+                if let Principal::Service(token) = &principal
+                    && !token.allows_profile(profile)
+                {
+                    return Ok((
+                        StatusCode::FORBIDDEN,
+                        json!({"error":"This service token is not granted that profile."}),
+                    ));
+                }
+                if !runtime.profiles.exists(profile) {
+                    return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown profile."})));
+                }
+            }
+            let resolved = match &profile_name {
+                Some(profile) => Some(
+                    runtime
+                        .profiles
+                        .resolve(profile, string(&body, "provider")?)?,
+                ),
+                None => None,
+            };
+            let callback = match callback_url {
+                Some(url) => {
+                    callbacks::validate_url(&url)?;
+                    // A service token signs with its own key; the owner signs
+                    // with the profile's. Keys are never taken from the request.
+                    let secret = match &principal {
+                        Principal::Service(token) => token.callback_secret().map(str::to_owned),
+                        Principal::Owner => profile_name
+                            .as_deref()
+                            .and_then(|p| runtime.profiles.callback_secret(p)),
+                    }
+                    .context("No callback key is configured for this caller")?;
+                    Some(enginebox_agents::service::Callback { url, secret })
+                }
+                None => None,
+            };
+            let options = enginebox_agents::service::LaunchOptions {
+                profile: resolved,
+                idempotency_key,
+                callback,
+            };
             let started_by = principal.started_by();
-            json!({"run":blocking(move||runtime.agents.launch_as(&host,&name,body,&started_by)).await?})
+            let (run, replayed) = blocking(move || {
+                runtime
+                    .agents
+                    .launch_with(&host, &name, body, &started_by, options)
+            })
+            .await?;
+            if replayed {
+                json!({"run":run,"replayed":true})
+            } else {
+                code = StatusCode::ACCEPTED;
+                json!({"run":run})
+            }
+        }
+        ["v1", "profile-files"] => {
+            code = StatusCode::CREATED;
+            runtime.profiles.upload(&body)?
+        }
+        ["v1", "profiles"] => runtime.profiles.put(body)?,
+        ["v1", "profiles", name, "delete"] => {
+            empty(&body)?;
+            runtime.profiles.delete(name)?
         }
         ["v1", "service-tokens"] => {
             let request: service_tokens::MintRequest = serde_json::from_value(body)?;
             let fleet = c.fleet.clone();
             code = StatusCode::CREATED;
-            runtime
-                .service_tokens
-                .mint(request, |host| fleet.hosts().iter().any(|h| h.id == host))?
+            let profiles = runtime.profiles.clone();
+            runtime.service_tokens.mint(
+                request,
+                |host| fleet.hosts().iter().any(|h| h.id == host),
+                |profile| profiles.exists(profile),
+            )?
         }
         ["v1", "service-tokens", id, "revoke"] => {
             empty(&body)?;
@@ -1584,6 +1680,204 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn profiles_are_owner_managed_validated_and_granted_per_token() {
+        use base64::Engine;
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let skill = b"---\nname: review\ndescription: Review a diff.\n---\nRead the diff.\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(skill);
+        let (status, uploaded) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/profile-files",
+                &json!({"content_base64":encoded}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{uploaded}");
+        let sha = uploaded["sha256"].as_str().unwrap().to_owned();
+        assert_eq!(sha, enginebox_agents::profile::sha256_hex(skill));
+        let key = "c".repeat(40);
+        let verifier = json!({"name":"verifier","description":"Black-box checks","providers":{
+            "claude":{"max_turns":200,"permission_profile":"read_only",
+                "skills":[{"name":"review","files":[{"path":"SKILL.md","sha256":sha}]}],
+                "env":{"CHECK_MODE":"strict-secret-value"}},
+            "codex":{"permission_profile":"read_only"}},
+            "callback_secret":key});
+        let (status, saved) = call(
+            &app,
+            request(Method::POST, "/v1/profiles", &verifier.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["profile"]["revision"], 1);
+        assert_eq!(saved["profile"]["owner"], "owner");
+        assert_eq!(saved["profile"]["has_callback_secret"], true);
+        let (_, listed) = call(&app, request(Method::GET, "/v1/profiles", "", true)).await;
+        let text = listed.to_string();
+        assert!(!text.contains(&key) && !text.contains("strict-secret-value"));
+        assert_eq!(
+            listed["profiles"][0]["providers"]["claude"]["env_keys"],
+            json!(["CHECK_MODE"])
+        );
+        let (_, again) = call(
+            &app,
+            request(Method::POST, "/v1/profiles", &verifier.to_string(), true),
+        )
+        .await;
+        assert_eq!(again["profile"]["revision"], 2);
+        let coder = json!({"name":"coder","providers":{"claude":{"max_turns":500}}});
+        assert_eq!(
+            call(
+                &app,
+                request(Method::POST, "/v1/profiles", &coder.to_string(), true)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        for bad in [
+            json!({"name":"x","providers":{"claude":{"max_turns":501}}}),
+            json!({"name":"x","providers":{"claude":{"max_turns":0}}}),
+            json!({"name":"x","providers":{"claude":{"permission_profile":"bypassPermissions"}}}),
+            json!({"name":"x","providers":{"claude":{"allowed_tools":["--dangerously-skip-permissions"]}}}),
+            json!({"name":"x","providers":{"claude":{"flags":["--yolo"]}}}),
+            json!({"name":"x","providers":{"claude":{"skills":[{"name":"s","files":[{"path":"SKILL.md","sha256":"0".repeat(64)}]}]}}}),
+            json!({"name":"x","providers":{"claude":{"skills":[{"name":"s","files":[{"path":"SKILL.md","sha256":"XYZ"}]}]}}}),
+            json!({"name":"x","providers":{"claude":{}},"owner":"someone-else"}),
+            json!({"name":"x","providers":{"claude":{}},"revision":9}),
+            json!({"name":"x","providers":{"claude":{"env":{"LD_PRELOAD":"/tmp/x.so"}}}}),
+            json!({"name":"Bad Name","providers":{"claude":{}}}),
+        ] {
+            let (status, body) = call(
+                &app,
+                request(Method::POST, "/v1/profiles", &bad.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+        }
+        // Grants must name existing profiles.
+        let token = |profiles: Value| {
+            json!({"label":"runner","scopes":[{"host_id":"worker","name":"ebox-a"}],
+            "operations":["agent_runs.start","agent_runs.get"],"profiles":profiles,"callback_secret":"t".repeat(40)})
+        };
+        assert_eq!(
+            call(
+                &app,
+                request(
+                    Method::POST,
+                    "/v1/service-tokens",
+                    &token(json!(["missing"])).to_string(),
+                    true
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (_, secret) = mint(&app, token(json!(["verifier"]))).await;
+        // Profiles and profile files are owner-only.
+        for (method, path, body) in [
+            (Method::GET, "/v1/profiles".to_string(), String::new()),
+            (
+                Method::GET,
+                "/v1/profiles/verifier".to_string(),
+                String::new(),
+            ),
+            (Method::POST, "/v1/profiles".to_string(), coder.to_string()),
+            (
+                Method::POST,
+                "/v1/profiles/verifier/delete".to_string(),
+                "{}".into(),
+            ),
+            (
+                Method::POST,
+                "/v1/profile-files".to_string(),
+                json!({"content_base64":"eA=="}).to_string(),
+            ),
+        ] {
+            assert_eq!(
+                call(&app, bearer(method, &path, &body, &secret)).await.0,
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+        let launch = |profile: &str| {
+            json!({"provider":"claude","prompt":"check","profile":profile}).to_string()
+        };
+        let (status, body) = call(
+            &app,
+            bearer(Method::POST, RUNS_A, &launch("coder"), &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body["error"],
+            "This service token is not granted that profile."
+        );
+        // A granted profile passes the grant check; the offline fixture host
+        // then refuses the launch itself.
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, RUNS_A, &launch("verifier"), &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&app, request(Method::POST, RUNS_A, &launch("nope"), true)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Callbacks: https only, no private targets, no key in the request.
+        for callback in [
+            json!({"url":"http://hooks.example.com/x"}),
+            json!({"url":"https://169.254.169.254/latest"}),
+            json!({"url":"https://hooks.example.com/x","secret":"mine-mine-mine-mine-mine-mine-mine"}),
+        ] {
+            let body = json!({"provider":"claude","prompt":"check","profile":"verifier","callback":callback});
+            let (status, _) = call(
+                &app,
+                bearer(Method::POST, RUNS_A, &body.to_string(), &secret),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{callback}");
+        }
+        assert_eq!(
+            call(
+                &app,
+                request(Method::POST, "/v1/profiles/coder/delete", "{}", true)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&app, request(Method::GET, "/v1/profiles/coder", "", true))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        // Profiles survive a controller reload.
+        drop(app);
+        let reopened = profiles::Profiles::open(&c.root).unwrap();
+        assert!(reopened.exists("verifier") && !reopened.exists("coder"));
+        let resolved = reopened.resolve("verifier", "claude").unwrap();
+        assert_eq!(resolved.revision, 2);
+        assert_eq!(resolved.files.len(), 1);
+        assert!(reopened.resolve("verifier", "cursor").is_err());
+        // A stored file that no longer matches its digest is refused.
+        let path = c.root.join("profile-files").join(&sha);
+        enginebox_agents::security::write_bytes(
+            &c.root.join("profile-files"),
+            &sha,
+            b"tampered",
+            1024,
+        )
+        .unwrap();
+        assert!(path.exists());
+        assert!(reopened.resolve("verifier", "claude").is_err());
+    }
     #[tokio::test]
     async fn service_tokens_see_and_cancel_only_runs_on_their_workspaces() {
         let (_temp, c) = setup();

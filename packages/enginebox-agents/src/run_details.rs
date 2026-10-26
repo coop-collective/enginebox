@@ -56,6 +56,37 @@ pub fn validate(detail: &Value) -> Result<()> {
             "Invalid native run env keys."
         );
     }
+    if let Some(profile) = detail.get("profile") {
+        ensure!(
+            profile["name"]
+                .as_str()
+                .is_some_and(crate::profile::valid_name)
+                && profile["revision"].is_u64(),
+            "Invalid native run profile."
+        );
+    }
+    if let Some(idempotency) = detail.get("idempotency") {
+        ensure!(
+            ["key_digest", "request_digest"]
+                .iter()
+                .all(|k| idempotency[*k]
+                    .as_str()
+                    .is_some_and(crate::profile::valid_sha256)),
+            "Invalid native run idempotency record."
+        );
+    }
+    if let Some(callback) = detail.get("callback") {
+        ensure!(
+            callback["origin"]
+                .as_str()
+                .is_some_and(|o| o.len() <= 2048 && o.starts_with("https://"))
+                && ["pending", "delivering", "delivered", "failed"]
+                    .contains(&callback["state"].as_str().unwrap_or(""))
+                && callback["attempts"].is_u64()
+                && (callback["last_status"].is_null() || callback["last_status"].is_u64()),
+            "Invalid native run callback record."
+        );
+    }
     if !detail["started_at"].is_null() {
         chrono::DateTime::parse_from_rfc3339(
             detail["started_at"]
@@ -125,6 +156,12 @@ pub fn enrich(record: &Value, detail: Option<&Value>, now: chrono::DateTime<chro
     value["env_keys"] = detail
         .and_then(|d| d.get("env_keys").cloned())
         .unwrap_or_else(|| json!([]));
+    value["profile"] = detail
+        .and_then(|d| d.get("profile").cloned())
+        .unwrap_or(Value::Null);
+    value["callback"] = detail
+        .and_then(|d| d.get("callback").cloned())
+        .unwrap_or(Value::Null);
     if detail.is_some_and(|d| d["cancelled"] == true) {
         value["status"] = json!("cancelled");
     }
@@ -170,6 +207,7 @@ pub fn summary(record: &Value, detail: Option<&Value>) -> Value {
         "execution_uncertain",
         "started_by",
         "env_keys",
+        "profile",
     ] {
         out.insert(key.into(), value[key].clone());
     }

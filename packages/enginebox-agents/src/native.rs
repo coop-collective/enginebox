@@ -82,6 +82,26 @@ pub fn env_key_allowed(key: &str) -> bool {
         && !DENIED_ENV.contains(&key)
         && !DENIED_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
 }
+/// Bounds and denylist for a map of caller-supplied variables (a run's `env`,
+/// a profile's default `env`, or the two merged). Messages name the rule, never a value.
+pub fn validate_env_map(env: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(
+        env.len() <= MAX_ENV_VARS,
+        "env accepts at most {MAX_ENV_VARS} variables."
+    );
+    ensure!(
+        env.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() <= MAX_ENV_BYTES,
+        "env names and values must total at most {MAX_ENV_BYTES} bytes."
+    );
+    for (key, value) in env {
+        ensure!(
+            env_key_allowed(key),
+            "env names must match ^[A-Z][A-Z0-9_]{{0,63}}$ and cannot replace a variable Engine Box controls."
+        );
+        ensure!(!value.contains('\0'), "env values cannot contain NUL.");
+    }
+    Ok(())
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
@@ -166,28 +186,8 @@ impl RunRequest {
         );
         Ok(())
     }
-    // Messages name the rule, never a value.
     fn validate_env(&self) -> Result<()> {
-        ensure!(
-            self.env.len() <= MAX_ENV_VARS,
-            "env accepts at most {MAX_ENV_VARS} variables."
-        );
-        ensure!(
-            self.env
-                .iter()
-                .map(|(k, v)| k.len() + v.len())
-                .sum::<usize>()
-                <= MAX_ENV_BYTES,
-            "env names and values must total at most {MAX_ENV_BYTES} bytes."
-        );
-        for (key, value) in &self.env {
-            ensure!(
-                env_key_allowed(key),
-                "env names must match ^[A-Z][A-Z0-9_]{{0,63}}$ and cannot replace a variable Engine Box controls."
-            );
-            ensure!(!value.contains('\0'), "env values cannot contain NUL.");
-        }
-        Ok(())
+        validate_env_map(&self.env)
     }
     /// The caller-supplied variable names, which are safe to record.
     pub fn env_keys(&self) -> Vec<String> {
@@ -461,7 +461,45 @@ pub fn execute_scoped(
     workspace: &Path,
     run_id: Option<&str>,
 ) -> Result<process::Output> {
+    execute_inner(r, home, workspace, run_id, None)
+}
+
+/// Run under a profile: the envelope is re-validated here, its files are
+/// materialized into this run's private directory, and that directory is
+/// removed again before the writer lease is released.
+pub fn execute_profiled(
+    envelope: &crate::profile::Envelope,
+    home: &Path,
+    workspace: &Path,
+    run_id: &str,
+) -> Result<process::Output> {
+    let files = envelope.validate()?;
+    execute_inner(
+        &envelope.request,
+        home,
+        workspace,
+        Some(run_id),
+        Some((&envelope.block, &files)),
+    )
+}
+
+type ProfileInput<'a> = (
+    &'a crate::profile::ProviderProfile,
+    &'a BTreeMap<String, Vec<u8>>,
+);
+
+fn execute_inner(
+    r: &RunRequest,
+    home: &Path,
+    workspace: &Path,
+    run_id: Option<&str>,
+    profile: Option<ProfileInput<'_>>,
+) -> Result<process::Output> {
     r.validate()?;
+    ensure!(
+        profile.is_none() || run_id.is_some(),
+        "Profile runs require a controller run ID."
+    );
     if let Some(id) = run_id {
         validate_run_id(id)?;
     }
@@ -484,20 +522,56 @@ pub fn execute_scoped(
     verify_client(&exe, &r.provider, &env, &cwd)?;
     // The version preflight uses only Engine Box's environment; caller variables
     // reach the native run alone and can never replace a controlled variable.
+    let caller_env = match profile {
+        Some((block, _)) => crate::profile::merged_env(block, r)?,
+        None => r.env.clone(),
+    };
     let mut run_env = env.clone();
-    for (key, value) in &r.env {
+    for (key, value) in &caller_env {
         ensure!(
             env_key_allowed(key) && !env.contains_key(key),
             "env cannot replace a variable Engine Box controls."
         );
         run_env.insert(key.clone(), value.clone());
     }
+    let mut argv = native_command_with_config(r, &exe, &home, &cwd);
+    let mut redacted = caller_env.clone();
+    if let (Some((block, files)), Some(id)) = (profile, run_id) {
+        let materialized = crate::profile::materialize(&home, id, &r.provider, block, files)?;
+        argv = crate::profile::command(r, &exe, block, &materialized)?;
+        if let Some(codex_home) = &materialized.codex_home {
+            run_env.insert(
+                "CODEX_HOME".into(),
+                codex_home
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid profile path."))?
+                    .into(),
+            );
+        }
+        // Delegated Claude access lives in user settings; a profile that does
+        // not load them still needs it, so Engine Box passes it itself.
+        if r.provider == "claude"
+            && block
+                .setting_sources
+                .as_ref()
+                .is_some_and(|s| !s.iter().any(|x| x == "user"))
+            && let Some(token) =
+                security::read_json(&home, ".claude/settings.json")?.and_then(|v| {
+                    v["env"]["CLAUDE_CODE_OAUTH_TOKEN"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+        {
+            redacted.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token.clone());
+            run_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token);
+        }
+    }
     let cancelled = || match run_id {
         Some(id) => cancellation_requested(&home, &r.provider, id),
         None => Ok(false),
     };
     let result = process::bounded_controlled(
-        &native_command_with_config(r, &exe, &home, &cwd),
+        &argv,
         Some(&run_env),
         Some(&cwd),
         if r.provider == "cursor" {
@@ -515,11 +589,14 @@ pub fn execute_scoped(
     if let Some(id) = run_id {
         // The writer lease still protects the native home while the helper cleans up.
         let _ = security::remove(&home, &cancel_path(id));
+        if profile.is_some() {
+            let _ = crate::profile::remove_run_dir(&home, id);
+        }
     }
     drop(lease);
     let result = result.map(|mut output| {
-        if !r.env.is_empty() {
-            output.output = redact(&output.output, &r.env);
+        if !redacted.is_empty() {
+            output.output = redact(&output.output, &redacted);
         }
         output
     });

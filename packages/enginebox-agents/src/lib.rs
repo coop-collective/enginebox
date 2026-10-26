@@ -5,6 +5,7 @@ pub mod clients;
 pub mod delegation;
 pub mod native;
 pub mod process;
+pub mod profile;
 pub mod run_details;
 pub mod security;
 pub mod service;

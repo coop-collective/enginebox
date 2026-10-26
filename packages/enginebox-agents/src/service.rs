@@ -1,4 +1,4 @@
-use crate::{auth, delegation, native, process, run_details, security, usage};
+use crate::{auth, delegation, native, process, profile, run_details, security, usage};
 use anyhow::{Result, bail, ensure};
 use enginebox_core::{Fleet, Host};
 use serde_json::{Value, json};
@@ -32,6 +32,80 @@ struct Inner {
     usage: usage::Cache,
     status_cache: Mutex<BTreeMap<String, (std::time::Instant, Value)>>,
     receipt_lock: Mutex<()>,
+    /// Callback targets and keys of runs still in flight. Memory only: the
+    /// key never reaches a record, and a restart ends delivery for that run.
+    callbacks: Mutex<BTreeMap<String, Callback>>,
+    finish_hook: Mutex<Option<FinishHook>>,
+}
+
+/// A profile resolved by the controller for one launch: the provider block and
+/// every referenced file's bytes (base64) keyed by digest.
+#[derive(Clone)]
+pub struct ResolvedProfile {
+    pub name: String,
+    pub revision: u64,
+    pub template: Option<String>,
+    pub block: profile::ProviderProfile,
+    pub files: BTreeMap<String, String>,
+}
+/// Where to POST a run's terminal summary, and the HMAC key that signs it.
+#[derive(Clone)]
+pub struct Callback {
+    pub url: String,
+    pub secret: String,
+}
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Callback")
+            .field("origin", &callback_origin(&self.url))
+            .finish()
+    }
+}
+/// Optional v2 launch features. `Default` is exactly the original launch.
+#[derive(Clone, Default)]
+pub struct LaunchOptions {
+    pub profile: Option<ResolvedProfile>,
+    pub idempotency_key: Option<String>,
+    pub callback: Option<Callback>,
+}
+/// Handed to the finish hook once a run with a callback reaches a terminal state.
+#[derive(Debug, Clone)]
+pub struct FinishedRun {
+    pub id: String,
+    pub callback: Callback,
+    pub payload: Value,
+}
+pub type FinishHook = Arc<dyn Fn(FinishedRun) + Send + Sync>;
+
+/// Scheme, host and port only: a callback path or query may carry a token.
+pub fn callback_origin(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| "invalid".into())
+}
+pub fn valid_idempotency_key(key: &str) -> bool {
+    (1..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+}
+fn idempotency_key_digest(started_by: &str, key: &str) -> String {
+    profile::sha256_hex(format!("{started_by}\n{key}").as_bytes())
+}
+/// What a replay must match: the request with env values replaced by names
+/// (values are secrets and are never hashed to disk), plus the v2 choices.
+fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOptions) -> String {
+    security::digest(&json!({
+        "provider":request.provider,
+        "prompt":request.prompt,
+        "resume_id":request.resume_id,
+        "workdir":request.workdir,
+        "timeout_seconds":request.timeout_seconds,
+        "model":request.model,
+        "env_keys":request.env_keys(),
+        "profile":options.profile.as_ref().map(|p| &p.name),
+        "callback":options.callback.as_ref().map(|c| &c.url),
+    }))
 }
 struct Session {
     public: Value,
@@ -154,6 +228,8 @@ impl AgentService {
                 usage: usage::Cache::default(),
                 status_cache: Mutex::new(BTreeMap::new()),
                 receipt_lock: Mutex::new(()),
+                callbacks: Mutex::new(BTreeMap::new()),
+                finish_hook: Mutex::new(None),
             }),
         })
     }
@@ -1023,10 +1099,93 @@ impl AgentService {
         value: Value,
         started_by: &str,
     ) -> Result<Value> {
+        Ok(self
+            .launch_with(host_id, name, value, started_by, LaunchOptions::default())?
+            .0)
+    }
+    /// Register the controller's callback deliverer.
+    pub fn set_finish_hook(&self, hook: FinishHook) {
+        *self.inner.finish_hook.lock().unwrap() = Some(hook);
+    }
+    /// The run an idempotency key already names for this principal, if any.
+    fn replay(
+        &self,
+        started_by: &str,
+        key: &str,
+        request_digest: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let key_digest = idempotency_key_digest(started_by, key);
+        let details = self.inner.details.lock().unwrap();
+        let Some((id, detail)) = details
+            .iter()
+            .find(|(_, d)| d["idempotency"]["key_digest"] == key_digest.as_str())
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            detail["idempotency"]["request_digest"] == request_digest,
+            "idempotency_key was already used with a different request."
+        );
+        let records = self.inner.records.lock().unwrap();
+        let record = records
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Missing run for idempotency key."))?;
+        Ok(Some((
+            record["host_id"].as_str().unwrap_or("").to_owned(),
+            record["name"].as_str().unwrap_or("").to_owned(),
+            id.clone(),
+        )))
+    }
+    /// Launch with the optional v2 features. Returns the run and whether it is
+    /// an existing run returned for a repeated idempotency key.
+    pub fn launch_with(
+        &self,
+        host_id: &str,
+        name: &str,
+        value: Value,
+        started_by: &str,
+        options: LaunchOptions,
+    ) -> Result<(Value, bool)> {
         run_details::validate_principal(started_by)?;
         let request = native::RunRequest::parse(value)?;
+        if let Some(resolved) = &options.profile {
+            ensure!(profile::valid_name(&resolved.name), "Invalid profile name.");
+            let envelope = profile::Envelope {
+                request: request.clone(),
+                profile: resolved.name.clone(),
+                block: resolved.block.clone(),
+                files: resolved.files.clone(),
+            };
+            envelope.validate()?;
+        }
+        if let Some(key) = &options.idempotency_key {
+            ensure!(
+                valid_idempotency_key(key),
+                "idempotency_key must be 1-128 characters of A-Z a-z 0-9 . _ : -"
+            );
+        }
+        let request_digest = idempotency_request_digest(&request, &options);
+        if let Some(key) = &options.idempotency_key
+            && let Some((h, n, id)) = self.replay(started_by, key, &request_digest)?
+        {
+            ensure!(
+                h == host_id && n == name,
+                "idempotency_key was already used with a different request."
+            );
+            return Ok((self.get_run(&h, &n, &id)?, true));
+        }
         let pending = self.pending_guard()?;
         let host = self.inner.fleet.account_workspace(host_id, name)?;
+        if let Some(template) = options.profile.as_ref().and_then(|p| p.template.as_ref()) {
+            ensure!(
+                self.inner
+                    .fleet
+                    .workspace_template(host_id, name)?
+                    .as_deref()
+                    == Some(template.as_str()),
+                "This workspace was not created from the profile's template."
+            );
+        }
         let _hostlock = enginebox_core::operation_lock(&host)?;
         let key = (
             host_id.to_owned(),
@@ -1055,13 +1214,48 @@ impl AgentService {
             "Connect this agent on the controller before launching a session."
         );
         let mut leases = self.inner.leases.lock().unwrap();
+        // Checked again under the queue lock, which also guards insertion, so
+        // two concurrent launches with one key cannot both start a run.
+        if let Some(key) = &options.idempotency_key
+            && let Some((h, n, id)) = self.replay(started_by, key, &request_digest)?
+        {
+            drop(leases);
+            ensure!(
+                h == host_id && n == name,
+                "idempotency_key was already used with a different request."
+            );
+            return Ok((self.get_run(&h, &n, &id)?, true));
+        }
         ensure!(
             !leases.contains(&key),
             "This workspace provider already has an active native run."
         );
         ensure!(leases.len() < 16, "Native run queue is full.");
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let (value, detail) = new_run_entries(&id, host_id, name, &request, started_by);
+        let (value, mut detail) = new_run_entries(&id, host_id, name, &request, started_by);
+        if let Some(resolved) = &options.profile {
+            detail["profile"] = json!({"name":resolved.name,"revision":resolved.revision});
+        }
+        if let Some(key) = &options.idempotency_key {
+            detail["idempotency"] = json!({
+                "key_digest":idempotency_key_digest(started_by, key),
+                "request_digest":request_digest,
+            });
+        }
+        if let Some(callback) = &options.callback {
+            detail["callback"] = json!({
+                "origin":callback_origin(&callback.url),
+                "state":"pending",
+                "attempts":0,
+                "last_status":null,
+                "updated_at":crate::now(),
+            });
+            self.inner
+                .callbacks
+                .lock()
+                .unwrap()
+                .insert(id.clone(), callback.clone());
+        }
         self.save_detail(&id, &detail)?;
         self.save_record(&value)?;
         self.inner
@@ -1077,6 +1271,7 @@ impl AgentService {
             .insert(id.clone(), value.clone());
         let this = self.clone();
         let name = name.to_owned();
+        let resolved = options.profile;
         thread::spawn(move || {
             let _pending = pending;
             let mut workers = this.inner.workers.0.lock().unwrap();
@@ -1088,7 +1283,7 @@ impl AgentService {
                 *workers += 1;
             }
             drop(workers);
-            this.run_worker(host, &name, request, &id);
+            this.run_worker_with(host, &name, request, &id, resolved);
             this.inner.leases.lock().unwrap().remove(&key);
             if admitted {
                 let mut workers = this.inner.workers.0.lock().unwrap();
@@ -1096,11 +1291,41 @@ impl AgentService {
             }
             this.inner.workers.1.notify_one();
         });
-        self.get_run(
-            host_id,
-            value["name"].as_str().unwrap_or(""),
-            value["id"].as_str().unwrap_or(""),
-        )
+        Ok((
+            self.get_run(
+                host_id,
+                value["name"].as_str().unwrap_or(""),
+                value["id"].as_str().unwrap_or(""),
+            )?,
+            false,
+        ))
+    }
+    /// Record a callback delivery attempt on the run's sidecar.
+    pub fn record_callback(
+        &self,
+        id: &str,
+        state: &str,
+        attempts: u32,
+        last_status: Option<u16>,
+    ) -> Result<()> {
+        ensure!(
+            ["pending", "delivering", "delivered", "failed"].contains(&state),
+            "Invalid callback state."
+        );
+        let mut details = self.inner.details.lock().unwrap();
+        let detail = details
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown native run."))?;
+        ensure!(detail["callback"].is_object(), "Run has no callback.");
+        detail["callback"]["state"] = json!(state);
+        detail["callback"]["attempts"] = json!(attempts);
+        detail["callback"]["last_status"] = json!(last_status);
+        detail["callback"]["updated_at"] = json!(crate::now());
+        self.save_detail(id, detail)?;
+        if ["delivered", "failed"].contains(&state) {
+            self.inner.callbacks.lock().unwrap().remove(id);
+        }
+        Ok(())
     }
     fn cancel_requested(&self, id: &str) -> bool {
         self.inner
@@ -1118,7 +1343,18 @@ impl AgentService {
             native::MAX_OUTPUT * 7,
         )
     }
+    #[cfg(test)]
     fn run_worker(&self, host: Host, name: &str, request: native::RunRequest, id: &str) {
+        self.run_worker_with(host, name, request, id, None)
+    }
+    fn run_worker_with(
+        &self,
+        host: Host,
+        name: &str,
+        request: native::RunRequest,
+        id: &str,
+        resolved: Option<ResolvedProfile>,
+    ) {
         let outcome = (|| -> Result<Value> {
             if let Some(v) = self.inner.records.lock().unwrap().get_mut(id) {
                 let mut details = self.inner.details.lock().unwrap();
@@ -1135,16 +1371,30 @@ impl AgentService {
                 v["status"] = json!("running");
                 self.save_record(v)?;
             }
+            // Runs without a profile keep the original guest command and
+            // payload, so older guest helpers still serve them.
+            let (mode, input) = match &resolved {
+                None => ("run", serde_json::to_vec(&request)?),
+                Some(p) => (
+                    "run-profile",
+                    serde_json::to_vec(&profile::Envelope {
+                        request: request.clone(),
+                        profile: p.name.clone(),
+                        block: p.block.clone(),
+                        files: p.files.clone(),
+                    })?,
+                ),
+            };
             let command = guest_command(
                 &host,
                 name,
-                &["run".into(), host.guest.workspace.clone(), id.into()],
+                &[mode.into(), host.guest.workspace.clone(), id.into()],
             )?;
             let output = process::checked(
                 &command,
                 None,
                 None,
-                &serde_json::to_vec(&request)?,
+                &input,
                 request.timeout_seconds + 20,
                 native::MAX_OUTPUT * 7,
             )?;
@@ -1189,6 +1439,15 @@ impl AgentService {
             }
             let _ = self.save_record(v);
         }
+        let finished = records.get(id).and_then(|record| {
+            let callback = self.inner.callbacks.lock().unwrap().get(id).cloned()?;
+            let details = self.inner.details.lock().unwrap();
+            Some(FinishedRun {
+                id: id.to_owned(),
+                callback,
+                payload: callback_payload(record, details.get(id)),
+            })
+        });
         while records.len() > 100 {
             let oldest = records
                 .iter()
@@ -1204,7 +1463,37 @@ impl AgentService {
             let _ = std::fs::remove_file(self.inner.details_root.join(format!("{key}.json")));
             let _ = std::fs::remove_file(self.inner.runs_root.join(format!("{key}.json")));
         }
+        drop(records);
+        if let Some(finished) = finished {
+            let hook = self.inner.finish_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                let _ = self.record_callback(&finished.id, "delivering", 0, None);
+                hook(finished);
+            }
+        }
     }
+}
+
+/// The signed callback body: identity, status and timing only. Never output,
+/// prompts, env names or values, or error text.
+pub fn callback_payload(record: &Value, detail: Option<&Value>) -> Value {
+    let run = run_details::enrich(record, detail, chrono::Utc::now());
+    json!({
+        "schema":1,
+        "event":"agent_run.finished",
+        "run_id":run["id"],
+        "host_id":run["host_id"],
+        "name":run["name"],
+        "provider":run["provider"],
+        "profile":detail.and_then(|d| d["profile"]["name"].as_str()),
+        "status":run["status"],
+        "exit_code":run["result"]["exit_code"],
+        "timed_out":run["result"]["timed_out"],
+        "execution_uncertain":run["execution_uncertain"] == true,
+        "created_at":run["created_at"],
+        "started_at":run["started_at"],
+        "finished_at":run["finished_at"],
+    })
 }
 fn active_session(v: &Value) -> bool {
     ["starting", "waiting"].contains(&v["status"].as_str().unwrap_or(""))
@@ -1391,5 +1680,195 @@ mod run_control_tests {
             "cancelled"
         );
         assert_eq!(restarted.list_runs()["runs"][0]["task"], "fixture task");
+    }
+
+    fn fixture() -> (tempfile::TempDir, AgentService, Host) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let host = Host {
+            id: "test-node".into(),
+            target: "offline.invalid".into(),
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host.clone()], &root).unwrap();
+        (temp, AgentService::new(&root, fleet).unwrap(), host)
+    }
+    fn insert(service: &AgentService, id: &str, detail: Value) {
+        let record = json!({"id":id,"host_id":"test-node","name":"ebox-private","provider":"codex","scope":"controller-owner","state_scope":"private-workspace","status":"queued","workdir":".","resume_id":null,"created_at":crate::now()});
+        service
+            .inner
+            .records
+            .lock()
+            .unwrap()
+            .insert(id.into(), record);
+        service
+            .inner
+            .details
+            .lock()
+            .unwrap()
+            .insert(id.into(), detail);
+    }
+
+    #[test]
+    fn a_repeated_idempotency_key_returns_the_same_run_for_the_same_principal_only() {
+        let (_t, service, _host) = fixture();
+        let id = "22222222222222222222222222222222";
+        let body = json!({"provider":"codex","prompt":"build it","env":{"TOKEN":"secret-value-1"}});
+        let request = native::RunRequest::parse(body.clone()).unwrap();
+        let options = LaunchOptions {
+            idempotency_key: Some("job-42".into()),
+            ..Default::default()
+        };
+        let (_, mut detail) = new_run_entries(id, "test-node", "ebox-private", &request, "owner");
+        detail["idempotency"] = json!({
+            "key_digest":idempotency_key_digest("owner", "job-42"),
+            "request_digest":idempotency_request_digest(&request, &options),
+        });
+        run_details::validate(&detail).unwrap();
+        // The stored digests never contain env values.
+        assert!(!detail.to_string().contains("secret-value-1"));
+        insert(&service, id, detail);
+        // Same principal, key and request: the existing run, no new launch
+        // (the offline fixture host would refuse a real one).
+        let (run, replayed) = service
+            .launch_with(
+                "test-node",
+                "ebox-private",
+                body.clone(),
+                "owner",
+                options.clone(),
+            )
+            .unwrap();
+        assert!(replayed);
+        assert_eq!(run["id"], id);
+        // A changed env value is the same request (values are never hashed).
+        let same = json!({"provider":"codex","prompt":"build it","env":{"TOKEN":"rotated-value"}});
+        assert!(
+            service
+                .launch_with("test-node", "ebox-private", same, "owner", options.clone())
+                .unwrap()
+                .1
+        );
+        // The same key with a different request is refused.
+        let changed = json!({"provider":"codex","prompt":"something else"});
+        let error = service
+            .launch_with(
+                "test-node",
+                "ebox-private",
+                changed,
+                "owner",
+                options.clone(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("different request"));
+        // Another workspace with the same key is refused, not silently replayed.
+        assert!(
+            service
+                .launch_with(
+                    "test-node",
+                    "ebox-other",
+                    body.clone(),
+                    "owner",
+                    options.clone()
+                )
+                .is_err()
+        );
+        // Another principal's identical key is a different key: it reaches the
+        // real launch path (which fails offline) instead of replaying.
+        let other = format!("service-token:{}", "a".repeat(32));
+        let error = service
+            .launch_with(
+                "test-node",
+                "ebox-private",
+                body.clone(),
+                &other,
+                options.clone(),
+            )
+            .unwrap_err();
+        assert!(!error.to_string().contains("different request"));
+        assert_eq!(service.inner.records.lock().unwrap().len(), 1);
+        for bad in ["", "has space", &"k".repeat(129), "semi;colon"] {
+            let options = LaunchOptions {
+                idempotency_key: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(
+                service
+                    .launch_with("test-node", "ebox-private", body.clone(), "owner", options)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_run_hands_its_callback_a_summary_without_output_or_env() {
+        let (_t, service, host) = fixture();
+        let id = "33333333333333333333333333333333";
+        let request = native::RunRequest::parse(
+            json!({"provider":"codex","prompt":"private prompt text","env":{"TOKEN":"secret-value-2"}}),
+        )
+        .unwrap();
+        let (_, mut detail) = new_run_entries(id, "test-node", "ebox-private", &request, "owner");
+        detail["cancel_requested"] = json!(true);
+        detail["profile"] = json!({"name":"verifier","revision":3});
+        detail["callback"] = json!({"origin":"https://hooks.example.com","state":"pending","attempts":0,"last_status":null,"updated_at":crate::now()});
+        run_details::validate(&detail).unwrap();
+        insert(&service, id, detail);
+        let key = "k".repeat(40);
+        service.inner.callbacks.lock().unwrap().insert(
+            id.into(),
+            Callback {
+                url: "https://hooks.example.com/runs?token=abc".into(),
+                secret: key.clone(),
+            },
+        );
+        let seen: Arc<Mutex<Vec<FinishedRun>>> = Arc::default();
+        let sink = seen.clone();
+        service.set_finish_hook(Arc::new(move |finished| {
+            sink.lock().unwrap().push(finished)
+        }));
+        service.run_worker(host, "ebox-private", request, id);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let payload = &seen[0].payload;
+        assert_eq!(payload["run_id"], id);
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["profile"], "verifier");
+        assert_eq!(payload["exit_code"], process::CANCELLED_EXIT_CODE);
+        let text = payload.to_string();
+        for forbidden in [
+            "secret-value-2",
+            "TOKEN",
+            "private prompt",
+            "output",
+            key.as_str(),
+            "token=abc",
+        ] {
+            assert!(!text.contains(forbidden), "payload leaked {forbidden}");
+        }
+        assert!(text.len() < 1024);
+        assert!(!format!("{:?}", seen[0]).contains(&key));
+        // The run records the delivery state and only the callback origin.
+        let run = service.get_run("test-node", "ebox-private", id).unwrap();
+        assert_eq!(run["callback"]["state"], "delivering");
+        assert_eq!(run["callback"]["origin"], "https://hooks.example.com");
+        service
+            .record_callback(id, "delivered", 1, Some(204))
+            .unwrap();
+        let run = service.get_run("test-node", "ebox-private", id).unwrap();
+        assert_eq!(run["callback"]["state"], "delivered");
+        assert_eq!(run["callback"]["last_status"], 204);
+        assert!(service.inner.callbacks.lock().unwrap().is_empty());
+        assert!(!run.to_string().contains(&key));
+        let raw =
+            std::fs::read_to_string(service.inner.details_root.join(format!("{id}.json"))).unwrap();
+        assert!(
+            !raw.contains(&key) && !raw.contains("token=abc") && !raw.contains("secret-value-2")
+        );
     }
 }
