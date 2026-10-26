@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 pub const MAX_OUTPUT: usize = 262144;
+/// Longest native run: a day, so build and verify tasks are not cut off; callers still choose a timeout per run.
+pub const MAX_RUN_SECONDS: u64 = 86400;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
@@ -39,8 +41,8 @@ impl RunRequest {
             "Prompt must contain 1–12000 UTF-8 bytes without NUL."
         );
         ensure!(
-            (1..=300).contains(&self.timeout_seconds),
-            "timeout_seconds must be 1–300."
+            (1..=MAX_RUN_SECONDS).contains(&self.timeout_seconds),
+            "timeout_seconds must be 1–86400."
         );
         ensure!(
             !self.workdir.is_empty()
