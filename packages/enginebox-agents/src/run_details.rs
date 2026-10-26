@@ -87,6 +87,18 @@ pub fn validate(detail: &Value) -> Result<()> {
             "Invalid native run callback record."
         );
     }
+    if let Some(failure) = detail.get("failure") {
+        ensure!(
+            failure["stage"]
+                .as_str()
+                .is_some_and(|s| crate::launch_events::Stage::parse(s).is_some())
+                && failure["reason"]
+                    .as_str()
+                    .is_some_and(crate::launch_events::valid_reason)
+                && failure.as_object().is_some_and(|m| m.len() == 2),
+            "Invalid native run failure."
+        );
+    }
     if !detail["started_at"].is_null() {
         chrono::DateTime::parse_from_rfc3339(
             detail["started_at"]
@@ -162,6 +174,10 @@ pub fn enrich(record: &Value, detail: Option<&Value>, now: chrono::DateTime<chro
     value["callback"] = detail
         .and_then(|d| d.get("callback").cloned())
         .unwrap_or(Value::Null);
+    // Why a launch stopped: `{stage, reason}` codes, null otherwise.
+    value["failure"] = detail
+        .and_then(|d| d.get("failure").cloned())
+        .unwrap_or(Value::Null);
     if detail.is_some_and(|d| d["cancelled"] == true) {
         value["status"] = json!("cancelled");
     }
@@ -208,6 +224,7 @@ pub fn summary(record: &Value, detail: Option<&Value>) -> Value {
         "started_by",
         "env_keys",
         "profile",
+        "failure",
     ] {
         out.insert(key.into(), value[key].clone());
     }

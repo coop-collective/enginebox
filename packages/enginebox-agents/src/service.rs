@@ -1,5 +1,7 @@
 use crate::{
-    auth, delegation, native, pools, process, profile,
+    auth, delegation,
+    launch_events::{self, LaunchEvent, LaunchEvents, LaunchFailure, Stage},
+    native, pools, process, profile,
     queue::{self, Entry, EntryState, HostLoad, Placement, QueueLimits, StoredCallback, Target},
     run_details, security, usage,
 };
@@ -59,6 +61,8 @@ struct Inner {
     hooks: Hooks,
     /// Runs interrupted by a restart whose callback is still owed.
     owed_callbacks: Mutex<Vec<String>>,
+    /// Bounded history of launch failures and pool member creations.
+    launch_events: LaunchEvents,
 }
 
 #[derive(Default)]
@@ -110,6 +114,8 @@ pub struct AdmittedRun {
     pub pool: Option<String>,
     pub request: native::RunRequest,
     pub profile: Option<String>,
+    /// Milliseconds between acceptance and admission.
+    pub queue_wait_ms: u64,
 }
 
 /// A profile resolved by the controller for one launch: the provider block and
@@ -234,6 +240,7 @@ impl AgentService {
         let queue_root = controller_root.join("agent-run-queue");
         security::private_dir(&queue_root)?;
         let pools = pools::Pools::open(&controller_root)?;
+        let launch_events = LaunchEvents::open(&controller_root)?;
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
         for item in std::fs::read_dir(&queue_root)? {
             let filename = item?.file_name().to_string_lossy().into_owned();
@@ -406,6 +413,7 @@ impl AgentService {
                 measures: Mutex::new(BTreeMap::new()),
                 hooks: Hooks::default(),
                 owed_callbacks: Mutex::new(owed),
+                launch_events,
             }),
         })
     }
@@ -1967,8 +1975,26 @@ impl AgentService {
         sched.waiting = plan.waiting;
         sched.cursor = plan.cursor;
         for (id, placement) in plan.admit {
-            if let Err(error) = self.admit(&mut sched, &id, placement) {
-                eprintln!("Agent run {id} could not be admitted: {error:#}");
+            let started = Instant::now();
+            if let Err(error) = self.admit(&mut sched, &id, placement.clone()) {
+                // The run stays queued and is retried on a later pass.
+                let entry = sched.entries.get(&id).map(|q| q.entry.clone());
+                self.record_launch(LaunchEvent {
+                    kind: "run_admission_failed".into(),
+                    outcome: "failed".into(),
+                    run_id: Some(id.clone()),
+                    pool: entry.as_ref().and_then(|e| e.pool().map(str::to_owned)),
+                    host_id: Some(placement.host_id.clone()),
+                    workspace: Some(placement.name.clone()),
+                    template: entry.as_ref().and_then(|e| e.template.clone()),
+                    profile: entry.as_ref().and_then(|e| e.profile.clone()),
+                    provider: entry.as_ref().map(|e| e.provider().to_owned()),
+                    stage: Stage::Place.as_str().into(),
+                    reason: "admission_error".into(),
+                    message: format!("{error:#}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    ..Default::default()
+                });
             }
         }
         for (pool, host) in plan.create {
@@ -2057,6 +2083,14 @@ impl AgentService {
         self.save_entry(&admitted)?;
         queued.entry = admitted;
         let resolved = queued.resolved.take();
+        let queue_wait_ms = chrono::DateTime::parse_from_rfc3339(&queued.entry.created_at)
+            .map(|at| {
+                chrono::Utc::now()
+                    .signed_duration_since(at)
+                    .num_milliseconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(0);
         let run = AdmittedRun {
             id: id.to_owned(),
             host_id: placement.host_id.clone(),
@@ -2064,6 +2098,7 @@ impl AgentService {
             pool: queued.entry.pool().map(str::to_owned),
             request,
             profile: queued.entry.profile.clone(),
+            queue_wait_ms,
         };
         let template = queued.entry.template.clone();
         let lease = (
@@ -2114,13 +2149,14 @@ impl AgentService {
         Ok(())
     }
     /// Prepare the workspace and run the native CLI, or fail the run cleanly
-    /// when it cannot start.
+    /// (and log a launch event) when it cannot start.
     fn execute(
         &self,
         run: AdmittedRun,
         resolved: Option<ResolvedProfile>,
         template: Option<String>,
     ) {
+        let started = Instant::now();
         let resolved = match (&run.profile, resolved) {
             (None, _) => None,
             (Some(_), Some(r)) => Some(r),
@@ -2128,11 +2164,14 @@ impl AgentService {
                 let resolver = self.inner.hooks.resolver.lock().unwrap().clone();
                 match resolver.map(|r| r(name, &run.request.provider)) {
                     Some(Ok(r)) => Some(r),
-                    _ => {
-                        self.fail_unstarted(
-                            &run.id,
-                            "Run could not start: its profile is no longer available.",
-                        );
+                    other => {
+                        let message = match other {
+                            Some(Err(error)) => format!("{error:#}"),
+                            _ => "No profile resolver is installed.".into(),
+                        };
+                        let failure =
+                            LaunchFailure::new(Stage::Resolve, "profile_unavailable", message);
+                        self.launch_failed(&run, template.as_deref(), None, &failure, started);
                         return;
                     }
                 }
@@ -2153,93 +2192,261 @@ impl AgentService {
                     );
                 });
         }
+        let template = template.or_else(|| resolved.as_ref().and_then(|p| p.template.clone()));
         let executor = self.inner.hooks.executor.lock().unwrap().clone();
         if let Some(executor) = executor {
             let request = run.request.clone();
-            self.run_with(&run.id, &request, || executor(&run));
+            let outcome = self.run_with(&run.id, &request, || executor(&run));
+            if let Err(failure) = outcome {
+                self.launch_failed(
+                    &run,
+                    template.as_deref(),
+                    resolved.as_ref(),
+                    &failure,
+                    started,
+                );
+            }
             return;
         }
-        let template = template.or_else(|| resolved.as_ref().and_then(|p| p.template.clone()));
         match self.prepare(&run, template.as_deref()) {
-            Ok(host) => self.run_worker_with(host, &run.name, run.request, &run.id, resolved),
-            Err(_) => self.fail_unstarted(
-                &run.id,
-                "Run could not start: the workspace is unavailable or not running, was not created from the required template, still holds an earlier run's lease, or the provider could not be delegated to it.",
+            Ok(host) => {
+                let request = run.request.clone();
+                if let Err(failure) =
+                    self.run_worker_with(host, &run.name, request, &run.id, resolved.clone())
+                {
+                    self.launch_failed(
+                        &run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                }
+            }
+            Err(failure) => self.launch_failed(
+                &run,
+                template.as_deref(),
+                resolved.as_ref(),
+                &failure,
+                started,
             ),
         }
     }
-    fn prepare(&self, run: &AdmittedRun, template: Option<&str>) -> Result<Host> {
+    /// Check each launch step in order; the first that fails names its stage.
+    fn prepare(
+        &self,
+        run: &AdmittedRun,
+        template: Option<&str>,
+    ) -> std::result::Result<Host, LaunchFailure> {
         let (host_id, name) = (run.host_id.as_str(), run.name.as_str());
-        let host = self.inner.fleet.account_workspace(host_id, name)?;
+        let host = self
+            .inner
+            .fleet
+            .account_workspace(host_id, name)
+            .map_err(|e| LaunchFailure::from_error(Stage::Place, "workspace_unavailable", &e))?;
         if let Some(template) = template {
-            ensure!(
-                self.inner
-                    .fleet
-                    .workspace_template(host_id, name)?
-                    .as_deref()
-                    == Some(template),
-                "This workspace was not created from the required template."
-            );
+            let actual = self
+                .inner
+                .fleet
+                .workspace_template(host_id, name)
+                .map_err(|e| {
+                    LaunchFailure::from_error(Stage::Place, "workspace_unavailable", &e)
+                })?;
+            if actual.as_deref() != Some(template) {
+                return Err(LaunchFailure::new(
+                    Stage::Place,
+                    "template_mismatch",
+                    format!(
+                        "Workspace template is {}; the run requires {template}.",
+                        actual.as_deref().unwrap_or("unrecorded")
+                    ),
+                ));
+            }
         }
-        let _hostlock = enginebox_core::operation_lock(&host)?;
+        let _hostlock = enginebox_core::operation_lock(&host)
+            .map_err(|e| LaunchFailure::from_error(Stage::Bootstrap, "workspace_locked", &e))?;
         let uncertain = self.inner.records.lock().unwrap().values().any(|v| {
             v["execution_uncertain"] == true && v["host_id"] == host_id && v["name"] == name
         });
         if uncertain && self.active(host_id, name) {
-            bail!("Previous native run must release its guest lease.")
+            return Err(LaunchFailure::new(
+                Stage::Place,
+                "lease_unresolved",
+                "Previous native run must release its guest lease.",
+            ));
         }
-        let attached = self.attach_locked(
-            host_id,
-            name,
-            Some(vec![run.request.provider.clone()]),
-            None,
-            None,
-        )?;
-        ensure!(
-            attached["providers"]
-                .as_array()
-                .is_some_and(|items| items.len() == 1
-                    && items.iter().all(|item| ["attached", "unchanged"]
-                        .contains(&item["status"].as_str().unwrap_or("")))),
-            "Connect this agent on the controller before launching a session."
-        );
+        let attached = self
+            .attach_locked(
+                host_id,
+                name,
+                Some(vec![run.request.provider.clone()]),
+                None,
+                None,
+            )
+            .map_err(|e| LaunchFailure::from_error(Stage::Delegate, "delegation_failed", &e))?;
+        if !attached["providers"].as_array().is_some_and(|items| {
+            items.len() == 1
+                && items.iter().all(|item| {
+                    ["attached", "unchanged"].contains(&item["status"].as_str().unwrap_or(""))
+                })
+        }) {
+            return Err(LaunchFailure::new(
+                Stage::Delegate,
+                "provider_not_delegable",
+                "The provider could not be delegated to this workspace.",
+            ));
+        }
         Ok(host)
+    }
+    /// Record a launch failure: a structured log line and event, the run's
+    /// `failure` (stage and reason code), and its terminal state. A failure
+    /// before the guest started is not `execution_uncertain`; a guest launch
+    /// failure keeps the original uncertain handling.
+    fn launch_failed(
+        &self,
+        run: &AdmittedRun,
+        template: Option<&str>,
+        resolved: Option<&ResolvedProfile>,
+        failure: &LaunchFailure,
+        started: Instant,
+    ) {
+        let mut secrets = run.request.env.clone();
+        if let Some(p) = resolved {
+            secrets.extend(p.block.env.clone());
+        }
+        let profile_name = resolved
+            .map(|p| p.name.clone())
+            .or_else(|| run.profile.clone());
+        self.record_launch(LaunchEvent {
+            kind: "run_admission_failed".into(),
+            outcome: "failed".into(),
+            run_id: Some(run.id.clone()),
+            pool: run.pool.clone(),
+            host_id: Some(run.host_id.clone()),
+            workspace: Some(run.name.clone()),
+            template: template.map(str::to_owned),
+            template_revision: template.and_then(|t| self.template_revision(&run.host_id, t)),
+            profile: profile_name,
+            profile_revision: resolved.map(|p| p.revision),
+            provider: Some(run.request.provider.clone()),
+            stage: failure.stage.as_str().into(),
+            reason: failure.reason.into(),
+            message: launch_events::clip_message(&failure.message, &secrets),
+            duration_ms: started.elapsed().as_millis() as u64,
+            queue_wait_ms: Some(run.queue_wait_ms),
+            ..Default::default()
+        });
+        if let Some(detail) = self.inner.details.lock().unwrap().get_mut(&run.id) {
+            detail["failure"] = json!({"stage":failure.stage.as_str(),"reason":failure.reason});
+            let _ = self.save_detail(&run.id, detail);
+        }
+        let uncertain = failure.stage == Stage::Start;
+        let message = failure.run_error();
+        self.finish(&run.id, |v| {
+            v["status"] = json!("failed");
+            v["error"] = json!(message);
+            if uncertain {
+                v["execution_uncertain"] = json!(true);
+            }
+        });
+    }
+    /// Fill in the pool's project, then log and retain the event.
+    fn record_launch(&self, mut event: LaunchEvent) {
+        if event.project.is_none()
+            && let Some(pool) = &event.pool
+        {
+            event.project = self.inner.pools.get(pool).map(|p| p.project);
+        }
+        self.inner.launch_events.record(event);
+    }
+    /// The installed revision of `template` on `host`, when the registry knows it.
+    fn template_revision(&self, host: &str, template: &str) -> Option<Value> {
+        let host = self.inner.fleet.host(host).ok()?;
+        let record = self.inner.fleet.template(&host, template).ok()?;
+        let revision = record.get("revision").cloned().unwrap_or(Value::Null);
+        (!revision.is_null()).then_some(revision)
+    }
+    /// Owner view of the launch history (newest first).
+    pub fn launch_events(&self, filter: &launch_events::Filter) -> Value {
+        self.inner.launch_events.list(filter)
     }
     fn spawn_create(&self, pool: String, host: String) {
         let this = self.clone();
         thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let _pending = this.pending_guard()?;
-                let def = this
-                    .inner
-                    .pools
-                    .get(&pool)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown pool."))?;
-                let template = def
-                    .template
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Pool has no template."))?;
+            let started = Instant::now();
+            let mut event = LaunchEvent {
+                kind: "pool_member_created".into(),
+                outcome: "succeeded".into(),
+                pool: Some(pool.clone()),
+                host_id: Some(host.clone()),
+                stage: Stage::Create.as_str().into(),
+                reason: "ok".into(),
+                ..Default::default()
+            };
+            let result = (|| -> std::result::Result<(), LaunchFailure> {
+                let _pending = this
+                    .pending_guard()
+                    .map_err(|e| LaunchFailure::from_error(Stage::Create, "create_failed", &e))?;
+                let def = this.inner.pools.get(&pool).ok_or_else(|| {
+                    LaunchFailure::new(Stage::Resolve, "pool_unavailable", "Unknown pool.")
+                })?;
+                event.project = Some(def.project.clone());
+                event.profile = def.profile.clone();
+                let template = def.template.clone().ok_or_else(|| {
+                    LaunchFailure::new(
+                        Stage::Create,
+                        "pool_has_no_template",
+                        "Pool has no template.",
+                    )
+                })?;
+                event.template = Some(template.clone());
+                event.template_revision = this.template_revision(&host, &template);
                 let size = def.autoscale.as_ref().and_then(|a| a.size.clone());
-                let name = this.inner.pools.reserve_name(&pool)?;
+                let name = this.inner.pools.reserve_name(&pool).map_err(|e| {
+                    LaunchFailure::from_error(Stage::Create, "name_unavailable", &e)
+                })?;
+                event.workspace = Some(name.clone());
                 let hook = this.inner.hooks.create.lock().unwrap().clone();
                 match hook {
-                    Some(create) => create(&host, &name, &template, size.as_deref())?,
+                    Some(create) => create(&host, &name, &template, size.as_deref()),
                     None => {
                         let mut params = json!({"name":name,"template":template});
                         if let Some(size) = &size {
                             params["size"] = json!(size);
                         }
-                        this.inner.fleet.operate(&host, "create", &params)?;
+                        this.inner
+                            .fleet
+                            .operate(&host, "create", &params)
+                            .map(|_| ())
                     }
                 }
-                this.inner.pools.add_created(
-                    &pool,
-                    Placement {
-                        host_id: host.clone(),
-                        name,
-                    },
-                )
+                .map_err(|e| match e.downcast::<LaunchFailure>() {
+                    Ok(failure) => failure,
+                    Err(e) => LaunchFailure::from_error(Stage::Create, "create_failed", &e),
+                })?;
+                this.inner
+                    .pools
+                    .add_created(
+                        &pool,
+                        Placement {
+                            host_id: host.clone(),
+                            name,
+                        },
+                    )
+                    .map_err(|e| {
+                        LaunchFailure::from_error(Stage::Bootstrap, "member_record_failed", &e)
+                    })
             })();
+            event.duration_ms = started.elapsed().as_millis() as u64;
+            if let Err(failure) = &result {
+                event.kind = "pool_member_create_failed".into();
+                event.outcome = "failed".into();
+                event.stage = failure.stage.as_str().into();
+                event.reason = failure.reason.into();
+                event.message = launch_events::clip_message(&failure.message, &BTreeMap::new());
+            }
+            let backoff_message = event.message.clone();
+            this.record_launch(event);
             let mut sched = this.inner.sched.lock().unwrap();
             if let Some(n) = sched.creating.get_mut(&pool) {
                 *n = n.saturating_sub(1);
@@ -2248,11 +2455,11 @@ impl AgentService {
                 Ok(()) => {
                     sched.backoff.remove(&pool);
                 }
-                Err(error) => {
-                    let message: String = format!("{error:#}").chars().take(240).collect();
-                    sched
-                        .backoff
-                        .insert(pool.clone(), (Instant::now() + CREATE_BACKOFF, message));
+                Err(_) => {
+                    sched.backoff.insert(
+                        pool.clone(),
+                        (Instant::now() + CREATE_BACKOFF, backoff_message),
+                    );
                 }
             }
             sched.dirty = true;
@@ -2294,8 +2501,32 @@ impl AgentService {
         view["last_create_error"] = json!(sched.backoff.get(name).map(|(_, m)| m));
         Ok(json!({"pool":view}))
     }
+    /// Every pool, plus `projects`: pool names grouped by project.
     pub fn list_pools(&self) -> Value {
-        json!({"pools":self.inner.pools.all().iter().map(pools::Pool::public).collect::<Vec<_>>()})
+        Self::pool_listing(self.inner.pools.all())
+    }
+    /// The pools of one project, in the same shape as [`Self::list_pools`].
+    pub fn list_project_pools(&self, project: &str) -> Result<Value> {
+        ensure!(pools::valid_project(project), "Invalid project.");
+        let mut listing = Self::pool_listing(self.inner.pools.in_project(project));
+        listing["project"] = json!(project);
+        Ok(listing)
+    }
+    fn pool_listing(all: Vec<pools::Pool>) -> Value {
+        let mut projects: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for pool in &all {
+            projects
+                .entry(pool.project.clone())
+                .or_default()
+                .push(pool.name.clone());
+        }
+        json!({
+            "pools":all.iter().map(pools::Pool::public).collect::<Vec<_>>(),
+            "projects":projects
+                .into_iter()
+                .map(|(project, pools)| json!({"project":project,"pools":pools}))
+                .collect::<Vec<_>>(),
+        })
     }
     /// Delete a pool with no queued or running runs. Its workspaces are kept.
     pub fn delete_pool(&self, name: &str) -> Result<Value> {
@@ -2347,8 +2578,10 @@ impl AgentService {
     }
     #[cfg(test)]
     fn run_worker(&self, host: Host, name: &str, request: native::RunRequest, id: &str) {
-        self.run_worker_with(host, name, request, id, None)
+        let _ = self.run_worker_with(host, name, request, id, None);
     }
+    /// Run the guest helper. A guest launch failure is returned (stage
+    /// `start`) after the run is marked failed and uncertain.
     fn run_worker_with(
         &self,
         host: Host,
@@ -2356,7 +2589,7 @@ impl AgentService {
         request: native::RunRequest,
         id: &str,
         resolved: Option<ResolvedProfile>,
-    ) {
+    ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
             // Runs without a profile keep the original guest command and
             // payload, so older guest helpers still serve them.
@@ -2389,16 +2622,19 @@ impl AgentService {
             native::validate_result(&result)?;
             Ok(result)
         };
-        self.run_with(id, &request, guest);
+        self.run_with(id, &request, guest)
     }
     /// Mark the run running (unless cancelled first), execute it, and record
-    /// its terminal state.
+    /// its terminal state. An execution error is returned as a launch failure
+    /// for the caller to record: a [`LaunchFailure`] from the executor as is,
+    /// anything else as a guest launch failure (stage `start`). The run is
+    /// left unfinished in that case; the caller finishes it.
     fn run_with(
         &self,
         id: &str,
         request: &native::RunRequest,
         exec: impl FnOnce() -> Result<Value>,
-    ) {
+    ) -> std::result::Result<(), LaunchFailure> {
         let outcome = (|| -> Result<Value> {
             if let Some(v) = self.inner.records.lock().unwrap().get_mut(id) {
                 let mut details = self.inner.details.lock().unwrap();
@@ -2415,44 +2651,40 @@ impl AgentService {
             }
             exec()
         })();
-        self.finish(id, |v| match outcome {
-            Ok(result) => {
-                v["status"] = json!(if result["exit_code"] == 0
-                    && result["timed_out"] == false
-                    && result["output_truncated"] == false
-                {
-                    "succeeded"
-                } else {
-                    "failed"
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(match error.downcast::<LaunchFailure>() {
+                    Ok(failure) => failure,
+                    Err(error) => {
+                        LaunchFailure::from_error(Stage::Start, "guest_launch_failed", &error)
+                    }
                 });
-                if let Some(session) = native::session_id(result["output"].as_str().unwrap_or(""))
-                    .or_else(|| request.resume_id.clone())
-                {
-                    v["native_session_id"] = json!(session);
-                }
-                if result["exit_code"] == process::CANCELLED_EXIT_CODE
-                    && let Some(detail) = self.inner.details.lock().unwrap().get_mut(id)
-                {
-                    detail["cancelled"] = json!(detail["cancel_requested"] == true);
-                    let _ = self.save_detail(id, detail);
-                }
-                v["result"] = result;
             }
-            Err(_) => {
-                v["status"] = json!("failed");
-                v["execution_uncertain"] = json!(true);
-                v["error"] = json!(
-                    "Native launch failed; inspect installation and the workspace session lease."
-                );
-            }
-        });
-    }
-    /// A run that never reached its guest: failed, not uncertain.
-    fn fail_unstarted(&self, id: &str, message: &str) {
+        };
         self.finish(id, |v| {
-            v["status"] = json!("failed");
-            v["error"] = json!(message);
+            v["status"] = json!(if result["exit_code"] == 0
+                && result["timed_out"] == false
+                && result["output_truncated"] == false
+            {
+                "succeeded"
+            } else {
+                "failed"
+            });
+            if let Some(session) = native::session_id(result["output"].as_str().unwrap_or(""))
+                .or_else(|| request.resume_id.clone())
+            {
+                v["native_session_id"] = json!(session);
+            }
+            if result["exit_code"] == process::CANCELLED_EXIT_CODE
+                && let Some(detail) = self.inner.details.lock().unwrap().get_mut(id)
+            {
+                detail["cancelled"] = json!(detail["cancel_requested"] == true);
+                let _ = self.save_detail(id, detail);
+            }
+            v["result"] = result;
         });
+        Ok(())
     }
     /// Apply the terminal state, persist, retain the newest finished runs and
     /// hand the run's callback (if any) to the deliverer, once.
@@ -2599,6 +2831,8 @@ pub fn callback_payload(record: &Value, detail: Option<&Value>) -> Value {
         "exit_code":run["result"]["exit_code"],
         "timed_out":run["result"]["timed_out"],
         "execution_uncertain":run["execution_uncertain"] == true,
+        // Codes only (`{stage, reason}`), never the failure message.
+        "failure":detail.and_then(|d| d.get("failure")).map(|f| json!({"stage":f["stage"],"reason":f["reason"]})),
         "created_at":run["created_at"],
         "started_at":run["started_at"],
         "finished_at":run["finished_at"],

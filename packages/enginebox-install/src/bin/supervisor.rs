@@ -67,6 +67,14 @@ fn main() -> Result<()> {
                     "ENGINEBOX_NODE_INSTALLER_SHA256",
                     "ENGINEBOX_NODE_PUBLIC_ORIGIN",
                     "ENGINEBOX_OAUTH_STATE_DIR",
+                    "ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS",
+                    // Run queue and admission tuning (docs/QUEUE.md).
+                    "ENGINEBOX_RUN_QUEUE_MAX_TOTAL",
+                    "ENGINEBOX_RUN_QUEUE_MAX_PER_PRINCIPAL",
+                    "ENGINEBOX_HOST_MAX_AGENT_RUNS",
+                    "ENGINEBOX_AGENT_RUN_MEMORY_MIB",
+                    "ENGINEBOX_HOST_MEASURE_TTL_SECONDS",
+                    "ENGINEBOX_RUN_QUEUE_RETRY_AFTER_SECONDS",
                     "PATH"
                 ]
                 .contains(&key.as_str()),

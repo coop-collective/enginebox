@@ -22,6 +22,24 @@ const SESSIONS_FILE: &str = "agent-pool-sessions.json";
 const SESSIONS_LIMIT: usize = 2 * 1024 * 1024;
 const SIZES: [&str; 5] = ["minimum", "recommended", "small", "standard", "large"];
 
+/// Project of pools created before pools carried one, and of new pools whose
+/// request names none.
+pub const DEFAULT_PROJECT: &str = "default";
+
+/// A project ID, the same shape as the fleet Worker's project IDs
+/// (`^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$`).
+pub fn valid_project(project: &str) -> bool {
+    let b = project.as_bytes();
+    (1..=48).contains(&b.len())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[0] != b'-'
+        && b[b.len() - 1] != b'-'
+}
+fn default_project() -> String {
+    DEFAULT_PROJECT.into()
+}
+
 /// `^[a-z][a-z0-9-]{0,31}$`: short enough that `ebox-<pool>-<n>` stays a
 /// valid instance name.
 pub fn valid_name(name: &str) -> bool {
@@ -48,6 +66,10 @@ pub struct Autoscale {
 #[serde(deny_unknown_fields)]
 pub struct Pool {
     pub name: String,
+    /// The project the pool belongs to. Records written before projects
+    /// existed load as [`DEFAULT_PROJECT`].
+    #[serde(default = "default_project")]
+    pub project: String,
     #[serde(default)]
     pub description: String,
     /// Profile every run in the pool uses. A run may omit it or name it.
@@ -93,6 +115,10 @@ impl Pool {
         ensure!(
             valid_name(&self.name),
             "Pool names match ^[a-z][a-z0-9-]{{0,31}}$"
+        );
+        ensure!(
+            valid_project(&self.project),
+            "project must match ^[a-z0-9](?:[a-z0-9-]{{0,46}}[a-z0-9])?$"
         );
         ensure!(
             self.description.len() <= 512 && !self.description.chars().any(char::is_control),
@@ -146,6 +172,7 @@ impl Pool {
     pub fn public(&self) -> Value {
         json!({
             "name":self.name,
+            "project":self.project,
             "description":self.description,
             "profile":self.profile,
             "template":self.template,
@@ -221,6 +248,7 @@ impl Pools {
         ensure!(
             object.keys().all(|k| [
                 "name",
+                "project",
                 "description",
                 "profile",
                 "template",
@@ -230,11 +258,16 @@ impl Pools {
             .contains(&k.as_str())),
             "Unsupported pool fields"
         );
+        let named_project = object.contains_key("project");
         let mut pool: Pool = serde_json::from_value(body)?;
         let mut pools = self.pools.lock().unwrap();
         let now = crate::now();
         match pools.get(&pool.name) {
             Some(existing) => {
+                // Replacing a pool without naming a project keeps its project.
+                if !named_project {
+                    pool.project = existing.project.clone();
+                }
                 pool.created = existing.created.clone();
                 pool.next_index = existing.next_index;
                 pool.revision = existing.revision + 1;
@@ -258,6 +291,24 @@ impl Pools {
     }
     pub fn all(&self) -> Vec<Pool> {
         self.pools.lock().unwrap().values().cloned().collect()
+    }
+    /// Pools of one project, by name.
+    pub fn in_project(&self, project: &str) -> Vec<Pool> {
+        self.pools
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| p.project == project)
+            .cloned()
+            .collect()
+    }
+    /// The project a pool belongs to.
+    pub fn project_of(&self, name: &str) -> Option<String> {
+        self.pools
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|p| p.project.clone())
     }
     pub fn exists(&self, name: &str) -> bool {
         self.pools.lock().unwrap().contains_key(name)

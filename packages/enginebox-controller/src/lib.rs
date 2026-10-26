@@ -368,12 +368,18 @@ impl Principal {
         }
     }
     /// A run is visible by its workspace once placed, or by its pool.
-    fn sees_run(&self, host: Option<&str>, name: Option<&str>, pool: Option<&str>) -> bool {
+    fn sees_run(
+        &self,
+        host: Option<&str>,
+        name: Option<&str>,
+        pool: Option<&str>,
+        project_of: &dyn Fn(&str) -> Option<String>,
+    ) -> bool {
         match self {
             Self::Owner => true,
             Self::Service(token) => {
                 host.zip(name).is_some_and(|(h, n)| token.sees(h, n))
-                    || pool.is_some_and(|p| token.sees_pool(p))
+                    || pool.is_some_and(|p| token.sees_pool(p, project_of(p).as_deref()))
             }
         }
     }
@@ -381,9 +387,16 @@ impl Principal {
 
 /// A service token may reach only the agent-run routes it was granted, on its
 /// own workspaces. Every other route, including token minting, is refused.
-fn service_allows(token: &service_tokens::Token, method: &Method, path: &str) -> bool {
+fn service_allows(
+    token: &service_tokens::Token,
+    method: &Method,
+    path: &str,
+    project_of: &dyn Fn(&str) -> Option<String>,
+) -> bool {
     use service_tokens::Operation;
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let pool_ok =
+        |operation, pool: &str| token.allows_pool(operation, pool, project_of(pool).as_deref());
     match (method, parts.as_slice()) {
         (&Method::GET, ["v1", "agent-runs"]) => token.operations.contains(&Operation::List),
         (&Method::GET, ["v1", "hosts", host, "instances", name, "agent-runs", _]) => {
@@ -405,14 +418,10 @@ fn service_allows(token: &service_tokens::Token, method: &Method, path: &str) ->
                 "cancel",
             ],
         ) => token.allows(Operation::Cancel, host, name),
-        (&Method::POST, ["v1", "pools", pool, "agent-runs"]) => {
-            token.allows_pool(Operation::Start, pool)
-        }
-        (&Method::GET, ["v1", "pools", pool, "agent-runs", _]) => {
-            token.allows_pool(Operation::Get, pool)
-        }
+        (&Method::POST, ["v1", "pools", pool, "agent-runs"]) => pool_ok(Operation::Start, pool),
+        (&Method::GET, ["v1", "pools", pool, "agent-runs", _]) => pool_ok(Operation::Get, pool),
         (&Method::POST, ["v1", "pools", pool, "agent-runs", _, "cancel"]) => {
-            token.allows_pool(Operation::Cancel, pool)
+            pool_ok(Operation::Cancel, pool)
         }
         _ => false,
     }
@@ -489,8 +498,14 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         Ok(principal) => principal,
         Err((code, message)) => return error(code, message),
     };
+    let project_of = |pool: &str| {
+        controller
+            .runtime()
+            .ok()
+            .and_then(|r| r.agents.pools().project_of(pool))
+    };
     if let Principal::Service(token) = &principal
-        && !service_allows(token, &method, &path)
+        && !service_allows(token, &method, &path, &project_of)
     {
         return error(
             StatusCode::FORBIDDEN,
@@ -761,16 +776,46 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
                 .status(&format!("{owner}/{repo}"), run.parse()?)
         }
         ["v1", "agents"] => c.runtime()?.agents.status(),
-        ["v1", "agent-runs"] => Ok(c
-            .runtime()?
-            .agents
-            .list_runs_visible(|host, name, pool| principal.sees_run(host, name, pool))),
+        ["v1", "agent-runs"] => {
+            let agents = c.runtime()?.agents;
+            let project_of = |pool: &str| agents.pools().project_of(pool);
+            Ok(agents.list_runs_visible(|host, name, pool| {
+                principal.sees_run(host, name, pool, &project_of)
+            }))
+        }
         ["v1", "pools"] => Ok(c.runtime()?.agents.list_pools()),
         ["v1", "pools", pool] => c.runtime()?.agents.pool_status(pool),
+        ["v1", "projects", project, "pools"] => c.runtime()?.agents.list_project_pools(project),
+        ["v1", "launch-events"] => Ok(c
+            .runtime()?
+            .agents
+            .launch_events(&enginebox_agents::launch_events::Filter::default())),
+        ["v1", "pools", pool, "launch-events"] => {
+            Ok(c.runtime()?
+                .agents
+                .launch_events(&enginebox_agents::launch_events::Filter {
+                    pool: Some(pool.to_string()),
+                    ..Default::default()
+                }))
+        }
+        ["v1", "projects", project, "launch-events"] => {
+            Ok(c.runtime()?
+                .agents
+                .launch_events(&enginebox_agents::launch_events::Filter {
+                    project: Some(project.to_string()),
+                    ..Default::default()
+                }))
+        }
         ["v1", "pools", pool, "agent-runs", id] => {
             Ok(json!({"run":c.runtime()?.agents.get_pool_run(pool,id)?}))
         }
-        ["v1", "service-tokens"] => Ok(c.runtime()?.service_tokens.list()),
+        ["v1", "service-tokens"] => {
+            let runtime = c.runtime()?;
+            let agents = runtime.agents.clone();
+            Ok(runtime
+                .service_tokens
+                .list_grouped(|pool| agents.pools().project_of(pool)))
+        }
         ["v1", "profiles"] => Ok(c.runtime()?.profiles.list()),
         ["v1", "profiles", name] => c.runtime()?.profiles.get(name),
         ["v1", "agents", provider, "usage"] => {
@@ -1037,7 +1082,7 @@ async fn write(
                 request,
                 |host| fleet.hosts().iter().any(|h| h.id == host),
                 |profile| profiles.exists(profile),
-                |pool| agents.pools().exists(pool),
+                |pool| agents.pools().project_of(pool),
             )?
         }
         ["v1", "service-tokens", id, "revoke"] => {
@@ -2406,6 +2451,113 @@ mod tests {
             .unwrap()
             .agents
             .set_measure_hook(Arc::new(|_| anyhow::bail!("fixture host is offline")));
+    }
+
+    #[tokio::test]
+    async fn pools_belong_to_projects_and_tokens_can_be_restricted_to_one_project() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        queue_fixture(&c);
+        for pool in [
+            json!({"name":"alpha-w","project":"alpha","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}),
+            json!({"name":"beta-w","project":"beta","workspaces":[{"host_id":"worker","name":"ebox-p2"}]}),
+            json!({"name":"legacy","workspaces":[{"host_id":"worker","name":"ebox-p3"}]}),
+        ] {
+            let (status, body) = call(
+                &app,
+                request(Method::POST, "/v1/pools", &pool.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (_, all) = call(&app, request(Method::GET, "/v1/pools", "", true)).await;
+        assert_eq!(
+            all["projects"],
+            json!([{"project":"alpha","pools":["alpha-w"]},{"project":"beta","pools":["beta-w"]},
+                {"project":"default","pools":["legacy"]}])
+        );
+        let (status, alpha) = call(
+            &app,
+            request(Method::GET, "/v1/projects/alpha/pools", "", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(alpha["pools"].as_array().unwrap().len(), 1);
+        assert_eq!(alpha["pools"][0]["name"], "alpha-w");
+        let ops = json!(["agent_runs.start", "agent_runs.get", "agent_runs.list"]);
+        // A project restriction refuses pools of other projects at mint.
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/service-tokens",
+                &json!({"label":"x","scopes":[],"pools":["alpha-w","beta-w"],"project":"alpha","operations":ops})
+                    .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, secret) = mint(
+            &app,
+            json!({"label":"alpha-only","scopes":[],"pools":["alpha-w"],"project":"alpha","operations":ops}),
+        )
+        .await;
+        let (_, list) = call(&app, request(Method::GET, "/v1/service-tokens", "", true)).await;
+        let token = &list["tokens"][0];
+        assert_eq!(token["project"], "alpha");
+        assert_eq!(
+            token["pool_grants"],
+            json!([{"project":"alpha","pools":["alpha-w"]}])
+        );
+        let start = r#"{"provider":"claude","prompt":"work"}"#;
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, "/v1/pools/alpha-w/agent-runs", start, &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // The owner moves the pool to another project: the restricted token
+        // loses it on the next request.
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools",
+                &json!({"name":"alpha-w","project":"beta","workspaces":[{"host_id":"worker","name":"ebox-p1"}]})
+                    .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, "/v1/pools/alpha-w/agent-runs", start, &secret),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, runs) = call(&app, bearer(Method::GET, "/v1/agent-runs", "", &secret)).await;
+        assert_eq!(
+            runs["total"], 0,
+            "its runs in the moved pool are hidden too"
+        );
+        // Launch events and project listings are owner-only.
+        for path in [
+            "/v1/launch-events",
+            "/v1/pools/alpha-w/launch-events",
+            "/v1/projects/alpha/launch-events",
+            "/v1/projects/alpha/pools",
+        ] {
+            let (status, _) = call(&app, bearer(Method::GET, path, "", &secret)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            let (status, body) = call(&app, request(Method::GET, path, "", true)).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            if path.ends_with("launch-events") {
+                assert_eq!(body["max_retained"], 500);
+                assert!(body["events"].is_array());
+            }
+        }
     }
 
     #[tokio::test]

@@ -61,6 +61,11 @@ pub struct Token {
     /// operations). Omitted when empty so older releases still read it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pools: BTreeSet<String>,
+    /// When set, the token's pool grants hold only while each pool belongs to
+    /// this project: checked at mint and again on every request. Omitted when
+    /// unset so older releases still read the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,11 +90,22 @@ impl Token {
     pub fn callback_secret(&self) -> Option<&str> {
         self.callback_secret.as_deref()
     }
-    pub fn allows_pool(&self, operation: Operation, pool: &str) -> bool {
-        self.operations.contains(&operation) && self.sees_pool(pool)
+    /// `pool_project` is the pool's current project (None: unknown pool).
+    pub fn allows_pool(
+        &self,
+        operation: Operation,
+        pool: &str,
+        pool_project: Option<&str>,
+    ) -> bool {
+        self.operations.contains(&operation) && self.sees_pool(pool, pool_project)
     }
-    pub fn sees_pool(&self, pool: &str) -> bool {
+    /// Granted, and inside the token's project restriction if it has one.
+    pub fn sees_pool(&self, pool: &str, pool_project: Option<&str>) -> bool {
         self.pools.contains(pool)
+            && self
+                .project
+                .as_deref()
+                .is_none_or(|project| pool_project == Some(project))
     }
     pub fn sees(&self, host_id: &str, name: &str) -> bool {
         self.scopes
@@ -114,6 +130,7 @@ impl Token {
             "revoked_at":self.revoked_at,
             "profiles":self.profiles,
             "pools":self.pools,
+            "project":self.project,
             "has_callback_secret":self.callback_secret.is_some(),
             "active":self.revoked_at.is_none() && !self.expired(now),
         })
@@ -135,6 +152,9 @@ pub struct MintRequest {
     pub callback_secret: Option<String>,
     #[serde(default)]
     pub pools: Vec<String>,
+    /// Restrict the pool grants to this project's pools.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 fn secret_hash(secret: &str) -> String {
@@ -186,14 +206,14 @@ impl ServiceTokens {
         )
     }
     /// Mint a token. `known_host` rejects scopes naming unregistered hosts.
-    /// `known_profile` and `known_pool` reject grants naming profiles or
-    /// pools that do not exist.
+    /// `known_profile` rejects profiles that do not exist; `pool_project`
+    /// answers a pool's project (None: no such pool).
     pub fn mint(
         &self,
         request: MintRequest,
         known_host: impl Fn(&str) -> bool,
         known_profile: impl Fn(&str) -> bool,
-        known_pool: impl Fn(&str) -> bool,
+        pool_project: impl Fn(&str) -> Option<String>,
     ) -> Result<Value> {
         let label = request.label.trim().to_owned();
         ensure!(
@@ -210,9 +230,26 @@ impl ServiceTokens {
                 && request
                     .pools
                     .iter()
-                    .all(|p| enginebox_agents::pools::valid_name(p) && known_pool(p)),
+                    .all(|p| enginebox_agents::pools::valid_name(p) && pool_project(p).is_some()),
             "pools must name at most 256 existing pools"
         );
+        if let Some(project) = &request.project {
+            ensure!(
+                enginebox_agents::pools::valid_project(project),
+                "project must be a project ID"
+            );
+            ensure!(
+                !request.pools.is_empty(),
+                "project restricts pool grants; name at least one pool"
+            );
+            ensure!(
+                request
+                    .pools
+                    .iter()
+                    .all(|p| pool_project(p).as_deref() == Some(project.as_str())),
+                "Every granted pool must belong to the token's project"
+            );
+        }
         for scope in &request.scopes {
             identifier(&scope.host_id, false)?;
             identifier(&scope.name, true)?;
@@ -270,6 +307,7 @@ impl ServiceTokens {
             profiles: request.profiles.into_iter().collect(),
             callback_secret: request.callback_secret,
             pools: request.pools.into_iter().collect(),
+            project: request.project,
         };
         self.save(&token)?;
         let public = token.public();
@@ -311,6 +349,29 @@ impl ServiceTokens {
     pub fn list(&self) -> Value {
         let tokens = self.tokens.lock().unwrap();
         json!({"tokens":tokens.values().map(Token::public).collect::<Vec<_>>()})
+    }
+    /// The listing with each token's pool grants also grouped by project
+    /// (`pool_grants: [{project, pools}]`; a deleted pool's project is null).
+    pub fn list_grouped(&self, project_of: impl Fn(&str) -> Option<String>) -> Value {
+        let tokens = self.tokens.lock().unwrap();
+        let views: Vec<Value> = tokens
+            .values()
+            .map(|t| {
+                let mut groups: BTreeMap<Option<String>, Vec<&str>> = BTreeMap::new();
+                for pool in &t.pools {
+                    groups.entry(project_of(pool)).or_default().push(pool);
+                }
+                let mut view = t.public();
+                view["pool_grants"] = json!(
+                    groups
+                        .into_iter()
+                        .map(|(project, pools)| json!({"project":project,"pools":pools}))
+                        .collect::<Vec<_>>()
+                );
+                view
+            })
+            .collect();
+        json!({"tokens":views})
     }
     pub fn revoke(&self, id: &str) -> Result<Value> {
         ensure!(valid_id(id), "Invalid service token ID");
@@ -365,14 +426,95 @@ mod tests {
             profiles: vec![],
             callback_secret: None,
             pools: vec![],
+            project: None,
         }
+    }
+    #[test]
+    fn a_project_restriction_limits_pool_grants_to_that_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let tokens = ServiceTokens::open(temp.path()).unwrap();
+        let projects = |p: &str| match p {
+            "alpha-workers" => Some("alpha".to_owned()),
+            "beta-workers" => Some("beta".to_owned()),
+            _ => None,
+        };
+        let restricted = |pools: &[&str], project: Option<&str>| {
+            let mut r = request(None);
+            r.scopes.clear();
+            r.pools = pools.iter().map(|p| p.to_string()).collect();
+            r.project = project.map(str::to_owned);
+            r
+        };
+        // Every granted pool must be in the project; a project needs pools.
+        assert!(
+            tokens
+                .mint(
+                    restricted(&["alpha-workers", "beta-workers"], Some("alpha")),
+                    |_| true,
+                    |_| true,
+                    projects
+                )
+                .is_err()
+        );
+        assert!(
+            tokens
+                .mint(restricted(&[], Some("alpha")), |_| true, |_| true, projects)
+                .is_err()
+        );
+        assert!(
+            tokens
+                .mint(
+                    restricted(&["alpha-workers"], Some("Bad_Project")),
+                    |_| true,
+                    |_| true,
+                    projects
+                )
+                .is_err()
+        );
+        let minted = tokens
+            .mint(
+                restricted(&["alpha-workers"], Some("alpha")),
+                |_| true,
+                |_| true,
+                projects,
+            )
+            .unwrap();
+        assert_eq!(minted["token"]["project"], "alpha");
+        let id = minted["token"]["id"].as_str().unwrap();
+        let token = tokens.tokens.lock().unwrap().get(id).unwrap().clone();
+        assert!(token.allows_pool(Operation::Start, "alpha-workers", Some("alpha")));
+        // A pool moved to another project is no longer reachable with it.
+        assert!(!token.allows_pool(Operation::Start, "alpha-workers", Some("beta")));
+        assert!(!token.sees_pool("alpha-workers", None));
+        // Without a restriction, the grant ignores projects (as before).
+        let open = tokens
+            .mint(
+                restricted(&["alpha-workers"], None),
+                |_| true,
+                |_| true,
+                projects,
+            )
+            .unwrap();
+        let id = open["token"]["id"].as_str().unwrap();
+        let token = tokens.tokens.lock().unwrap().get(id).unwrap().clone();
+        assert!(token.sees_pool("alpha-workers", Some("beta")));
+        let stored = std::fs::read_to_string(
+            temp.path()
+                .join("service-tokens")
+                .join(format!("{id}.json")),
+        )
+        .unwrap();
+        assert!(
+            !stored.contains("\"project\""),
+            "unset project is omitted for older releases"
+        );
     }
     #[test]
     fn secrets_are_hashed_shown_once_and_revocation_persists() {
         let temp = tempfile::tempdir().unwrap();
         let tokens = ServiceTokens::open(temp.path()).unwrap();
         let minted = tokens
-            .mint(request(None), |h| h == "worker", |_| false, |_| false)
+            .mint(request(None), |h| h == "worker", |_| false, |_| None)
             .unwrap();
         let secret = minted["secret"].as_str().unwrap().to_owned();
         let id = minted["token"]["id"].as_str().unwrap().to_owned();
@@ -409,20 +551,16 @@ mod tests {
         let tokens = ServiceTokens::open(temp.path()).unwrap();
         let mut unknown = request(None);
         unknown.profiles = vec!["verifier".into()];
-        assert!(
-            tokens
-                .mint(unknown, |_| true, |_| false, |_| false)
-                .is_err()
-        );
+        assert!(tokens.mint(unknown, |_| true, |_| false, |_| None).is_err());
         let mut weak = request(None);
         weak.callback_secret = Some("short".into());
-        assert!(tokens.mint(weak, |_| true, |_| true, |_| false).is_err());
+        assert!(tokens.mint(weak, |_| true, |_| true, |_| None).is_err());
         let mut granted = request(None);
         granted.profiles = vec!["verifier".into()];
         let key = "k".repeat(40);
         granted.callback_secret = Some(key.clone());
         let minted = tokens
-            .mint(granted, |_| true, |p| p == "verifier", |_| false)
+            .mint(granted, |_| true, |p| p == "verifier", |_| None)
             .unwrap();
         assert_eq!(minted["token"]["profiles"], json!(["verifier"]));
         assert_eq!(minted["token"]["has_callback_secret"], true);
@@ -436,7 +574,7 @@ mod tests {
         assert_eq!(token.callback_secret(), Some(key.as_str()));
         // A token without grants or a key keeps the original record shape.
         let plain = tokens
-            .mint(request(None), |_| true, |_| true, |_| false)
+            .mint(request(None), |_| true, |_| true, |_| None)
             .unwrap();
         let id = plain["token"]["id"].as_str().unwrap();
         let stored = std::fs::read_to_string(
@@ -474,13 +612,14 @@ mod tests {
                     profiles: BTreeSet::new(),
                     callback_secret: None,
                     pools: BTreeSet::new(),
+                    project: None,
                 };
                 tokens.save(&token).unwrap();
                 map.insert(id, token);
             }
         }
         tokens
-            .mint(request(None), |_| true, |_| true, |_| false)
+            .mint(request(None), |_| true, |_| true, |_| None)
             .unwrap();
         let map = tokens.tokens.lock().unwrap();
         assert_eq!(map.len(), MAX_TOKENS / 2 + 1);
@@ -504,25 +643,25 @@ mod tests {
         let tokens = ServiceTokens::open(temp.path()).unwrap();
         assert!(
             tokens
-                .mint(request(None), |_| false, |_| false, |_| false)
+                .mint(request(None), |_| false, |_| false, |_| None)
                 .is_err()
         );
         let mut empty = request(None);
         empty.operations.clear();
-        assert!(tokens.mint(empty, |_| true, |_| true, |_| false).is_err());
+        assert!(tokens.mint(empty, |_| true, |_| true, |_| None).is_err());
         assert!(
             tokens
                 .mint(
                     request(Some("2000-01-01T00:00:00Z".into())),
                     |_| true,
                     |_| true,
-                    |_| false
+                    |_| None
                 )
                 .is_err()
         );
         let mut bad = request(None);
         bad.scopes[0].name = "../other".into();
-        assert!(tokens.mint(bad, |_| true, |_| true, |_| false).is_err());
+        assert!(tokens.mint(bad, |_| true, |_| true, |_| None).is_err());
         assert!(
             serde_json::from_value::<MintRequest>(
                 json!({"label":"x","scopes":[],"operations":["hosts.admin"]})
