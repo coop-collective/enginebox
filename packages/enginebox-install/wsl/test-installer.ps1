@@ -24,7 +24,12 @@ using System;
 public static class EngineboxNativeStderrFixture {
   public static int Main(string[] args) {
     Console.Error.WriteLine("wsl: Failed to start the systemd user session for 'root'.");
-    Console.Out.WriteLine("{\"ok\":true}");
+    if (args.Length > 0 && args[0] == "stdin") {
+      using (var buffer = new System.IO.MemoryStream()) {
+        Console.OpenStandardInput().CopyTo(buffer);
+        Console.Out.WriteLine(Convert.ToBase64String(buffer.ToArray()));
+      }
+    } else { Console.Out.WriteLine("{\"ok\":true}"); }
     return args.Length > 0 && args[0] == "fail" ? 7 : 0;
   }
 }
@@ -40,6 +45,16 @@ public static class EngineboxNativeStderrFixture {
   $rejected=$false
   try { Invoke-Wsl -Arguments @('fail') | Out-Null } catch { $rejected=$_.Exception.Message -like '*exit 7*' -and $_.Exception.Message -like '*systemd user session*' }
   if (-not $rejected) { throw 'Nonzero native exits must still stop setup with their error output' }
+  $savedEncoding=$OutputEncoding
+  try {
+    $OutputEncoding=[Text.UnicodeEncoding]::new()
+    $value='fixture-'+[char]0x00e9
+    $encoded=Invoke-WslNative -Arguments @('stdin') -InputText $value
+    $bytes=[Convert]::FromBase64String(($encoded.Stdout -join '').Trim())
+    $expected=[Text.UTF8Encoding]::new($false).GetBytes($value+[Environment]::NewLine)
+    if ($encoded.ExitCode -ne 0 -or [Convert]::ToBase64String($bytes) -ne [Convert]::ToBase64String($expected)) { throw 'Native stdin must use exact UTF-8 bytes without a BOM' }
+    if ($OutputEncoding.CodePage -ne 1200) { throw 'Native stdin changed the caller encoding' }
+  } finally { $OutputEncoding=$savedEncoding }
   Remove-Item Function:\global:wsl.exe
   Write-Output 'PowerShell 5.1 parsing, controller validation and resource bounds passed.'
 } finally {
@@ -65,6 +80,8 @@ $global:EngineboxWslFixture.claimError=$null
 $global:EngineboxWslFixture.claimWarning=$false
 $global:EngineboxWslFixture.warnEveryCall=$false
 $global:EngineboxWslFixture.locationOverride=$null
+$global:EngineboxWslFixture.retryChoice='n'
+$global:EngineboxWslFixture.recoverEnrollmentOnRetry=$false
 function global:Get-ItemProperty {
   param($Path,$ErrorAction)
   if ($Path -ne 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*') { throw 'Unexpected registry lookup' }
@@ -87,6 +104,10 @@ function global:Read-Host {
   }
   $global:EngineboxWslFixture.prompts+=@($Prompt)
   if ($Prompt -eq 'Override existing? [Y/n]') { return $global:EngineboxWslFixture.overrideChoice }
+  if ($Prompt -eq 'Retry registration without reinstalling? [Y/n]') {
+    if ($global:EngineboxWslFixture.recoverEnrollmentOnRetry) { $global:EngineboxWslFixture.enrollmentError=$null }
+    return $global:EngineboxWslFixture.retryChoice
+  }
   if ($Prompt -like 'Controller address*' -and $global:EngineboxWslFixture.controllerChoice) { return $global:EngineboxWslFixture.controllerChoice }
   return ''
 }
@@ -275,6 +296,23 @@ try {
   try { & $flowScript -InstallDirectory $errorsRoot -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code } catch { $failed=$_.Exception.Message -like '*HTTP 409*' -and -not $_.Exception.Message.Contains($code) }
   $detail=Get-Content -Raw -LiteralPath (Join-Path $errorsRoot 'registration-error.txt')
   if (-not $failed -or $detail.Contains($code) -or -not $detail.Contains('[redacted credential]') -or $f.enrolled) { throw 'Registration failure detail must be useful and exclude credentials' }
+  # A rejected registration retries only enrollment. It keeps the saved ID,
+  # does not re-import Linux, and accepts a renewed secret for that exact ID.
+  $f.enrollmentError='Controller returned HTTP 400'; $f.retryChoice=''; $f.recoverEnrollmentOnRetry=$true
+  $f.secret=('a'*32)+'.'+('c'*64); $f.calls=@(); $beforeDownloads=$f.downloads
+  & $flowScript -InstallDirectory $errorsRoot -Resume -EnrollmentCode $code
+  if (-not $f.enrolled -or $f.code -ne $f.secret -or $f.pendingId -ne ('a'*32) -or $f.downloads -ne $beforeDownloads -or ($f.calls | Where-Object { $_ -like '--install*' -or $_ -like '--unregister*' })) { throw 'Registration retry must retain the installed runtime and saved identity' }
+  if (@($f.calls | Where-Object { $_ -like '* configure' }).Count -ne 1) { throw 'Registration retry repeated runtime configuration' }
+  $f.retryChoice='n'; $f.recoverEnrollmentOnRetry=$false; $f.enrollmentError=$null
+  # Pasting a dashboard password is rejected locally, then the user can paste
+  # the raw registration code into the same prompt without reinstalling.
+  $f.enrolled=$false; $f.pendingId=$null; $f.secret=$code; $f.calls=@()
+  & $flowScript -InstallDirectory $errorsRoot -Resume -EnrollmentCode 'fixture-dashboard-password'
+  if (-not $f.enrolled -or $f.code -ne $code -or ($f.calls | Where-Object { $_ -like '--install*' -or $_ -like '--unregister*' })) { throw 'Invalid local code should re-prompt without reinstallation' }
+  $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@()
+  & $flowScript -InstallDirectory $errorsRoot -Resume -EnrollmentCode $code -EnrollmentExpires 1
+  if (-not $f.enrolled -or $f.pendingId -ne ('a'*32) -or $f.downloads -ne $beforeDownloads) { throw 'Expired code must be replaced without changing identity or downloading Linux' }
+  $f.secret=$null
   $f.enrollmentError=$null; $f.pendingId=$null; $f.enrolled=$true
   $f.version=''; $f.calls=@(); $beforeStarts=$f.starts
   $rebootRoot=Join-Path $testRoot 'reboot'

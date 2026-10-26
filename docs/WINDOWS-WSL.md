@@ -85,6 +85,17 @@ credential-redacted copy to `registration-error.txt` beside the Windows setup
 receipt. A mismatched code reports the saved machine ID before attempting
 registration.
 
+The installer validates the raw machine code locally and re-prompts if a password
+or full install command was pasted. A rejected registration offers to retry with
+another code without repeating Linux import or runtime configuration. If a pending
+machine ID exists, renew that exact card's code. Input is sent to Linux as UTF-8
+without a BOM, regardless of the calling PowerShell session's output encoding.
+To resume an installer that has already exited, use the saved copy:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Enginebox\wsl-node\install.ps1" -Resume
+```
+
 It refuses an unrelated distribution named Enginebox, unrelated scheduled tasks,
 symlink/junction installation paths and changes to an existing identity's
 controller or budget. Existing Ubuntu distributions, Docker Desktop, global

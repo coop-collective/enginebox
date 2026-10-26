@@ -76,10 +76,7 @@ jobs:
       - name: Exercise real outbound Linux node and revoked-lease cleanup
         shell: pwsh
         run: |
-          $source=[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/packages/enginebox-install/wsl/test-node.py"))
-          wsl.exe -d EngineboxCI -u root --exec python3 -c 'import base64,pathlib,sys; pathlib.Path("/tmp/enginebox-node-proof.py").write_bytes(base64.b64decode(sys.argv[1]))' $source
-          if ($LASTEXITCODE) { throw 'Could not stage node test in disposable distro' }
-          wsl.exe -d EngineboxCI -u root --exec python3 /tmp/enginebox-node-proof.py
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-node.ps1
           if ($LASTEXITCODE) { throw 'Linux outbound node execution/cleanup qualification failed' }
       - name: Replace the disposable runtime and restore its preserved state
         shell: pwsh
