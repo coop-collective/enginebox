@@ -51,6 +51,84 @@ fn inventory(root: &Path) -> Result<Vec<Value>> {
 }
 
 impl Runtime {
+    /// A bounded preview at a command boundary, not a checkpoint or acceptance.
+    /// The writer lease and kernel census exclude both scheduled and orphaned
+    /// writers. Attached guests remain unsupported: their exclusive custody and
+    /// page-cache semantics must not be bypassed with a host-side copy.
+    pub fn workspace_export(&self, project: &str, name: &str) -> Result<Value> {
+        identifier(project)?;
+        identifier(name)?;
+        self.root()?;
+        self.verify_binding()?;
+        let _lease = state::lock(
+            &self
+                .config
+                .root
+                .join("workspaces")
+                .join(format!("{name}.lock")),
+            false,
+        )
+        .context("workspace-writer-busy")?;
+        crate::incus::ensure_detached(&self.config.root, name)
+            .context("workspace-attached-unqualified")?;
+        let w = self.workspace(name)?;
+        let internal = if self
+            .config
+            .root
+            .join("github")
+            .join(project)
+            .join("repository.json")
+            .exists()
+        {
+            crate::github::Repositories::new(&self.config.root)?
+                .current(project)?
+                .project
+        } else {
+            project.into()
+        };
+        ensure!(w.project == internal, "workspace-project-mismatch");
+        ensure!(w.status == "ready", "workspace-writer-busy");
+        let p = self.project(&internal)?;
+        self.owned_volume(&p)?;
+        self.verify_container(
+            &p,
+            &w.sandbox,
+            w.container.as_deref().context("Container missing")?,
+        )?;
+        self.probe(&w).context("workspace-writer-busy")?;
+        let directory = self
+            .project_dir(&internal)
+            .join("workspace-exports")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        state::private_dir(&directory)?;
+        let files = directory.join("source");
+        state::private_dir(&files)?;
+        // No native command can begin while this lease is held. The copy runs
+        // inside the verified mount namespace; Docker cp alone misses FUSE.
+        self.export_workspace_files(&w, &files)?;
+        self.probe(&w).context("workspace-writer-busy")?;
+        let entries = inventory(&files)?;
+        let tree_hash = state::digest(&json!(entries));
+        let revision = state::digest(&json!({"schema":1,"project":project,"workspace":name,
+            "sandbox":w.sandbox,"branch":w.branch,"treeHash":tree_hash}));
+        let manifest = json!({"schema":1,"authority":"local-layerfs-workspace","project":project,
+            "workspace":name,"revision":revision,"branch":w.branch,"sandbox":w.sandbox,
+            "consistency":"exclusive-command-boundary","treeHash":tree_hash,"entries":entries});
+        state::write_json(&directory.join("source.json"), &manifest)?;
+        let retained = directory.parent().context("Export parent")?.join(&revision);
+        if retained.exists() {
+            ensure!(
+                state::read_json(&retained.join("source.json"))? == manifest
+                    && inventory(&retained.join("source"))? == entries,
+                "Retained workspace export failed integrity check"
+            );
+            fs::remove_dir_all(&directory)?;
+        } else {
+            fs::rename(&directory, &retained)?;
+        }
+        Ok(json!({"revision":revision,"sourceRoot":retained.join("source"),"manifest":manifest}))
+    }
+
     /// Only a stable closed checkpoint or the owned main can supply a preview.
     pub fn dev_export(&self, project: &str, workspace: Option<&str>) -> Result<Value> {
         identifier(project)?;

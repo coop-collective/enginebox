@@ -14,7 +14,7 @@ it("mints bounded ephemeral relay credentials without exposing its provider key"
   expect(upstream).toHaveBeenCalledOnce();
   const [url, init] = upstream.mock.calls[0];
   expect(url).toBe("https://rtc.live.cloudflare.com/v1/turn/keys/test-key/credentials/generate-ice-servers");
-  expect(init?.redirect).toBe("error");
+  expect(init?.redirect).toBe("manual");
   expect(JSON.parse(String(init?.body))).toEqual({ ttl: 300 });
   expect(new Headers(init?.headers).get("authorization")).toBe("Bearer private-provider-token");
   expect(ice.iceTransportPolicy).toBe("relay");
@@ -46,6 +46,7 @@ it("redacts provider failures and rejects oversized, foreign, or incomplete resp
   const upstream = vi.spyOn(globalThis, "fetch");
   for (const response of [
     new Response(cloud.apiToken, { status: 403 }),
+    new Response(null, { status: 302, headers: { location: "https://foreign.example/collect" } }),
     new Response("x".repeat(17 * 1024)),
     Response.json({ iceServers: [{ ...relay, urls: "turn:foreign.example:3478" }] }),
     Response.json({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] }),
@@ -85,4 +86,14 @@ it("does not mint credentials without an authorized mode", async () => {
     machineIce(settings(cloud), undefined as never),
   ).rejects.toMatchObject({ status: 403 });
   expect(upstream).not.toHaveBeenCalled();
+});
+
+it("uses a request configuration accepted by the actual Worker runtime", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    // Construct in workerd before mocking the remote response. Node accepts
+    // redirect:error, but Workers rejects it before any network request.
+    new Request(url, init);
+    return Response.json({ iceServers: [relay] });
+  });
+  expect((await machineIce(settings(cloud), "control")).iceServers).toHaveLength(1);
 });

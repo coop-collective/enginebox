@@ -107,3 +107,17 @@ The opt-in test is [live_backend.rs](../packages/enginebox-storage-layerfs/tests
 The test requires `ENGINEBOX_LAYERFS_LIVE=1`, `ENGINEBOX_LAYERFS_LIVE_CONFIG`, `ENGINEBOX_LAYERFS_EBOX`, `ENGINEBOX_LAYERFS_SEED` (synthetic package/lockfile directory), and a fresh `ENGINEBOX_LAYERFS_REPORT` path. Build with the pinned root workspace and run the resulting Linux release test executable with `--exact real_checkout_lifecycle --ignored --nocapture` under an outer timeout. It leaves evidence and any interrupted workspace intact for ownership-checked cleanup after export.
 
 Actual results and remaining limits are recorded in [the backend validation report](reports/LAYERFS-BACKEND-VALIDATION.md). The earlier [LayerFS storage measurements](reports/LAYERFS-VALIDATION.md) and [Rust VM startup benchmarks](reports/RUST-BOOT-BENCHMARKS.md) have different workloads and timing boundaries.
+
+### Open-workspace development exports
+
+`workspace-export PROJECT WORKSPACE` produces an immutable, hashed development
+source batch from an open workspace at an exclusive command boundary. It acquires
+the same nonblocking writer lease as `exec`, rejects cross-project and attached
+workspaces, and requires the kernel census to contain only the expected init and
+LayerFS daemon with the recorded `/project` mount. It never kills a writer,
+checkpoints, closes or promotes the workspace. Repeated identical exports reuse
+the same revision directory. Busy or uncertain workspaces are refused and can be
+retried after the writer settles; attached Incus workspaces remain unqualified.
+See [leased environment previews](ENVIRONMENT-SERVICES.md#leased-open-workspace-previews)
+for the authenticated service lifecycle. This does not relax the closed-workspace
+contract of `dev-export --workspace` or expose arbitrary commands through HTTP.

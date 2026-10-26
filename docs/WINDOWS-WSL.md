@@ -33,6 +33,20 @@ a fresh runtime. The backup retains the previous identity, credentials, settings
 and LayerFS workspace data. Keep it private. A failed export prevents removal.
 Other WSL distributions are untouched.
 
+Ownership setup verifies that WSL registered Enginebox in this installation's
+directory. It can finish an interrupted import with no ownership marker, and a
+retry with the same Windows owner leaves the marker unchanged. The SID is passed
+as a non-secret argument; the Linux claim reads its input inside Linux. A different
+owner, a different registration directory, or configured state without an owner
+marker is refused. Ownership errors include the underlying WSL/native output.
+
+The image includes `libpam-systemd` and `dbus-user-session` so WSL can create
+root's systemd login session. Windows qualification checks the user manager and
+session bus after a cold boot and after replacement. All installer WSL calls
+separate stdout from stderr and check the native exit code. A startup warning
+from an older runtime cannot abort PowerShell setup or corrupt a JSON probe;
+nonzero command exits still stop setup and report the underlying error.
+
 Use a newly generated dashboard install command for a replacement. Choose **N**
 to continue the existing runtime and identity instead. Automatic startup uses
 `-Resume`, which never asks to replace an existing distribution. The installer
@@ -70,6 +84,20 @@ Registration errors include the underlying WSL/native error and save a bounded,
 credential-redacted copy to `registration-error.txt` beside the Windows setup
 receipt. A mismatched code reports the saved machine ID before attempting
 registration.
+
+The installer validates the raw machine code locally and re-prompts if a password
+or full install command was pasted. A rejected registration offers to retry with
+another code without repeating Linux import or runtime configuration. If a pending
+machine ID exists, renew that exact card's code. Input is sent to Linux as UTF-8
+without a BOM, regardless of the calling PowerShell session's output encoding.
+The helper also temporarily sets the console input encoding: Windows PowerShell
+5.1 can otherwise prepend a BOM when .NET Framework opens a native stdin pipe.
+The caller's console encoding is restored after each command.
+To resume an installer that has already exited, use the saved copy:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Enginebox\wsl-node\install.ps1" -Resume
+```
 
 It refuses an unrelated distribution named Enginebox, unrelated scheduled tasks,
 symlink/junction installation paths and changes to an existing identity's

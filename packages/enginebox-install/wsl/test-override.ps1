@@ -26,6 +26,8 @@ $disk=Join-Path $backup 'enginebox.tar'
 $receipt=Get-Content -Raw -LiteralPath (Join-Path $backup 'backup.json') | ConvertFrom-Json
 try {
   Invoke-Wsl -Arguments @('--install','--from-file',([IO.Path]::GetFullPath($Image)),'--name',$name,'--location',(Join-Path $root 'fresh'),'--version','2','--vhd-size','20GB','--no-launch')
+  Initialize-RuntimeOwnership $name (Join-Path $root 'fresh')
+  & (Join-Path $PSScriptRoot 'test-systemd.ps1') -Name $name
   $clean=@'
 import pathlib
 root=pathlib.Path('/var/lib/enginebox')

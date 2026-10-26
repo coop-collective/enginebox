@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node src/main.ts",
     "check": "tsc --noEmit",
-    "test": "node --test test/*.test.ts",
+    "test": "node --test test/*.test.ts test/*.test.mjs",
     "build": "tsc --noEmit"
   },
   "dependencies": {

@@ -29,7 +29,7 @@ RUN git init && git remote add origin https://github.com/Ephemeral-AI-Lab/layerf
  && npm --prefix sdk/js run build:native
 
 FROM node:24.21.0-bookworm@sha256:3d27e5c11e5786e309ec3e03f93ae536eb36e6e5eb3714d5eb3300a36157add0 AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus iptables ca-certificates curl git fuse3 bindfs util-linux python3 jq openssl \
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv libpam-systemd dbus dbus-user-session iptables ca-certificates curl git fuse3 bindfs util-linux python3 jq openssl \
  && install -m 0755 -d /etc/apt/keyrings \
  && curl --fail --location --proto '=https' https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
  && echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable' > /etc/apt/sources.list.d/docker.list \

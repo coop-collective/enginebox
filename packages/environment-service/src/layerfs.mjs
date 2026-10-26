@@ -10,9 +10,10 @@ export async function layerfsSource(env, stateRoot, run) {
   const [program, ...argv] = env.source.command;
   const value = JSON.parse(await run(program, argv, { timeout: 300000 }));
   const manifest = value.manifest;
-  check(/^[a-f0-9]{64}$/.test(value.revision) && manifest?.schema === 1 && manifest.authority === 'local-layerfs'
+  check(/^[a-f0-9]{64}$/.test(value.revision) && manifest?.schema === 1 && manifest.authority === (env.source.kind === 'workspace' ? 'local-layerfs-workspace' : 'local-layerfs')
     && manifest.revision === value.revision && manifest.project === env.source.project
     && (manifest.workspace ?? null) === (env.source.workspace ?? null), 'layerfs-export-provenance-mismatch');
+  if (env.source.kind === 'workspace') check(manifest.consistency === 'exclusive-command-boundary' && typeof manifest.sandbox === 'string' && typeof manifest.branch === 'string', 'workspace-consistency-proof-required');
   check(Array.isArray(manifest.entries) && manifest.entries.length <= 100000
     && createHash('sha256').update(JSON.stringify(manifest.entries)).digest('hex') === manifest.treeHash, 'layerfs-export-inventory-mismatch');
   check(typeof value.sourceRoot === 'string' && isAbsolute(value.sourceRoot)

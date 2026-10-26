@@ -65,8 +65,10 @@ jobs:
           if (-not $version -or $version -lt [version]'2.5.7') { throw 'WSL 2.5.7 or newer is required for qualification.' }
           wsl.exe --install --from-file "$PWD/.state/wsl-release/enginebox.wsl" --name EngineboxCI --location "$PWD/.state/wsl-ci" --version 2 --vhd-size 20GB --no-launch
           if ($LASTEXITCODE) { throw 'WSL2 import/boot failed' }
-          [Security.Principal.WindowsIdentity]::GetCurrent().User.Value | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl claim
-          if ($LASTEXITCODE) { throw 'Windows-to-Linux ownership claim failed' }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-ownership.ps1 -Location "$PWD/.state/wsl-ci"
+          if ($LASTEXITCODE) { throw 'Real Windows PowerShell 5.1 ownership/recovery qualification failed' }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-systemd.ps1
+          if ($LASTEXITCODE) { throw 'Real WSL systemd root session qualification failed' }
           '{"controller":"https://fixture.invalid","cpu":2,"memory_gib":4,"disk_gib":20}' | wsl.exe -d EngineboxCI -u root --exec /usr/local/sbin/enginebox-wsl configure
           if ($LASTEXITCODE) { throw 'Real WSL LayerFS/isolation qualification failed' }
           wsl.exe -d EngineboxCI -u root --exec cat /var/lib/enginebox/qualification.json
@@ -74,10 +76,7 @@ jobs:
       - name: Exercise real outbound Linux node and revoked-lease cleanup
         shell: pwsh
         run: |
-          $source=[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/packages/enginebox-install/wsl/test-node.py"))
-          wsl.exe -d EngineboxCI -u root --exec python3 -c 'import base64,pathlib,sys; pathlib.Path("/tmp/enginebox-node-proof.py").write_bytes(base64.b64decode(sys.argv[1]))' $source
-          if ($LASTEXITCODE) { throw 'Could not stage node test in disposable distro' }
-          wsl.exe -d EngineboxCI -u root --exec python3 /tmp/enginebox-node-proof.py
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-node.ps1
           if ($LASTEXITCODE) { throw 'Linux outbound node execution/cleanup qualification failed' }
       - name: Replace the disposable runtime and restore its preserved state
         shell: pwsh
@@ -91,6 +90,7 @@ jobs:
           wsl.exe -d EngineboxCI -u root --exec findmnt --target /var/lib/enginebox
           wsl.exe -d EngineboxCI -u root --exec systemctl status enginebox-docker.service --no-pager
           wsl.exe -d EngineboxCI -u root --exec journalctl -u enginebox-docker.service -n 80 --no-pager
+          wsl.exe -d EngineboxCI -u root --exec journalctl -b -u user@0.service -u systemd-logind.service -n 80 --no-pager
           wsl.exe -d EngineboxCI -u root --exec cat /proc/meminfo
           exit 0
       - name: Remove only the disposable CI distribution

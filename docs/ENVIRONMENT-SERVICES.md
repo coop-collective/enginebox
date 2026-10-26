@@ -293,3 +293,103 @@ branch preview before promotion, an external GitHub commit after promotion, and
 main-service refresh with persistent data retained. No Actions workflow or CD job
 ran for the app. See `packages/enginebox-storage-layerfs/tests/live-github-dev.py`
 and `test/live-project-probe.mjs` for the explicit opt-in qualification helpers.
+
+## Leased open-workspace previews
+
+`POST /v1/environments/previews` creates a separate draft development environment
+from `{host, project, workspace, task, ttlSeconds}`. The existing private bearer
+credential authenticates this API; it is not an account-admission API. A trusted
+application adapter must derive the host/project/workspace/task binding from its
+authorized task and keep this credential and returned lease outside project code
+and browsers. Requests cannot select commands, paths or supply replacement source.
+`ttlSeconds` is an integer from 30 through 3600. Creation of the same live binding
+is idempotent and does not renew it.
+
+The result contains `id`, `host`, `project`, `workspace`, `task`, `lease`,
+`revision` (an integer lease metadata version), `expiresAt`, `status`, `healthy`,
+`environment`, `sourceRevision`, `desiredSourceRevision`, `urls`, and an optional
+`error`. A queued draft has no environment, source revision or URL yet. Read with
+`GET /v1/environments/previews/:id` or list with `GET /v1/environments/previews`.
+Renew through POST `{id, lease, expectedRevision, ttlSeconds, retry?}`; revoke through POST
+`{id, lease, expectedRevision, revoke:true}`. Stale revisions, other leases, expired
+leases and revoked leases are rejected. An explicit boolean `retry:true` on renewal
+retries a failed preparation at the same source/template revision, retaining the
+prior healthy draft until its replacement is ready. Ordinary renewal only extends
+the lease; `retry` is rejected on revocation. Re-creating an expired binding allocates a
+new identity and lease. These endpoints are authenticated even for reads.
+
+Add an operator-owned `workspaceCommand` to the existing bootstrap host:
+
+```json
+{"id":"node", "command":["/opt/enginebox/export-main"],
+ "workspaceCommand":["/opt/enginebox/export-workspace"]}
+```
+
+The wrapper receives exactly `PROJECT WORKSPACE` and executes:
+
+```sh
+exec /opt/enginebox/current/bin/ebox storage layerfs \
+  --config /etc/enginebox/layerfs.json workspace-export "$1" "$2"
+```
+
+The exporter takes the existing workspace writer lease and checks its exact
+container/mount and kernel process census. It exports uncommitted source only when
+the workspace is open, ready, unattached, and has no native writer or orphaned
+command. It leaves the workspace open and never checkpoints or promotes it. The
+immutable manifest binds project, workspace, sandbox, branch, every source byte and
+`consistency: "exclusive-command-boundary"`. This is a coherent export **between
+completed commands**, not an arbitrary scan during concurrent writes. The old
+`dev-export --workspace` still requires a closed checkpoint.
+
+A running command reports `workspace-writer-busy`; an attached Incus guest reports
+`workspace-attached-unqualified`. The last healthy preview keeps serving while the
+next poll retries. A long-running native CLI must finish its bounded command before
+another batch can appear. Live saves during that command and attached-guest live
+projection remain unsupported. Administrator writes outside the writer lease are
+outside this consistency contract. The API does not add a general remote shell or
+another source authority.
+
+Drafts reuse repository template preparation, resource/port policy, file update
+mode, dependency replacement and readiness. Each draft owns its source, process,
+route and `/data`, separate from accepted development and other drafts. Source
+application is still atomic per file; Vite owns debouncing and HMR. `sourceRevision`
+is applied source provenance, not evidence of compilation or a rendered frame.
+Expiry withdraws routes even while an export or preparation is in flight, fences
+subsequent activation, then removes only owned draft containers when that bounded
+operation settles. Revocation immediately fences source reads and routing before
+waiting for cleanup. Restart reloads leases and cleans expired drafts. Private
+source/data receipts remain for diagnosis; at most 256 lease records are retained,
+and operators must archive old records under a stopped supervisor to reclaim this
+registry capacity. Export retention is operator-managed; unchanged trees reuse the
+same immutable export.
+
+Routes use the configured bootstrap access policy. Use authenticated gateway routes
+or a private gateway behind an application ingress that authorizes **both HTTP and
+WebSocket Upgrade**. Public bootstrap access explicitly permits direct route access;
+an application login by itself does not protect that route. Lease timers require a
+running supervisor; static gateway files cannot independently expire while it is
+offline. A private application ingress must check expiry on admission and fail
+closed if its authority is unavailable. No native credentials,
+provider home or Docker socket is mounted into the draft container.
+
+`test/previews.test.mjs` uses a simulated Docker runner for lifecycle, concurrent
+lease mutations, provenance rejection, removal/rename, recovery, failed preparation,
+expiry during an in-flight export and authenticated HTTP behavior. The opt-in Linux
+`live_backend.rs` harness separately exercises real open workspace exports and busy
+writer rejection. Running the simulated tests alone is not Linux/LayerFS, Docker
+process, Vite HMR or browser qualification.
+
+For an ingress on a non-default port, bootstrap `urlPort` (integer 1–65535) adds
+that port to status URLs and `ENGINEBOX_PUBLIC_URL`, allowing the project's dev
+server to configure the same public HMR port. Omitting it preserves ordinary
+HTTP/HTTPS default ports. It does not allocate an ingress listener or change the
+container's internal/loopback service ports; provision that listener separately.
+
+Install the matching Linux CLI and environment-service source as separate,
+versioned operator components; the controller/dashboard release builder does not
+activate this optional service. Restarting the environment supervisor retains its
+private state and Docker-supervised application processes. For rollback to an
+older supervisor, revoke all draft leases first and remove unsupported
+`workspaceCommand`/`urlPort` configuration; otherwise its older route/config
+validator cannot load the new draft registrations. Do not restore old provider
+credentials or stop native workspaces as part of this update.

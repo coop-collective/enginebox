@@ -141,6 +141,11 @@ createServer(async (req, res) => {
     return send(200, { ok: true });
   }
   if (req.url === "/__test/contributor-online") { contributors = contributors.map(n => ({...n,enrolled:true,online:true,budget:{cpu:2,memory_gib:4,disk_gib:20},tools:{workspace:true,backend:'wsl2-layerfs'}})); return send(200,{ok:true}); }
+  if (req.url === '/__test/contributor-inventory') {
+    const base={enrolled:true,revoked:false,blocked:false,online:false,budget:{cpu:4,memory_gib:8,disk_gib:50},workloads:{ci:true,agents:true},tools:{workspace:true,backend:'wsl2-layerfs'}};
+    contributors=[{...base,id:'1'.repeat(32),label:'Render RTX',online:true},{...base,id:'2'.repeat(32),label:'Build workstation'},{...base,id:'3'.repeat(32),label:'Retired machine',revoked:true},...Array.from({length:12},(_,i)=>({...base,id:'f'+i.toString(16).padStart(31,'0'),label:`Windows setup ${i+1}`,enrolled:false,tools:{}}))];
+    return send(200,{ok:true});
+  }
   if (req.url === "/__test/storage-requests") return send(200, storageRequests);
   if (req.url === "/__test/mode") {
     mode = data.mode;
@@ -217,7 +222,8 @@ createServer(async (req, res) => {
     if (!node || node.enrolled || node.revoked) return send(400,{error:'Only a pending registration can be renewed.'});
     return send(200,{id:node.id,code:`${node.id}.${'c'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+3600});
   }
-  if (/^\/v1\/contributors\/[a-f0-9]{32}\/revoke$/.test(req.url)) { contributors=contributors.map(n=>({...n,revoked:true}));return send(200,{revoked:true}); }
+  const revokeContributor=req.url.match(/^\/v1\/contributors\/([a-f0-9]{32})\/revoke$/);
+  if (revokeContributor) { contributors=contributors.map(n=>n.id===revokeContributor[1]?{...n,revoked:true}:n);return send(200,{revoked:true}); }
   if (req.url === '/v1/environments/routes' && req.method === 'POST') {
     environmentRoutes = environmentRoutes.filter(r => r.id !== (data.remove ?? data.id));
     if (!data.remove) environmentRoutes.push(data);

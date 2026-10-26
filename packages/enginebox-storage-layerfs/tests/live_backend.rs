@@ -159,6 +159,56 @@ fn real_checkout_lifecycle() -> Result<()> {
             "-c",
             "set -eu; test ! -e only-a.txt; printf 'agent-b\\n' > only-b.txt",
         ])?;
+        let draft = h.call(&["workspace-export", "fixture", "a"])?;
+        ensure!(
+            draft["manifest"]["authority"] == "local-layerfs-workspace"
+                && draft["manifest"]["consistency"] == "exclusive-command-boundary",
+            "Missing live export proof"
+        );
+        let draft_root = PathBuf::from(draft["sourceRoot"].as_str().context("Export root")?);
+        ensure!(
+            fs::read_to_string(draft_root.join("only-a.txt"))? == "agent-a\n"
+                && !draft_root.join("only-b.txt").exists(),
+            "Draft isolation failed"
+        );
+        ensure!(
+            h.call(&["workspace-export", "foreign", "a"]).is_err(),
+            "Cross-project export accepted"
+        );
+        ensure!(
+            h.call(&["dev-export", "fixture", "--workspace", "a"])
+                .is_err(),
+            "Closed exporter accepted open workspace"
+        );
+        ensure!(
+            state::read_json(&config.root.join("workspaces/a.json"))?["last_checkpoint"].is_null(),
+            "Preview checkpointed workspace"
+        );
+        h.call(&[
+            "exec",
+            "a",
+            "--",
+            "sh",
+            "-c",
+            "mv only-a.txt renamed-a.txt; printf changed > hello.txt",
+        ])?;
+        let renamed = h.call(&["workspace-export", "fixture", "a"])?;
+        let renamed_root = PathBuf::from(renamed["sourceRoot"].as_str().context("Export root")?);
+        ensure!(
+            !renamed_root.join("only-a.txt").exists()
+                && renamed_root.join("renamed-a.txt").exists()
+                && draft["revision"] != renamed["revision"]
+                && draft_root.join("only-a.txt").exists(),
+            "Revision rename or immutable retention failed"
+        );
+        h.call(&[
+            "exec",
+            "a",
+            "--",
+            "sh",
+            "-c",
+            "mv renamed-a.txt only-a.txt; printf 'base\n' > hello.txt",
+        ])?;
         ensure!(
             h.call(&["close", "a"]).is_err(),
             "Dirty close discarded changes"
@@ -186,6 +236,10 @@ fn real_checkout_lifecycle() -> Result<()> {
         ensure!(
             h.call(&["checkpoint", "a"]).is_err(),
             "Concurrent mutation of busy workspace accepted"
+        );
+        ensure!(
+            h.call(&["workspace-export", "fixture", "a"]).is_err(),
+            "Concurrent writer export accepted"
         );
         let b = h.clone();
         let second = std::thread::spawn(move || {
