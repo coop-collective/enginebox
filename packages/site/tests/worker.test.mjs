@@ -23,7 +23,8 @@ test('dashboard requests retain credentials, query and streamed body on the fixe
 });
 
 test('API, assets and health requests reach the controller without path rewrites', async () => {
-  for (const path of ['/api/session', '/api/node/enroll', '/api/node/poll', '/api/contributors/enrollments', '/_next/static/chunks/app.js', '/healthz']) {
+  for (const path of ['/api/session', '/api/node/enroll', '/api/node/poll', '/api/contributors/enrollments', '/_next/static/chunks/app.js', '/healthz',
+    '/.well-known/oauth-authorization-server', '/.well-known/oauth-protected-resource', '/oauth/register', '/oauth/token', '/v1/agent-runs', '/v1/pools/p/agent-runs']) {
     const url = 'https://example.com' + path;
     const response = await worker.fetch(new Request(url), { DASHBOARD: { async fetch(request) {
       assert.equal(request.url, url);
@@ -34,7 +35,8 @@ test('API, assets and health requests reach the controller without path rewrites
 });
 
 test('website and unknown routes stay with static assets, including upstream-looking input', async () => {
-  for (const path of ['/', '/docs/quickstart/', '/pricing/', '/missing', '/dashboard/unknown', '/api-other', '/?url=http://169.254.169.254/']) {
+  for (const path of ['/', '/docs/quickstart/', '/pricing/', '/missing', '/dashboard/unknown', '/api-other', '/?url=http://169.254.169.254/',
+    '/.well-known/security.txt', '/oauthx', '/v1']) {
     const request = new Request('https://example.com' + path);
     const response = await worker.fetch(request, { ASSETS: { async fetch(input) {
       assert.equal(input, request);

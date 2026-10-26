@@ -11,8 +11,12 @@ export default {
       });
     }
     const dashboard = url.pathname === '/dashboard/';
+    // Connected apps (docs/OAUTH.md): OAuth discovery, the authorization server and the
+    // token-scoped agent-run routes are the dashboard's too.
     const controller = dashboard || url.pathname.startsWith('/api/') ||
-      url.pathname.startsWith('/_next/') || url.pathname === '/healthz';
+      url.pathname.startsWith('/_next/') || url.pathname === '/healthz' ||
+      url.pathname.startsWith('/.well-known/oauth-') || url.pathname.startsWith('/oauth/') ||
+      url.pathname.startsWith('/v1/');
     if (!controller) return env.ASSETS.fetch(request);
 
     // The native dashboard is a single page at /. Preserve the origin, query,
