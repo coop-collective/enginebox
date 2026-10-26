@@ -6,7 +6,12 @@
   "account_id": "e40385e6d96d5cad8df33b1ef3e3694a",
   "compatibility_date": "2026-09-01",
   "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "404-page", "run_worker_first": true },
-  "services": [{ "binding": "DASHBOARD", "service": "enginebox-dashboard-edge" }],
+  // ARTIFACTS: the Artifacts gateway (packages/artifacts-gateway), RPC only;
+  // deploy the gateway first.
+  "services": [
+    { "binding": "DASHBOARD", "service": "enginebox-dashboard-edge" },
+    { "binding": "ARTIFACTS", "service": "enginebox-artifacts-gateway", "entrypoint": "ArtifactsGateway" }
+  ],
   "observability": { "enabled": true, "traces": { "enabled": true, "head_sampling_rate": 0.1 } },
   "routes": [{ "pattern": "enginebox.coopcollective.dev", "custom_domain": true }]
 }

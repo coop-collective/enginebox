@@ -60,3 +60,73 @@ test('an unavailable dashboard fails without serving a misleading static page', 
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.doesNotMatch(await response.text(), /private diagnostic/);
 });
+
+const envelopeHeaders = {
+  'content-type': 'application/json',
+  'x-enginebox-timestamp': '1800000000',
+  'x-enginebox-nonce': '0'.repeat(32),
+  'x-enginebox-signature': 'v1=' + 'a'.repeat(64),
+};
+
+test('signed repository requests are forwarded over RPC with their headers and body, never cached', async () => {
+  const calls = [];
+  const env = { ARTIFACTS: { async invoke(envelope) {
+    calls.push(envelope);
+    return { status: 201, body: { token: { id: 't1' } } };
+  } } };
+  const body = JSON.stringify({ namespace: 'enginebox-alpha', repo: 'game', scope: 'write', ttl: 720 });
+  const response = await worker.fetch(new Request('https://example.com/_artifacts/tokens.create', { method: 'POST', headers: envelopeHeaders, body }), env);
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await response.json(), { token: { id: 't1' } });
+  assert.deepEqual(calls, [{
+    method: 'POST', path: '/tokens.create', timestamp: '1800000000', nonce: '0'.repeat(32), signature: 'v1=' + 'a'.repeat(64), body,
+  }]);
+  for (const op of ['repos.create', 'repos.get', 'repos.list', 'tokens.revoke']) {
+    const forwarded = await worker.fetch(new Request(`https://example.com/_artifacts/${op}`, { method: 'POST', headers: envelopeHeaders, body: '{}' }), env);
+    assert.equal(forwarded.status, 201, op);
+    assert.equal(calls.at(-1).path, `/${op}`);
+  }
+  // The gateway's verdict, a 401 included, passes through unchanged.
+  const refused = await worker.fetch(new Request('https://example.com/_artifacts/repos.get', { method: 'POST', headers: envelopeHeaders, body: '{}' }),
+    { ARTIFACTS: { async invoke() { return { status: 401, body: { error: 'unauthorized' } }; } } });
+  assert.deepEqual([refused.status, await refused.json()], [401, { error: 'unauthorized' }]);
+});
+
+test('anything else under /_artifacts is refused before the gateway; an unavailable gateway is a 503', async () => {
+  const env = { ARTIFACTS: { invoke() { throw new Error('must not be called'); } }, ASSETS: { fetch() { throw new Error('must not be static'); } } };
+  for (const [method, path, status] of [
+    ['GET', '/_artifacts/repos.list', 405],
+    ['PUT', '/_artifacts/repos.list', 405],
+    ['OPTIONS', '/_artifacts/repos.list', 405],
+    ['GET', '/_artifacts', 405],
+    ['POST', '/_artifacts', 404],
+    ['POST', '/_artifacts/', 404],
+    ['POST', '/_artifacts/repos.delete', 404],
+    ['POST', '/_artifacts/repos.list/extra', 404],
+    ['POST', '/_artifacts/repos.list?x=1', 404],
+  ]) {
+    const response = await worker.fetch(new Request('https://example.com' + path, method === 'POST' ? { method, headers: envelopeHeaders, body: '{}' } : { method }), env);
+    assert.equal(response.status, status, `${method} ${path}`);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+  }
+  const browser = await worker.fetch(new Request('https://example.com/_artifacts/repos.list', { method: 'POST', headers: { ...envelopeHeaders, origin: 'https://evil.example' }, body: '{}' }), env);
+  assert.equal(browser.status, 403);
+  const big = await worker.fetch(new Request('https://example.com/_artifacts/repos.create', { method: 'POST', headers: envelopeHeaders, body: 'x'.repeat(16385) }), env);
+  assert.equal(big.status, 413);
+  const down = await worker.fetch(new Request('https://example.com/_artifacts/repos.list', { method: 'POST', headers: envelopeHeaders, body: '{}' }),
+    { ARTIFACTS: { invoke() { throw new Error('private diagnostic'); } } });
+  assert.equal(down.status, 503);
+});
+
+test('paths that only look like /_artifacts stay static', async () => {
+  for (const path of ['/_artifactsx', '/_artifacts.json', '/x/_artifacts/repos.list']) {
+    const request = new Request('https://example.com' + path, { method: 'GET' });
+    const response = await worker.fetch(request, { ASSETS: { async fetch(input) {
+      assert.equal(input, request);
+      return new Response('static', { status: 404 });
+    } }, ARTIFACTS: { invoke() { throw new Error('must not be called'); } } });
+    assert.equal(response.status, 404, path);
+    assert.equal(await response.text(), 'static');
+  }
+});

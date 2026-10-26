@@ -6,7 +6,7 @@
   "license": "SEE LICENSE IN ../../LICENSE",
   "scripts": {
     "configure": "node configure.mjs",
-    "check": "node --check src/index.mjs && node --check configure.mjs",
+    "check": "node --check src/gateway.mjs && node --check configure.mjs",
     "test": "node --test test/*.test.mjs",
     "dry-run": "wrangler deploy --dry-run --config ../../.state/artifacts-gateway/wrangler.json",
     "deploy": "wrangler deploy --config ../../.state/artifacts-gateway/wrangler.json",

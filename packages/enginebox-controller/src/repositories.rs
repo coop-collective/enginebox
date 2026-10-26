@@ -209,7 +209,7 @@ impl WorkerConfig {
     fn validate(&self) -> Result<()> {
         if !valid_gateway_url(&self.url) {
             return Err(invalid(
-                "url must be the gateway's https origin on its custom domain (no path, credentials, query or workers.dev).",
+                "url must be an https URL such as https://<site>/_artifacts (no credentials, query, fragment or workers.dev).",
             ));
         }
         if !valid_secret(&self.secret) {
@@ -250,7 +250,20 @@ fn valid_gateway_url(value: &str) -> bool {
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && url.path() == "/"
+        && (url.path() == "/"
+            || url
+                .path()
+                .trim_end_matches('/')
+                .split('/')
+                .skip(1)
+                .all(|segment| {
+                    !segment.is_empty()
+                        && segment != "."
+                        && segment != ".."
+                        && segment
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                }))
         && value.len() <= 256
 }
 fn valid_secret(secret: &str) -> bool {
@@ -928,7 +941,8 @@ pub mod mock {
     //! five operations from memory.
     use super::*;
     pub const SECRET: &str = "test-only-gateway-secret-0123456789abcdef";
-    pub const URL: &str = "https://artifacts-gateway.example.test";
+    /// The site Worker's forwarding prefix, as deployed.
+    pub const URL: &str = "https://site.example.test/_artifacts";
     #[derive(Default)]
     pub struct State {
         /// (namespace, name) -> (id, default_branch, last_push_at)
@@ -938,6 +952,8 @@ pub mod mock {
         /// (operation, body) of every accepted call.
         pub calls: Vec<(String, Value)>,
         pub nonces: std::collections::BTreeSet<String>,
+        /// Every URL the controller posted to.
+        pub urls: Vec<String>,
         pub rejected: usize,
         pub fail: bool,
     }
@@ -984,6 +1000,8 @@ pub mod mock {
             if s.fail {
                 anyhow::bail!("connection refused");
             }
+            s.urls.push(url.to_owned());
+            // The site Worker forwards `/_artifacts/<op>` as path `/<op>`.
             let path = url.strip_prefix(URL).context("unexpected URL")?;
             let header = |name: &str| {
                 headers
@@ -1156,7 +1174,8 @@ mod tests {
         for bad in [
             json!({"url":"http://gw.example.com","secret":mock::SECRET}),
             json!({"url":"https://gw.acct.workers.dev","secret":mock::SECRET}),
-            json!({"url":"https://gw.example.com/path","secret":mock::SECRET}),
+            json!({"url":"https://gw.example.com/a%2Fb","secret":mock::SECRET}),
+            json!({"url":"https://gw.example.com/_artifacts?x=1","secret":mock::SECRET}),
             json!({"url":"https://user:pw@gw.example.com","secret":mock::SECRET}),
             json!({"url":"https://gw.example.com","secret":"short"}),
             json!({"url":"https://gw.example.com","secret":mock::SECRET,"namespace_prefix":"Bad_Prefix"}),
@@ -1169,10 +1188,10 @@ mod tests {
             );
         }
         let put = repos
-            .put_worker(&json!({"url":"https://gw.example.com/","secret":mock::SECRET}))
+            .put_worker(&json!({"url":"https://gw.example.com/_artifacts/","secret":mock::SECRET}))
             .unwrap();
         assert_eq!(put["backend"]["kind"], "artifacts_worker");
-        assert_eq!(put["backend"]["url"], "https://gw.example.com");
+        assert_eq!(put["backend"]["url"], "https://gw.example.com/_artifacts");
         assert_eq!(put["backend"]["namespace_prefix"], "enginebox");
         assert_eq!(put["backend"]["secret"], "[redacted]");
         for view in [put, repos.get_worker(), repos.backend_view()] {
@@ -1189,7 +1208,7 @@ mod tests {
         let (reopened, _) = open(temp.path());
         assert_eq!(
             reopened.backend_view()["backend"]["url"],
-            "https://gw.example.com"
+            "https://gw.example.com/_artifacts"
         );
         assert_eq!(reopened.delete_worker().unwrap()["deleted"], true);
         assert_eq!(reopened.get_worker()["backend"]["configured"], false);
@@ -1228,6 +1247,10 @@ mod tests {
             assert_eq!(
                 state.rejected, 0,
                 "the fake gateway verified every signature"
+            );
+            assert_eq!(
+                state.urls[0], "https://site.example.test/_artifacts/repos.create",
+                "the operation joins the base URL's path"
             );
             assert_eq!(
                 state.calls[0],

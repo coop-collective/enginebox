@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { handle, mapError, ReplayGuard, sign, WINDOW_SECONDS } from "../src/index.mjs";
+import { invoke, mapError, ReplayGuard, sign, WINDOW_SECONDS } from "../src/gateway.mjs";
 
 const SECRET = "test-only-gateway-secret-0123456789abcdef";
 const NOW = 1_800_000_000;
-const ORIGIN = "https://artifacts.example.test";
 const REMOTE = (ns, name) => `https://acct.artifacts.cloudflare.net/git/${ns}/${name}.git`;
 const artifactsError = (code) => Object.assign(new Error(`${code}: detail with art_v1_secret`), { name: "ArtifactsError", code });
 
@@ -92,40 +91,26 @@ function setup() {
 }
 
 let counter = 0;
-async function signed(op, body, { secret = SECRET, timestamp = NOW, nonce, tamper, headers = {}, method = "POST", host = ORIGIN } = {}) {
+/** The envelope the site Worker forwards over RPC, signed as the controller signs it. */
+async function signed(op, body, { secret = SECRET, timestamp = NOW, nonce, tamper, method = "POST" } = {}) {
   const raw = JSON.stringify(body);
   nonce ??= (++counter).toString(16).padStart(32, "0");
   const signature = await sign(secret, method, `/${op}`, String(timestamp), nonce, raw);
-  return new Request(`${host}/${op}`, {
-    method,
-    headers: {
-      "content-type": "application/json",
-      "x-enginebox-timestamp": String(timestamp),
-      "x-enginebox-nonce": nonce,
-      "x-enginebox-signature": `v1=${signature}`,
-      ...headers,
-    },
-    body: method === "GET" ? undefined : tamper ?? raw,
-  });
+  return { method, path: `/${op}`, timestamp: String(timestamp), nonce, signature: `v1=${signature}`, body: tamper ?? raw };
 }
-const call = async (env, request) => {
-  const response = await handle(request, env, NOW);
-  return { status: response.status, body: await response.json(), headers: response.headers };
-};
+const call = async (env, envelope) => invoke(envelope, env, NOW);
 
 test("a signed request is served; expired, future, replayed, tampered or wrongly keyed ones answer 401 without detail", async () => {
   const { env } = setup();
   const ok = await call(env, await signed("repos.list", { namespace: "enginebox-alpha" }));
   assert.equal(ok.status, 200);
-  assert.equal(ok.headers.get("cache-control"), "no-store");
-  assert.equal(ok.headers.get("access-control-allow-origin"), null);
   const cases = [
     await signed("repos.list", { namespace: "enginebox-alpha" }, { timestamp: NOW - WINDOW_SECONDS - 1 }),
     await signed("repos.list", { namespace: "enginebox-alpha" }, { timestamp: NOW + WINDOW_SECONDS + 1 }),
     await signed("repos.list", { namespace: "enginebox-alpha" }, { tamper: JSON.stringify({ namespace: "enginebox-alpha", cursor: "x" }) }),
     await signed("repos.list", { namespace: "enginebox-alpha" }, { secret: "another-secret-of-sufficient-length-000" }),
     await signed("repos.list", { namespace: "enginebox-alpha" }, { nonce: "not-a-nonce" }),
-    new Request(`${ORIGIN}/repos.list`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+    { method: "POST", path: "/repos.list", body: "{}" },
   ];
   for (const request of cases) {
     const result = await call(env, request);
@@ -134,7 +119,7 @@ test("a signed request is served; expired, future, replayed, tampered or wrongly
   }
   // A path signed for one operation cannot be replayed against another.
   const moved = await signed("repos.list", { namespace: "enginebox-alpha" });
-  const swapped = new Request(`${ORIGIN}/repos.get`, { method: "POST", headers: moved.headers, body: JSON.stringify({ namespace: "enginebox-alpha" }) });
+  const swapped = { ...moved, path: "/repos.get" };
   assert.equal((await call(env, swapped)).status, 401);
   // The same nonce is accepted once within the window.
   const nonce = "f".repeat(32);
@@ -154,17 +139,22 @@ test("a signed request is served; expired, future, replayed, tampered or wrongly
   assert.equal(env.REPLAY.store.size, 0);
 });
 
-test("only signed POSTs to the five operations on the custom domain: no GET, CORS, workers.dev, query or oversized body", async () => {
+test("only POST envelopes for the five operations, with a string body of at most 16 KiB", async () => {
   const { env } = setup();
   const body = { namespace: "enginebox-alpha" };
   assert.equal((await call(env, await signed("repos.list", body, { method: "GET" }))).status, 405);
-  assert.equal((await call(env, new Request(`${ORIGIN}/repos.list`, { method: "OPTIONS" }))).status, 405);
-  assert.equal((await call(env, await signed("repos.list", body, { headers: { origin: "https://evil.example" } }))).status, 403);
-  assert.equal((await call(env, await signed("repos.list", body, { host: "https://gw.acct.workers.dev" }))).status, 404);
   assert.equal((await call(env, await signed("repos.delete", body))).status, 404);
-  assert.equal((await call(env, new Request(`${ORIGIN}/repos.list?x=1`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }))).status, 404);
+  assert.equal((await call(env, { ...(await signed("repos.list", body)), body: { namespace: "enginebox-alpha" } })).status, 400);
+  assert.equal((await call(env, null)).status, 400);
   const big = await signed("repos.create", { namespace: "enginebox-alpha", name: "x", description: "d".repeat(20000) });
   assert.equal((await call(env, big)).status, 413);
+});
+
+test("the Worker module has no HTTP surface beyond refusing", async () => {
+  const source = await import("node:fs/promises").then((fs) => fs.readFile(new URL("../src/index.mjs", import.meta.url), "utf8"));
+  assert.match(source, /class ArtifactsGateway extends WorkerEntrypoint/);
+  assert.match(source, /status: 404/);
+  assert.doesNotMatch(source, /invoke\(await request/);
 });
 
 test("namespaces are restricted to the configured prefix and to provisioned bindings", async () => {
@@ -224,8 +214,8 @@ test("binding errors map to codes, never to their messages", async () => {
   for (const [code, status, error] of cases) {
     const response = mapError(code ? artifactsError(code) : new Error("boom art_v1_secret"));
     assert.equal(response.status, status);
-    const text = await response.text();
-    assert.deepEqual(JSON.parse(text), { error });
+    const text = JSON.stringify(response.body);
+    assert.deepEqual(response.body, { error });
     assert.ok(!text.includes("art_v1_"));
   }
   const { env, alpha } = setup();

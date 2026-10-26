@@ -1,6 +1,6 @@
 # Project repositories
 
-Engine Box can host Git repositories per [project](QUEUE.md#pools), so agents running in Engine Box workspaces clone and push without anyone's personal GitHub account. Repositories live in [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) (beta), reached through the **Artifacts gateway**: a small Worker (`packages/artifacts-gateway`) that holds Artifacts bindings and answers only requests the controller signs. Engine Box stores no Cloudflare API token. A GitHub App backend is planned next behind the same interface.
+Engine Box can host Git repositories per [project](QUEUE.md#pools), so agents running in Engine Box workspaces clone and push without anyone's personal GitHub account. Repositories live in [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) (beta), reached through the **Artifacts gateway**: a small Worker (`packages/artifacts-gateway`) that holds Artifacts bindings and answers only requests the controller signs. The gateway has no hostname; the controller posts to the site Worker at `https://<site>/_artifacts/<op>`, which forwards each request over a service binding (RPC) and holds no secret. Engine Box stores no Cloudflare API token. A GitHub App backend is planned next behind the same interface.
 
 This is separate from the optional [GitHub sync](GITHUB-SYNC.md) and from LayerFS project storage: a hosted repository is an ordinary Git remote that agents use directly.
 
@@ -14,44 +14,53 @@ This is separate from the optional [GitHub sync](GITHUB-SYNC.md) and from LayerF
 
 ## Setup
 
-You need a Cloudflare account on the **Workers Paid** plan (Artifacts is not available on Workers Free; Artifacts operations and storage are billed, see [pricing](https://developers.cloudflare.com/artifacts/platform/pricing/)), Wrangler signed in to that account (`pnpm --filter @enginebox/artifacts-gateway exec wrangler login`), and a hostname on a zone in that account for the gateway's custom domain.
+You need a Cloudflare account on the **Workers Paid** plan (Artifacts is not available on Workers Free; Artifacts operations and storage are billed, see [pricing](https://developers.cloudflare.com/artifacts/platform/pricing/)) and Wrangler signed in to that account. **Deploy order: the gateway first, then the site** (the site's service binding needs the gateway's `ArtifactsGateway` entrypoint to exist).
 
-1. **Generate the deploy configuration** (written privately to `.state/artifacts-gateway/wrangler.json`; nothing account-specific is committed):
+1. **Gateway configuration** (written privately to `.state/artifacts-gateway/wrangler.json`; nothing account-specific is committed). It has no route, `workers_dev: false`, `preview_urls: false`, one `artifacts` binding per project and the `ReplayGuard` Durable Object that remembers request nonces:
 
    ```sh
    ENGINEBOX_ARTIFACTS_ACCOUNT_ID=<32-hex account ID> \
-   ENGINEBOX_ARTIFACTS_HOSTNAME=artifacts.example.com \
    ENGINEBOX_ARTIFACTS_PROJECTS=default,alpha \
    pnpm --filter @enginebox/artifacts-gateway configure
    ```
 
-   Optional: `ENGINEBOX_ARTIFACTS_NAMESPACE_PREFIX` (default `enginebox`), `ENGINEBOX_ARTIFACTS_WORKER_NAME` (default `enginebox-artifacts-gateway`). The file has `workers_dev: false`, `preview_urls: false`, the custom domain route, one `artifacts` binding per project, and the `ReplayGuard` Durable Object that remembers request nonces.
+   Optional: `ENGINEBOX_ARTIFACTS_NAMESPACE_PREFIX` (default `enginebox`), `ENGINEBOX_ARTIFACTS_WORKER_NAME` (default `enginebox-artifacts-gateway`; the site's binding names this service).
 
-2. **Deploy and set the shared secret on the Worker:**
+2. **Deploy the gateway and set its secret:**
 
    ```sh
-   pnpm --filter @enginebox/artifacts-gateway dry-run
+   pnpm --filter @enginebox/artifacts-gateway run dry-run
    pnpm --filter @enginebox/artifacts-gateway run deploy
-   openssl rand -hex 32 > /tmp/gateway-secret   # keep it private; delete after step 3
+   openssl rand -hex 32 > /tmp/gateway-secret   # keep it private; delete after step 4
    pnpm --filter @enginebox/artifacts-gateway run secret < /tmp/gateway-secret
    ```
 
-3. **Configure the controller** with the owner token (the same secret):
+3. **Deploy the site** (`packages/site/wrangler.jsonc` binds `ARTIFACTS` to service `enginebox-artifacts-gateway`, entrypoint `ArtifactsGateway`):
+
+   ```sh
+   pnpm --filter enginebox-site run deploy
+   ```
+
+4. **Configure the controller** with the owner token (the same secret; the URL is the site's `/_artifacts` prefix):
 
    ```sh
    curl -X PUT "$ENGINEBOX_API/v1/repository-backends/artifacts-worker" \
      -H "Authorization: Bearer $ENGINEBOX_OWNER_TOKEN" -H "Content-Type: application/json" \
-     -d "{\"url\":\"https://artifacts.example.com\",\"namespace_prefix\":\"enginebox\",\"secret\":\"$(cat /tmp/gateway-secret)\"}"
+     -d "{\"url\":\"https://<site>/_artifacts\",\"namespace_prefix\":\"enginebox\",\"secret\":\"$(cat /tmp/gateway-secret)\"}"
    rm /tmp/gateway-secret
    ```
 
-The secret is write-only on the controller: stored in owner-only private state (`repositories/backends/artifacts-worker.json`, mode 0600, never in Git), never returned and never logged. `GET` answers the redacted view; `DELETE` removes the configuration (records stay, and operations that need the backend answer 409 until it is configured again). While repositories exist, a new `PUT` may replace the URL and secret but not the prefix. To rotate the secret, set the new value on the Worker, then `PUT` it on the controller (requests fail with 502 in between).
+The secret is write-only on the controller: stored in owner-only private state (`repositories/backends/artifacts-worker.json`, mode 0600, never in Git), never returned and never logged. The site Worker never sees it. `GET` answers the redacted view; `DELETE` removes the configuration (records stay, and operations that need the backend answer 409 until it is configured again). While repositories exist, a new `PUT` may replace the URL and secret but not the prefix. To rotate the secret, set the new value on the gateway, then `PUT` it on the controller (requests fail with 502 in between).
 
-To add a project later, rerun step 1 with the longer `ENGINEBOX_ARTIFACTS_PROJECTS` list and `deploy` again.
+To add a project later, rerun step 1 with the longer `ENGINEBOX_ARTIFACTS_PROJECTS` list and deploy the gateway again (the site needs no change).
 
 ## Gateway protocol
 
-The gateway answers only `POST` with a JSON body (at most 16 KiB) on its custom domain. Every request carries `X-EngineBox-Timestamp` (unix seconds), `X-EngineBox-Nonce` (32 lowercase hex) and `X-EngineBox-Signature: v1=<hex HMAC-SHA256(secret, canonical)>`, where `canonical` is `v1\nPOST\n<path>\n<timestamp>\n<nonce>\n<hex SHA-256 of the body>`. The timestamp must be within ±300 seconds, each nonce is accepted once (the `ReplayGuard` Durable Object remembers it for 600 seconds; only correctly signed requests reach it), and the comparison is constant time. Any failure answers `401 {"error":"unauthorized"}` without detail. Other requests: `GET`/`OPTIONS` 405, any `Origin` header 403, workers.dev hosts and unknown paths 404. Responses carry `Cache-Control: no-store` and no CORS headers. The Worker logs operation, namespace and status only.
+The controller posts the JSON body (at most 16 KiB) to `https://<site>/_artifacts/<op>` with `X-EngineBox-Timestamp` (unix seconds), `X-EngineBox-Nonce` (32 lowercase hex) and `X-EngineBox-Signature: v1=<hex HMAC-SHA256(secret, canonical)>`, where `canonical` is `v1\nPOST\n/<op>\n<timestamp>\n<nonce>\n<hex SHA-256 of the body>`.
+
+The site Worker accepts only `POST /_artifacts/<op>` for the five operations (other methods 405, other paths under `/_artifacts` 404, any `Origin` header 403, bodies over 16 KiB 413), and calls the gateway's RPC method `invoke({method, path: "/<op>", timestamp, nonce, signature, body})` with the body text unchanged. It returns the gateway's `{status, body}` with `Cache-Control: no-store` and no CORS headers (503 if the gateway is unreachable). Paths such as `/_artifactsx` stay with the static site.
+
+The gateway (`ArtifactsGateway`, a `WorkerEntrypoint`; its `fetch` answers 404) verifies inside itself: the timestamp must be within ±300 seconds, each nonce is accepted once (the `ReplayGuard` Durable Object remembers it for 600 seconds; only correctly signed envelopes reach it), and the comparison is constant time. Any failure answers `401 {"error":"unauthorized"}` without detail. It logs operation, namespace and status only.
 
 | Path | Body | Result |
 |---|---|---|
