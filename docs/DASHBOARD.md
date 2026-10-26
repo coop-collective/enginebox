@@ -4,7 +4,8 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 
 ## What is implemented
 
-- Sidebar navigation for Fleet overview, Agents and Templates. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
+- Sidebar navigation for Compute, Agents, Templates, Storage, Environments, GitHub and Connected apps. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
+- **Compute** combines configured VM hosts and enrolled Windows workers in one machine list. Pending and revoked registrations stay collapsed. Add machine issues the Windows installer command; CPU/memory/disk allowances are selected on that PC. The online count includes both inventories; VM resource cards and VM allocation controls use only VM hosts. Worker allowances are not physical host utilization or additional VM capacity. Either inventory remains visible if the other fails, with a visible error.
 - Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size. The top CPU card shows allocated cores and percentage, not CPU utilization. Host memory usage is total minus available memory, clamped to the reported total.
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.
 - Allocating a workspace from a matching ready, paused reserve, with an explicit cold-start fallback. Completed operations show the actual startup mode and ready time reported by the API. Availability is advisory; another request can claim a ready instance before submission.
@@ -16,9 +17,9 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 - Asynchronous operation status, error messages, loading states, empty fleet instructions and responsive mobile layouts.
 - A separate operator sign-in, an eight-hour signed HttpOnly session, and exact Origin checks for login, logout and mutations.
 
-The page reads `/v1/fleet` every ten seconds while signed in. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. Infrastructure jobs cannot be cancelled through the dashboard. There is no multi-user account system.
+The page reads `/v1/fleet` and `/v1/contributors` every ten seconds while signed in and visible. Refresh updates both inventories. Registration changes refresh the worker list immediately. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. Infrastructure jobs cannot be cancelled through the dashboard. There is no multi-user account system.
 
-The assigned-workspace count excludes unmanaged bases and pool reserves. The instance inventory still shows all of them, with reserve state clearly marked. Claimed reserves keep their Incus VM ID; the requested workspace name appears above that ID, and lifecycle requests always use the actual VM ID. Host cards show each configured reserve's ready/preparing/target counts and refill errors. Paused reserves retain their memory allocation.
+The assigned-workspace count excludes unmanaged bases and pool reserves. The instance inventory still shows all of them, with reserve state clearly marked. Claimed reserves keep their Incus VM ID; the requested workspace name appears above that ID, and lifecycle requests always use the actual VM ID. Each VM host’s **Details** shows its configured reserve's ready/preparing/target counts and refill errors. Paused reserves retain their memory allocation.
 
 Warm matching compares template and resolved CPU/RAM/disk requirements, so a custom allocation can match a reserve prepared under a named preset. Sizing prefers the selected host's `host_resources` requirements when present. Cold capacity uses the API's available CPU, memory, disk and instance-count budgets. Disk admission includes the requested root disk plus RAM size and 2 GiB of checkpoint overhead. The backend enforces all limits and readiness checks.
 

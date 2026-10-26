@@ -8,7 +8,7 @@ async function signIn(page: Page) {
   await page.getByLabel("Operator password").fill("fixture-dashboard-password");
   await page.getByRole("button", { name: "Open dashboard" }).click();
   await expect(
-    page.getByRole("heading", { name: "Fleet overview." }),
+    page.getByRole("heading", { name: "Compute." }),
   ).toBeVisible();
 }
 test.beforeEach(async ({ request }) => {
@@ -54,7 +54,7 @@ test("live inventory, template creation and all lifecycle actions follow asynchr
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await signIn(page);
-  await expect(page.getByText("SSH connection timed out.")).toBeVisible();
+  await expect(page.getByText("SSH connection timed out.").first()).toBeVisible();
   const base = page.getByRole("row").filter({ hasText: "ebox-native-base" });
   await expect(base.getByText("Read only")).toBeVisible();
   await expect(base.getByRole("button")).toHaveCount(0);
@@ -111,7 +111,7 @@ test("failed jobs, empty fleet and API errors are visible", async ({
   });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "Add your first host" }),
+    page.getByText("No machines connected yet", { exact: true }),
   ).toBeVisible();
   await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "error" },
@@ -168,14 +168,14 @@ test("top resource cards distinguish CPU allocation from actual host memory usag
   const cpu = page.locator(".stat-card").filter({ hasText: "CPU allocated" });
   await expect(cpu.locator("strong")).toHaveText("12 / 32");
   await expect(cpu.locator("small")).toHaveText(
-    "37.5% allocated · logical cores",
+    "37.5% allocated · VM hosts",
   );
   const memory = page
     .locator(".stat-card")
-    .filter({ hasText: "Host memory used" });
+    .filter({ hasText: "VM host memory used" });
   await expect(memory.locator("strong")).toHaveText("24 GiB / 128 GiB");
   await expect(memory.locator("small")).toHaveText(
-    "18.8% used · across online hosts",
+    "18.8% used · online VM hosts",
   );
 });
 
@@ -212,9 +212,10 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   await signIn(page);
   const assigned = page
     .locator(".stat-card")
-    .filter({ hasText: "Assigned workspaces" });
+    .filter({ hasText: "VM workspaces" });
   await expect(assigned.locator("strong")).toHaveText("2");
   await expect(assigned).toContainText("1 ready in reserve");
+  await page.getByRole("listitem", { name: "Machine Build machine", exact: true }).locator("summary").filter({ hasText: "Details" }).click();
   await expect(
     page.getByText("1 ready · 1 preparing · target 2"),
   ).toBeVisible();
