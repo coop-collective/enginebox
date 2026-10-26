@@ -71,7 +71,8 @@ export async function machineIce(env: Env, mode: MachineMode): Promise<MachineIc
     (config.iceTransportPolicy === undefined || config.iceTransportPolicy === "relay" || config.iceTransportPolicy === "all"), "Invalid machine relay configuration", 503);
   try {
     const response = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${config.keyId}/credentials/generate-ice-servers`, {
-      method: "POST", redirect: "error", signal: AbortSignal.timeout(5000),
+      // Workers accepts manual redirects; the status check below rejects 3xx.
+      method: "POST", redirect: "manual", signal: AbortSignal.timeout(5000),
       headers: { authorization: `Bearer ${config.apiToken}`, "content-type": "application/json" },
       body: JSON.stringify({ ttl }),
     });
