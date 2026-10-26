@@ -5,7 +5,10 @@ $tokens=$null; $errors=$null
 if ($errors.Count) { $errors | Format-List; throw 'PowerShell syntax failure' }
 # Load helpers from a .ps1 copy; no host setup may execute during this test.
 $fixture=Join-Path $env:TEMP ('enginebox-installer-'+[Guid]::NewGuid()+'.ps1')
-$nativeFixturePath=$fixture+'.exe'
+$nativeFixtureDirectory=$fixture+'.native'
+$nativeFixturePath=Join-Path $nativeFixtureDirectory 'wsl.exe'
+$savedPath=$env:PATH
+New-Item -ItemType Directory -Path $nativeFixtureDirectory | Out-Null
 Copy-Item -LiteralPath $path -Destination $fixture
 try {
   . $fixture
@@ -37,7 +40,10 @@ public static class EngineboxNativeStderrFixture {
   $reproduced=$false
   try { $null=(& $nativeFixturePath ok 2>&1) } catch { $reproduced=$true }
   if (-not $reproduced) { throw 'Native stderr fixture did not reproduce the PowerShell 5.1 failure' }
-  function global:wsl.exe { $input | & $nativeFixturePath @args }
+  # Resolve a real native executable, not a function shim: a shim introduces
+  # another PowerShell scope that can change the native-pipeline encoding.
+  $env:PATH=$nativeFixtureDirectory+[IO.Path]::PathSeparator+$savedPath
+  if ((Get-Command wsl.exe).Source -ne $nativeFixturePath) { throw 'Native fixture did not take precedence on PATH' }
   $result=Invoke-WslNative -Arguments @('ok')
   if ($result.ExitCode -ne 0 -or -not (($result.Stdout -join "`n") | ConvertFrom-Json).ok -or -not ($result.Stderr -join "`n").Contains('systemd user session')) { throw 'Native stdout and stderr must stay separate' }
   $json=Invoke-Wsl -Arguments @('ok') | Out-String | ConvertFrom-Json
@@ -55,12 +61,13 @@ public static class EngineboxNativeStderrFixture {
     if ($encoded.ExitCode -ne 0 -or [Convert]::ToBase64String($bytes) -ne [Convert]::ToBase64String($expected)) { throw ('Native stdin fixture bytes differ: actual='+[BitConverter]::ToString($bytes)+' expected='+[BitConverter]::ToString($expected)) }
     if ($OutputEncoding.CodePage -ne 1200) { throw 'Native stdin changed the caller encoding' }
   } finally { $OutputEncoding=$savedEncoding }
-  Remove-Item Function:\global:wsl.exe
+  $env:PATH=$savedPath
   Write-Output 'PowerShell 5.1 parsing, controller validation and resource bounds passed.'
 } finally {
-  Remove-Item Function:\global:wsl.exe -ErrorAction SilentlyContinue
+  $env:PATH=$savedPath
   Remove-Item -LiteralPath $fixture -Force
   Remove-Item -LiteralPath $nativeFixturePath -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $nativeFixtureDirectory -Force -ErrorAction SilentlyContinue
 }
 
 # Exercise the actual installer orchestration with Windows effects replaced by
