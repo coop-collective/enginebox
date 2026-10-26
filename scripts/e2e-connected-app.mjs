@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // End-to-end check of the connected-app contract: an OAuth client (shaped like
-// Ideator's EngineBox dispatcher) connects to an Engine Box dashboard, starts
+// a typical connected app's run dispatcher) connects to an Engine Box dashboard, starts
 // pool runs, polls them to completion, verifies a signed callback, refreshes,
 // revokes, and confirms the revoked token is refused.
 //
@@ -15,7 +15,7 @@
 //   cd packages/dashboard && EB_BASE=http://127.0.0.1:13000 EB_PASSWORD=... \
 //     EB_API=http://127.0.0.1:18765 EB_OWNER_TOKEN=$OWNER EB_CREATE_POOL=1 \
 //     EB_CALLBACK_URL=https://callbacks.example.com/enginebox \
-//     IDEATOR_CLIENT=/path/to/ideator/packages/api/src/enginebox/client.ts \
+//     EB_CLIENT_MODULE=/path/to/your-app/enginebox-client.ts \
 //     node --import tsx ../../scripts/e2e-connected-app.mjs
 //
 // Against a real Engine Box: EB_BASE=https://<dashboard origin>, EB_POOL=<an
@@ -33,7 +33,7 @@
 //   EB_CALLBACK_URL    callback URL put on one run; EB_SINK_PORT (default 18790) is the
 //                      loopback listener for the OAuth redirect and dev callback deliveries
 //   EB_PROVIDER        provider for runs (default "claude")
-//   IDEATOR_CLIENT     path to Ideator's src/enginebox/client.ts; its startRun/getRun/
+//   EB_CLIENT_MODULE   optional path to an app's own client module; its startRun/getRun/
 //                      cancelRun/listRuns are used for the run calls (needs --import tsx)
 //
 // No token, code, verifier or secret is ever printed.
@@ -86,11 +86,11 @@ const sink = createServer((req, res) => {
 await new Promise((r) => sink.listen(SINK_PORT, "127.0.0.1", r));
 
 // ------------------------------------------------------------- run client
-// Ideator's own client when available, else the same requests inline.
+// The app's own client module when given, else the same requests inline.
 let client;
-if (env.IDEATOR_CLIENT) {
-  client = await import(env.IDEATOR_CLIENT);
-  console.log("using Ideator's client.ts for run calls");
+if (env.EB_CLIENT_MODULE) {
+  client = await import(env.EB_CLIENT_MODULE);
+  console.log("using the given client module for run calls");
 } else {
   const base = (t) => `${t.base_url}/v1/${t.pool ? `pools/${encodeURIComponent(t.pool)}` : `hosts/${encodeURIComponent(t.host)}/instances/${encodeURIComponent(t.instance)}`}/agent-runs`;
   const send = async (t, method, url, body) => {
@@ -109,7 +109,7 @@ if (env.IDEATOR_CLIENT) {
     cancelRun: async (_f, t, id) => (await send(t, "POST", `${base(t)}/${id}/cancel`, {})).run,
     listRuns: async (_f, t) => (await send(t, "GET", `${t.base_url}/v1/agent-runs`)).runs ?? [],
   };
-  console.log("using the inline client (set IDEATOR_CLIENT to use Ideator's)");
+  console.log("using the inline client (set EB_CLIENT_MODULE to use an app's own)");
 }
 const fetcher = (input, init) => fetch(input, init);
 
@@ -151,11 +151,11 @@ try {
   );
   const meta = as.json;
 
-  // ----------------------------------------------------------- 2. registration (Ideator's exact body)
+  // ----------------------------------------------------------- 2. registration (a typical confidential client's body)
   const reg = await getJson(meta.registration_endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ client_name: "Ideator", redirect_uris: [REDIRECT_URI], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "client_secret_basic", scope: "agent-runs" }),
+    body: JSON.stringify({ client_name: "Example Connected App", redirect_uris: [REDIRECT_URI], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "client_secret_basic", scope: "agent-runs" }),
   });
   must("dynamic client registration (RFC 7591) issues a confidential client", reg.res.status === 201 && typeof reg.json?.client_id === "string" && typeof reg.json?.client_secret === "string");
   const clientId = reg.json.client_id;
@@ -189,7 +189,7 @@ try {
     const signedIn = await formPost([["request", requestId], ["action", "sign_in"], ["password", env.EB_PASSWORD]]);
     const cookie = (signedIn.headers.get("set-cookie") ?? "").split(";")[0];
     const consent = await signedIn.text();
-    must("sign-in sets a session and shows the consent screen", !!cookie && /Connect “Ideator”/.test(consent));
+    must("sign-in sets a session and shows the consent screen", !!cookie && /Connect “Example Connected App”/.test(consent));
     step("consent offers the pool", consent.includes(`name="pool" value="${POOL}"`), POOL);
     const approved = await formPost([["request", requestId], ["action", "approve"], ["pool", POOL]], cookie);
     must("approving redirects to the registered URI", approved.status === 303 && (approved.headers.get("location") ?? "").startsWith(REDIRECT_URI));
@@ -206,8 +206,8 @@ try {
   const grants = tok.json.enginebox_grants ?? [];
   const poolGrant = grants.find((g) => g.kind === "pool" && g.pool === POOL);
   step("enginebox_grants lists the pool with kind, profile and profiles", !!poolGrant && "profile" in poolGrant && Array.isArray(poolGrant.profiles), JSON.stringify(grants.map(({ kind, pool, host, instance, profile }) => ({ kind, pool, host, instance, profile }))));
-  // Ideator's parseGrants keeps an entry with a string `pool` (or host + ebox- instance).
-  step("Ideator's grant parser would keep it", grants.some((g) => typeof g.pool === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(g.pool)));
+  // A client that keeps entries with a string `pool` (or host + ebox- instance) would keep it.
+  step("a strict grant parser would keep it", grants.some((g) => typeof g.pool === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(g.pool)));
   const callbackSecret = tok.json.enginebox_callback_secret;
   step("the code exchange returns the connection's callback key", typeof callbackSecret === "string" && callbackSecret.length >= 32);
   let access = tok.json.access_token;
@@ -215,9 +215,9 @@ try {
   const target = () => ({ base_url: BASE, token: access, pool: POOL });
 
   // ----------------------------------------------------------- 5. pool runs
-  const runEnv = { HQ_URL: "https://ideator.example", HQ_TOKEN: `hqa_${b64url(randomBytes(24))}`, HQ_TASK_ID: "task_e2e", HQ_MACHINE: "enginebox:org_e2e", HQ_ORG: "org_e2e" };
+  const runEnv = { APP_URL: "https://app.example", APP_TOKEN: `apt_${b64url(randomBytes(24))}`, APP_TASK_ID: "task_e2e", APP_ORG: "org_e2e" };
   const key = `task_e2e:${Date.now()}`;
-  const prompt = `[ideator ${key}] Run Ideator (HQ) task task_e2e: connected-app e2e`;
+  const prompt = `[e2e ${key}] Run task task_e2e: connected-app e2e`;
   const startInput = { provider: PROVIDER, prompt, workdir: ".", timeout_seconds: 600, env: runEnv, idempotency_key: key };
   const run1 = await client.startRun(fetcher, target(), startInput);
   step("a pool start with env and idempotency_key is accepted as queued", run1?.status === "queued" && !!run1.id, `status ${run1?.status}`);
@@ -230,14 +230,14 @@ try {
     const r = await getJson(`${BASE}/v1/pools/${POOL}/agent-runs`, {
       method: "POST",
       headers: { authorization: `Bearer ${access}`, "content-type": "application/json" },
-      body: JSON.stringify({ provider: PROVIDER, prompt: `[ideator ${key}:cb] callback run`, workdir: ".", timeout_seconds: 600, idempotency_key: `${key}:cb`, callback: { url: env.EB_CALLBACK_URL } }),
+      body: JSON.stringify({ provider: PROVIDER, prompt: `[e2e ${key}:cb] callback run`, workdir: ".", timeout_seconds: 600, idempotency_key: `${key}:cb`, callback: { url: env.EB_CALLBACK_URL } }),
     });
     run2 = r.json?.run;
     step("a pool start with a callback is accepted", r.res.status === 202 && !!run2?.id, `HTTP ${r.res.status}${r.json?.error ? `: ${r.json.error}` : ""}`);
   }
 
   // Cancel a run while it is still queued behind the others (unplaced).
-  const run3 = await client.startRun(fetcher, target(), { ...startInput, prompt: `[ideator ${key}:x] cancel me`, idempotency_key: `${key}:x` });
+  const run3 = await client.startRun(fetcher, target(), { ...startInput, prompt: `[e2e ${key}:x] cancel me`, idempotency_key: `${key}:x` });
   const cancelled = await client.cancelRun(fetcher, target(), run3.id);
   let c3 = cancelled;
   for (let i = 0; i < 40 && !["cancelled", "failed", "succeeded"].includes(c3?.status); i++) {
@@ -256,9 +256,9 @@ try {
   }
   step("the run moves queued -> running -> succeeded", done?.status === "succeeded" && seen.has("running"), [...seen].join(" -> "));
   step("the finished run names its workspace, session and result", !!done?.host_id && !!done?.name && /^[0-9a-f-]{36}$/.test(done?.native_session_id ?? "") && done?.result?.exit_code === 0 && done?.result?.timed_out === false, `${done?.host_id}/${done?.name}`);
-  step("env values never come back (names only)", JSON.stringify(done).includes("HQ_TOKEN") && !JSON.stringify(done).includes(runEnv.HQ_TOKEN));
+  step("env values never come back (names only)", JSON.stringify(done).includes("APP_TOKEN") && !JSON.stringify(done).includes(runEnv.APP_TOKEN));
   const listed = await client.listRuns(fetcher, target());
-  step("the run list finds the run by its prompt preview (Ideator's lost-answer recovery)", listed.some((r) => r.id === run1.id && typeof r.task === "string" && r.task.includes(`[ideator ${key}]`)));
+  step("the run list finds the run by its prompt preview (lost-answer recovery)", listed.some((r) => r.id === run1.id && typeof r.task === "string" && r.task.includes(`[e2e ${key}]`)));
 
   if (run2) {
     let r2 = null;
@@ -285,7 +285,7 @@ try {
   }
 
   // Resume: through the pool (pinned to the session's workspace) works; the workspace route needs a workspace grant.
-  const resumeInput = { ...startInput, prompt: `[ideator ${key}:r1] resume`, idempotency_key: `${key}:r1`, resume_id: done?.native_session_id };
+  const resumeInput = { ...startInput, prompt: `[e2e ${key}:r1] resume`, idempotency_key: `${key}:r1`, resume_id: done?.native_session_id };
   const viaPool = await client.startRun(fetcher, target(), resumeInput);
   let rr = viaPool;
   for (let i = 0; i < 120 && !["succeeded", "failed", "cancelled"].includes(rr?.status); i++) {
@@ -312,7 +312,7 @@ try {
   const fresh = await client.getRun(fetcher, target(), run1.id);
   step("the new access token reads the run", fresh?.id === run1.id);
 
-  // ----------------------------------------------------------- 7. revoke (Ideator's order: refresh, then access)
+  // ----------------------------------------------------------- 7. revoke (refresh, then access)
   for (const [token, hint] of [[refresh, "refresh_token"], [access, "access_token"]]) {
     const r = await postForm(meta.revocation_endpoint, { token, token_type_hint: hint });
     step(`revoking the ${hint} answers 200`, r.res.status === 200);

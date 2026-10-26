@@ -198,7 +198,7 @@ keep strict one-time refresh tokens.
 ## End-to-end check
 
 `scripts/e2e-connected-app.mjs` drives the whole connected-app flow the way an
-OAuth client such as Ideator's dispatcher does: discovery, registration, sign-in
+OAuth client such as an app's run dispatcher does: discovery, registration, sign-in
 and consent, the code exchange, pool runs with `env` and `idempotency_key`
 (queued, running, succeeded, replay, cancel, resume through the pool), a signed
 callback, refresh, revocation and the 401 afterwards. It never prints a token.
