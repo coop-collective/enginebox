@@ -40,6 +40,13 @@ as a non-secret argument; the Linux claim reads its input inside Linux. A differ
 owner, a different registration directory, or configured state without an owner
 marker is refused. Ownership errors include the underlying WSL/native output.
 
+The image includes `libpam-systemd` and `dbus-user-session` so WSL can create
+root's systemd login session. Windows qualification checks the user manager and
+session bus after a cold boot and after replacement. All installer WSL calls
+separate stdout from stderr and check the native exit code. A startup warning
+from an older runtime cannot abort PowerShell setup or corrupt a JSON probe;
+nonzero command exits still stop setup and report the underlying error.
+
 Use a newly generated dashboard install command for a replacement. Choose **N**
 to continue the existing runtime and identity instead. Automatic startup uses
 `-Resume`, which never asks to replace an existing distribution. The installer

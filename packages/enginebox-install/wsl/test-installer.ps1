@@ -5,6 +5,7 @@ $tokens=$null; $errors=$null
 if ($errors.Count) { $errors | Format-List; throw 'PowerShell syntax failure' }
 # Load helpers from a .ps1 copy; no host setup may execute during this test.
 $fixture=Join-Path $env:TEMP ('enginebox-installer-'+[Guid]::NewGuid()+'.ps1')
+$nativeFixturePath=$fixture+'.exe'
 Copy-Item -LiteralPath $path -Destination $fixture
 try {
   . $fixture
@@ -16,8 +17,36 @@ try {
   if ((Read-Number 'CPU' 4 2 1 8) -ne 4) { throw 'Explicit allowance ignored' }
   $rejected=$false;try { Read-Number 'CPU' 9 2 1 8 | Out-Null } catch { $rejected=$true }
   if (-not $rejected) { throw 'Physical resource ceiling ignored' }
+  # Reproduce Windows PowerShell 5.1's actual native stderr behavior. A
+  # PowerShell function mock alone does not prove NativeCommandError handling.
+  Add-Type -OutputAssembly $nativeFixturePath -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+public static class EngineboxNativeStderrFixture {
+  public static int Main(string[] args) {
+    Console.Error.WriteLine("wsl: Failed to start the systemd user session for 'root'.");
+    Console.Out.WriteLine("{\"ok\":true}");
+    return args.Length > 0 && args[0] == "fail" ? 7 : 0;
+  }
+}
+'@
+  $reproduced=$false
+  try { $null=(& $nativeFixturePath ok 2>&1) } catch { $reproduced=$true }
+  if (-not $reproduced) { throw 'Native stderr fixture did not reproduce the PowerShell 5.1 failure' }
+  function global:wsl.exe { & $nativeFixturePath @args }
+  $result=Invoke-WslNative -Arguments @('ok')
+  if ($result.ExitCode -ne 0 -or -not (($result.Stdout -join "`n") | ConvertFrom-Json).ok -or -not ($result.Stderr -join "`n").Contains('systemd user session')) { throw 'Native stdout and stderr must stay separate' }
+  $json=Invoke-Wsl -Arguments @('ok') | Out-String | ConvertFrom-Json
+  if (-not $json.ok -or $ErrorActionPreference -ne 'Stop') { throw 'Successful native stderr must not abort or corrupt structured output' }
+  $rejected=$false
+  try { Invoke-Wsl -Arguments @('fail') | Out-Null } catch { $rejected=$_.Exception.Message -like '*exit 7*' -and $_.Exception.Message -like '*systemd user session*' }
+  if (-not $rejected) { throw 'Nonzero native exits must still stop setup with their error output' }
+  Remove-Item Function:\global:wsl.exe
   Write-Output 'PowerShell 5.1 parsing, controller validation and resource bounds passed.'
-} finally { Remove-Item -LiteralPath $fixture -Force }
+} finally {
+  Remove-Item Function:\global:wsl.exe -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $fixture -Force
+  Remove-Item -LiteralPath $nativeFixturePath -Force -ErrorAction SilentlyContinue
+}
 
 # Exercise the actual installer orchestration with Windows effects replaced by
 # fixtures. Real WSL/container behavior is covered by the separate WSL job.
@@ -34,6 +63,7 @@ $fixtureHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $fixtureImage).Hash
 $global:EngineboxWslFixture=@{ version='2.6.0'; calls=@(); prompts=@(); registrations=@(); starts=0; updates=0; enables=0; configuration=$null; installed=$true; enrolled=$true; claim=$null; code=$null; downloads=0; controllerChoice=$null; secret=$null; linuxCpu=16; linuxMemory=16GB; committed=$false; overrideChoice='n'; pendingId=$null; exportFailure=$false; exportInvalid=$false; enrollmentError=$null; stopped=0 }
 $global:EngineboxWslFixture.claimError=$null
 $global:EngineboxWslFixture.claimWarning=$false
+$global:EngineboxWslFixture.warnEveryCall=$false
 $global:EngineboxWslFixture.locationOverride=$null
 function global:Get-ItemProperty {
   param($Path,$ErrorAction)
@@ -86,6 +116,7 @@ function global:tar.exe {
 function global:wsl.exe {
   $global:LASTEXITCODE=0
   $global:EngineboxWslFixture.calls+=@(($args -join ' '))
+  if ($global:EngineboxWslFixture.warnEveryCall) { Write-Error "wsl: Failed to start the systemd user session for 'root'." }
   if ($args[0] -eq '--distribution' -and $args -contains '-c') {
     if ($args[4] -ne '--cd' -or $args[5] -ne '/' -or $args[8] -ne '-c' -or $args[9] -notlike 'import base64;exec*') { throw 'Ownership must use explicit Linux argv and working directory' }
     if ($global:EngineboxWslFixture.claimError) {
@@ -161,10 +192,11 @@ try {
   $before=$f.prompts.Count
   & $flowScript -InstallDirectory (Join-Path $testRoot 'updated') -Resume
   if ($f.prompts.Count -ne $before -or $f.updates -ne 1) { throw 'Resume must retain existing choices' }
-  $f.installed=$false; $f.enrolled=$false
+  $f.installed=$false; $f.enrolled=$false; $f.warnEveryCall=$true
   $code=('a'*32)+'.'+('b'*64)
   & $flowScript -InstallDirectory (Join-Path $testRoot 'fresh') -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $code
   if ($f.downloads -ne 1 -or $f.claim -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or $f.code -ne $code -or -not $f.enrolled) { throw 'Fresh distribution import/claim/registration failed' }
+  $f.warnEveryCall=$false
   # A failed initial ownership claim retains the imported runtime and can be
   # retried without another import. The underlying WSL error must be visible.
   $f.installed=$false; $f.enrolled=$false; $f.claimError='Wsl/Service/E_UNEXPECTED'; $beforeStarts=$f.starts
@@ -209,10 +241,11 @@ try {
   $f.linuxMemory=16GB; $f.linuxCpu=16
   # Enter accepts Override existing by default. A complete private backup must
   # precede unregistering, and the new runtime must take the fresh invitation.
-  $f.overrideChoice=''; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@()
+  $f.overrideChoice=''; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@(); $f.warnEveryCall=$true
   $replacement=Join-Path $testRoot 'replacement'
   $newCode=('e'*32)+'.'+('f'*64)
   & $flowScript -InstallDirectory $replacement -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode
+  $f.warnEveryCall=$false
   $backups=@(Get-ChildItem -LiteralPath (Join-Path $replacement 'backups') -Directory)
   if ($backups.Count -ne 1 -or $f.code -ne $newCode -or -not $f.enrolled -or $f.stopped -ne 1) { throw 'Default override must back up and register a fresh runtime' }
   $backup=Join-Path $backups[0].FullName 'enginebox.tar'
