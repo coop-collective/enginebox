@@ -10,6 +10,7 @@ import http.server
 import json
 import pathlib
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,8 +20,17 @@ root = pathlib.Path('/var/lib/enginebox')
 assert not (root / 'private/worker.json').exists(), 'Use an unenrolled disposable CI distribution'
 settings = json.loads(pathlib.Path('/etc/enginebox/settings.json').read_text())
 budget = {key: settings[key] for key in ('cpu', 'memory_gib', 'disk_gib')}
-node = uuid.uuid4().hex
-code = node + '.' + uuid.uuid4().hex + uuid.uuid4().hex
+if len(sys.argv) == 3 and sys.argv[1] == '--stdin-code-sha256':
+    registration_input = sys.stdin.buffer.read(512)
+    code = registration_input.decode('utf-8').strip()
+    assert len(code) == 97 and code[32] == '.'
+    assert hashlib.sha256(code.encode()).hexdigest() == sys.argv[2], 'Windows-to-WSL registration input changed'
+    node = code[:32]
+else:
+    assert len(sys.argv) == 1
+    node = uuid.uuid4().hex
+    code = node + '.' + uuid.uuid4().hex + uuid.uuid4().hex
+    registration_input = code.encode()
 workloads = {'ci': True, 'agents': True}
 workspace = 'node-proof-' + uuid.uuid4().hex[:12]
 operations = [
@@ -92,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix='node-proof-', dir=root) as private:
     base = ['/usr/local/bin/enginebox-node']
     subprocess.run(base + ['register-worker', '--controller', f'http://127.0.0.1:{server.server_port}', '--config', str(config),
                           '--cpu', str(budget['cpu']), '--memory-gib', str(budget['memory_gib']), '--disk-gib', str(budget['disk_gib']),
-                          '--test-loopback-http'], input=code, text=True, check=True, capture_output=True)
+                          '--test-loopback-http'], input=registration_input, check=True, capture_output=True)
     state['token'] = json.loads(config.read_text())['token']
     assert hashlib.sha256(json.dumps(state['token'], separators=(',', ':')).encode()).hexdigest() == state['token_hash']
     worker = subprocess.Popen(['systemd-run', '--quiet', '--wait', '--pipe', '--collect', '--slice=enginebox.slice', '--unit=' + unit]

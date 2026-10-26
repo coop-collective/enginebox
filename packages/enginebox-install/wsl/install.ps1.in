@@ -25,6 +25,18 @@ function Assert-Origin([string]$Value) {
   if (-not [Uri]::TryCreate($Value,[UriKind]::Absolute,[ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -ne '/') { throw 'Controller must be an HTTPS origin without a path or credentials.' }
   return $uri.GetLeftPart([UriPartial]::Authority)
 }
+function Read-EnrollmentCode([string]$Value) {
+  while ($true) {
+    if ($Value) {
+      $Value=$Value.Trim()
+      if ($Value -cmatch '^[a-f0-9]{32}\.[a-f0-9]{64}$') { return $Value }
+      Write-Host 'That is not a machine registration code. Paste only the dashboard Registration code field, not the dashboard password or the full install command. Installed components are retained.'
+    }
+    $secret=Read-Host 'One-time registration code' -AsSecureString
+    $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+    try { $Value=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secret.Dispose() }
+  }
+}
 function Protect-Directory([string]$Path) {
   $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
   $acl=New-Object Security.AccessControl.DirectorySecurity
@@ -38,11 +50,19 @@ function Invoke-WslNative([string[]]$Arguments,[AllowNull()][string]$InputText=$
   # Keep stderr out of JSON probes and preserve secret input on stdin only.
   $previous=$ErrorActionPreference
   $PSNativeCommandUseErrorActionPreference=$false
+  # Linux expects UTF-8 without a BOM, even if the parent PowerShell session
+  # has selected another native-pipeline encoding.
+  $OutputEncoding=[Text.UTF8Encoding]::new($false)
+  $previousConsoleInput=[Console]::InputEncoding
   try {
+    # .NET Framework creates and flushes Process.StandardInput using the
+    # console encoding before PowerShell attaches its own writer. A UTF-8
+    # console with a BOM would prepend it even with OutputEncoding above.
+    [Console]::InputEncoding=$OutputEncoding
     $ErrorActionPreference='Continue'
     $items=if ($PSBoundParameters.ContainsKey('InputText')) { @($InputText | & wsl.exe @Arguments 2>&1) } else { @(& wsl.exe @Arguments 2>&1) }
     $code=$LASTEXITCODE
-  } finally { $ErrorActionPreference=$previous }
+  } finally { $ErrorActionPreference=$previous; [Console]::InputEncoding=$previousConsoleInput }
   $stdout=@(); $stderr=@()
   foreach ($item in $items) {
     if ($item -is [System.Management.Automation.ErrorRecord]) { $stderr+=@($item.ToString()) }
@@ -334,16 +354,12 @@ Invoke-Wsl -Arguments @('--distribution',$Distro,'--user','root','--cd','/','--e
 $enrollmentStatus=Invoke-WslNative -Arguments @('--distribution',$Distro,'--user','root','--cd','/','--exec','/usr/local/sbin/enginebox-wsl','enrolled')
 if ($enrollmentStatus.ExitCode -notin @(0,1)) { throw "Could not inspect registration: $(Get-WslFailure $enrollmentStatus)" }
 $registered=$enrollmentStatus.ExitCode -eq 0
-if (-not $registered) {
+while (-not $registered) {
   if ($EnrollmentExpires -gt 0 -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge $EnrollmentExpires) { $EnrollmentCode=$null; Write-Host 'The original registration code expired during setup. Generate a fresh code; installed components are retained.' }
-  if (-not $EnrollmentCode) {
-    Write-Host "Open $Controller/dashboard/ and copy a machine registration code. For a saved pending identity, renew the code on its matching machine card."
-    $secret=Read-Host 'One-time registration code' -AsSecureString
-    $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
-    try { $EnrollmentCode=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secret.Dispose() }
-  }
   $identity=Get-RuntimeIdentity
-  if ($identity.id) { Write-Host "Saved machine ID: $($identity.id)" }
+  if ($identity.id) { Write-Host "Saved machine ID: $($identity.id). Renew the registration code on this exact machine card in the dashboard." }
+  if (-not $EnrollmentCode) { Write-Host "Open $Controller/dashboard/ and copy the Registration code for an installer already open field." }
+  $EnrollmentCode=Read-EnrollmentCode $EnrollmentCode
   if ($identity.id -and $EnrollmentCode.Split('.')[0] -ne $identity.id) { throw "The registration code is for a different machine. Saved machine ID: $($identity.id). Rerun this installer and choose Override existing, or renew the code for that exact ID in the dashboard. State was retained." }
   try {
     $registration=Invoke-WslNative -Arguments @('--distribution',$Distro,'--user','root','--cd','/','--exec','/usr/local/sbin/enginebox-wsl','enroll') -InputText $EnrollmentCode
@@ -351,8 +367,13 @@ if (-not $registered) {
   if ($registration.ExitCode -ne 0) {
     $detail=Get-WslFailure $registration
     $detail | Set-Content -LiteralPath (Join-Path $root 'registration-error.txt') -Encoding UTF8
-    throw "Registration failed: $detail`nState is retained. Error details: $(Join-Path $root 'registration-error.txt')"
+    Write-Host "Registration failed: $detail`nState is retained. Error details: $(Join-Path $root 'registration-error.txt')"
+    $choice=Read-Host 'Retry registration without reinstalling? [Y/n]'
+    if ($choice -and $choice -notmatch '^(?i:y|yes)$') { throw "Registration failed: $detail`nResume the saved installer with -Resume to retry without reinstalling. State is retained." }
+    $EnrollmentExpires=0
+    continue
   }
+  $registered=$true
 }
 $action=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '--distribution Enginebox --user root --exec /usr/local/sbin/enginebox-wsl supervise'
 $taskSettings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
