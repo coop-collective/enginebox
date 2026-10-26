@@ -6,7 +6,7 @@ async function openMachines(page: Page) {
   const signature=createHmac('sha256','fixture-session-secret-at-least-32-characters').update('fixture-dashboard-password').update('\0').update(payload).digest('base64url');
   await page.context().addCookies([{name:'enginebox_session',value:`${payload}.${signature}`,url:dashboardOrigin,httpOnly:true,sameSite:'Strict'}]);
   await page.goto('/');
-  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Worker machines',exact:true}).click();
+  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Compute',exact:true}).click();
 }
 test('copies the installer and raw code separately, renews the same identity, and moves a registered machine into the list',async ({page,request})=>{
   await request.post(`${fixtureOrigin}/__test/reset`);
@@ -18,7 +18,7 @@ test('copies the installer and raw code separately, renews the same identity, an
   const command=page.getByLabel('PowerShell install command');
   await expect(command).not.toHaveValue(/-Cpu|-MemoryGiB|-DiskGiB/);
   await expect(command).toHaveValue(/https:\/\/controller.fixture.example/);
-  await expect(page.getByRole('region',{name:'Registered machines',exact:true})).toContainText('No machines connected yet');
+  await expect(page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem', {name:'Machine Windows RTX',exact:true})).toHaveCount(0);
   await expect(page.getByRole('list',{name:'Pending registrations'})).not.toBeVisible();
   await page.context().grantPermissions(['clipboard-read','clipboard-write']);
   await page.getByRole('button',{name:'Copy install command',exact:true}).click();
@@ -41,9 +41,9 @@ test('copies the installer and raw code separately, renews the same identity, an
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
   await page.screenshot({path:'test-results/contributors-enrollment-mobile.png',fullPage:true});
   await request.post(`${fixtureOrigin}/__test/contributor-online`);
-  await page.getByRole('button',{name:'Refresh machines'}).click();
+  await page.getByRole('button',{name:'Refresh',exact:true}).click();
   await expect(command).toHaveCount(0);
-  const row=page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem');
+  const row=page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem',{name:'Machine Windows RTX',exact:true});
   await expect(row).toContainText('Online');await expect(row).toContainText('Templates ready');
   await expect(row).toContainText('2 CPU · 4 GiB memory');await expect(row).toContainText('20 GiB disk');
   await expect(row.getByRole('button',{name:'Renew registration code'})).toHaveCount(0);
@@ -58,9 +58,14 @@ test('keeps unfinished and revoked registrations out of the main machine list',a
   await request.post(`${fixtureOrigin}/__test/contributor-inventory`);
   await openMachines(page);
   const machines=page.getByRole('region',{name:'Registered machines',exact:true});
-  await expect(machines.getByRole('listitem')).toHaveCount(2);
-  await expect(machines.getByRole('listitem').first()).toContainText('Render RTX');
-  await expect(page.getByText('1 online · 2 registered',{exact:true})).toBeVisible();
+  await expect(machines.getByRole('listitem')).toHaveCount(4);
+  await expect(machines.getByRole('listitem').first()).toContainText('Build machine');
+  await expect(machines.getByRole('listitem',{name:'Machine Render RTX'})).toContainText('Templates ready');
+  await expect(page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Worker machines',exact:true})).toHaveCount(0);
+  await expect(page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Fleet overview',exact:true})).toHaveCount(0);
+  await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('2');
+  await expect(page.locator('.stat-card').filter({hasText:'VM CPU allocated'}).locator('strong')).toHaveText('12 / 32');
+  await expect(page.getByText('2 online · 4 registered',{exact:true})).toBeVisible();
   await expect(page.getByRole('list',{name:'Pending registrations'})).not.toBeVisible();
   await expect(page.getByRole('list',{name:'Revoked machines and invitations'})).not.toBeVisible();
   await expect(page.getByLabel('Machine name',{exact:true})).toHaveCount(0);
@@ -73,6 +78,40 @@ test('keeps unfinished and revoked registrations out of the main machine list',a
   await expect(pending.getByRole('listitem')).toHaveCount(12);
   await pending.getByRole('listitem').first().getByRole('button',{name:'Cancel invitation'}).click();
   await expect(pending.getByRole('listitem')).toHaveCount(11);
-  await expect(machines.getByRole('listitem')).toHaveCount(2);
+  await expect(machines.getByRole('listitem')).toHaveCount(4);
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+});
+
+for (const inventory of ['hosts', 'workers'] as const) {
+  test(`keeps the other machine inventory usable when ${inventory} cannot load`, async ({page, request}) => {
+    await request.post(`${fixtureOrigin}/__test/reset`);
+    await request.post(`${fixtureOrigin}/__test/contributor-inventory`);
+    const route = inventory === 'hosts' ? '**/api/control/v1/fleet' : '**/api/contributors';
+    await page.route(route, route => route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Inventory temporarily unavailable'})}));
+    await openMachines(page);
+    await expect(page.getByRole('alert')).toContainText('Inventory temporarily unavailable');
+    const machines = page.getByRole('region', {name:'Registered machines',exact:true});
+    await expect(machines.getByRole('listitem', {name:inventory === 'hosts' ? 'Machine Render RTX' : 'Machine Build machine',exact:true})).toBeVisible();
+    await expect(machines.getByRole('listitem')).toHaveCount(2);
+    if (inventory === 'hosts') await expect(page.getByRole('button', {name:'New workspace',exact:true})).toBeDisabled();
+    await page.unroute(route);
+    await page.getByRole('button', {name:'Refresh',exact:true}).click();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await expect(machines.getByRole('listitem')).toHaveCount(4);
+    const host = machines.getByRole('listitem',{name:'Machine Build machine',exact:true});
+    await host.locator('summary').filter({hasText:'Details'}).click();
+    await expect(host.getByText('Memory allocated',{exact:true})).toBeVisible();
+    await page.setViewportSize({width:390,height:844});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+  });
+}
+test('shows workers when there are no VM hosts without offering an incompatible VM allocation',async ({page,request})=>{
+  await request.post(`${fixtureOrigin}/__test/reset`);
+  await request.post(`${fixtureOrigin}/__test/contributor-inventory`);
+  await request.post(`${fixtureOrigin}/__test/mode`,{data:{mode:'empty'}});
+  await openMachines(page);
+  await expect(page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem')).toHaveCount(2);
+  await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeDisabled();
+  await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('1');
+  await expect(page.locator('.stat-card').filter({hasText:'VM CPU allocated'}).locator('strong')).toHaveText('0 / 0');
 });
