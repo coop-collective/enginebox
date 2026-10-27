@@ -567,6 +567,38 @@ fn codex_config_carries_sandbox_mcp_and_disables_bundled_skills() {
 }
 
 #[test]
+fn codex_network_access_is_opt_in_and_edit_only() {
+    let off: toml::Value = toml::from_str(&profile::codex_config(
+        &block(json!({"permission_profile":"edit"})).unwrap(),
+        false,
+    ))
+    .unwrap();
+    assert!(off.get("sandbox_workspace_write").is_none());
+    let b = block(json!({"permission_profile":"edit","network_access":true})).unwrap();
+    let on: toml::Value = toml::from_str(&profile::codex_config(&b, false)).unwrap();
+    assert_eq!(on["sandbox_mode"].as_str(), Some("workspace-write"));
+    assert_eq!(
+        on["sandbox_workspace_write"]["network_access"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        check(
+            "codex",
+            json!({"permission_profile":"edit","network_access":true})
+        )
+        .is_ok()
+    );
+    assert!(
+        check(
+            "codex",
+            json!({"permission_profile":"read_only","network_access":true})
+        )
+        .is_err()
+    );
+    assert!(check("claude", json!({"network_access":true})).is_err());
+}
+
+#[test]
 fn bootstrap_writes_only_the_runs_private_directory_and_is_removed() {
     let (_t, home) = temp();
     security::write_bytes(
