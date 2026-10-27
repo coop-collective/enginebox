@@ -19,6 +19,9 @@ jobs:
       - name: Validate this installer on Windows PowerShell 5.1
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-installer.ps1
+      - name: Qualify noninteractive startup and automatic crash recovery
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-startup.ps1
   publish:
     if: github.event_name == 'workflow_dispatch'
     needs: installer
@@ -60,7 +63,7 @@ jobs:
           git fetch --depth=1 origin "$runtime_commit"
           # A newer installer can reuse a qualified image only if every runtime
           # source, build recipe and dependency input remains identical.
-          git diff --exit-code "$runtime_commit" "$GITHUB_SHA" -- Cargo.toml Cargo.lock rust-toolchain.toml package.json pnpm-lock.yaml packages/ ':!packages/enginebox-install/wsl/install.ps1.in' ':!packages/enginebox-install/wsl/test-installer.ps1'
+          git diff --exit-code "$runtime_commit" "$GITHUB_SHA" -- Cargo.toml Cargo.lock rust-toolchain.toml package.json pnpm-lock.yaml packages/ ':!packages/enginebox-install/wsl/install.ps1.in' ':!packages/enginebox-install/wsl/test-installer.ps1' ':!packages/enginebox-install/wsl/test-startup.ps1'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: ${{ steps.proof.outputs.artifact }}

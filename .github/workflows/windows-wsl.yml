@@ -16,6 +16,9 @@ jobs:
       - name: Validate PowerShell 5.1 installer and input policy
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-installer.ps1
+      - name: Qualify noninteractive startup and automatic crash recovery
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/enginebox-install/wsl/test-startup.ps1
   image:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
