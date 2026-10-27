@@ -144,6 +144,33 @@ pub fn id(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+/// Scoped service token wire format (`ebst_<32 hex id>.<secret>`), shared by
+/// the controller, which mints tokens and enforces their scopes, and the
+/// supervisor, which only admits active tokens to its ownership queue.
+pub mod service_token {
+    use sha2::{Digest, Sha256};
+
+    pub const PREFIX: &str = "ebst_";
+    pub const MAX_SECRET: usize = 128;
+
+    pub fn valid_id(id: &str) -> bool {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+    /// Split a presented bearer into `(id, secret)` when it is well formed.
+    pub fn parse(presented: &str) -> Option<(&str, &str)> {
+        let (id, secret) = presented.strip_prefix(PREFIX)?.split_once('.')?;
+        (valid_id(id) && !secret.is_empty() && secret.len() <= MAX_SECRET).then_some((id, secret))
+    }
+    /// The stored digest: SHA-256 of the secret's JSON string encoding.
+    pub fn secret_hash(secret: &str) -> String {
+        let encoded = serde_json::to_vec(&serde_json::Value::String(secret.to_owned()))
+            .expect("JSON string serializes");
+        format!("{:x}", Sha256::digest(encoded))
+    }
+}
 pub fn hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }

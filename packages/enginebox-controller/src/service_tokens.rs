@@ -13,7 +13,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
-pub const PREFIX: &str = "ebst_";
+pub use enginebox_node_protocol::service_token::PREFIX;
 const MAX_TOKENS: usize = 1000;
 const MAX_SCOPES: usize = 256;
 const MAX_LABEL: usize = 128;
@@ -185,15 +185,7 @@ pub struct MintRequest {
     pub repositories: Vec<RepositoryGrant>,
 }
 
-fn secret_hash(secret: &str) -> String {
-    state::digest(&json!(secret))
-}
-fn valid_id(id: &str) -> bool {
-    id.len() == 32
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
+use enginebox_node_protocol::service_token::{secret_hash, valid_id};
 
 /// Why a presented service token was refused (both answer HTTP 401).
 #[derive(Debug, PartialEq)]
@@ -440,13 +432,8 @@ impl ServiceTokens {
     }
     /// Resolve `ebst_<id>.<secret>`; the digest comparison is constant time.
     pub fn authenticate(&self, presented: &str) -> std::result::Result<Token, Refusal> {
-        let (id, secret) = presented
-            .strip_prefix(PREFIX)
-            .and_then(|rest| rest.split_once('.'))
-            .ok_or(Refusal::Unknown)?;
-        if !valid_id(id) || secret.is_empty() || secret.len() > 128 {
-            return Err(Refusal::Unknown);
-        }
+        let (id, secret) =
+            enginebox_node_protocol::service_token::parse(presented).ok_or(Refusal::Unknown)?;
         let tokens = self.tokens.lock().unwrap();
         let token = tokens.get(id).ok_or(Refusal::Unknown)?;
         let matches: bool = token
@@ -467,6 +454,13 @@ impl ServiceTokens {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_secret_digest_matches_persisted_records() {
+        // Records minted before the helper moved hash with state::digest.
+        for secret in ["", "abc", "0123456789abcdef0123456789abcdef", "quote\"é"] {
+            assert_eq!(secret_hash(secret), state::digest(&json!(secret)));
+        }
+    }
     fn request(expires_at: Option<String>) -> MintRequest {
         MintRequest {
             label: "ci".into(),

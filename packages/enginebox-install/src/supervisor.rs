@@ -173,6 +173,28 @@ impl Supervisor {
         };
         bool::from(value.as_bytes().ct_eq(self.config.token.as_bytes()))
     }
+    /// Owner token, or an active scoped service token. Admission only: the
+    /// controller still enforces every service token's scopes per route.
+    async fn admitted(&self, headers: &HeaderMap) -> bool {
+        if self.authorized(headers) {
+            return true;
+        }
+        let Some(state_dir) = self.config.state_dir.clone() else {
+            return false;
+        };
+        let Some(presented) = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .filter(|s| enginebox_node_protocol::service_token::parse(s).is_some())
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || active_service_token(&state_dir, &presented))
+            .await
+            .unwrap_or(false)
+    }
     async fn control(&self, candidate: &Candidate, path: &str) -> Result<serde_json::Value> {
         let response = self
             .client
@@ -306,6 +328,66 @@ impl Supervisor {
         self.handoff(candidate).await
     }
 }
+/// The persisted fields the supervisor needs; the controller owns the rest.
+#[derive(Deserialize)]
+struct ServiceTokenRecord {
+    id: String,
+    secret_hash: String,
+    expires_at: Option<String>,
+    revoked_at: Option<String>,
+}
+/// Check `ebst_<id>.<secret>` against `<state>/service-tokens/<id>.json` only:
+/// no directory walk, no symlinks, bounded size, constant-time digest compare.
+fn active_service_token(state_dir: &std::path::Path, presented: &str) -> bool {
+    use enginebox_node_protocol::service_token::{parse, secret_hash};
+    use std::io::Read;
+    let Some((id, secret)) = parse(presented) else {
+        return false;
+    };
+    let dir = state_dir.join("service-tokens");
+    let path = dir.join(format!("{id}.json"));
+    let plain = |p: &std::path::Path, dir: bool| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            !m.file_type().is_symlink() && if dir { m.is_dir() } else { m.is_file() }
+        })
+    };
+    if !plain(&dir, true) || !plain(&path, false) {
+        return false;
+    }
+    #[allow(unused_mut)]
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    const MAX_RECORD: u64 = 64 * 1024;
+    let Ok(file) = options.read(true).open(&path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() <= MAX_RECORD)
+    {
+        return false;
+    }
+    let mut data = Vec::new();
+    if file.take(MAX_RECORD + 1).read_to_end(&mut data).is_err() || data.len() as u64 > MAX_RECORD {
+        return false;
+    }
+    let Ok(record) = serde_json::from_slice::<ServiceTokenRecord>(&data) else {
+        return false;
+    };
+    let matches: bool = record
+        .secret_hash
+        .as_bytes()
+        .ct_eq(secret_hash(secret).as_bytes())
+        .into();
+    let expired = record.expires_at.as_deref().is_some_and(|at| {
+        chrono::DateTime::parse_from_rfc3339(at).map_or(true, |at| at <= chrono::Utc::now())
+    });
+    matches && record.id == id && record.revoked_at.is_none() && !expired
+}
 fn failure(status: StatusCode, error: impl std::fmt::Display) -> Response {
     (status, Json(serde_json::json!({"error":error.to_string()}))).into_response()
 }
@@ -403,7 +485,9 @@ async fn proxy(supervisor: Supervisor, request: Request, dashboard: bool) -> Res
             && (path == "/v1/agents"
                 || (path.starts_with("/v1/agents/")
                     && (path.ends_with("/usage") || path.ends_with("/accounts"))))));
-    if owned_request && node_action.is_none() && !supervisor.authorized(request.headers()) {
+    // Service tokens are admitted only when active on disk, so unauthenticated
+    // or forged bearers never reach the bounded ownership queue below.
+    if owned_request && node_action.is_none() && !supervisor.admitted(request.headers()).await {
         return failure(StatusCode::UNAUTHORIZED, "authentication required");
     }
     let permit = if owned_request {
