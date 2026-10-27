@@ -28,6 +28,7 @@ A [pool](QUEUE.md#pools) may name a profile: every run started on `POST /v1/pool
 | `skills` | bundles `{name, files}`, each with `SKILL.md` at its root | wrapped in one generated plugin, loaded with `--plugin-dir` | copied to `CODEX_HOME/skills/<name>/`; bundled system skills off | refused |
 | `mcp_servers` | `{name, command, args, env_vars}` (stdio) or `{name, url, headers_from_env}` (HTTP) | a generated `mcp.json` passed with `--mcp-config` | `[mcp_servers.<name>]` in the generated `config.toml`, tools approved | refused |
 | `strict_mcp` | use only the profile's MCP servers | `--strict-mcp-config` | the workspace browser server is left out of the generated config | refused |
+| `network_access` | let sandboxed commands reach the network (git clone/push to the run's repository, package installs); edit profile only, off by default | refused | `[sandbox_workspace_write] network_access = true` | refused |
 | `setting_sources` | distinct values from `user`, `project`, `local` | `--setting-sources` | refused | refused |
 | `env` | default variables (same names, bounds and denylist as a run's `env`) | merged under the run's `env` | same | same |
 

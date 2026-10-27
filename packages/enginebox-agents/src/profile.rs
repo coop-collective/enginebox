@@ -125,6 +125,11 @@ pub struct ProviderProfile {
     /// Use only the profile's MCP servers, not the workspace's own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict_mcp: bool,
+    /// Codex only, with the edit profile: let sandboxed commands reach the
+    /// network (git clone/push to the run's repository, package installs).
+    /// Off by default; the workspace sandbox otherwise has no network.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_access: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setting_sources: Option<Vec<String>>,
     /// Default variables; a run's own `env` wins on a name clash. Values are
@@ -361,6 +366,15 @@ impl ProviderProfile {
         }
         if provider == "cursor" && (!self.mcp_servers.is_empty() || self.strict_mcp) {
             unsupported("mcp_servers or strict_mcp")?;
+        }
+        if self.network_access {
+            if provider != "codex" {
+                unsupported("network_access")?;
+            }
+            ensure!(
+                self.permission_profile == PermissionProfile::Edit,
+                "network_access needs the edit permission profile."
+            );
         }
         ensure!(
             self.plugins.len() <= MAX_BUNDLES && self.skills.len() <= MAX_BUNDLES,
@@ -771,6 +785,13 @@ pub fn codex_config(block: &ProviderProfile, browser: bool) -> String {
         "[skills.bundled]".into(),
         "enabled = false".into(),
     ]);
+    if block.network_access && block.permission_profile == PermissionProfile::Edit {
+        lines.extend([
+            String::new(),
+            "[sandbox_workspace_write]".into(),
+            "network_access = true".into(),
+        ]);
+    }
     if browser {
         lines.extend([
             String::new(),
