@@ -425,6 +425,11 @@ impl Drop for Fixture {
     }
 }
 async fn fixture() -> Fixture {
+    fixture_with_state(false).await
+}
+/// With `controller_state`, the supervisor knows `<tmp>/controller-state`,
+/// where tests mint real service tokens with the controller's own store.
+async fn fixture_with_state(controller_state: bool) -> Fixture {
     let tmp = temp();
     let install = installation(&tmp);
     fixture_release(&install, "0.3.0", 1);
@@ -442,6 +447,10 @@ async fn fixture() -> Fixture {
         dashboard_listen: None,
         token: "test-supervisor-token-at-least-32-characters".into(),
         drain_timeout: Duration::from_secs(1),
+    };
+    let config = SupervisorConfig {
+        state_dir: controller_state.then(|| controller_state_dir(&tmp)),
+        ..config
     };
     let supervisor = Supervisor::new(
         config,
@@ -948,4 +957,178 @@ async fn scoped_node_results_pass_drain_gate_without_authorizing_operator_writes
     }
     upgrade.await.unwrap().unwrap();
     assert_eq!(f.supervisor.current_version().await, Version::new(0, 4, 0));
+}
+
+fn controller_state_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    let state = tmp.path().canonicalize().unwrap().join("controller-state");
+    enginebox_install::release::private_dir(&state).unwrap();
+    state
+}
+fn service_tokens(state: &Path) -> enginebox_controller::service_tokens::ServiceTokens {
+    enginebox_controller::service_tokens::ServiceTokens::open(state).unwrap()
+}
+/// Mint a write-scoped token exactly as the controller does; returns (id, secret).
+fn mint_service_token(
+    tokens: &enginebox_controller::service_tokens::ServiceTokens,
+) -> (String, String) {
+    let request: enginebox_controller::service_tokens::MintRequest = serde_json::from_value(
+        serde_json::json!({"label":"ideator","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.start"]}),
+    )
+    .unwrap();
+    let minted = tokens.mint(request, |_| true, |_| true, |_| None).unwrap();
+    (
+        minted["token"]["id"].as_str().unwrap().to_owned(),
+        minted["secret"].as_str().unwrap().to_owned(),
+    )
+}
+async fn pending_mutations(f: &Fixture) -> u64 {
+    let status: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/__enginebox/status", f.url))
+        .bearer_auth(&f.supervisor.config.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    status["pending_mutations"].as_u64().unwrap()
+}
+async fn post_value(f: &Fixture, bearer: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/value", f.url))
+        .bearer_auth(bearer)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn active_service_tokens_join_the_owned_write_path_and_forged_ones_never_queue() {
+    let f = fixture_with_state(true).await;
+    let state = f.supervisor.config.state_dir.clone().unwrap();
+    let tokens = service_tokens(&state);
+    let (_, valid) = mint_service_token(&tokens);
+    let (revoked_id, revoked) = mint_service_token(&tokens);
+    tokens.revoke(&revoked_id).unwrap();
+    let (expired_id, expired) = mint_service_token(&tokens);
+    let record = state.join(format!("service-tokens/{expired_id}.json"));
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    value["expires_at"] = serde_json::json!("2000-01-01T00:00:00+00:00");
+    fs::write(&record, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (valid_id, valid_secret) = valid
+        .strip_prefix("ebst_")
+        .unwrap()
+        .split_once('.')
+        .unwrap();
+    let forged = [
+        format!("ebst_{valid_id}.wrong-secret"),
+        format!("ebst_{}.{valid_secret}", "0".repeat(32)),
+        format!("ebst_{valid_id}"),
+        format!("ebst_../{valid_id}.{valid_secret}"),
+        format!("ebst_{valid_id}.{}", "a".repeat(129)),
+        "ebst_nope".to_owned(),
+        revoked,
+        expired,
+    ];
+    // Outside an upgrade the active token writes through; the owner is unchanged.
+    let response = post_value(&f, &valid).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "0.3.0");
+    assert_eq!(
+        post_value(&f, &f.supervisor.config.token).await.status(),
+        StatusCode::OK
+    );
+    for bearer in &forged {
+        assert_eq!(
+            post_value(&f, bearer).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{bearer}"
+        );
+    }
+    assert_eq!(f.old.mutations.load(Ordering::SeqCst), 2);
+
+    // During handoff the service-token write waits at the mutation gate like the owner's.
+    f.old.jobs.store(1, Ordering::SeqCst);
+    let sup = f.supervisor.clone();
+    let next = candidate(&f);
+    let handoff = tokio::spawn(async move { sup.handoff(next).await });
+    while f.old.drain_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let url = format!("{}/value", f.url);
+    let write = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .bearer_auth(valid)
+            .send()
+            .await
+            .unwrap()
+    });
+    while pending_mutations(&f).await == 0 {
+        tokio::task::yield_now().await;
+    }
+    // Forged, unknown, revoked and expired tokens are refused without a permit.
+    for bearer in &forged {
+        let response = reqwest::Client::new()
+            .post(format!("{}/value", f.url))
+            .bearer_auth(bearer)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{bearer}");
+    }
+    assert_eq!(pending_mutations(&f).await, 1);
+    assert!(!write.is_finished());
+    assert_eq!(f.old.mutations.load(Ordering::SeqCst), 2);
+    f.old.jobs.store(0, Ordering::SeqCst);
+    handoff.await.unwrap().unwrap();
+    let response = write.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "0.4.0");
+    assert_eq!(f.new.mutations.load(Ordering::SeqCst), 1);
+    assert_eq!(pending_mutations(&f).await, 0);
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_service_token_records_are_refused() {
+    let f = fixture_with_state(true).await;
+    let state = f.supervisor.config.state_dir.clone().unwrap();
+    let tokens = service_tokens(&state);
+    let (id, secret) = mint_service_token(&tokens);
+    let dir = state.join("service-tokens");
+    let moved = state.join("elsewhere.json");
+    fs::rename(dir.join(format!("{id}.json")), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, dir.join(format!("{id}.json"))).unwrap();
+    assert_eq!(
+        post_value(&f, &secret).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(f.old.mutations.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn without_controller_state_service_tokens_cannot_write() {
+    let f = fixture().await;
+    assert!(f.supervisor.config.state_dir.is_none());
+    // A real token in the default location is still refused: owner only.
+    let state = f.supervisor.config.install.root.join("state");
+    enginebox_install::release::private_dir(&state).unwrap();
+    let (_, secret) = mint_service_token(&service_tokens(&state));
+    assert_eq!(
+        post_value(&f, &secret).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_value(&f, &f.supervisor.config.token).await.status(),
+        StatusCode::OK
+    );
+    // Reads are unchanged.
+    let response = reqwest::Client::new()
+        .get(format!("{}/value", f.url))
+        .bearer_auth(&secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(f.old.mutations.load(Ordering::SeqCst), 1);
 }

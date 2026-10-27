@@ -206,6 +206,14 @@ keep strict one-time refresh tokens.
   the seven agent-run route shapes (four workspace, three pool) and the four
   repository route shapes, and rejects query strings. The repository backend
   configuration and the owner's repository listing are never forwarded.
+- The proxy forwards to `ENGINEBOX_API_URL`, normally the supervisor's front door.
+  The supervisor admits a write (or a credential-refreshing observation) only from
+  the owner token or an active service token. It checks the token against that one
+  record under its configured `state_dir` (`service-tokens/<id>.json`: digest,
+  revocation, expiry) before the request may wait at the upgrade gate. It does
+  not check scopes; the controller enforces those per route. A supervisor without
+  `state_dir` admits only the owner token for writes, so connected apps there must
+  point at a supervisor configured with `state_dir`.
 - Logs never contain tokens, codes or secrets; a failed revocation logs only a count.
 
 ## End-to-end check
