@@ -92,6 +92,12 @@ $global:EngineboxWslFixture.warnEveryCall=$false
 $global:EngineboxWslFixture.locationOverride=$null
 $global:EngineboxWslFixture.retryChoice='n'
 $global:EngineboxWslFixture.recoverEnrollmentOnRetry=$false
+$global:EngineboxWslFixture.existingTask=$null
+$global:EngineboxWslFixture.taskRecords=@()
+$global:EngineboxWslFixture.removedTasks=@()
+$global:EngineboxWslFixture.configureFailure=$false
+$global:EngineboxWslFixture.disabledTasks=@()
+$global:EngineboxWslFixture.enabledTasks=@()
 function global:Get-ItemProperty {
   param($Path,$ErrorAction)
   if ($Path -ne 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*') { throw 'Unexpected registry lookup' }
@@ -99,11 +105,19 @@ function global:Get-ItemProperty {
   [pscustomobject]@{DistributionName='Enginebox';BasePath=('\\?\'+$location)}
 }
 function global:Get-CimInstance { [pscustomobject]@{NumberOfLogicalProcessors=16;TotalPhysicalMemory=32GB} }
-function global:Get-ScheduledTask { return $null }
+function global:Get-ScheduledTask {
+  param($TaskName,$ErrorAction)
+  if ($TaskName -eq 'Enginebox WSL Node') { return $global:EngineboxWslFixture.existingTask }
+  return $null
+}
 function global:Register-ScheduledTask {
   param($TaskName,$Action,$Trigger,$Principal,$Description,$Settings,[switch]$Force)
   $global:EngineboxWslFixture.registrations+=@($Action.Execute)
+  $global:EngineboxWslFixture.taskRecords+=@([pscustomobject]@{Name=$TaskName;Action=$Action;Trigger=$Trigger;Principal=$Principal;Settings=$Settings})
 }
+function global:Unregister-ScheduledTask { param($TaskName,[switch]$Confirm) $global:EngineboxWslFixture.removedTasks+=@($TaskName) }
+function global:Disable-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.disabledTasks+=@($TaskName) }
+function global:Enable-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.enabledTasks+=@($TaskName) }
 function global:Stop-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.stopped++ }
 function global:Start-ScheduledTask { param($TaskName) $global:EngineboxWslFixture.starts++ }
 function global:Read-Host {
@@ -123,6 +137,10 @@ function global:Read-Host {
 }
 function global:Start-Process {
   param($FilePath,$ArgumentList,$Verb,[switch]$Wait,[switch]$PassThru)
+  if ([IO.Path]::GetFileName($FilePath) -eq 'powershell.exe' -and $ArgumentList -like '*-RegisterStartupTask*' -and $Verb -eq 'RunAs') {
+    Register-RuntimeTask ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    return [pscustomobject]@{ExitCode=0}
+  }
   if ($FilePath -eq 'wsl.exe' -and $ArgumentList -eq '--install --no-distribution --web-download' -and $Verb -eq 'RunAs') {
     $global:EngineboxWslFixture.enables++
     return [pscustomobject]@{ExitCode=3010}
@@ -192,7 +210,10 @@ function global:wsl.exe {
           } else { throw 'Unexpected probe body' }
         }
         '/etc/enginebox/installation-owner' { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
-        'configure' { $global:EngineboxWslFixture.configuration=($input | Out-String | ConvertFrom-Json) }
+        'configure' {
+          if ($global:EngineboxWslFixture.configureFailure) { $global:LASTEXITCODE=1; Write-Error 'Fixture runtime configuration failed'; return }
+          $global:EngineboxWslFixture.configuration=($input | Out-String | ConvertFrom-Json)
+        }
         'enrolled' { if (-not $global:EngineboxWslFixture.enrolled) { $global:LASTEXITCODE=1 }; return }
         'claim' { $global:EngineboxWslFixture.claim=($input | Out-String).Trim() }
         'enginebox-docker.service' { return }
@@ -216,6 +237,31 @@ try {
   if ($f.prompts.Count -ne 5 -or $f.configuration.controller -ne 'https://enginebox.coopcollective.dev' -or $f.configuration.cpu -ne 4 -or $f.configuration.memory_gib -ne 8) { throw 'Installer defaults or prompts were not applied' }
   if ($f.configuration.disk_gib -lt 20 -or $f.configuration.disk_gib -gt 50) { throw 'Disk default outside bounds' }
   if ($f.starts -ne 1 -or [IO.Path]::GetFileName($f.registrations[-1]) -ne 'wsl.exe' -or $f.updates -ne 0) { throw ('Worker must start only in WSL: '+($f | ConvertTo-Json -Compress)) }
+  $runtime=$f.taskRecords[-1]
+  if ($runtime.Name -ne 'Enginebox WSL Node' -or $runtime.Principal.LogonType -ne 2 -or $runtime.Principal.RunLevel -ne 0) { throw 'Worker must use passwordless S4U under its limited installing account' }
+  if (@($runtime.Trigger | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' -and $_.Delay -eq 'PT30S' }).Count -ne 1 -or @($runtime.Trigger | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }).Count -ne 1) { throw 'Worker requires boot and logon triggers' }
+  if (@($runtime.Trigger | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and $_.Repetition.Interval -eq 'PT1M' -and -not $_.Repetition.Duration }).Count -ne 1 -or $runtime.Settings.MultipleInstances -ne 2) { throw 'Recovery must repeat indefinitely without interrupting an active worker' }
+  if ($runtime.Settings.RestartCount -ne 999 -or $runtime.Settings.RestartInterval -ne 'PT1M' -or $runtime.Settings.ExecutionTimeLimit -ne 'PT0S' -or -not $runtime.Settings.StartWhenAvailable -or $runtime.Settings.DisallowStartIfOnBatteries -or $runtime.Settings.StopIfGoingOnBatteries) { throw 'Worker must recover failures and run without time or battery limits' }
+  if ($f.removedTasks[-1] -ne 'Enginebox WSL Setup') { throw 'Successful registration must remove only the pending setup task' }
+  # Reproduce a failed installer rerun against a registered worker. Pending
+  # setup may be saved, but the live runtime action and retry policy must survive.
+  $f.existingTask=[pscustomobject]@{Description='Enginebox WSL2 schema 1';Principal=[pscustomobject]@{UserId=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value};Actions=@([pscustomobject]@{Execute='wsl.exe'});Settings=[pscustomobject]@{Enabled=$true};State='Ready'}
+  $f.configureFailure=$true; $f.taskRecords=@(); $beforeStarts=$f.starts; $beforeRemoved=$f.removedTasks.Count
+  $failed=$false
+  try { & $flowScript -InstallDirectory (Join-Path $testRoot 'ready') -Resume } catch { $failed=$_.Exception.Message -like '*configuration failed*' }
+  if (-not $failed -or $f.starts -ne $beforeStarts -or $f.removedTasks.Count -ne $beforeRemoved -or @($f.taskRecords | Where-Object { $_.Name -eq 'Enginebox WSL Node' }).Count) { throw 'Interrupted setup replaced or started the existing worker task' }
+  if ($f.taskRecords.Count -ne 1 -or $f.taskRecords[0].Name -ne 'Enginebox WSL Setup') { throw 'Pending setup must use a separate task name' }
+  $f.configureFailure=$false
+  & $flowScript -InstallDirectory (Join-Path $testRoot 'ready') -Resume
+  if ($f.taskRecords[-1].Name -ne 'Enginebox WSL Node' -or $f.starts -ne $beforeStarts+1) { throw 'Retry must restore durable worker startup without re-registering the machine' }
+  $rejected=$false
+  try { Register-RuntimeTask 'S-1-5-18' } catch { $rejected=$_.Exception.Message -like '*installing Windows account*' }
+  if (-not $rejected) { throw 'Elevation must reject a different Windows owner' }
+  $f.existingTask.Principal.UserId='S-1-5-18'
+  $rejected=$false
+  try { & $flowScript -InstallDirectory (Join-Path $testRoot 'ready') -Resume } catch { $rejected=$_.Exception.Message -like '*different Windows account*' }
+  if (-not $rejected) { throw 'Setup must not take over another Windows account task' }
+  $f.existingTask=$null
   $global:EngineboxWslFixture.version='2.3.26'
   & $flowScript -InstallDirectory (Join-Path $testRoot 'updated') -Controller 'https://custom.example' -Cpu 2 -MemoryGiB 4 -DiskGiB 20
   $f=$global:EngineboxWslFixture
@@ -273,12 +319,14 @@ try {
   # Enter accepts Override existing by default. A complete private backup must
   # precede unregistering, and the new runtime must take the fresh invitation.
   $f.overrideChoice=''; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@(); $f.warnEveryCall=$true
+  $f.existingTask=[pscustomobject]@{Description='Enginebox WSL2 schema 1';Principal=[pscustomobject]@{UserId=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value};Actions=@([pscustomobject]@{Execute='wsl.exe'});Settings=[pscustomobject]@{Enabled=$true};State='Ready'}
   $replacement=Join-Path $testRoot 'replacement'
   $newCode=('e'*32)+'.'+('f'*64)
   & $flowScript -InstallDirectory $replacement -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode
   $f.warnEveryCall=$false
   $backups=@(Get-ChildItem -LiteralPath (Join-Path $replacement 'backups') -Directory)
   if ($backups.Count -ne 1 -or $f.code -ne $newCode -or -not $f.enrolled -or $f.stopped -ne 1) { throw 'Default override must back up and register a fresh runtime' }
+  if ($f.disabledTasks[-1] -ne 'Enginebox WSL Node') { throw 'Override must suspend automatic recovery before backing up the runtime' }
   $backup=Join-Path $backups[0].FullName 'enginebox.tar'
   $receipt=Get-Content -Raw -LiteralPath (Join-Path $backups[0].FullName 'backup.json') | ConvertFrom-Json
   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backup).Hash -ne $receipt.sha256) { throw 'Missing verified backup receipt' }
@@ -290,10 +338,12 @@ try {
   & $flowScript -InstallDirectory $replacement -Resume
   if ($f.stopped -ne $beforeStops -or ($f.calls | Where-Object { $_ -like '--export*' -or $_ -like '--unregister*' })) { throw 'Resume must not repeat replacement' }
   foreach ($failure in @('exportFailure','exportInvalid')) {
+    $beforeEnabled=$f.enabledTasks.Count
     $f[$failure]=$true; $f.enrolled=$false; $f.pendingId='a'*32; $f.calls=@(); $beforeStarts=$f.starts
     $failed=$false
     try { & $flowScript -InstallDirectory (Join-Path $testRoot $failure) -Cpu 2 -MemoryGiB 4 -DiskGiB 20 -EnrollmentCode $newCode } catch { $failed=$true }
     if (-not $failed -or -not $f.installed -or $f.pendingId -ne ('a'*32) -or $f.starts -ne $beforeStarts -or ($f.calls | Where-Object { $_ -like '--unregister*' })) { throw 'An incomplete backup must retain the existing distribution' }
+    if ($f.enabledTasks.Count -ne $beforeEnabled+1 -or $f.enabledTasks[-1] -ne 'Enginebox WSL Node') { throw 'A failed backup must restore the retained runtime recovery task' }
     $f[$failure]=$false
   }
   # Choosing No retains the old identity and explains a mismatched code locally.
@@ -334,6 +384,6 @@ try {
   Write-Output 'Fresh import and stdin registration, defaults, custom controller/resources, WSL upgrade/reboot, constrained-memory recovery, immutable registered budgets, minimum capacity and WSL-only startup passed.'
 } finally {
   Remove-Item -LiteralPath $testRoot -Recurse -Force
-  foreach ($name in @('Get-ItemProperty','Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','tar.exe','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
+  foreach ($name in @('Get-ItemProperty','Get-CimInstance','Get-ScheduledTask','Register-ScheduledTask','Unregister-ScheduledTask','Disable-ScheduledTask','Enable-ScheduledTask','Start-ScheduledTask','Stop-ScheduledTask','Read-Host','Start-Process','Invoke-WebRequest','tar.exe','wsl.exe')) { Remove-Item ('Function:\global:'+$name) -ErrorAction SilentlyContinue }
   Remove-Variable EngineboxWslFixture -Scope Global
 }

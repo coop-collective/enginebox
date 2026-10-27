@@ -213,9 +213,33 @@ PowerShell 5.1 and attempts a real WSL import plus LayerFS proof. A runner that
 cannot enable virtualization/reboot fails the qualification step; it is not a
 passing WSL test.
 
-The Windows startup task runs under the installing user at sign-in; it is not a
-SYSTEM service that starts before anyone signs in. WSL runtime services run
-inside the dedicated distribution.
+The Windows runtime task runs under the installing user's S4U identity, with a
+30-second delayed boot trigger and a sign-in trigger. It can start before anyone
+signs in without storing a Windows password. Setup requests administrator
+approval for this task; approval must use the same Windows account that owns the
+WSL distribution. The task itself runs with limited Windows privileges. WSL
+runtime services and template tools remain inside the dedicated distribution.
+
+The task keeps `wsl.exe` attached to the Linux supervisor, retries failures every
+minute (up to 999 retries), and also has an indefinite one-minute recovery
+trigger. The latter recovers stopped tasks even when Windows does not retry a
+manually started process; `IgnoreNew` preserves an already running worker.
+The task starts when a missed trigger becomes available and has no runtime
+time limit or battery stop condition. An idle WSL instance with
+only systemd services is not a substitute for this persistent Windows process.
+Pending installation resumes through a separate `Enginebox WSL Setup` task,
+removed after successful startup. Rerunning or interrupting setup must not
+replace the runtime task with an installer action or erase its retry policy.
+Override disables recovery before exporting the runtime and restores it if the
+backup fails while the original distribution remains registered. To deliberately
+keep a worker offline, disable its runtime task; stopping it alone allows the
+next recovery trigger to start it again.
+
+S4U does not grant Windows network-share credentials or encrypted-file access.
+Controller connections originate inside WSL. Local qualification must verify
+that this account can start its WSL distribution and reach the controller in a
+noninteractive scheduled task. A boot trigger and a successful task launch are
+not evidence of a completed reboot test; record that separately.
 
 The `Publish qualified WSL installer preview` workflow accepts a successful
 qualification run. It verifies that runtime sources are identical, tests the

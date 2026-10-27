@@ -8,13 +8,51 @@ param(
   [int]$MemoryGiB=0,
   [int]$DiskGiB=0,
   [switch]$Resume,
+  [switch]$RegisterStartupTask,
+  [string]$OwnerSid,
   [string]$InstallDirectory=(Join-Path $env:LOCALAPPDATA 'Enginebox\wsl-node')
 )
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
 $DefaultController='https://enginebox.coopcollective.dev'
 $Distro='Enginebox'
 $TaskName='Enginebox WSL Node'
+$SetupTaskName='Enginebox WSL Setup'
 $Marker='Enginebox WSL2 schema 1'
+function Assert-TaskOwner($Task,[string]$ExpectedOwnerSid) {
+  if (-not $Task) { return }
+  if ($Task.Description -ne $Marker) { throw 'An unrelated task owns an Enginebox task name.' }
+  $owner=$Task.Principal.UserId
+  if ($owner -notmatch '^S-1-[0-9-]+$') { $owner=[Security.Principal.NTAccount]::new($owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+  if ($owner -ne $ExpectedOwnerSid) { throw 'An Enginebox task belongs to a different Windows account.' }
+}
+function Register-RuntimeTask([string]$ExpectedOwnerSid) {
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+  if ($identity.User.Value -ne $ExpectedOwnerSid) { throw 'Approve startup registration using the installing Windows account, not a different administrator.' }
+  $existing=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  Assert-TaskOwner $existing $ExpectedOwnerSid
+  $action=New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\wsl.exe') -Argument '--distribution Enginebox --user root --cd / --exec /usr/local/sbin/enginebox-wsl supervise'
+  $boot=New-ScheduledTaskTrigger -AtStartup
+  $boot.Delay='PT30S'
+  $logon=New-ScheduledTaskTrigger -AtLogOn -User $ExpectedOwnerSid
+  # Manual task starts do not reliably honor RestartOnFailure. A repeating
+  # trigger also recovers clean exits and outages longer than the retry count.
+  # IgnoreNew leaves the current supervisor and its workloads untouched.
+  $recovery=New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 1)
+  # S4U retains this user's WSL registration without storing a Windows password
+  # or depending on an interactive desktop session. Workloads stay in Linux.
+  $principal=New-ScheduledTaskPrincipal -UserId $ExpectedOwnerSid -LogonType S4U -RunLevel Limited
+  $settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($boot,$logon,$recovery) -Principal $principal -Settings $settings -Description $Marker -Force | Out-Null
+}
+function Enable-RuntimeStartup([string]$ExpectedOwnerSid,[string]$Script,[string]$Directory) {
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+  $admin=[Security.Principal.WindowsPrincipal]::new($identity)
+  if ($admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Register-RuntimeTask $ExpectedOwnerSid; return }
+  Write-Host 'Windows will request administrator approval to start this worker after a reboot, before sign-in. Use this same Windows account.'
+  $arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -RegisterStartupTask -OwnerSid {1} -InstallDirectory "{2}"' -f $Script,$ExpectedOwnerSid,$Directory
+  $process=Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+  if ($process.ExitCode -ne 0) { throw 'Automatic startup registration failed. The runtime is retained; resume setup and approve startup registration using the same Windows account.' }
+}
 function Read-Number([string]$Label,[int]$Value,[int]$Default,[int]$Minimum,[int]$Maximum) {
   if ($Value -eq 0) { $inputValue=Read-Host "$Label [$Default]"; if (-not $inputValue) { $Value=$Default } elseif (-not [int]::TryParse($inputValue,[ref]$Value)) { throw "$Label must be a whole number." } }
   if ($Value -lt $Minimum -or $Value -gt $Maximum) { throw "$Label must be between $Minimum and $Maximum." }
@@ -226,7 +264,10 @@ if ($root.Contains('"')) { throw 'Installation path contains a quote.' }
 $receiptPath=Join-Path $root 'setup.json'
 $resumeScript=Join-Path $root 'install.ps1'
 $existingTask=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existingTask -and $existingTask.Description -ne $Marker) { throw 'An unrelated task owns the Enginebox task name.' }
+$currentOwner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+Assert-TaskOwner $existingTask $currentOwner
+$existingSetupTask=Get-ScheduledTask -TaskName $SetupTaskName -ErrorAction SilentlyContinue
+Assert-TaskOwner $existingSetupTask $currentOwner
 $settings=$null
 if (Test-Path -LiteralPath $receiptPath) {
   $settings=Get-Content -Raw -LiteralPath $receiptPath | ConvertFrom-Json
@@ -234,6 +275,11 @@ if (Test-Path -LiteralPath $receiptPath) {
   if (-not $Controller) { $Controller=$settings.controller }
   if (-not $Cpu) { $Cpu=$settings.cpu }; if (-not $MemoryGiB) { $MemoryGiB=$settings.memory_gib }; if (-not $DiskGiB) { $DiskGiB=$settings.disk_gib }
 } elseif ((Test-Path -LiteralPath $root) -and @(Get-ChildItem -LiteralPath $root -Force).Count) { throw 'Installation directory is not empty and has no Enginebox receipt.' }
+if ($RegisterStartupTask) {
+  if (-not $settings -or -not $OwnerSid) { throw 'Startup registration requires an existing owned installation and its Windows owner.' }
+  Register-RuntimeTask $OwnerSid
+  return
+}
 if (-not $Controller) { $Controller=$DefaultController }
 $codeController=Assert-Origin $Controller
 if (-not $settings) { $chosen=Read-Host "Controller address [$Controller]"; if ($chosen) { $Controller=$chosen } }
@@ -269,7 +315,9 @@ $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Resume' -f $resumeScript)
 $trigger=New-ScheduledTaskTrigger -AtLogOn -User $sid
 $principal=New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Description $Marker -Force | Out-Null
+# Pending setup must never replace a registered worker's action or retry policy.
+# An interruption or declined override leaves the runtime task intact.
+Register-ScheduledTask -TaskName $SetupTaskName -Action $action -Trigger $trigger -Principal $principal -Description $Marker -Force | Out-Null
 if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
   # Older Windows installations may omit the WSL launcher until its optional
   # component is enabled. Only the Windows feature operation is elevated.
@@ -316,8 +364,25 @@ if ($hasDistro) {
       # Download and verify the replacement before stopping the old runtime.
       if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) { throw 'Windows tar.exe is required to verify the backup. The existing runtime was retained.' }
       $null=Get-RuntimeImage $root
-      Stop-ScheduledTask -TaskName $TaskName
-      $null=Backup-AndRemoveRuntime $Distro $root
+      try {
+        if ($existingTask) {
+          # A recovery trigger must not restart the runtime during its export.
+          Disable-ScheduledTask -TaskName $TaskName | Out-Null
+          Stop-ScheduledTask -TaskName $TaskName
+        }
+        $null=Backup-AndRemoveRuntime $Distro $root
+      } catch {
+        $failure=$_
+        try {
+          $remaining=Invoke-WslNative -Arguments @('--list','--quiet')
+          $names=@($remaining.Stdout | ForEach-Object { ($_ -replace "`0",'').Trim() })
+          if ($existingTask -and $existingTask.Settings.Enabled -and $remaining.ExitCode -eq 0 -and $names -contains $Distro) {
+            Enable-ScheduledTask -TaskName $TaskName | Out-Null
+            if ($existingTask.State -eq 'Running') { Start-ScheduledTask -TaskName $TaskName }
+          }
+        } catch { Write-Warning 'Could not restore the previous startup task; resume the retained installer.' }
+        throw $failure
+      }
       $hasDistro=$false
     }
   }
@@ -375,10 +440,10 @@ while (-not $registered) {
   }
   $registered=$true
 }
-$action=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '--distribution Enginebox --user root --exec /usr/local/sbin/enginebox-wsl supervise'
-$taskSettings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description $Marker -Force | Out-Null
+Enable-RuntimeStartup $sid $resumeScript $root
 Start-ScheduledTask -TaskName $TaskName
+Unregister-ScheduledTask -TaskName $SetupTaskName -Confirm:$false
 Write-Host "Registered. WSL2 owns the Linux runtime and template workspaces: $Cpu CPU, $MemoryGiB GiB memory, $DiskGiB GiB virtual disk maximum."
+Write-Host 'Automatic startup is configured for boot and sign-in; the worker retries failures every minute without a runtime time limit.'
 Write-Host "Agent tools are inside templates; sign in through an authorized workspace. Dashboard: $Controller/dashboard/"
 } finally { $installationLock.Dispose() }
