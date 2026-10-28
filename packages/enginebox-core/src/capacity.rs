@@ -90,22 +90,31 @@ pub fn capacity(host: &Host, facts: &Value) -> Result<Value> {
     ] {
         ensure!(facts[key].is_u64(), "Host inventory lacks {key}");
     }
-    let active = items
+    // Stopped instances hold only disk. Frozen instances hold their RAM but
+    // no CPU time. Running, transitional and unknown states hold both.
+    let holds_memory = |v: &&Value| v["status"] != "Stopped";
+    let holds_cpu = |v: &&Value| v["status"] != "Stopped" && v["status"] != "Frozen";
+    let allocated_cpu = items
         .iter()
-        .filter(|v| v["status"] != "Stopped")
-        .collect::<Vec<_>>();
-    let allocated_cpu = active.iter().map(|v| number(&v["cpu"])).sum::<u64>();
-    let allocated_memory = active
+        .filter(holds_cpu)
+        .map(|v| number(&v["cpu"]))
+        .sum::<u64>();
+    let allocated_memory = items
         .iter()
+        .filter(holds_memory)
         .map(|v| number(&v["memory_bytes"]))
         .sum::<u64>();
-    let contributed = active
+    let contributed = |v: &&Value| v["managed"] == true || v["enginebox_owned"] == true;
+    let contributed_cpu = items
         .iter()
-        .filter(|v| v["managed"] == true || v["enginebox_owned"] == true)
-        .collect::<Vec<_>>();
-    let contributed_cpu = contributed.iter().map(|v| number(&v["cpu"])).sum::<u64>();
-    let contributed_mem = contributed
+        .filter(holds_cpu)
+        .filter(contributed)
+        .map(|v| number(&v["cpu"]))
+        .sum::<u64>();
+    let contributed_mem = items
         .iter()
+        .filter(holds_memory)
+        .filter(contributed)
         .map(|v| number(&v["memory_bytes"]))
         .sum::<u64>();
     let committed = items
@@ -113,9 +122,14 @@ pub fn capacity(host: &Host, facts: &Value) -> Result<Value> {
         .filter(|v| v["pool"] == host.pool)
         .map(|v| number(&v["disk_bytes"]) + number(&v["state_disk_bytes"]))
         .sum::<u64>();
-    let mut cpu_room = number(&facts["cpu_total"])
-        .saturating_sub(host.reserve_cpu)
-        .saturating_sub(allocated_cpu);
+    // vCPU limits are ceilings: the physical cores left after the host
+    // reserve admit `cpu_overcommit` times as many running vCPUs.
+    let overcommit = host.cpu_overcommit();
+    let cpu_budget = cpu_budget(
+        number(&facts["cpu_total"]).saturating_sub(host.reserve_cpu),
+        overcommit,
+    );
+    let mut cpu_room = cpu_budget.saturating_sub(allocated_cpu);
     let mut memory_room = number(&facts["memory_total_bytes"])
         .saturating_sub(host.reserve_memory_gib * GIB)
         .saturating_sub(allocated_memory)
@@ -150,15 +164,56 @@ pub fn capacity(host: &Host, facts: &Value) -> Result<Value> {
         );
     }
     Ok(
-        json!({"cpu_total":facts["cpu_total"],"memory_total_bytes":facts["memory_total_bytes"],"memory_available_bytes":facts["memory_available_bytes"],"disk_free_bytes":facts["disk_free_bytes"],"pool_total_bytes":facts["pool_total_bytes"],"pool_free_bytes":pool_free,"reserve_cpu":host.reserve_cpu,"reserve_memory_bytes":host.reserve_memory_gib*GIB,"contribution_cpu":host.contribution_cpu,"contribution_memory_bytes":host.contribution_memory_gib.map(|m|m*GIB),"contribution_allocated_cpu":contributed_cpu,"contribution_allocated_memory_bytes":contributed_mem,"allocated_cpu":allocated_cpu,"allocated_memory_bytes":allocated_memory,"disk_committed_bytes":committed,"max_additional":additional,"cpu_available":cpu_room,"memory_budget_available_bytes":memory_room,"disk_budget_available_bytes":disk_room,"instance_slots_available":slots}),
+        json!({"cpu_total":facts["cpu_total"],"memory_total_bytes":facts["memory_total_bytes"],"memory_available_bytes":facts["memory_available_bytes"],"disk_free_bytes":facts["disk_free_bytes"],"pool_total_bytes":facts["pool_total_bytes"],"pool_free_bytes":pool_free,"reserve_cpu":host.reserve_cpu,"cpu_overcommit":overcommit,"cpu_budget":cpu_budget,"reserve_memory_bytes":host.reserve_memory_gib*GIB,"contribution_cpu":host.contribution_cpu,"contribution_memory_bytes":host.contribution_memory_gib.map(|m|m*GIB),"contribution_allocated_cpu":contributed_cpu,"contribution_allocated_memory_bytes":contributed_mem,"allocated_cpu":allocated_cpu,"allocated_memory_bytes":allocated_memory,"disk_committed_bytes":committed,"max_additional":additional,"cpu_available":cpu_room,"memory_budget_available_bytes":memory_room,"disk_budget_available_bytes":disk_room,"instance_slots_available":slots}),
     )
 }
-pub fn resource_fits(host: &Host, facts: &Value, r: Resources) -> Result<bool> {
+/// Running vCPUs admitted on `physical` cores at `ratio` overcommit.
+pub fn cpu_budget(physical: u64, ratio: f64) -> u64 {
+    let ratio = if ratio.is_finite() {
+        ratio.max(1.0)
+    } else {
+        1.0
+    };
+    // Bounded inputs (cores <= 4096 * ratio <= 64) are exact in f64.
+    (physical as f64 * ratio).floor() as u64
+}
+/// The first resource that stops a new instance of `r`, or `None` when it fits.
+pub fn shortage(host: &Host, facts: &Value, r: Resources) -> Result<Option<String>> {
     let c = capacity(host, facts)?;
-    Ok(number(&c["instance_slots_available"]) >= 1
-        && number(&c["cpu_available"]) >= r.cpu
-        && number(&c["memory_budget_available_bytes"]) >= r.memory_gib * GIB
-        && number(&c["disk_budget_available_bytes"]) >= (r.disk_gib + r.memory_gib + 2) * GIB)
+    let gib = |b: u64| b / GIB;
+    Ok(if number(&c["instance_slots_available"]) < 1 {
+        Some(format!(
+            "no instance slots (max_instances {})",
+            host.max_instances
+        ))
+    } else if number(&c["cpu_available"]) < r.cpu {
+        Some(format!(
+            "CPU: {} vCPU requested, {} of {} running vCPU budget free (overcommit {})",
+            r.cpu,
+            number(&c["cpu_available"]),
+            number(&c["cpu_budget"]),
+            host.cpu_overcommit()
+        ))
+    } else if number(&c["memory_budget_available_bytes"]) < r.memory_gib * GIB {
+        Some(format!(
+            "memory: {} GiB requested, {} GiB free after the {} GiB reserve",
+            r.memory_gib,
+            gib(number(&c["memory_budget_available_bytes"])),
+            host.reserve_memory_gib
+        ))
+    } else if number(&c["disk_budget_available_bytes"]) < (r.disk_gib + r.memory_gib + 2) * GIB {
+        Some(format!(
+            "disk: {} GiB requested, {} GiB free after the {} GiB reserve",
+            r.disk_gib + r.memory_gib + 2,
+            gib(number(&c["disk_budget_available_bytes"])),
+            host.reserve_disk_gib
+        ))
+    } else {
+        None
+    })
+}
+pub fn resource_fits(host: &Host, facts: &Value, r: Resources) -> Result<bool> {
+    Ok(shortage(host, facts, r)?.is_none())
 }
 pub fn inventory(host: &Host) -> Result<Value> {
     let bytes = host_run(

@@ -137,6 +137,9 @@ pub struct WarmPolicy {
     pub size: String,
     pub ready: u32,
 }
+/// Default vCPU overcommit for agent workloads, which are mostly idle while a
+/// native client waits on inference.
+pub const DEFAULT_CPU_OVERCOMMIT: f64 = 4.0;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Host {
@@ -156,6 +159,14 @@ pub struct Host {
     pub warm_pools: Vec<WarmPolicy>,
     pub contribution_cpu: Option<u64>,
     pub contribution_memory_gib: Option<u64>,
+    /// vCPU overcommit ratio (1.0-64.0). Instance `limits.cpu` values are
+    /// ceilings, not reservations, so admission allows
+    /// `(cpu_total - reserve_cpu) * cpu_overcommit` running vCPUs. Unset uses
+    /// [`DEFAULT_CPU_OVERCOMMIT`]; omitted from serialization when unset so
+    /// older releases still read generated configuration. Memory is never
+    /// overcommitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_overcommit: Option<f64>,
     /// Concurrent native agent runs admitted on this host (1-256). Unset uses
     /// the controller default; omitted from serialization when unset so older
     /// releases still read generated configuration.
@@ -185,6 +196,7 @@ impl Default for Host {
             warm_pools: vec![],
             contribution_cpu: None,
             contribution_memory_gib: None,
+            cpu_overcommit: None,
             max_agent_runs: None,
             managed_registration: false,
         }
@@ -213,7 +225,10 @@ impl Host {
                 && self.reserve_disk_gib <= 4096
                 && (8..=4096).contains(&self.disk_gib)
                 && (1..=256).contains(&self.max_instances)
-                && self.max_agent_runs.is_none_or(|n| (1..=256).contains(&n)),
+                && self.max_agent_runs.is_none_or(|n| (1..=256).contains(&n))
+                && self
+                    .cpu_overcommit
+                    .is_none_or(|r| r.is_finite() && (1.0..=64.0).contains(&r)),
             "Invalid host resource bounds"
         );
         match (self.contribution_cpu, self.contribution_memory_gib) {
@@ -263,6 +278,10 @@ impl Host {
     }
     pub fn box_(&self) -> EngineBox {
         self.engine_box()
+    }
+    /// Effective vCPU overcommit ratio for admission.
+    pub fn cpu_overcommit(&self) -> f64 {
+        self.cpu_overcommit.unwrap_or(DEFAULT_CPU_OVERCOMMIT)
     }
     pub fn binding(&self) -> Value {
         json!({"target":self.target,"project":self.project,"pool":self.pool,"guest":self.guest,"network":self.network.as_deref().unwrap_or("")})

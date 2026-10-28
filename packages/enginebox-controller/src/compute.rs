@@ -43,7 +43,7 @@ pub fn hosts(fleet: &Value, configured: &[Host]) -> Vec<Value> {
         let state = if !online { "offline" } else if templates.is_empty() { "preparing" }
             else if limited { "capacity_limited" } else { "ready" };
         let budget = if c.is_object() {
-            resources(number(&c["cpu_total"]).saturating_sub(host.reserve_cpu).min(host.contribution_cpu.unwrap_or(u64::MAX)),
+            resources(c["cpu_budget"].as_u64().unwrap_or_else(|| number(&c["cpu_total"]).saturating_sub(host.reserve_cpu)).min(host.contribution_cpu.unwrap_or(u64::MAX)),
                 number(&c["memory_total_bytes"]).saturating_sub(host.reserve_memory_gib * GIB).min(host.contribution_memory_gib.map(|v| v * GIB).unwrap_or(u64::MAX)),
                 number(&c["pool_total_bytes"]).saturating_sub(host.reserve_disk_gib * GIB))
         } else { Value::Null };

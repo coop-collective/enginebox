@@ -20,6 +20,9 @@ reserve_memory_gib = 4
 reserve_disk_gib = 10
 disk_gib = 30
 max_instances = 16
+# Optional: running vCPUs admitted per physical core left after reserve_cpu
+# (1.0-64.0, default 4.0). Older controller releases reject this key.
+cpu_overcommit = 4.0
 # Optional: concurrent native agent runs on this host (1–256, default 8).
 # Older controller releases reject this key; set it only after upgrading.
 max_agent_runs = 8
@@ -146,12 +149,25 @@ Connection status does not prove remaining quota. The fleet does not schedule pr
 
 Admission is recalculated immediately before each creation or stopped-VM resume. It accounts for:
 
-- CPU and configured memory allocations across **all Incus projects** on the machine. Frozen and transitional/unknown states retain their allocations; only `Stopped` releases CPU/RAM commitments.
-- Actual available host memory, with configured host reserves retained.
+- CPU and configured memory allocations across **all Incus projects** on the machine, by instance state:
+
+  | State | CPU | Memory | Disk |
+  | --- | --- | --- | --- |
+  | `Running`, transitional (`Starting`, `Stopping`, `Migrating`) and unknown/`Error` | counted | counted | counted |
+  | `Frozen` (paused, e.g. a warm spare) | not counted | counted (it holds its RAM) | counted |
+  | `Stopped` (templates, parked workspaces) | not counted | not counted | counted |
+
+- A CPU budget of `(cpu_total - reserve_cpu) * cpu_overcommit` running vCPUs. An instance's `limits.cpu` is a ceiling, not a reservation, and agent workloads mostly wait on inference, so `cpu_overcommit` defaults to `4.0` (range 1.0–64.0; set `1.0` for strict one-vCPU-per-core accounting). A frozen VM's vCPUs count again once it runs.
+- Memory with no overcommit: the configured memory of every instance that holds RAM plus `reserve_memory_gib` must fit in total memory, and new instances must also fit in the actual available host memory after the reserve.
+- An optional `contribution_cpu` / `contribution_memory_gib` ceiling on a contributed machine is an owner's promise and is never overcommitted.
 - Actual pool/backing-filesystem free space and full root-disk plus saved-memory commitments for every VM in the admission pool, including stopped VMs.
 - The configured limit on fleet-created instances in the project.
 
 The model is deliberately conservative about copy-on-write storage: inexpensive initial clones still reserve their full configured disk capacity. Ordinary host processes and CI jobs are not Incus allocations; reserve enough headroom for them. These checks do not guarantee latency or prevent unrelated administrator workloads from consuming resources afterward.
+
+A refused creation names the first limiting resource, for example `Insufficient CPU, memory, disk or instance slots; preserve reserves (memory: 4 GiB requested, 2 GiB free after the 40 GiB reserve)`. `GET /v1/fleet` reports `cpu_overcommit`, `cpu_budget`, `allocated_cpu` (running vCPUs) and `allocated_memory_bytes` (running and frozen) per host.
+
+Example: a 48-core, 125 GiB host with `reserve_cpu = 12`, `reserve_memory_gib = 40` and 13 VMs of 4 vCPU / 4 GiB, of which 5 are stopped, 4 frozen and 4 running, has a CPU budget of 144 vCPU with 16 used, and 125 − 40 − 32 = 53 GiB of memory budget, so it admits 13 more standard VMs.
 
 `max_additional` is a point-in-time estimate for repeatedly creating one size, not three budgets that can all be consumed independently. Queued jobs have not reserved capacity yet. A job can be rejected when it reaches execution even if inventory previously showed room.
 
