@@ -11,6 +11,8 @@ install Incus, change networking, replace VM state or install provider tools on
 the host. A new bare server first needs the existing inspected host plan/apply
 flow, an approved fleet entry and a root-owned `enginebox-host` helper. It must
 be Linux x86-64 with systemd, curl, Python 3 and ordinary core utilities.
+The published executable is built on Ubuntu 24.04; the installer verifies that
+it can run locally before attempting enrollment.
 
 ## Enable managed registration
 

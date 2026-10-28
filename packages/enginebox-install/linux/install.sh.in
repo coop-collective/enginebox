@@ -82,6 +82,9 @@ printf '%s  %s\n' "$binary_sha256" "$download/enginebox-node" | sha256sum --chec
   echo 'Node executable checksum mismatch.' >&2; exit 1;
 }
 chmod 0700 "$download/enginebox-node"
+"$download/enginebox-node" --version >/dev/null || {
+  echo 'The verified node executable cannot run on this Linux installation. This package is built on Ubuntu 24.04 x86-64.' >&2; exit 1;
+}
 if [[ "$enrolled" != true ]]; then
   printf '%s\n' "$code" | "$download/enginebox-node" register-host --controller "$controller" --config "$configuration"
 fi

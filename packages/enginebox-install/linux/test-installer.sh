@@ -13,6 +13,8 @@ export PATH="$fixture/tools:$PATH"
 cat > "$fixture/node" <<'PY'
 #!/usr/bin/env python3
 import json,os,pathlib,sys
+if sys.argv[1:]==['--version']:
+ print('enginebox-node fixture'); raise SystemExit(0)
 assert sys.argv[1]=='register-host'
 args=dict(zip(sys.argv[2::2],sys.argv[3::2]))
 code=sys.stdin.readline().strip(); assert '.' in code
