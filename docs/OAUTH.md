@@ -116,8 +116,16 @@ with, and it stays the same across refreshes. A refresh response repeats
 | `POST /v1/projects/{project}/repositories/{name}/tokens` | Mint a short-lived repository token (`read` grants: read tokens only) |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 
-The dashboard's **Connected apps** section lists every live connection (app name,
-redirect hosts, workspaces, pools, repository grants, profiles, last renewal) with a Disconnect button.
+The dashboard's **MCP** section includes Connected apps and grants: every live
+connection (app name, redirect hosts, workspaces, pools, repository grants,
+profiles, last renewal) retains a Disconnect button. The former `?panel=apps`
+URL remains supported.
+
+The MCP setup instructions describe the local `enginebox-fleet-mcp` stdio binary.
+This OAuth authorization server and its scoped REST API do not expose a remote
+`/mcp` transport endpoint; a URL-only MCP client cannot use the dashboard origin
+as an MCP server. See [MCP connection](FLEET.md#mcp-connection) for the supported
+local configuration. Operator credentials stay outside project environments.
 
 ## Tokens and lifetimes
 

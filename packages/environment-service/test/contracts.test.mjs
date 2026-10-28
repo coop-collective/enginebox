@@ -80,6 +80,8 @@ test('source follows only main, checks out exact commits, and preserves prior co
     const config = fixture(join(root, 'state')); config.environments[0].source.url = repo;
     const manager = new Environments(config); await manager.init(); const env = config.environments[0];
     const first = await manager.source(env); await manager.prepare(env, first);
+    assert.equal(manager.states.main.metrics.preparation.source_bytes, null, 'Git checkout has no verified source byte inventory');
+    assert.equal(manager.states.main.metrics.preparation.prepare_ms, null, 'No configured preparation command ran');
     await mkdir(join(first.root, 'data')); await atomic(join(first.root, 'data', 'database.json'), { count: 42 });
     await git(['checkout', '-b', 'agent']); await atomic(join(repo, 'code.json'), { version: 2 }); await git(['add', '.']); await git(['commit', '-m', 'agent work']);
     assert.equal((await manager.source(env)).revision, first.revision);
@@ -110,6 +112,9 @@ test('failed readiness restores the previous process and suppresses automatic re
     assert.equal(manager.states.main.status, 'update-failed');
     assert.equal(manager.states.main.failedRevision, 'b'.repeat(40));
     assert.equal(manager.states.main.error, 'service-exited');
+    assert.equal(manager.states.main.metrics.startup.status, 'failed');
+    assert.equal(manager.states.main.metrics.startup.revision, 'b'.repeat(40));
+    assert(manager.states.main.metrics.startup.elapsed_ms >= 0);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 test('a recovered source read clears transient failure for the healthy active revision', async () => {

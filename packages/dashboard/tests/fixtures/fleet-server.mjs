@@ -269,6 +269,12 @@ createServer(async (req, res) => {
     if (!data.remove) environmentRoutes.push(data);
     return send(200, environmentCatalog());
   }
+  if (req.url === "/v1/workspaces" && req.method === "GET") {
+    const projects = [...new Set(["game", "demo", ...githubProjects.map(project => project.id)])];
+    return send(200, { workspaces: projects.map(id => ({ id, repositories: [], pools: [], runs: [], storage_nodes: ["metal-01"], storage_usage: [], checkouts: [], operations: [], launch_events: [], source_observations: [], integration_observations: [] })), coverage: { run_history_limit: 256, operation_history_limit: 200, operations_per_workspace_limit: 30 } });
+  }
+  if (req.url === "/v1/repository-backends" && req.method === "GET") return send(200, { backend: { configured: false } });
+  if (req.url === "/v1/github" && req.method === "GET") return send(200, { configured: false, repositories: [] });
   if (req.url === "/v1/storage" && req.method === "GET") {
     if (mode === "storage-error") return send(503, { error: "Storage catalog unavailable." });
     return send(200, { backend: "layerfs", configured: mode !== "storage-empty", nodes: mode === "storage-empty" ? [] : [{ host_id: "metal-01", status: "registered", github: { enabled: true, private_auth_configured: false }, projects: [{ id: "game" }, { id: "demo" }] }], incus_attachment: false, automatic_replay: false });

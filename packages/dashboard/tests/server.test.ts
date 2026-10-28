@@ -401,3 +401,22 @@ test("storage proxy exposes bounded operations and never a general command or re
     (error: unknown) => error instanceof HttpError && error.status === 403);
   assert.equal(fetch.mock.callCount(), 17);
 });
+
+test("workspace summary, approved source linking and pool runs preserve server-only credentials", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async (_url: string, options: RequestInit) => {
+    assert.equal((options.headers as Record<string, string>).Authorization, `Bearer ${token}`);
+    return Response.json({ ok: true });
+  });
+  for (const [method, path, body] of [
+    ["GET", "v1/workspaces", undefined],
+    ["POST", "v1/projects/app/repositories/github", { name: "main", full_name: "fixture/private" }],
+    ["POST", "v1/pools/app-pool/agent-runs", { provider: "codex", prompt: "Inspect source" }],
+  ] as const) {
+    const response = await proxy(request(`/api/control/${path}`, method, body), path.split("/"));
+    assert.equal(response.status, 200);
+  }
+  assert.equal(fetch.mock.callCount(), 3);
+  for (const path of ["v1/workspaces/secret", "v1/projects/app/repositories/github/tokens", "v1/pools/app-pool/agent-runs/arbitrary/cancel"]) {
+    await assert.rejects(proxy(request(`/api/control/${path}`, "POST", {}), path.split("/")), (e: unknown) => e instanceof HttpError && e.status === 404);
+  }
+});

@@ -1681,3 +1681,13 @@ input::placeholder {
   .worker-code { grid-template-columns: minmax(0, 1fr); padding: 14px; }
   .worker-pending-row .worker-actions { justify-content: flex-start; }
 }
+
+.workspaces-panel .host-card { margin-block: 12px; min-width: 0; }
+.workspaces-panel .workspace-remote { overflow-wrap: anywhere; }
+.workspaces-panel summary { cursor: pointer; font-weight: 600; padding-block: 8px; }
+.workspaces-panel textarea { min-height: 100px; width: 100%; }
+.workspace-receipts { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
+
+.mcp-config { display: block; width: 100%; max-width: 100%; margin-block: 10px; font-family: var(--font-mono, monospace); font-size: 12px; overflow: auto; }
+.mcp-tool-list dt { font-weight: 600; margin-top: 12px; }
+.mcp-tool-list dd { margin: 6px 0 0; overflow-wrap: anywhere; }

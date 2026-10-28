@@ -52,7 +52,7 @@ export class ProjectBootstrap {
   summary(p) {
     const state = this.manager.states[p.active?.env.id];
     return { id: p.id, host: p.host, project: p.project, status: p.status, error: p.error, healthy: state?.healthy ?? false,
-      environment: p.active?.env.id, revision: state?.revision, desiredRevision: p.desiredRevision,
+      environment: p.active?.env.id, revision: state?.revision, desiredRevision: p.desiredRevision, metrics: state?.metrics ?? null,
       template: p.active && { id: p.active.template.id, revision: p.active.template.revision, digest: p.active.templateDigest },
       urls: this.manager.routes.filter(r => r.environment === p.active?.env.id && r.hostname).map(r => `${this.policy?.urlScheme ?? (this.config.httpTls ? 'https' : 'http')}://${r.hostname}${this.policy?.urlPort ? `:${this.policy.urlPort}` : ''}`) };
   }

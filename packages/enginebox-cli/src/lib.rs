@@ -109,6 +109,48 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 pub fn tools() -> Vec<Value> {
     vec![
         tool(
+            "workspace_catalog",
+            "Read the owner's unified workspace sources, environments, retained activity and measured storage receipts. Observations are not CI acceptance evidence.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "repository_list",
+            "List source repositories registered to an authorized project.",
+            json!({"project":{"type":"string"}}),
+            &["project"],
+        ),
+        tool(
+            "repository_create",
+            "Create an idempotent hosted source repository for an authorized project. Requires a configured repository backend; does not prepare a LayerFS checkout.",
+            json!({"project":{"type":"string"},"name":{"type":"string"},"description":{"type":"string","maxLength":512}}),
+            &["project", "name"],
+        ),
+        tool(
+            "repository_link_github",
+            "Owner-only: map an already selected GitHub repository to a project. Selection and grants remain enforced; this does not import or overwrite LayerFS source.",
+            json!({"project":{"type":"string"},"name":{"type":"string"},"full_name":{"type":"string"},"description":{"type":"string","maxLength":512}}),
+            &["project", "name", "full_name"],
+        ),
+        tool(
+            "pool_agent_launch",
+            "Submit a native agent task to an authorized project pool. May consume provider allowance. An unconfirmed response must be reconciled using agent_runs, never automatically replayed. Run success does not approve promotion.",
+            json!({"pool":{"type":"string"},"provider":{"type":"string","enum":["codex","claude","cursor"]},"prompt":{"type":"string","minLength":1,"maxLength":12000},"repository":{"type":"string","description":"Optional existing project/name source; credential access does not prepare source."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"model":{"type":"string"}}),
+            &["pool", "provider", "prompt"],
+        ),
+        tool(
+            "pool_agent_run",
+            "Read a pool run, including a queued run without an assigned environment.",
+            json!({"pool":{"type":"string"},"run_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}),
+            &["pool", "run_id"],
+        ),
+        tool(
+            "pool_agent_cancel",
+            "Request cancellation of a pool run. Poll pool_agent_run until termination is confirmed; retained capacity is not released on an uncertain response.",
+            json!({"pool":{"type":"string"},"run_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}),
+            &["pool", "run_id"],
+        ),
+        tool(
             "ci_templates",
             "List enabled CI toolchain recipes and per-node verification/install status.",
             json!({}),
@@ -375,6 +417,20 @@ fn storage_id(v: &Value, key: &str) -> Result<String> {
     );
     Ok(value)
 }
+fn repository_name(value: &str) -> Result<&str> {
+    ensure!(
+        (1..=63).contains(&value.len())
+            && value.as_bytes()[0].is_ascii_alphanumeric()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+            && !value.ends_with(".git")
+            && !value.ends_with(".lock")
+            && !value.contains(".."),
+        "Invalid repository name"
+    );
+    Ok(value)
+}
 
 pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)> {
     let spec = tools()
@@ -395,6 +451,84 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         );
     }
     let result = match name {
+        "workspace_catalog" => ("/v1/workspaces".into(), None),
+        "repository_list" | "repository_create" | "repository_link_github" => {
+            let project = storage_id(args, "project")?;
+            let mut path = format!("/v1/projects/{project}/repositories");
+            if name == "repository_list" {
+                (path, None)
+            } else {
+                let mut body = json!({"name":repository_name(field(args,"name")?)?});
+                if let Some(description) = args.get("description") {
+                    let description = description
+                        .as_str()
+                        .context("Description must be a string")?;
+                    ensure!(
+                        description.len() <= 512 && !description.chars().any(char::is_control),
+                        "Invalid repository description"
+                    );
+                    body["description"] = json!(description);
+                }
+                if name == "repository_link_github" {
+                    let full_name = field(args, "full_name")?;
+                    // Normalize only a repository identity; no arbitrary URL or credential input.
+                    body["full_name"] =
+                        json!(enginebox_storage_layerfs::github::repository(full_name)?);
+                    path.push_str("/github");
+                }
+                (path, Some(body))
+            }
+        }
+        "pool_agent_run" | "pool_agent_cancel" => (
+            format!(
+                "/v1/pools/{}/agent-runs/{}{}",
+                id(args, "pool", false)?,
+                record_id(args, "run_id")?,
+                if name == "pool_agent_cancel" {
+                    "/cancel"
+                } else {
+                    ""
+                }
+            ),
+            (name == "pool_agent_cancel").then(|| json!({})),
+        ),
+        "pool_agent_launch" => {
+            let pool = id(args, "pool", false)?;
+            ensure!(
+                ["codex", "claude", "cursor"].contains(&field(args, "provider")?),
+                "Unknown agent"
+            );
+            let prompt = field(args, "prompt")?;
+            ensure!(
+                !prompt.trim().is_empty() && prompt.len() <= 12000 && !prompt.contains('\0'),
+                "Invalid prompt"
+            );
+            if let Some(repository) = args.get("repository") {
+                let (project, name) = repository
+                    .as_str()
+                    .and_then(|r| r.split_once('/'))
+                    .context("Repository must be project/name")?;
+                enginebox_storage_layerfs::config::identifier(project)?;
+                repository_name(name)?;
+            }
+            if let Some(timeout) = args.get("timeout_seconds") {
+                ensure!(
+                    timeout.as_u64().is_some_and(|n| (1..=86400).contains(&n)),
+                    "Invalid run timeout"
+                );
+            }
+            if let Some(model) = args.get("model") {
+                ensure!(
+                    model.as_str().is_some_and(|m| !m.is_empty()
+                        && m.len() <= 256
+                        && !m.chars().any(char::is_control)),
+                    "Invalid model"
+                );
+            }
+            let mut body = args.clone();
+            body.as_object_mut().unwrap().remove("pool");
+            (format!("/v1/pools/{pool}/agent-runs"), Some(body))
+        }
         "ci_templates" => ("/v1/ci/templates".into(), None),
         "ci_template_register" => {
             let manifest: enginebox_ci::templates::Template =
@@ -803,6 +937,86 @@ pub fn rpc(request: Value, client: &FleetClient) -> Option<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn workspace_source_and_pool_tools_preserve_the_controller_boundaries() {
+        assert_eq!(
+            tool_request("workspace_catalog", &json!({})).unwrap(),
+            ("/v1/workspaces".into(), None)
+        );
+        assert_eq!(
+            tool_request(
+                "repository_create",
+                &json!({"project":"app","name":"main","description":"Fixture"})
+            )
+            .unwrap(),
+            (
+                "/v1/projects/app/repositories".into(),
+                Some(json!({"name":"main","description":"Fixture"}))
+            )
+        );
+        assert_eq!(
+            tool_request(
+                "repository_link_github",
+                &json!({"project":"app","name":"main","full_name":"Owner/Repo"})
+            )
+            .unwrap(),
+            (
+                "/v1/projects/app/repositories/github".into(),
+                Some(json!({"name":"main","full_name":"owner/repo"}))
+            )
+        );
+        let request = json!({"pool":"app-pool","provider":"codex","prompt":"Inspect source","repository":"app/main","timeout_seconds":3600});
+        let (path, body) = tool_request("pool_agent_launch", &request).unwrap();
+        assert_eq!(path, "/v1/pools/app-pool/agent-runs");
+        let body = body.unwrap();
+        assert!(body.get("pool").is_none());
+        assert_eq!(body["repository"], "app/main");
+        assert_eq!(body["timeout_seconds"], 3600);
+        assert_eq!(
+            tool_request(
+                "pool_agent_cancel",
+                &json!({"pool":"app-pool","run_id":"a".repeat(32)})
+            )
+            .unwrap(),
+            (
+                format!("/v1/pools/app-pool/agent-runs/{}/cancel", "a".repeat(32)),
+                Some(json!({}))
+            )
+        );
+        for (tool, args) in [
+            ("workspace_catalog", json!({"token":"secret"})),
+            ("repository_list", json!({"project":"../other"})),
+            (
+                "repository_create",
+                json!({"project":"app","name":"main.git"}),
+            ),
+            (
+                "repository_create",
+                json!({"project":"app","name":"main","description":"bad\ntext"}),
+            ),
+            (
+                "repository_link_github",
+                json!({"project":"app","name":"main","full_name":"https://user:secret@github.com/owner/repo"}),
+            ),
+            (
+                "pool_agent_launch",
+                json!({"pool":"app-pool","provider":"codex","prompt":"Inspect","repository":"app/../other"}),
+            ),
+            (
+                "pool_agent_launch",
+                json!({"pool":"app-pool","provider":"codex","prompt":"Inspect","timeout_seconds":0}),
+            ),
+            (
+                "pool_agent_run",
+                json!({"pool":"app-pool","run_id":"../private"}),
+            ),
+        ] {
+            assert!(
+                tool_request(tool, &args).is_err(),
+                "{tool} accepted invalid inputs"
+            );
+        }
+    }
+    #[test]
     fn rejects_token_exfiltration_and_path_injection() {
         let token = "x".repeat(32);
         assert!(FleetClient::new("http://example.com", token.clone()).is_err());
@@ -854,7 +1068,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            38
+            45
         );
     }
     #[test]

@@ -312,3 +312,9 @@ Unreal/Unity workspaces and the Cloudflare data-fork experiment remain separate 
 ## GitHub account and Actions adapter
 
 The optional native controller adapter is specified in [GitHub Actions](GITHUB-ACTIONS.md). It adds GitHub App account connections and repository-scoped credential handoff to the existing LayerFS import/acceptance/export path. The same App can grant organization runner administration using one installation and shared OAuth session; separate registrations remain optional, and signed webhooks request bounded disposable native JIT runners. Core runtime and existing CI automations remain forge-independent. This adapter does not replace the required Cloudflare fleet authority or claim that runner-pool distribution and live workflow acceptance are qualified.
+
+The native dashboard's [Workspaces view](WORKSPACES.md) groups project source
+connections, runtime environments and measured preparation/storage observations
+under durable project identity. It is a read-only aggregate over existing
+authorities, with existing source and native execution APIs for mutations.
+Successful execution does not imply accepted-main promotion.

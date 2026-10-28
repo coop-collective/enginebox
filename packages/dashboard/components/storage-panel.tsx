@@ -174,11 +174,15 @@ function TaskStatus({
   );
 }
 
-function NodeStorage({ node }: { node: StorageNode }) {
+function NodeStorage({ node, projectId, repository }: { node: StorageNode; projectId?: string; repository?: string }) {
   const { tasks, run } = useStorageJobs(node.host_id);
   const [github, setGithub] = useState<GitHubProject[]>([]);
   const [rows, setRows] = useState<Checkout[] | null>(null);
   const [project, setProject] = useState(node.projects[0]?.id ?? "");
+  useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get("workspace");
+    if (requested && node.projects.some(p => p.id === requested)) setProject(requested);
+  }, [node.projects]);
   const [revision, setRevision] = useState("HEAD");
   const [reviewed, setReviewed] = useState(false);
   const [previewContext, setPreviewContext] = useState("");
@@ -202,14 +206,14 @@ function NodeStorage({ node }: { node: StorageNode }) {
           setListError("The node returned invalid workspace receipts.");
           continue;
         }
-        setRows(rows);
-        setGithub(githubProjects(result));
+        setRows(projectId ? rows.filter(row => (row.github_project ?? row.project) === projectId) : rows);
+        setGithub(githubProjects(result).filter(project => !projectId || project.id === projectId));
         setListError("");
       }
     } finally {
       refreshing.current = false;
     }
-  }, [run]);
+  }, [run, projectId]);
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -316,6 +320,8 @@ function NodeStorage({ node }: { node: StorageNode }) {
       )}
       {node.github?.enabled && (
         <GitHubStorage
+          projectId={projectId}
+          initialRepository={repository}
           projects={github}
           rows={rows ?? []}
           tasks={tasks}
@@ -329,6 +335,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
             Project
             <select
               value={project}
+              disabled={!!projectId}
               onChange={(event) => {
                 setProject(event.target.value);
                 setReviewed(false);
@@ -458,7 +465,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
         </>
       ) : (
         <p className="workspace-hint">
-          Register repository aliases on this node before importing a project.
+          {projectId ? "This workspace has no native source alias on this node. Use its GitHub import controls where available." : "Register repository aliases on this node before importing a project."}
         </p>
       )}
       <div className="section-title storage-checkouts-heading">
@@ -484,7 +491,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
             : "Checkout receipts are unavailable."}
         </p>
       ) : !rows.length ? (
-        <p className="catalog-description">No checkouts on this node yet.</p>
+        <p className="catalog-description">{projectId ? "No checkouts for this workspace on this node yet." : "No checkouts on this node yet."}</p>
       ) : (
         <div className="storage-checkouts">
           {rows.map((row) => {
@@ -554,7 +561,7 @@ function NodeStorage({ node }: { node: StorageNode }) {
   );
 }
 
-export function StoragePanel({ refreshToken }: { refreshToken: number }) {
+export function StoragePanel({ refreshToken, projectId, repository }: { refreshToken: number; projectId?: string; repository?: string }) {
   const [catalog, setCatalog] = useState<StorageCatalog | null>(null);
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
@@ -572,17 +579,19 @@ export function StoragePanel({ refreshToken }: { refreshToken: number }) {
       });
     return () => controller.abort();
   }, [refreshToken, retry]);
+  const nodes = catalog?.nodes.filter(node => !projectId || node.projects.some(project => project.id === projectId) || node.github?.enabled).map(node => projectId ? { ...node, projects: node.projects.filter(project => project.id === projectId) } : node) ?? [];
   return (
     <section className="catalog-panel" aria-labelledby="storage-title">
       <div className="section-title">
         <div>
-          <h2 id="storage-title">Shared checkout storage</h2>
+          <h2 id="storage-title">{projectId ? `Source and storage · ${projectId}` : "Shared checkout storage"}</h2>
           <p>
             Import a project once, then fork independent writable checkouts with
             prepared dependencies.
           </p>
         </div>
       </div>
+      {!projectId && <p className="workspace-hint">All workspaces · import a new source or inspect storage setup. Open a workspace to limit controls to that project.</p>}
       <p className="workspace-hint">
         Checkout sandboxes are managed separately from Incus VMs and private
         agent homes. VM attachment is not available from this dashboard yet.
@@ -600,7 +609,7 @@ export function StoragePanel({ refreshToken }: { refreshToken: number }) {
       )}
       {!catalog ? (
         <p className="catalog-description">Loading storage catalog…</p>
-      ) : !catalog.nodes.length ? (
+      ) : !nodes.length ? (
         <div className="empty-state compact">
           <h3>Storage setup required</h3>
           <p>
@@ -611,8 +620,8 @@ export function StoragePanel({ refreshToken }: { refreshToken: number }) {
         </div>
       ) : (
         <div className="storage-nodes">
-          {catalog.nodes.map((node) => (
-            <NodeStorage key={node.host_id} node={node} />
+          {nodes.map((node) => (
+            <NodeStorage key={`${node.host_id}/${projectId ?? "all"}`} node={node} projectId={projectId} repository={repository} />
           ))}
         </div>
       )}

@@ -133,7 +133,9 @@ A backend implements `repositories::Backend` in `packages/enginebox-controller/s
 
 ### Linked GitHub repositories
 
-A GitHub repository is linked, not created. The owner configures the GitHub repository App ([GitHub secrets](GITHUB-SECRETS.md)), connects their account and selects the repository in the dashboard's GitHub panel, then links it to a project:
+Linking is owner/admin-only: a project repository write grant does not authorize attaching another account-selected source. The owner controls account connection, repository selection and project source mapping.
+
+A GitHub repository is linked, not created. The owner configures the GitHub repository App ([GitHub secrets](GITHUB-SECRETS.md)), connects their account and selects the repository in the dashboard's Workspaces → GitHub connection, then links it to a project:
 
 ```
 POST /v1/projects/{project}/repositories/github   {"full_name":"owner/repo", "name"?: "repo", "description"?: "..."}
@@ -166,3 +168,8 @@ Repository handles are disposed after each call. Git clients use the full `art_v
 - Branch protection or push policies; anyone holding a write token can push any branch.
 - Opening pull requests from a run (agents push branches; PRs are opened outside the run).
 - Tokens longer than GitHub's one hour for long runs.
+
+The dashboard now groups hosted and GitHub sources under **Workspaces**. See
+[WORKSPACES.md](WORKSPACES.md) for source linking, agent execution, measured
+preparation coverage, and the distinction between repository creation and a
+materialized LayerFS environment.

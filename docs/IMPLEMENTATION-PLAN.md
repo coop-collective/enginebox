@@ -211,3 +211,13 @@ Delivery order: project registry and owned startup service; code updates that pr
 ## Shared integration and CI ownership
 
 [Integration and CI](INTEGRATION-CI.md) applies the Beanstalk principles within Enginebox: private task results, frozen batched candidates, protected full checks and conditional accepted-head promotion. The Cloudflare candidate gate is tested with a 100-change record. A separate real two-task flow qualifies same-Store logical LayerFS integration, protected Godot Web/Linux builds, browser recording, CPU validation and reviewed batch promotion. Automatic batch composition, cross-Store import, red-batch isolation, native Unity/Unreal builds and engine-pool scheduling remain Enginebox work. Gamejam consumes the APIs and presents application state; it does not own a second integration queue or CI authority.
+
+### Workspace source and activity view
+
+The native dashboard consolidates repository and GitHub navigation into
+Workspaces, a project-ID projection over source connections, pools, environments
+and measured operation receipts. See [WORKSPACES.md](WORKSPACES.md) for its exact
+coverage. Automatic hosted Git bootstrap into LayerFS, automatic harness command
+classification, Cloudflare/native telemetry federation, and Ideator builder dispatch
+remain unqualified. Existing accepted-main and owner promotion guards remain in
+force.

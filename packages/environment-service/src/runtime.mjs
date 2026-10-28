@@ -72,7 +72,7 @@ export class Environments {
   }
   catalog() {
     return { schema: 1, projects: this.projects.catalog(), baseDomains: this.config.baseDomains, transportEntrypoints: this.config.transportEntrypoints, routes: this.routes,
-      environments: this.config.environments.map(e => ({ id: e.id, updateMode: e.updateMode ?? 'restart', source: { kind: e.source.kind, branch: e.source.branch }, services: e.ports.map(({ name, protocol }) => ({ name, protocol })), cpu: e.cpu, memoryMiB: e.memoryMiB, ...(this.states[e.id] ?? { status: 'pending', healthy: false }) })) };
+      environments: this.config.environments.map(e => ({ id: e.id, updateMode: e.updateMode ?? 'restart', source: { kind: e.source.kind, branch: e.source.branch, project: e.source.project, workspace: e.source.workspace }, services: e.ports.map(({ name, protocol }) => ({ name, protocol })), cpu: e.cpu, memoryMiB: e.memoryMiB, ...(this.states[e.id] ?? { status: 'pending', healthy: false }) })) };
   }
   async updateRoutes(transform) {
     const write = this.routeWrites.then(async () => {
@@ -131,31 +131,62 @@ export class Environments {
     check(/^[a-f0-9]{40,64}$/.test(revision), 'invalid-source-revision');
     return { revision, repo, root };
   }
+  observe(env, stage, value) {
+    const state = this.states[env.id] ??= { healthy: false, status: 'pending' };
+    (state.metrics ??= {})[stage] = { schema: 1, observed_at: new Date().toISOString(), ...value };
+  }
   async prepare(env, source) {
     await this.assertAdmission();
+    const started = performance.now();
     const release = join(source.root, source.revision); const marker = join(release, '.enginebox-prepared');
-    if (await load(marker, null)) return release;
-    // Each failed attempt gets an independent checkout; never clean a live tree.
-    const checkout = join(source.root, `checkout-${source.revision}-${randomUUID()}`);
-    if (source.manifest) await copyAccepted(source, checkout);
-    else {
-      await this.run('git', ['-c', 'core.hooksPath=/dev/null', 'clone', '--no-hardlinks', '--no-checkout', source.repo, checkout]);
-      await this.run('git', ['-c', 'core.hooksPath=/dev/null', '-C', checkout, 'checkout', '--detach', source.revision]);
+    if (await load(marker, null)) {
+      this.observe(env, 'preparation_reuse', { revision: source.revision, status: 'reused', elapsed_ms: performance.now() - started });
+      return release;
     }
-    if (env.cwd && env.cwd !== '.') {
-      let path = checkout;
-      for (const part of env.cwd.split('/')) { path = join(path, part); check((await lstat(path)).isDirectory(), 'working-directory-invalid'); }
-    }
-    if (env.prepare?.length) {
-      await this.remove(env, '-prepare');
+    const receipt = { revision: source.revision, source_copy_ms: null, source_bytes: null, prepare_ms: null };
+    try {
+      // Each failed attempt gets an independent checkout; never clean a live tree.
+      const checkout = join(source.root, `checkout-${source.revision}-${randomUUID()}`);
+      const copyStarted = performance.now();
       try {
-        await this.docker([...this.base(env, source.revision, '-prepare'), '--mount', `type=bind,src=${checkout},dst=/app`, env.image, ...env.prepare], { timeout: env.timeoutSeconds * 1000 });
-      } finally { await this.remove(env, '-prepare'); }
+        if (source.manifest) receipt.source_bytes = (await copyAccepted(source, checkout)).bytes;
+        else {
+          await this.run('git', ['-c', 'core.hooksPath=/dev/null', 'clone', '--no-hardlinks', '--no-checkout', source.repo, checkout]);
+          await this.run('git', ['-c', 'core.hooksPath=/dev/null', '-C', checkout, 'checkout', '--detach', source.revision]);
+        }
+      } finally { receipt.source_copy_ms = performance.now() - copyStarted; }
+      if (env.cwd && env.cwd !== '.') {
+        let path = checkout;
+        for (const part of env.cwd.split('/')) { path = join(path, part); check((await lstat(path)).isDirectory(), 'working-directory-invalid'); }
+      }
+      if (env.prepare?.length) {
+        await this.remove(env, '-prepare');
+        const prepareStarted = performance.now();
+        try {
+          await this.docker([...this.base(env, source.revision, '-prepare'), '--mount', `type=bind,src=${checkout},dst=/app`, env.image, ...env.prepare], { timeout: env.timeoutSeconds * 1000 });
+        } finally { receipt.prepare_ms = performance.now() - prepareStarted; await this.remove(env, '-prepare'); }
+      }
+      await atomic(join(checkout, '.enginebox-prepared'), { revision: source.revision });
+      await rename(checkout, release);
+      this.observe(env, 'preparation', { ...receipt, status: 'succeeded', elapsed_ms: performance.now() - started });
+      return release;
+    } catch (error) {
+      this.observe(env, 'preparation', { ...receipt, status: 'failed', elapsed_ms: performance.now() - started });
+      throw error;
     }
-    await atomic(join(checkout, '.enginebox-prepared'), { revision: source.revision });
-    await rename(checkout, release);
-    return release;
   }
+  async startReady(env, revision) {
+    const started = performance.now();
+    const observedRevision = env.updateMode === 'files' ? this.states[env.id]?.revision ?? revision : revision;
+    try {
+      await this.start(env, revision); await this.ready(env);
+      this.observe(env, 'startup', { revision: observedRevision, status: 'succeeded', elapsed_ms: performance.now() - started });
+    } catch (error) {
+      this.observe(env, 'startup', { revision: observedRevision, status: 'failed', elapsed_ms: performance.now() - started });
+      throw error;
+    }
+  }
+
   base(env, revision, suffix = '') {
     return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, ...(env.publicHost ? ['--env', `ENGINEBOX_PUBLIC_HOST=${env.publicHost}`, '--env', `ENGINEBOX_PUBLIC_URL=${env.publicScheme}://${env.publicHost}${env.publicPort ? `:${env.publicPort}` : ''}`] : []), ...Object.entries(env.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--workdir', env.cwd && env.cwd !== '.' ? `/app/${env.cwd}` : '/app'];
   }
@@ -226,7 +257,7 @@ export class Environments {
       state.status = 'updating'; state.healthy = false; await this.save(); await this.render();
       // One writer owns /data. Stop the old process before starting new code.
       if (container) await this.docker(['stop', '--time', '15', this.container(env)]);
-      await this.start(env, source.revision); await this.ready(env);
+      await this.startReady(env, source.revision);
       state.revision = source.revision; state.healthy = true; state.status = 'ready';
       delete state.failedRevision; delete state.error;
       state.updatedAt = new Date().toISOString();
@@ -276,11 +307,21 @@ export class Environments {
       if (receipt.revision !== source.revision || receipt.pendingEntries) {
         const entries = receipt.pendingEntries ?? receipt.entries;
         state.status = 'syncing'; await this.save();
-        state.fileUpdate = await syncFiles(source, workspace, entries, env.writableDirs ?? [], async pendingEntries => {
-          check((await this.source(env)).revision === source.revision, 'source-superseded');
-          await this.assertAdmission();
-          receipt.pendingEntries = pendingEntries; await atomic(receiptFile, receipt);
-        });
+        const updateStarted = performance.now();
+        try {
+          state.fileUpdate = await syncFiles(source, workspace, entries, env.writableDirs ?? [], async pendingEntries => {
+            check((await this.source(env)).revision === source.revision, 'source-superseded');
+            await this.assertAdmission();
+            receipt.pendingEntries = pendingEntries; await atomic(receiptFile, receipt);
+          });
+          this.observe(env, 'source_update', { revision: source.revision, status: 'succeeded', elapsed_ms: performance.now() - updateStarted,
+            source_bytes: source.manifest.entries.filter(e => e.kind === 'file').reduce((sum, e) => sum + e.size, 0),
+            written_files: state.fileUpdate.written, removed_files: state.fileUpdate.removed });
+        } catch (error) {
+          this.observe(env, 'source_update', { revision: source.revision, status: 'failed', elapsed_ms: performance.now() - updateStarted,
+            source_bytes: null, written_files: null, removed_files: null });
+          throw error;
+        }
         await writableDirectories(workspace, env.writableDirs ?? []);
         receipt = { schema: 1, initialRevision: receipt.initialRevision, revision: source.revision, entries: source.manifest.entries };
         await atomic(receiptFile, receipt);
@@ -289,7 +330,7 @@ export class Environments {
       } else state.revision = receipt.revision;
       const container = await this.inspect(env);
       check(!container || container.Config.Labels['enginebox.environment.recipe'] === recipe, 'live-process-recipe-mismatch');
-      if (!container?.State.Running) { await this.start(env, receipt.initialRevision); await this.ready(env); }
+      if (!container?.State.Running) await this.startReady(env, receipt.initialRevision);
       state.healthy = await this.healthy(env);
       state.status = state.healthy ? 'ready' : 'unhealthy';
       delete state.error; delete state.failedRevision;
