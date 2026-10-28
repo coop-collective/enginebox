@@ -13,7 +13,7 @@ A start (`POST /v1/hosts/{host}/instances/{name}/agent-runs` or `POST /v1/pools/
 A run then moves `queued` → `running` → `succeeded`, `failed` or `cancelled`. Run reads and listings add:
 
 - `queue_position`: the run's 1-based place in the scheduler's current order (null unless queued).
-- `waiting_reason`: why it is still queued, for example `workspace ebox-a busy`, `waiting for capacity on host primary (3 of 8 runs)`, `waiting for capacity on host primary (memory)`, `waiting for capacity on host primary (resource measurement unavailable)`, `waiting for a free workspace in pool workers`, `creating a workspace for pool workers`, `workspace ebox-w2 busy (resume is pinned to it)`, or `admission is paused while the controller drains`.
+- `waiting_reason`: why it is still queued, for example `workspace ebox-a busy`, `waiting for capacity on host primary (3 of 8 runs)`, `waiting for capacity on host primary (memory)`, `waiting for capacity on host primary (resource measurement unavailable)`, `waiting for a free workspace in pool workers`, `creating a workspace for pool workers`, `workspace ebox-w2 busy (resume is pinned to it)`, `waiting for a free workspace in pool workers (ebox-w1: execution uncertain; the native session lease is still active)`, `waiting for a free workspace in pool workers; last workspace creation failed: Insufficient CPU, memory, disk or instance slots; preserve reserves (memory: …)`, or `admission is paused while the controller drains`.
 - `pool`: the pool the run was started on, or null.
 
 A run that was admitted but could not start (workspace stopped or missing, wrong template, an earlier run's unresolved lease, provider not delegable, profile deleted) fails with an `error` and without `execution_uncertain`. This check used to happen during the start request; it now happens at admission, and the run's callback reports the failure. The run shows why as `failure: {stage, reason}`, and every such failure is logged as a [launch event](#launch-events).
@@ -33,6 +33,10 @@ A run is admitted when all of these hold:
 3. **CPU.** Fewer runs on the host than its CPU count minus `reserve_cpu` (at least one).
 4. **Memory.** The host's measured available memory must cover its `reserve_memory_gib` plus a per-run headroom for this run and for each run admitted since the last measurement that is still running.
 
+### Workspaces fenced by an uncertain run
+
+A run that ended with `execution_uncertain` (the controller restarted while it ran, or the guest helper failed after it may have started the CLI) fences its workspace: pools place nothing there until the workspace's native session lease is known to be released. While pool runs are queued, the scheduler checks each fenced workspace in the background with one bounded `enginebox-guest lease <provider>` call (15 s timeout), at most once per `ENGINEBOX_UNCERTAIN_PROBE_SECONDS` (default 60 s) per workspace. Only a definite `{"active":false}` clears the run's `execution_uncertain` and releases the workspace. An active lease, a timeout, an unreachable guest or any other answer keeps the fence and is tried again on the next interval. Waiting runs name the fenced workspace and why in `waiting_reason`, and each change (released, still active, probe failed) is one `uncertain_lease_probe` [launch event](#launch-events). A run targeted at a specific workspace performs the same check under the host lock at admission, as before.
+
 The CPU and memory numbers come from the inventory the controller already reads for VM admission (`cpu_total`, `memory_available_bytes`). Each host is measured at most once per TTL, and only while queued runs need it. If a measurement fails, that host admits nothing until a later measurement succeeds, and its runs show `resource measurement unavailable`.
 
 ## Limits and defaults
@@ -45,6 +49,7 @@ The CPU and memory numbers come from the inventory the controller already reads 
 | Memory headroom per run | 1024 MiB | `ENGINEBOX_AGENT_RUN_MEMORY_MIB` |
 | Host measurement TTL | 15 s | `ENGINEBOX_HOST_MEASURE_TTL_SECONDS` |
 | `Retry-After` on 429 | 30 s | `ENGINEBOX_RUN_QUEUE_RETRY_AFTER_SECONDS` |
+| Minimum interval between lease probes of one fenced workspace | 60 s | `ENGINEBOX_UNCERTAIN_PROBE_SECONDS` |
 
 The controller reads these at activation and refuses to start if one is invalid. Under the supervisor, set them in its private `environment_file` (on the allowlist of supervisors built from this release onward) or in the supervisor's service environment. Only queued runs count toward the hard bounds; running and finished runs do not. Set the per-host limit in the fleet configuration (`max_agent_runs = 12`, from 1 to 256). Older controller releases reject that key, so add it only after upgrading.
 
@@ -85,14 +90,14 @@ Service tokens are granted pools with `"pools":["workers"]` at mint time. Adding
 
 ## Launch events
 
-Every admission or placement failure of a run, and every pool member creation (success or failure), produces one structured log line on the controller's stderr (`{"event":"enginebox.launch",…}`) and one event in a bounded history: the newest 500, kept in memory and in the private file `launch-events.json` (mode 0600) under the controller root, so it survives restarts.
+Every admission or placement failure of a run, every pool member creation (success or failure), and every change in the lease check of a [fenced workspace](#workspaces-fenced-by-an-uncertain-run) produces one structured log line on the controller's stderr (`{"event":"enginebox.launch",…}`) and one event in a bounded history: the newest 500, kept in memory and in the private file `launch-events.json` (mode 0600) under the controller root, so it survives restarts.
 
-Each event has `at`, `kind` (`run_admission_failed`, `pool_member_created`, `pool_member_create_failed`), `outcome` (`failed` or `succeeded`), `run_id`, `pool`, `project`, `host_id`, `workspace`, `template`, `template_revision` (when the registry knows it), `profile`, `profile_revision`, `provider`, `stage`, `reason`, `message`, `duration_ms` (time in the step that produced the event) and `queue_wait_ms` (runs: acceptance to admission). Fields that do not apply are null.
+Each event has `at`, `kind` (`run_admission_failed`, `pool_member_created`, `pool_member_create_failed`, `uncertain_lease_probe`), `outcome` (`failed` or `succeeded`), `run_id`, `pool`, `project`, `host_id`, `workspace`, `template`, `template_revision` (when the registry knows it), `profile`, `profile_revision`, `provider`, `stage`, `reason`, `message`, `duration_ms` (time in the step that produced the event) and `queue_wait_ms` (runs: acceptance to admission). Fields that do not apply are null.
 
 | Stage | Meaning | Reason codes |
 |---|---|---|
 | `resolve` | The profile (after a restart) or the pool could not be resolved, or the run's [repository](REPOSITORIES.md) token could not be minted | `profile_unavailable`, `pool_unavailable`, `repository_unavailable` |
-| `place` | The chosen workspace cannot take the run | `workspace_unavailable` (missing or not running), `template_mismatch`, `lease_unresolved`, `admission_error` (bookkeeping failed; the run stays queued and is retried) |
+| `place` | The chosen workspace cannot take the run | `workspace_unavailable` (missing or not running), `template_mismatch`, `lease_unresolved`, `admission_error` (bookkeeping failed; the run stays queued and is retried); for `uncertain_lease_probe` events (`run_id` is the uncertain run): `lease_inactive` (succeeded: the workspace is released), `lease_active`, `lease_probe_failed` |
 | `create` | A pool member could not be created | `create_failed`, `pool_has_no_template`, `name_unavailable`; `ok` on success |
 | `bootstrap` | The workspace could not be prepared for the run, or a created member could not be recorded | `workspace_locked`, `member_record_failed`, `guest_outdated` (the guest helper does not support repository runs) |
 | `delegate` | The provider credential could not be delegated to the workspace | `delegation_failed`, `provider_not_delegable` |

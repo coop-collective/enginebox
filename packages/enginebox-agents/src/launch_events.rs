@@ -87,6 +87,9 @@ pub const REASONS: &[&str] = &[
     "guest_launch_failed",
     "repository_unavailable",
     "guest_outdated",
+    "lease_inactive",
+    "lease_active",
+    "lease_probe_failed",
 ];
 pub fn valid_reason(reason: &str) -> bool {
     REASONS.contains(&reason)
@@ -196,8 +199,8 @@ pub fn clip_message(message: &str, secrets: &BTreeMap<String, String>) -> String
     out
 }
 
-/// One launch event. `kind` is `run_admission_failed`, `pool_member_created`
-/// or `pool_member_create_failed`.
+/// One launch event. `kind` is `run_admission_failed`, `pool_member_created`,
+/// `pool_member_create_failed` or `uncertain_lease_probe`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchEvent {

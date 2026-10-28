@@ -58,6 +58,9 @@ struct Inner {
     admitting: AtomicBool,
     dispatcher: AtomicBool,
     measures: Mutex<BTreeMap<String, Measure>>,
+    /// Lease probes of workspaces fenced by an uncertain run, per
+    /// (host, workspace). A leaf lock: nothing else is taken while held.
+    probes: Mutex<BTreeMap<(String, String), Probe>>,
     hooks: Hooks,
     /// Runs interrupted by a restart whose callback is still owed.
     owed_callbacks: Mutex<Vec<String>>,
@@ -89,6 +92,14 @@ struct Measure {
     at: Instant,
     load: Option<HostLoad>,
 }
+/// The last lease probe of a fenced workspace.
+struct Probe {
+    /// When the last probe finished; `None` before the first.
+    last: Option<Instant>,
+    in_flight: bool,
+    /// Why the workspace stays fenced, for waiting reasons.
+    reason: String,
+}
 
 /// Measures one host's free resources (default: the fleet inventory).
 pub type MeasureHook = Arc<dyn Fn(&Host) -> Result<HostLoad> + Send + Sync>;
@@ -103,8 +114,13 @@ pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
 pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential> + Send + Sync>;
 /// Revokes a run's repository token when the run ends (best effort).
 pub type RepositoryRevoke = Arc<dyn Fn(&str, &repository::Credential) + Send + Sync>;
+/// Probes a workspace's native session lease for a provider: `Ok(true)` when
+/// active, `Ok(false)` only on a definite `{"active":false}` (default: the
+/// guest helper's `enginebox-guest lease <provider>`).
+pub type LeaseProbe = Arc<dyn Fn(&Host, &str, &str) -> Result<bool> + Send + Sync>;
 #[derive(Default)]
 struct Hooks {
+    lease_probe: Mutex<Option<LeaseProbe>>,
     measure: Mutex<Option<MeasureHook>>,
     create: Mutex<Option<CreateHook>>,
     resolver: Mutex<Option<ProfileResolver>>,
@@ -426,6 +442,7 @@ impl AgentService {
                 admitting: AtomicBool::new(true),
                 dispatcher: AtomicBool::new(false),
                 measures: Mutex::new(BTreeMap::new()),
+                probes: Mutex::new(BTreeMap::new()),
                 hooks: Hooks::default(),
                 owed_callbacks: Mutex::new(owed),
                 launch_events,
@@ -1169,33 +1186,199 @@ impl AgentService {
             .cloned()
             .collect::<Vec<_>>();
         for value in uncertain {
-            let result = (|| -> Result<bool> {
-                let host = self.inner.fleet.host(host_id)?;
-                let p = value["provider"].as_str().unwrap_or("");
-                let command = guest_command(&host, name, &["lease".into(), p.into()])?;
-                let output = process::checked(&command, None, None, b"", 15, 1024)?;
-                let v: Value = serde_json::from_str(&output)?;
-                v["active"]
-                    .as_bool()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid lease probe."))
-            })();
+            let result = self.probe_lease(host_id, name, value["provider"].as_str().unwrap_or(""));
             if result.unwrap_or(true) {
                 return true;
             }
-            if let Some(v) = self
-                .inner
-                .records
-                .lock()
-                .unwrap()
-                .get_mut(value["id"].as_str().unwrap_or(""))
-            {
-                v["execution_uncertain"] = json!(false);
-                if self.save_record(v).is_err() {
-                    return true;
-                }
+            if !self.clear_uncertain(value["id"].as_str().unwrap_or("")) {
+                return true;
             }
         }
+        self.inner
+            .probes
+            .lock()
+            .unwrap()
+            .remove(&(host_id.to_owned(), name.to_owned()));
         false
+    }
+    /// One bounded guest lease probe. Only a definite `{"active":false}`
+    /// yields `Ok(false)`; anything else is active or an error.
+    fn probe_lease(&self, host_id: &str, name: &str, provider: &str) -> Result<bool> {
+        let host = self.inner.fleet.host(host_id)?;
+        let hook = self.inner.hooks.lease_probe.lock().unwrap().clone();
+        if let Some(probe) = hook {
+            return probe(&host, name, provider);
+        }
+        let command = guest_command(&host, name, &["lease".into(), provider.into()])?;
+        let output = process::checked(&command, None, None, b"", 15, 1024)?;
+        let v: Value = serde_json::from_str(&output)?;
+        v["active"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("Invalid lease probe."))
+    }
+    /// Clear one record's `execution_uncertain` after a definite inactive
+    /// lease. False when the record could not be saved (the fence stays).
+    fn clear_uncertain(&self, id: &str) -> bool {
+        let mut records = self.inner.records.lock().unwrap();
+        let Some(v) = records.get_mut(id) else {
+            return true;
+        };
+        if v["execution_uncertain"] != true {
+            return true;
+        }
+        v["execution_uncertain"] = json!(false);
+        if self.save_record(v).is_err() {
+            v["execution_uncertain"] = json!(true);
+            return false;
+        }
+        true
+    }
+    /// Probe, in the background and at most once per
+    /// `uncertain_probe_seconds` per workspace, each workspace that an
+    /// uncertain run fences, and clear the fence on a definite inactive
+    /// lease. Probe failures and active leases keep the fence. Returns why
+    /// each fenced workspace still waits.
+    fn probe_uncertain(&self) -> BTreeMap<(String, String), String> {
+        let mut fenced: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+        for v in self.inner.records.lock().unwrap().values() {
+            if v["execution_uncertain"] == true {
+                fenced
+                    .entry((
+                        v["host_id"].as_str().unwrap_or("").to_owned(),
+                        v["name"].as_str().unwrap_or("").to_owned(),
+                    ))
+                    .or_default()
+                    .push((
+                        v["id"].as_str().unwrap_or("").to_owned(),
+                        v["provider"].as_str().unwrap_or("").to_owned(),
+                    ));
+            }
+        }
+        let held: BTreeSet<(String, String)> = self
+            .inner
+            .leases
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, n, _)| (h.clone(), n.clone()))
+            .collect();
+        let interval = Duration::from_secs(self.limits().uncertain_probe_seconds);
+        let mut reasons = BTreeMap::new();
+        let mut due = Vec::new();
+        {
+            let mut probes = self.inner.probes.lock().unwrap();
+            probes.retain(|k, _| fenced.contains_key(k));
+            for (key, runs) in fenced {
+                let probe = probes.entry(key.clone()).or_insert(Probe {
+                    last: None,
+                    in_flight: false,
+                    reason: "execution uncertain; checking its native session lease".into(),
+                });
+                // A workspace running a new run is busy anyway; probe later.
+                if !probe.in_flight
+                    && !held.contains(&key)
+                    && probe.last.is_none_or(|at| at.elapsed() >= interval)
+                {
+                    probe.in_flight = true;
+                    due.push((key.clone(), runs, probe.reason.clone()));
+                }
+                reasons.insert(key, probe.reason.clone());
+            }
+        }
+        for ((host_id, name), runs, previous) in due {
+            let this = self.clone();
+            thread::spawn(move || {
+                let key = (host_id.clone(), name.clone());
+                let mut reason = None;
+                for (id, provider) in runs {
+                    let started = Instant::now();
+                    let result = this.probe_lease(&host_id, &name, &provider);
+                    let (outcome, why) = match &result {
+                        Ok(false) if this.clear_uncertain(&id) => ("cleared", None),
+                        Ok(false) => (
+                            "failed",
+                            Some("execution uncertain; its record could not be saved".to_owned()),
+                        ),
+                        Ok(true) => (
+                            "blocked",
+                            Some(
+                                "execution uncertain; the native session lease is still active"
+                                    .to_owned(),
+                            ),
+                        ),
+                        Err(e) => (
+                            "failed",
+                            Some(format!(
+                                "execution uncertain; lease probe failed: {}",
+                                launch_events::clip_message(&format!("{e:#}"), &BTreeMap::new())
+                            )),
+                        ),
+                    };
+                    // One event per change, not one per probe interval.
+                    if why.as_ref() == Some(&previous) {
+                        reason = why;
+                        break;
+                    }
+                    this.record_launch(LaunchEvent {
+                        kind: "uncertain_lease_probe".into(),
+                        outcome: if outcome == "cleared" {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
+                        run_id: Some(id.clone()),
+                        pool: this
+                            .inner
+                            .pools
+                            .all()
+                            .into_iter()
+                            .find(|p| {
+                                p.members()
+                                    .iter()
+                                    .any(|m| m.host_id == host_id && m.name == name)
+                            })
+                            .map(|p| p.name),
+                        host_id: Some(host_id.clone()),
+                        workspace: Some(name.clone()),
+                        provider: Some(provider.clone()),
+                        stage: Stage::Place.as_str().into(),
+                        reason: match outcome {
+                            "cleared" => "lease_inactive",
+                            "blocked" => "lease_active",
+                            _ => "lease_probe_failed",
+                        }
+                        .into(),
+                        message: why.clone().unwrap_or_else(|| {
+                            "Native session lease is inactive; the workspace is released.".into()
+                        }),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    });
+                    if why.is_some() {
+                        reason = why;
+                        break;
+                    }
+                }
+                {
+                    let mut probes = this.inner.probes.lock().unwrap();
+                    match reason {
+                        Some(reason) => {
+                            if let Some(p) = probes.get_mut(&key) {
+                                p.in_flight = false;
+                                p.last = Some(Instant::now());
+                                p.reason = reason;
+                            }
+                        }
+                        None => {
+                            probes.remove(&key);
+                        }
+                    }
+                }
+                this.kick();
+            });
+        }
+        reasons
     }
     pub fn get_run(&self, host_id: &str, name: &str, id: &str) -> Result<Value> {
         ensure!(
@@ -1512,6 +1695,12 @@ impl AgentService {
     pub fn set_measure_hook(&self, hook: MeasureHook) {
         *self.inner.hooks.measure.lock().unwrap() = Some(hook);
         self.inner.measures.lock().unwrap().clear();
+        self.kick();
+    }
+    /// Replace the guest lease probe (tests).
+    pub fn set_lease_probe(&self, hook: LeaseProbe) {
+        *self.inner.hooks.lease_probe.lock().unwrap() = Some(hook);
+        self.inner.probes.lock().unwrap().clear();
         self.kick();
     }
     pub fn set_create_hook(&self, hook: CreateHook) {
@@ -1923,6 +2112,7 @@ impl AgentService {
             hosts
         };
         self.refresh_measurements(&needed);
+        let uncertain = self.probe_uncertain();
         let mut sched = self.inner.sched.lock().unwrap();
         let leases = self.inner.leases.lock().unwrap().clone();
         let mut busy: BTreeSet<(String, String)> = leases
@@ -1992,6 +2182,11 @@ impl AgentService {
                         .backoff
                         .get(&def.name)
                         .is_some_and(|(until, _)| *until > now),
+                    backoff_reason: sched
+                        .backoff
+                        .get(&def.name)
+                        .filter(|(until, _)| *until > now)
+                        .map(|(_, why)| why.clone()),
                 },
             );
         }
@@ -2013,6 +2208,7 @@ impl AgentService {
             hosts,
             leases,
             busy_workspaces: busy,
+            uncertain,
             pools: pool_states,
             headroom_bytes: self.limits().run_memory_headroom_bytes,
             admitting: self.inner.admitting.load(Ordering::SeqCst)
