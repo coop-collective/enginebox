@@ -1957,7 +1957,12 @@ impl AgentService {
                         .values()
                         .filter(|p| p.host_id == host.id)
                         .count(),
-                    load: measures.get(&host.id).and_then(|m| m.load),
+                    load: self
+                        .inner
+                        .fleet
+                        .assert_admission(&host.id)
+                        .ok()
+                        .and_then(|()| measures.get(&host.id).and_then(|m| m.load)),
                     admitted_since: sched.admitted_since.get(&host.id).map_or(0, BTreeSet::len),
                 },
             );
@@ -2087,6 +2092,7 @@ impl AgentService {
     }
     /// Move one queued run to running on `placement` and start its worker.
     fn admit(&self, sched: &mut Sched, id: &str, placement: Placement) -> Result<()> {
+        self.inner.fleet.assert_admission(&placement.host_id)?;
         let pending = self.pending_guard()?;
         let queued = sched
             .entries
@@ -2194,6 +2200,15 @@ impl AgentService {
         template: Option<String>,
     ) {
         let started = Instant::now();
+        if let Err(error) = self.inner.fleet.assert_admission(&run.host_id) {
+            let failure = LaunchFailure::new(
+                Stage::Place,
+                "managed_host_unavailable",
+                format!("{error:#}"),
+            );
+            self.launch_failed(&run, template.as_deref(), None, &failure, started);
+            return;
+        }
         let resolved = match (&run.profile, resolved) {
             (None, _) => None,
             (Some(_), Some(r)) => Some(r),

@@ -176,3 +176,42 @@ pub fn hash(value: &str) -> bool {
 }
 pub const HEARTBEAT_SECONDS: u64 = 3;
 pub const LEASE_SECONDS: u64 = 20;
+
+/// Owner-approved binding for an existing Incus host. It carries no SSH target
+/// or controller credential and cannot be selected by an enrolling worker.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedHostBinding {
+    pub host_id: String,
+    pub binding_digest: String,
+    pub machine_id_hash: String,
+    pub project: String,
+    pub pool: String,
+}
+impl ManagedHostBinding {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            id(&self.host_id)
+                && id(&self.project)
+                && id(&self.pool)
+                && hash(&self.binding_digest)
+                && hash(&self.machine_id_hash),
+            "Invalid managed host binding"
+        );
+        Ok(())
+    }
+}
+pub fn machine_id_hash(value: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let value = value.trim();
+    ensure!(
+        value.len() == 32
+            && value.bytes().all(|b| b.is_ascii_hexdigit())
+            && value.bytes().any(|b| b != b'0'),
+        "Invalid Linux machine identity"
+    );
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(value.to_ascii_lowercase().as_bytes())
+    ))
+}

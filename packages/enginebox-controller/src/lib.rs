@@ -188,6 +188,9 @@ impl Controller {
                     .collect::<Vec<_>>(),
             )?,
         };
+        let registration = runtime.contributors.clone();
+        self.fleet
+            .set_admission_guard(Arc::new(move |host| registration.assert_host(host)));
         let resolver = runtime.profiles.clone();
         runtime
             .agents
@@ -813,9 +816,20 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
     let result = admitted(admission, async move {
         blocking(move || {
             if action == "enroll" {
-                runtime
-                    .contributors
-                    .enroll(&token, serde_json::from_value(body)?)
+                match body["kind"].as_str() {
+                    Some("incus-info") => {
+                        ensure!(
+                            body.as_object().is_some_and(|o| o.len() == 1),
+                            "Provide only enrollment kind"
+                        );
+                        runtime.contributors.host_info(&token)
+                    }
+                    Some("incus") => runtime.contributors.enroll_host(&token, &body),
+                    Some(_) => anyhow::bail!("Unknown enrollment kind"),
+                    None => runtime
+                        .contributors
+                        .enroll(&token, serde_json::from_value(body)?),
+                }
             } else {
                 runtime.contributors.node_call(&token, &action, body)
             }
@@ -842,7 +856,11 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
         }
         ["v1", "fleet"] => {
             let mut fleet = c.fleet.summary()?;
-            fleet["compute_nodes"] = json!(compute::hosts(&fleet, &c.fleet.hosts()));
+            fleet["compute_nodes"] = json!(compute::enrolled_hosts(
+                &fleet,
+                &c.fleet.hosts(),
+                &c.runtime()?.contributors.catalog()
+            ));
             Ok(fleet)
         }
         ["v1", "compute"] => Ok(compute::catalog(
@@ -1050,6 +1068,46 @@ async fn write(
                 }
                 let _ = runtime.ci.reconcile(&runtime.ci_jobs);
                 Ok(runtime.ci.template_catalog())
+            })
+            .await?
+        }
+        ["v1", "hosts", host_id, "enrollment"] => {
+            empty(&body)?;
+            let host = c.fleet.host(host_id)?;
+            ensure!(
+                host.managed_registration,
+                "Enable managed registration for this configured host first"
+            );
+            blocking(move || {
+                let facts = enginebox_core::capacity::inventory(&host)?;
+                let capacity = enginebox_core::capacity::capacity(&host, &facts)?;
+                let number = enginebox_core::capacity::number;
+                let budget = enginebox_node_protocol::Budget {
+                    cpu: u32::try_from(
+                        number(&capacity["cpu_total"])
+                            .saturating_sub(host.reserve_cpu)
+                            .min(host.contribution_cpu.unwrap_or(u64::MAX)),
+                    )?,
+                    memory_gib: u32::try_from(
+                        (number(&capacity["memory_total_bytes"]) / enginebox_core::GIB)
+                            .saturating_sub(host.reserve_memory_gib)
+                            .min(host.contribution_memory_gib.unwrap_or(u64::MAX)),
+                    )?,
+                    disk_gib: u32::try_from(
+                        (number(&capacity["pool_total_bytes"]) / enginebox_core::GIB)
+                            .saturating_sub(host.reserve_disk_gib),
+                    )?,
+                };
+                budget.validate()?;
+                let machine_id = enginebox_core::transport::host_run(
+                    &host,
+                    &["cat".into(), "/etc/machine-id".into()],
+                    None,
+                    std::time::Duration::from_secs(15),
+                )?;
+                let hash =
+                    enginebox_node_protocol::machine_id_hash(std::str::from_utf8(&machine_id)?)?;
+                runtime.contributors.issue_host(&host, hash, budget)
             })
             .await?
         }
@@ -1869,6 +1927,7 @@ mod tests {
             ),
             (Method::GET, "/v1/fleet", String::new()),
             (Method::GET, "/v1/compute", String::new()),
+            (Method::POST, "/v1/hosts/worker/enrollment", "{}".into()),
             (Method::GET, "/v1/agents", String::new()),
             (Method::POST, "/v1/agents/codex/login", "{}".into()),
             (

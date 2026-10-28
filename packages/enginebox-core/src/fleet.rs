@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 type LifecycleGuard = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
+type AdmissionGuard = Arc<dyn Fn(&Host) -> Result<()> + Send + Sync>;
 type PostStart = Arc<dyn Fn(&str, &str) -> Result<Value> + Send + Sync>;
 pub(crate) enum CopyMode<'a> {
     Start(Option<&'a Value>),
@@ -30,6 +31,7 @@ pub(crate) struct Inner {
     locks: BTreeMap<String, Mutex<()>>,
     guard: RwLock<Option<LifecycleGuard>>,
     post_start: RwLock<Option<PostStart>>,
+    admission: RwLock<Option<AdmissionGuard>>,
 }
 impl Fleet {
     pub fn load(path: &Path, state_root: &Path) -> Result<Self> {
@@ -54,6 +56,7 @@ impl Fleet {
                 hosts: map,
                 guard: RwLock::new(None),
                 post_start: RwLock::new(None),
+                admission: RwLock::new(None),
             }),
         })
     }
@@ -73,6 +76,22 @@ impl Fleet {
     }
     pub fn set_lifecycle_guard(&self, guard: LifecycleGuard) {
         *self.inner.guard.write().expect("guard lock") = Some(guard);
+    }
+    pub fn set_admission_guard(&self, guard: AdmissionGuard) {
+        *self.inner.admission.write().expect("admission lock") = Some(guard);
+    }
+    /// Registration fences new work, while reads and cleanup remain available.
+    pub fn assert_admission(&self, id: &str) -> Result<()> {
+        let host = self.host(id)?;
+        if !host.managed_registration {
+            return Ok(());
+        }
+        self.inner
+            .admission
+            .read()
+            .expect("admission lock")
+            .clone()
+            .context("Managed host registration is unavailable")?(&host)
     }
     pub fn set_post_start(&self, hook: PostStart) {
         *self.inner.post_start.write().expect("hook lock") = Some(hook);
@@ -274,13 +293,22 @@ impl Fleet {
         Ok(())
     }
     pub fn operate(&self, id: &str, operation: &str, params: &Value) -> Result<Value> {
+        if !["pause", "stop", "hibernate"].contains(&operation) {
+            self.assert_admission(id)?;
+        }
         self.validate_operation(id, operation, params)?;
         let h = self.host(id)?;
         let _controller = self.controller_lock(id)?;
+        if !["pause", "stop", "hibernate"].contains(&operation) {
+            self.assert_admission(id)?;
+        }
         if operation == "install_template" {
             return self.registry.install(&h, required(params, "template")?);
         }
         let _lock = operation_lock(&h)?;
+        if !["pause", "stop", "hibernate"].contains(&operation) {
+            self.assert_admission(id)?;
+        }
         let name = required(params, "name")?;
         let mut result = match operation {
             "create" => self.create_locked(
@@ -374,6 +402,7 @@ impl Fleet {
         custom: Option<&Value>,
         mode: CopyMode<'_>,
     ) -> Result<Value> {
+        self.assert_admission(&h.id)?;
         let facts = inventory(h)?;
         check_name(h, name, &facts)?;
         let t = self.template(h, id)?;
@@ -546,6 +575,10 @@ impl Fleet {
         let mut failures = Vec::new();
         let records = self.registry.list()?;
         for h in self.hosts() {
+            if let Err(e) = self.assert_admission(&h.id) {
+                failures.push(json!({"host_id":h.id,"error":e.to_string()}));
+                continue;
+            }
             for r in &records {
                 if self.registry.current(r, &h) {
                     continue;
@@ -565,6 +598,7 @@ impl Fleet {
                 }
                 {
                     let _controller = self.controller_lock(&h.id)?;
+                    self.assert_admission(&h.id)?;
                     match self.registry.install(&h,id){Ok(v)=>changed.push(v),Err(e)=>failures.push(json!({"host_id":h.id,"template":id,"error":e.to_string().chars().take(500).collect::<String>()}))};
                 }
                 break;

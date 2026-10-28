@@ -1,8 +1,10 @@
-//! Outbound Windows contributors share this controller's durable job authority.
+//! Outbound contributors and managed Incus hosts share scoped registration.
 //! Node credentials never authorize operator APIs or another node's work.
 use anyhow::{Context, Result, ensure};
 use enginebox_core::state;
-use enginebox_node_protocol::{Budget, Enrollment, Invitation, LEASE_SECONDS, Run, hash, id};
+use enginebox_node_protocol::{
+    Budget, Enrollment, Invitation, LEASE_SECONDS, ManagedHostBinding, Run, Workloads, hash, id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -43,6 +45,13 @@ struct Node {
     last_seen: u64,
     tools: Value,
     active: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_binding: Option<ManagedHostBinding>,
+}
+fn invitation_response(n: &Node, code: &str) -> Value {
+    json!({"id":n.id,"code":code,"expires":n.expires,"one_time":true,
+        "kind":if n.host_binding.is_some() {"incus"} else {"workspace"},
+        "host_id":n.host_binding.as_ref().map(|b| &b.host_id),"budget":n.budget})
 }
 #[derive(Clone)]
 pub struct Contributors {
@@ -100,9 +109,55 @@ impl Contributors {
         )
     }
     pub fn issue(&self, invitation: Invitation) -> Result<Value> {
+        self.issue_bound(invitation, None)
+    }
+    pub fn issue_host(
+        &self,
+        host: &enginebox_core::Host,
+        machine_id_hash: String,
+        budget: Budget,
+    ) -> Result<Value> {
+        ensure!(
+            host.managed_registration,
+            "Enable managed_registration in the approved host configuration first"
+        );
+        let binding = ManagedHostBinding {
+            host_id: host.id.clone(),
+            binding_digest: state::digest(&host.binding()),
+            machine_id_hash,
+            project: host.project.clone(),
+            pool: host.pool.clone(),
+        };
+        binding.validate()?;
+        self.issue_bound(
+            Invitation {
+                label: host.label.clone(),
+                budget,
+                workloads: Workloads {
+                    agents: true,
+                    ci: false,
+                },
+            },
+            Some(binding),
+        )
+    }
+    fn issue_bound(
+        &self,
+        invitation: Invitation,
+        host_binding: Option<ManagedHostBinding>,
+    ) -> Result<Value> {
         invitation.validate()?;
         let mut nodes = self.nodes.lock().unwrap();
         ensure!(nodes.len() < 1000, "Contributor limit reached");
+        if let Some(binding) = &host_binding {
+            ensure!(
+                !nodes.values().any(|n| !n.revoked
+                    && n.host_binding
+                        .as_ref()
+                        .is_some_and(|b| b.host_id == binding.host_id)),
+                "This host already has a registration; renew its pending code or revoke it explicitly"
+            );
+        }
         let id = uuid::Uuid::new_v4().simple().to_string();
         let code = format!(
             "{id}.{}{}",
@@ -128,10 +183,12 @@ impl Contributors {
             last_seen: 0,
             tools: json!({}),
             active: None,
+            host_binding,
         };
         self.save(&node)?;
+        let response = invitation_response(&node, &code);
         nodes.insert(id.clone(), node);
-        Ok(json!({"id":id,"code":code,"expires":expires,"one_time":true}))
+        Ok(response)
     }
     /// Renew an owner's unconsumed invitation without replacing the identity
     /// already saved by an installer before its first network request.
@@ -151,7 +208,7 @@ impl Contributors {
         n.code_hash = secret_hash(&code);
         n.expires = now() + 3600;
         self.save(&n)?;
-        let response = json!({"id":n.id,"code":code,"expires":n.expires,"one_time":true});
+        let response = invitation_response(&n, &code);
         nodes.insert(key.to_owned(), n);
         Ok(response)
     }
@@ -177,6 +234,10 @@ impl Contributors {
             "Registration code expired or invalid"
         );
         ensure!(
+            n.host_binding.is_none(),
+            "Use the managed Incus enrollment flow for this invitation"
+        );
+        ensure!(
             e.budget.fits(&n.invitation.budget),
             "Local budget exceeds the owner's allowance"
         );
@@ -200,6 +261,92 @@ impl Contributors {
         nodes.insert(key.to_owned(), n);
         Ok(response)
     }
+    fn invitation_node(&self, code: &str) -> Result<Node> {
+        let (key, secret) = code.split_once('.').context("Invalid registration code")?;
+        ensure!(id(key) && hash(secret), "Invalid registration code");
+        let n = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .context("Unknown registration")?;
+        ensure!(
+            !n.revoked && n.expires > now() && equal(&n.code_hash, &secret_hash(code)),
+            "Registration code expired or invalid"
+        );
+        Ok(n)
+    }
+    pub fn host_info(&self, code: &str) -> Result<Value> {
+        let n = self.invitation_node(code)?;
+        let binding = n.host_binding.context("Not an Incus invitation")?;
+        Ok(json!({"id":n.id,"kind":"incus","binding":binding,"budget":n.budget}))
+    }
+    pub fn enroll_host(&self, code: &str, body: &Value) -> Result<Value> {
+        ensure!(body["kind"] == "incus", "Invalid enrollment kind");
+        ensure!(
+            body.as_object().is_some_and(|o| o.len() == 3
+                && o.contains_key("kind")
+                && o.contains_key("secret_hash")
+                && o.contains_key("machine_id_hash")),
+            "Invalid Incus enrollment"
+        );
+        let mut n = self.invitation_node(code)?;
+        let binding = n.host_binding.as_ref().context("Not an Incus invitation")?;
+        let secret = body["secret_hash"]
+            .as_str()
+            .context("Node secret hash required")?;
+        ensure!(
+            hash(secret) && body["machine_id_hash"] == binding.machine_id_hash,
+            "This invitation belongs to a different machine"
+        );
+        let mut nodes = self.nodes.lock().unwrap();
+        // Re-read under the commit lock so concurrent revocation/enrollment cannot be lost.
+        n = nodes.get(&n.id).cloned().context("Unknown registration")?;
+        ensure!(
+            !n.revoked && n.expires > now() && equal(&n.code_hash, &secret_hash(code)),
+            "Registration code expired or revoked"
+        );
+        if let Some(bound) = &n.secret_hash {
+            ensure!(equal(bound, secret), "Registration code already consumed");
+        } else {
+            n.secret_hash = Some(secret.to_owned());
+            n.os = "linux".into();
+            n.architecture = "x86_64".into();
+            self.save(&n)?;
+        }
+        let response = json!({"id":n.id,"enrolled":true,"kind":"incus","binding":n.host_binding,"budget":n.budget});
+        nodes.insert(n.id.clone(), n);
+        Ok(response)
+    }
+    /// Registration is an admission lease, not permission to kill existing VMs.
+    pub fn assert_host(&self, host: &enginebox_core::Host) -> Result<()> {
+        let nodes = self.nodes.lock().unwrap();
+        let n = nodes
+            .values()
+            .find(|n| {
+                !n.revoked
+                    && n.host_binding
+                        .as_ref()
+                        .is_some_and(|b| b.host_id == host.id)
+            })
+            .context("Managed host has no active registration")?;
+        let binding = n.host_binding.as_ref().unwrap();
+        ensure!(
+            binding.binding_digest == state::digest(&host.binding()),
+            "Host configuration changed; renew its approved binding"
+        );
+        ensure!(
+            n.secret_hash.is_some()
+                && !n.blocked
+                && n.last_seen + LEASE_SECONDS > now()
+                && n.tools["host_ready"] == true
+                && n.tools["backend"] == "incus"
+                && n.tools["binding_digest"] == binding.binding_digest,
+            "Managed host is offline, unprepared or fenced"
+        );
+        Ok(())
+    }
     pub fn authenticated(&self, token: &str) -> bool {
         let Some((key, _)) = token.split_once('.') else {
             return false;
@@ -215,8 +362,9 @@ impl Contributors {
         let rows=self.nodes.lock().unwrap().values().map(|n|json!({"id":n.id,"label":n.invitation.label,
             "budget":n.budget,"workloads":n.invitation.workloads,"os":n.os,"architecture":n.architecture,
             "enrolled":n.secret_hash.is_some(),"revoked":n.revoked,"blocked":n.blocked,"active_job":n.active,
-            "online":n.last_seen+LEASE_SECONDS>now(),"last_seen":n.last_seen,"tools":n.tools,
-            "disk_enforcement":if n.os == "linux" { "WSL virtual disk maximum" } else { "workspace usage watchdog" },"cpu_memory_enforcement":if n.os == "linux" { "WSL runtime cgroup" } else { "Windows Job Object (legacy)" }})).collect::<Vec<_>>();
+            "online":!n.revoked && n.last_seen+LEASE_SECONDS>now(),"last_seen":n.last_seen,"tools":n.tools,
+            "kind":if n.host_binding.is_some() {"incus"} else {"workspace"},"host_id":n.host_binding.as_ref().map(|b| &b.host_id),"binding_digest":n.host_binding.as_ref().map(|b| &b.binding_digest),
+            "disk_enforcement":if n.host_binding.is_some() { "Incus admission and configured host reserves" } else if n.os == "linux" { "WSL virtual disk maximum" } else { "workspace usage watchdog" },"cpu_memory_enforcement":if n.host_binding.is_some() { "Incus VM limits and configured host reserves" } else if n.os == "linux" { "WSL runtime cgroup" } else { "Windows Job Object (legacy)" }})).collect::<Vec<_>>();
         json!({"nodes":rows})
     }
     pub fn revoke(&self, key: &str) -> Result<Value> {
@@ -254,7 +402,7 @@ impl Contributors {
             }
             self.save(n)?;
             return Ok(
-                json!({"id":n.id,"session":n.session,"epoch":n.epoch,"budget":n.budget,"workloads":n.invitation.workloads,"blocked":n.blocked}),
+                json!({"id":n.id,"session":n.session,"epoch":n.epoch,"budget":n.budget,"workloads":n.invitation.workloads,"blocked":n.blocked,"kind":if n.host_binding.is_some() {"incus"} else {"workspace"},"binding":n.host_binding}),
             );
         }
         ensure!(
@@ -268,12 +416,26 @@ impl Contributors {
                     tools.is_object() && serde_json::to_vec(tools)?.len() <= 4096,
                     "Invalid tool report"
                 );
+                if let Some(binding) = &n.host_binding {
+                    ensure!(
+                        tools["backend"] == "incus"
+                            && tools["binding_digest"] == binding.binding_digest
+                            && tools["host_id"] == binding.host_id
+                            && tools["host_ready"].is_boolean()
+                            && tools["worker_running"] == false,
+                        "Invalid managed host report"
+                    );
+                }
                 n.tools = tools.clone();
                 n.last_seen = now();
                 self.save(n)?;
                 Ok(json!({"ok":true,"blocked":n.blocked}))
             }
             "poll" => {
+                ensure!(
+                    n.host_binding.is_none(),
+                    "Managed Incus work uses the approved host adapter"
+                );
                 ensure!(n.last_seen + LEASE_SECONDS > now(), "Heartbeat required");
                 if n.blocked || n.active.is_some() {
                     return Ok(json!({"job":null,"blocked":n.blocked}));
@@ -352,6 +514,10 @@ impl Contributors {
         let timeout = {
             let nodes = self.nodes.lock().unwrap();
             let n = nodes.get(key).context("Unknown node")?;
+            ensure!(
+                n.host_binding.is_none(),
+                "Use the managed Incus host adapter for this node"
+            );
             ensure!(
                 !n.revoked && !n.blocked && n.last_seen + LEASE_SECONDS > now(),
                 "Node is offline or needs reconciliation"
@@ -511,6 +677,136 @@ mod tests {
         let body = json!({"session":session,"epoch":hello["epoch"],"tools":{"ci":true,"codex":true,"worker_running":false}});
         service.node_call(token, "heartbeat", body.clone()).unwrap();
         body
+    }
+    fn managed_host() -> enginebox_core::Host {
+        enginebox_core::Host {
+            id: "metal".into(),
+            label: "Server".into(),
+            target: "local".into(),
+            managed_registration: true,
+            ..Default::default()
+        }
+    }
+    fn host_connection(service: &Contributors, token: &str, binding: &Value) -> Value {
+        let session = uuid::Uuid::new_v4().to_string();
+        let hello = service
+            .node_call(token, "hello", json!({"session":session}))
+            .unwrap();
+        assert_eq!(hello["kind"], "incus");
+        assert_eq!(hello["binding"], *binding);
+        let body = json!({"session":session,"epoch":hello["epoch"],"tools":{"backend":"incus","host_id":"metal","binding_digest":binding["binding_digest"],"host_ready":true,"worker_running":false}});
+        service.node_call(token, "heartbeat", body.clone()).unwrap();
+        body
+    }
+    #[test]
+    fn incus_invitation_binds_an_approved_machine_and_never_becomes_a_second_executor() {
+        let root = tempfile::tempdir().unwrap();
+        let service = Contributors::open(root.path()).unwrap();
+        let host = managed_host();
+        let machine = "b".repeat(64);
+        let mut legacy = host.clone();
+        legacy.managed_registration = false;
+        assert!(
+            service
+                .issue_host(&legacy, machine.clone(), invitation().budget)
+                .is_err()
+        );
+        let issued = service
+            .issue_host(&host, machine.clone(), invitation().budget)
+            .unwrap();
+        assert!(
+            service
+                .issue_host(&host, machine.clone(), invitation().budget)
+                .is_err()
+        );
+        let code = issued["code"].as_str().unwrap();
+        let id = issued["id"].as_str().unwrap();
+        assert_eq!(issued["kind"], "incus");
+        assert_eq!(issued["host_id"], "metal");
+        let info = service.host_info(code).unwrap();
+        let token = format!("{id}.{}", "d".repeat(64));
+        assert!(service.assert_host(&host).is_err());
+        assert!(
+            service
+                .enroll(
+                    code,
+                    Enrollment {
+                        secret_hash: secret_hash(&token),
+                        budget: invitation().budget,
+                        os: "linux".into(),
+                        architecture: "x86_64".into()
+                    }
+                )
+                .is_err()
+        );
+        let mut request = json!({"kind":"incus","secret_hash":secret_hash(&token),"machine_id_hash":"c".repeat(64)});
+        assert!(service.enroll_host(code, &request).is_err());
+        request["machine_id_hash"] = json!(machine);
+        let enrolled = service.enroll_host(code, &request).unwrap();
+        assert_eq!(enrolled, service.enroll_host(code, &request).unwrap());
+        request["secret_hash"] = json!("e".repeat(64));
+        assert!(service.enroll_host(code, &request).is_err());
+        assert!(service.assert_host(&host).is_err());
+        let body = host_connection(&service, &token, &info["binding"]);
+        assert!(service.assert_host(&host).is_ok());
+        assert!(service.node_call(&token, "poll", body).is_err());
+        let jobs = crate::jobs::Jobs::open(&root.path().join("jobs")).unwrap();
+        assert!(
+            service
+                .submit(
+                    &jobs,
+                    id,
+                    Run {
+                        request_id: "no-host-exec".into(),
+                        kind: "workspace".into(),
+                        request: json!({"operation":"fork","workspace":"proof"})
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(service.catalog()["nodes"][0]["kind"], "incus");
+        assert_eq!(service.catalog()["nodes"][0]["host_id"], "metal");
+    }
+    #[test]
+    fn managed_admission_fences_offline_revoked_unprepared_changed_and_restarted_nodes() {
+        let root = tempfile::tempdir().unwrap();
+        let service = Contributors::open(root.path()).unwrap();
+        let host = managed_host();
+        let issued = service
+            .issue_host(&host, "b".repeat(64), invitation().budget)
+            .unwrap();
+        let id = issued["id"].as_str().unwrap();
+        let code = issued["code"].as_str().unwrap();
+        let token = format!("{id}.{}", "d".repeat(64));
+        let info = service.host_info(code).unwrap();
+        service.enroll_host(code,&json!({"kind":"incus","secret_hash":secret_hash(&token),"machine_id_hash":"b".repeat(64)})).unwrap();
+        let mut body = host_connection(&service, &token, &info["binding"]);
+        body["tools"]["host_ready"] = json!(false);
+        service
+            .node_call(&token, "heartbeat", body.clone())
+            .unwrap();
+        assert!(service.assert_host(&host).is_err());
+        body["tools"]["host_ready"] = json!(true);
+        service.node_call(&token, "heartbeat", body).unwrap();
+        assert!(service.assert_host(&host).is_ok());
+        let mut changed = host.clone();
+        changed.pool = "different".into();
+        assert!(service.assert_host(&changed).is_err());
+        service.nodes.lock().unwrap().get_mut(id).unwrap().last_seen = 0;
+        assert!(service.assert_host(&host).is_err());
+        host_connection(&service, &token, &info["binding"]);
+        let restarted = Contributors::open(root.path()).unwrap();
+        assert!(restarted.assert_host(&host).is_err());
+        host_connection(&restarted, &token, &info["binding"]);
+        assert!(restarted.assert_host(&host).is_ok());
+        restarted.revoke(id).unwrap();
+        assert!(restarted.assert_host(&host).is_err());
+        assert!(!restarted.authenticated(&token));
+        assert!(
+            restarted
+                .issue_host(&host, "b".repeat(64), invitation().budget)
+                .is_ok()
+        );
     }
     #[test]
     fn codes_bind_one_identity_with_downward_budgets_expiry_and_revocation() {

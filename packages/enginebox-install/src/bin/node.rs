@@ -16,6 +16,22 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Register an approved existing Linux Incus host using a code on stdin.
+    RegisterHost {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, hide = true)]
+        test_loopback_http: bool,
+    },
+    /// Report liveness for a managed Incus registration; never executes host jobs.
+    RunHost {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, hide = true)]
+        test_loopback_http: bool,
+    },
     RegisterWorker {
         #[arg(long)]
         controller: String,
@@ -73,6 +89,27 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Args::parse().command {
+        Action::RegisterHost {
+            controller,
+            config,
+            test_loopback_http,
+        } => {
+            let code = native_node::read_enrollment_stdin().await?;
+            println!(
+                "{}",
+                enginebox_install::managed_host::register(
+                    &config,
+                    &controller,
+                    &code,
+                    test_loopback_http
+                )
+                .await?
+            );
+        }
+        Action::RunHost {
+            config,
+            test_loopback_http,
+        } => enginebox_install::managed_host::run(&config, test_loopback_http).await?,
         Action::RegisterWorker {
             controller,
             config,

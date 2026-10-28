@@ -49,6 +49,7 @@ pub struct Storage {
 }
 pub struct Plan {
     host: Host,
+    admission: Option<Fleet>,
     pub operation: String,
     pub name: String,
     argv: Vec<String>,
@@ -76,6 +77,9 @@ enum Action {
 }
 impl Plan {
     pub fn execute(self) -> Result<Value> {
+        if let Some(fleet) = &self.admission {
+            fleet.assert_admission(&self.host.id)?;
+        }
         let result = if let Action::Dev { service, start } = &self.action {
             service.request(&self.host.id, &self.name, *start, *start)?
         } else if let Action::Allocation { fleet } = &self.action {
@@ -630,7 +634,24 @@ impl Storage {
             }
             _ => anyhow::bail!("Unsupported storage operation"),
         };
+        let readonly = [
+            "inspect",
+            "list",
+            "preview",
+            "github-preview",
+            "github-settings",
+            "github-delivery",
+            "compatibility",
+            "allocation",
+            "dev-status",
+            "close",
+        ]
+        .contains(&operation);
+        if !readonly {
+            self.fleet.assert_admission(host_id)?;
+        }
         Ok(Plan {
+            admission: (!readonly).then(|| self.fleet.clone()),
             host,
             operation: format!("storage_{operation}"),
             name,
