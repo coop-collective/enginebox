@@ -152,6 +152,24 @@ pub fn checkout_project(jobs: &[Value], host: &str, name: &str) -> Option<String
         .map(str::to_owned)
 }
 
+/// A pool name is mutable owner configuration, not historical project identity.
+/// Existing run records have no admission-time project field. Only infer from
+/// a definition known to predate admission; absent/invalid dates stay unknown.
+fn pool_project_at_admission<'a>(pool: &'a Value, run: &Value) -> Option<&'a str> {
+    let date = |value: &Value, key: &str| {
+        value[key]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    };
+    let admitted = date(run, "created_at")?;
+    if date(pool, "created_at")? > admitted || date(pool, "updated_at")? > admitted {
+        return None;
+    }
+    pool["project"]
+        .as_str()
+        .filter(|project| enginebox_agents::pools::valid_project(project))
+}
+
 pub fn catalog(
     repositories: &Value,
     pools: &[Value],
@@ -184,7 +202,7 @@ pub fn catalog(
     let mut pool_projects = BTreeMap::new();
     for pool in pools {
         let project = pool["project"].as_str().unwrap_or("default");
-        pool_projects.insert(pool["name"].as_str().unwrap_or(""), project);
+        pool_projects.insert(pool["name"].as_str().unwrap_or(""), pool);
         if let Some(w) = workspace(&mut all, project) {
             push(
                 w,
@@ -377,16 +395,18 @@ pub fn catalog(
             }
         }
     }
+    let mut unattributed_runs = 0;
     for run in rows(runs, "runs") {
         let pool_project = run["pool"]
             .as_str()
             .and_then(|p| pool_projects.get(p))
-            .copied();
+            .and_then(|pool| pool_project_at_admission(pool, run));
         let repo_project = run["repository"]
             .as_str()
             .and_then(|r| r.split_once('/'))
             .map(|(p, _)| p);
         if pool_project.is_some() && repo_project.is_some() && pool_project != repo_project {
+            unattributed_runs += 1;
             continue;
         }
         if let Some(w) = pool_project
@@ -414,6 +434,8 @@ pub fn catalog(
                     ],
                 ),
             );
+        } else {
+            unattributed_runs += 1;
         }
     }
     for event in rows(events, "events") {
@@ -441,7 +463,7 @@ pub fn catalog(
         }
     }
     json!({"workspaces":all.into_values().collect::<Vec<_>>(), "coverage":{
-        "runs_truncated":runs["truncated"], "run_history_limit":256, "operation_history_limit":200,
+        "runs_truncated":runs["truncated"], "unattributed_runs":unattributed_runs, "run_history_limit":256, "operation_history_limit":200,
         "operations_per_workspace_limit":30, "physical_cache_bytes":null,
         "storage_observations":"Latest successful controller list receipts; refresh storage to observe changes.",
         "integration":"Native run success is not acceptance or merge evidence. Review LayerFS source and promotion separately."
@@ -469,6 +491,48 @@ mod tests {
         assert_eq!(result["coverage"]["runs_truncated"], true);
         assert!(result["coverage"]["physical_cache_bytes"].is_null());
         assert!(!result.to_string().contains("SECRET"));
+    }
+    #[test]
+    fn pool_changes_never_reassign_historical_runs_and_repository_identity_survives() {
+        let pools = [
+            json!({"name":"workers","project":"beta","created_at":"2026-10-01T09:00:00Z","updated_at":"2026-10-01T11:00:00Z"}),
+            json!({"name":"recreated","project":"beta","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-01T12:00:00Z"}),
+            json!({"name":"legacy","project":"beta"}),
+        ];
+        let runs = json!({"runs":[
+            {"id":"old-pool-only","pool":"workers","created_at":"2026-10-01T10:00:00Z"},
+            {"id":"old-source","pool":"workers","repository":"alpha/main","created_at":"2026-10-01T10:00:00Z"},
+            {"id":"new-pool-only","pool":"workers","created_at":"2026-10-01T12:00:00Z"},
+            {"id":"name-reused","pool":"recreated","created_at":"2026-10-01T11:00:00Z"},
+            {"id":"unknown-time","pool":"workers"},
+            {"id":"unknown-pool-history","pool":"legacy","created_at":"2026-10-01T12:00:00Z"},
+            {"id":"invalid-time","pool":"workers","created_at":"invalid"},
+            {"id":"offset-before-update","pool":"workers","created_at":"2026-10-01T12:00:00+02:00"},
+            {"id":"offset-after-update","pool":"workers","created_at":"2026-10-01T13:00:00+01:00"}
+        ]});
+        let result = catalog(&json!({}), &pools, &json!({}), &runs, &json!({}), &[]);
+        let all = result["workspaces"].as_array().unwrap();
+        let alpha = all.iter().find(|w| w["id"] == "alpha").unwrap();
+        let beta = all.iter().find(|w| w["id"] == "beta").unwrap();
+        assert_eq!(
+            alpha["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["old-source"]
+        );
+        assert_eq!(
+            beta["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["new-pool-only", "offset-after-update"]
+        );
+        assert_eq!(result["coverage"]["unattributed_runs"], 6);
     }
     #[test]
     fn command_receipts_are_typed_redacted_and_uncertain_duration_stays_unknown() {

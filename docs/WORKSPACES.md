@@ -53,7 +53,7 @@ observation view, not a performance benchmark or cost-savings claim.
 
 | Signal | Measurement and scope |
 | --- | --- |
-| Native activity | Up to 256 retained run summaries; total run duration is never labelled as test or dependency-install time. Pool working counts include retained leases requiring reconciliation. |
+| Native activity | Up to 256 retained run summaries; total run duration is never labelled as test or dependency-install time. Pool working counts include retained leases requiring reconciliation. Pool-only historical runs are attributed only when the current pool definition predates admission; reassigned/recreated pools or missing timestamps leave project identity unknown. A retained repository reference can still identify the original source project. Coverage reports the count of retained runs without reliable workspace attribution. |
 | Environment launch | Bounded native launch-event journal, with measured stage duration and queue wait when reported. |
 | Source preparation | Environment-service `metrics.preparation`: source copy time, validated regular source-file logical bytes, optional configured preparation-command time, total elapsed time, revision, observation timestamp and success/failure. Git copies and incomplete source copies have unknown source bytes. |
 | Prepared revision reuse | Separate `metrics.preparation_reuse` receipt records a successful marker reuse and its elapsed time without overwriting the actual copy/prepare receipt. This is not a dependency-cache hit rate. |
