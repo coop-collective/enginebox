@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+binary_url='@@NODE_BINARY_URL@@'
+binary_sha256='@@NODE_BINARY_SHA256@@'
+controller=''
+code=''
+prefix='/opt/enginebox/managed-node'
+unit='/etc/systemd/system/enginebox-managed-node.service'
+owner='enginebox-managed-node-v1'
+while (($#)); do
+  case "$1" in
+    --controller|--enrollment-code|--prefix)
+      (($# >= 2)) || { echo "Missing option value" >&2; exit 2; }
+      case "$1" in --controller) controller=$2;; --enrollment-code) code=$2;; --prefix) prefix=$2;; esac
+      shift 2;;
+    *) echo 'Use --controller HTTPS_ORIGIN --enrollment-code CODE [--prefix ABSOLUTE_PATH]' >&2; exit 2;;
+  esac
+done
+[[ $(id -u) == 0 && $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
+  echo 'Run this installer as root on Linux x86-64.' >&2; exit 1;
+}
+for executable in curl sha256sum python3 systemctl install flock enginebox-host; do
+  command -v "$executable" >/dev/null || { echo "Missing prerequisite: $executable. Complete server provisioning first." >&2; exit 1; }
+done
+[[ "$binary_sha256" =~ ^[a-f0-9]{64}$ ]] || { echo 'Installer has not been packaged.' >&2; exit 1; }
+[[ "$code" =~ ^[a-f0-9]{32}\.[a-f0-9]{64}$ ]] || { echo 'Invalid enrollment code format.' >&2; exit 1; }
+python3 - "$controller" "$prefix" "$unit" <<'PY'
+import pathlib,sys,urllib.parse
+origin,prefix,unit=sys.argv[1:]
+u=urllib.parse.urlsplit(origin)
+assert u.scheme=='https' and u.hostname and not u.username and not u.password and not u.query and not u.fragment and not u.path, 'Expected an HTTPS controller origin'
+p=pathlib.Path(prefix)
+# Restrict service paths so systemd substitutions and shell expansion cannot
+# reinterpret a prefix. Keep both the tree and its ancestors root-owned.
+assert p.is_absolute() and len(p.parts)>2 and all(c.isalnum() or c in '/._-' for c in prefix) and '..' not in p.parts, 'Unsafe installation prefix'
+for candidate in [p,*p.parents,pathlib.Path(unit),*(p/child for child in ['.enginebox-managed-node','private','bin','private/install.lock','private/host.json','bin/enginebox-node','bin/enginebox-node.next'])]:
+ assert not candidate.is_symlink(), 'Symlink installation paths are not supported'
+ if candidate.exists():
+  s=candidate.stat(); assert s.st_uid==0 and not s.st_mode&0o022, 'Installation paths must be root-owned and not writable by other users'
+PY
+if [[ -e "$prefix" && ! -f "$prefix/.enginebox-managed-node" ]]; then
+  echo 'Refusing to replace a directory without an Enginebox ownership receipt.' >&2; exit 1
+fi
+if [[ -f "$prefix/.enginebox-managed-node" && $(cat "$prefix/.enginebox-managed-node") != "$owner" ]]; then
+  echo 'This installation belongs to a different installer.' >&2; exit 1
+fi
+if [[ -e "$unit" ]] && ! python3 - "$unit" "$prefix" <<'PY'
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text()
+assert text.startswith('# Managed by Enginebox managed node installer\n')
+assert f'ExecStart={sys.argv[2]}/bin/enginebox-node run-host --config {sys.argv[2]}/private/host.json\n' in text
+PY
+then
+  echo 'Refusing to replace an unrelated service.' >&2; exit 1
+fi
+
+install -d -m 0700 "$prefix" "$prefix/private" "$prefix/private/home" "$prefix/private/incus" "$prefix/bin"
+exec 9>"$prefix/private/install.lock"
+flock -n 9 || { echo 'Another node installation is running.' >&2; exit 1; }
+printf '%s\n' "$owner" > "$prefix/.enginebox-managed-node"
+configuration="$prefix/private/host.json"
+enrolled=false
+if [[ -e "$configuration" ]]; then
+  # Preserve an existing credential, including a pending enrollment whose
+  # acknowledgment was lost. Never re-register it under another identity.
+  enrolled=$(python3 - "$configuration" "$controller" "${code%%.*}" <<'PY'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); assert not p.is_symlink()
+s=p.stat(); assert s.st_uid==0 and s.st_mode&0o077==0, 'Private registration permissions required'
+c=json.loads(p.read_text()); assert c['controller'].rstrip('/')==sys.argv[2] and c['id']==sys.argv[3], 'Existing registration belongs to another controller or node'
+assert c['schema']==1 and type(c['enrolled']) is bool
+print('true' if c['enrolled'] else 'false')
+PY
+  )
+fi
+download=$(mktemp -d "$prefix/private/download.XXXXXXXX")
+trap 'rm -rf -- "$download"' EXIT
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$binary_url" --output "$download/enginebox-node"
+printf '%s  %s\n' "$binary_sha256" "$download/enginebox-node" | sha256sum --check --status || {
+  echo 'Node executable checksum mismatch.' >&2; exit 1;
+}
+chmod 0700 "$download/enginebox-node"
+if [[ "$enrolled" != true ]]; then
+  printf '%s\n' "$code" | "$download/enginebox-node" register-host --controller "$controller" --config "$configuration"
+fi
+unset code
+python3 - "$configuration" <<'PY'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); c=json.loads(p.read_text())
+assert c['enrolled'] is True and c['binding']['host_id'], 'Registration has not completed'
+assert p.stat().st_uid==0 and p.stat().st_mode&0o077==0
+print('Registered server:', c['binding']['host_id'])
+print('Configured allowance: {cpu} CPU, {memory_gib} GiB memory, {disk_gib} GiB disk'.format(**c['budget']))
+PY
+# Atomic replacement retains the previous running process until systemd starts
+# the new version. The private registration and all Incus state stay in place.
+install -m 0700 "$download/enginebox-node" "$prefix/bin/enginebox-node.next"
+mv -f "$prefix/bin/enginebox-node.next" "$prefix/bin/enginebox-node"
+cat > "$download/service" <<EOF
+# Managed by Enginebox managed node installer
+[Unit]
+Description=Enginebox registered Incus node
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+ExecStart=$prefix/bin/enginebox-node run-host --config $prefix/private/host.json
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=$prefix/private/home
+Environment=INCUS_CONF=$prefix/private/incus
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=$prefix/private
+[Install]
+WantedBy=multi-user.target
+EOF
+install -m 0644 "$download/service" "$unit"
+systemctl daemon-reload
+systemctl enable enginebox-managed-node.service
+started=$(date +%s)
+systemctl restart enginebox-managed-node.service
+systemctl is-active --quiet enginebox-managed-node.service
+python3 - "$configuration" "$prefix/private/status.json" "$started" <<'PY'
+import json,pathlib,sys,time
+config=json.loads(pathlib.Path(sys.argv[1]).read_text()); status=pathlib.Path(sys.argv[2]); started=int(sys.argv[3])
+deadline=time.monotonic()+60
+while time.monotonic()<deadline:
+ try:
+  v=json.loads(status.read_text())
+  if v.get('id')==config['id'] and v.get('online') is True and v.get('ready') is True and v.get('blocked') is False and v.get('last_seen',0)>=started:
+   print('Enginebox node is connected and ready. Its service is enabled at boot.'); break
+ except (OSError,ValueError,TypeError): pass
+ time.sleep(1)
+else:
+ raise SystemExit('Service installed, but a fresh ready heartbeat was not confirmed. Registration was preserved; inspect enginebox-managed-node.service and Compute before reinstalling.')
+PY
