@@ -40,6 +40,10 @@ test("one workspace source list creates hosted sources, links approved GitHub an
   });
   await signIn(page);
   await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "GitHub", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Map fixture/private to workspace" }).click();
+  await expect(page.getByLabel("Source type")).toHaveValue("github");
+  await expect(page.getByLabel("Selected GitHub repository")).toHaveValue("fixture/private");
+  await page.getByRole("button", { name: "← All workspaces", exact: true }).click();
   await page.getByRole("button", { name: "Open workspace app" }).click();
   await expect(page.getByText(/1 runtime states unknown/)).toBeVisible();
   await expect(page.getByText(/Source copy 40 ms/)).toBeVisible();
