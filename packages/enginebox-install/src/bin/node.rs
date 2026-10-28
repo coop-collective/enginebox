@@ -16,6 +16,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Read-only network checks; transport reachability is not engine streaming qualification.
+    NetworkCheck(enginebox_install::network::Options),
     RegisterWorker {
         #[arg(long)]
         controller: String,
@@ -73,6 +75,7 @@ enum Action {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Args::parse().command {
+        Action::NetworkCheck(options) => enginebox_install::network::print(&options).await?,
         Action::RegisterWorker {
             controller,
             config,

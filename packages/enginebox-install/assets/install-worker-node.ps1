@@ -62,6 +62,8 @@ $drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($root))
 if (-not (Test-Path -LiteralPath $config) -and $drive.AvailableFreeSpace -lt (($DiskGiB+1)*1GB)) { throw 'Insufficient free disk space for this allowance plus 1 GiB reserve.' }
 $source=Join-Path $PSScriptRoot 'enginebox-node.exe'
 if ($ExpectedBinarySha256 -notmatch '^[a-fA-F0-9]{64}$' -or (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -ne $ExpectedBinarySha256) { throw 'Worker executable checksum mismatch.' }
+& $source network-check --profile control --controller $Controller
+if ($LASTEXITCODE -ne 0) { throw 'Controller network preflight failed; no worker installation changes were made.' }
 if (Test-Path -LiteralPath $config) {
   $existing=Get-Content -Raw -LiteralPath $config | ConvertFrom-Json
   if ([Uri]$existing.controller -ne $uri -or $existing.budget.cpu -ne $Cpu -or $existing.budget.memory_gib -ne $MemoryGiB -or $existing.budget.disk_gib -ne $DiskGiB) { throw 'Existing registration has a different host or budget. Revoke it and use a fresh installation directory.' }

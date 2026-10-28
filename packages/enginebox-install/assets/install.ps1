@@ -8,9 +8,16 @@ param(
   [ValidateSet('operator','controller')][string]$Role = 'controller',
   [string]$BaseUrl = 'https://github.com/coop-collective/enginebox/releases/download',
   [switch]$Apply,
-  [switch]$InstallDependencies
+  [switch]$InstallDependencies,
+  [ValidateSet('control','streaming')][string]$NetworkProfile,
+  [string]$Controller,
+  [switch]$RequireQuic,
+  [switch]$WithTunnel
 )
 $ErrorActionPreference = 'Stop'
+if ($NetworkProfile -eq 'control' -and -not $Controller) { throw 'The control network profile requires -Controller.' }
+if ($RequireQuic -and $NetworkProfile -ne 'streaming') { throw '-RequireQuic requires -NetworkProfile streaming.' }
+if (-not $NetworkProfile -and ($Controller -or $WithTunnel)) { throw 'Specify -NetworkProfile with network options.' }
 if (-not $BaseUrl.StartsWith('https://')) { throw 'HTTPS release source required.' }
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 $target = switch ($architecture) {
@@ -84,6 +91,14 @@ try {
   if ((Get-Item $installer).LinkType) { throw 'Bootstrap executable must not be a link.' }
   & $installer --prefix $Prefix plan --role $Role
   if ($LASTEXITCODE -ne 0) { throw 'Host inspection failed.' }
+  if ($NetworkProfile) {
+    $networkArgs=@('--prefix',$Prefix,'network-check','--profile',$NetworkProfile)
+    if ($Controller) { $networkArgs+=@('--controller',$Controller) }
+    if ($RequireQuic) { $networkArgs+='--require-quic' }
+    if ($WithTunnel) { $networkArgs+='--with-tunnel' }
+    & $installer @networkArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Required network preflight failed; no release was staged or activated.' }
+  }
   if ($InstallDependencies) {
     & $installer --prefix $Prefix plan --role $Role --apply-dependencies
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed; inspect a fresh plan.' }

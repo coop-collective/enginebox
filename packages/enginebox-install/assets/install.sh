@@ -9,6 +9,10 @@ base_url='https://github.com/coop-collective/enginebox/releases/download'
 apply=0
 deps=0
 role='controller'
+network_profile=''
+controller=''
+require_quic=0
+with_tunnel=0
 usage() {
   cat <<'USAGE'
 Usage: sh install.sh --version X.Y.Z [options]
@@ -18,25 +22,35 @@ Usage: sh install.sh --version X.Y.Z [options]
   --role operator|controller|incus-host
   --apply                   Download, verify, stage and initially activate the pinned release
   --install-dependencies    With --apply, run the inspected dependency plan
+  --network-profile control|streaming  Check the selected connections before installing
+  --controller HTTPS_ORIGIN           Required for the control network profile
+  --require-quic                       Require QUIC for a streaming/MoQ host
+  --with-tunnel                        Also inspect Tunnel TCP/7844 reachability
 Without --apply, prints the plan and changes nothing. Independent hashes can come from a trusted release receipt.
 Running controllers are never restarted by this bootstrap; use enginebox-install update.
 USAGE
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--archive-sha256|--manifest-sha256|--prefix|--role|--base-url)
+    --version|--archive-sha256|--manifest-sha256|--prefix|--role|--base-url|--network-profile|--controller)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       case "$1" in
         --version) version=$2;; --archive-sha256) archive_sha256=$2;; --manifest-sha256) manifest_sha256=$2;;
         --prefix) prefix=$2;; --role) role=$2;; --base-url) base_url=$2;;
+        --network-profile) network_profile=$2;; --controller) controller=$2;;
       esac
       shift 2;;
     --apply) apply=1; shift;; --install-dependencies) deps=1; shift;;
+    --require-quic) require_quic=1; shift;; --with-tunnel) with_tunnel=1; shift;;
     --help|-h) usage; exit 0;; *) usage >&2; exit 2;;
   esac
 done
 case "$version" in ''|*[!0-9A-Za-z.+-]*|*..*|*+*) echo 'Provide an exact release version, without v, ranges, paths or build metadata.' >&2; exit 2;; esac
 case "$role" in operator|controller|incus-host) ;; *) echo 'Unsupported role.' >&2; exit 2;; esac
+case "$network_profile" in ''|control|streaming) ;; *) echo 'Unsupported network profile.' >&2; exit 2;; esac
+if [ "$network_profile" = control ] && [ -z "$controller" ]; then echo 'The control network profile requires --controller.' >&2; exit 2; fi
+if [ "$require_quic" -eq 1 ] && [ "$network_profile" != streaming ]; then echo '--require-quic requires --network-profile streaming.' >&2; exit 2; fi
+if [ -z "$network_profile" ] && { [ -n "$controller" ] || [ "$with_tunnel" -eq 1 ]; }; then echo 'Specify --network-profile with network options.' >&2; exit 2; fi
 for digest in "$archive_sha256" "$manifest_sha256"; do
   [ -n "$digest" ] || continue
   [ "${#digest}" -eq 64 ] || { echo 'SHA256 digests must contain 64 characters.' >&2; exit 2; }
@@ -79,6 +93,13 @@ actual_manifest=$(hash "$manifest"); actual_manifest=${actual_manifest%% *}
 tar -xOf "$archive" bin/enginebox-install > "$tmp/enginebox-install"
 chmod 700 "$tmp/enginebox-install"
 "$tmp/enginebox-install" --prefix "$prefix" plan --role "$role"
+if [ -n "$network_profile" ]; then
+  set -- "$tmp/enginebox-install" --prefix "$prefix" network-check --profile "$network_profile"
+  if [ -n "$controller" ]; then set -- "$@" --controller "$controller"; fi
+  if [ "$require_quic" -eq 1 ]; then set -- "$@" --require-quic; fi
+  if [ "$with_tunnel" -eq 1 ]; then set -- "$@" --with-tunnel; fi
+  "$@"
+fi
 if [ "$deps" -eq 1 ]; then "$tmp/enginebox-install" --prefix "$prefix" plan --role "$role" --apply-dependencies; fi
 "$tmp/enginebox-install" --prefix "$prefix" stage --version "$version" --manifest "$manifest" --manifest-sha256 "$manifest_sha256" --archive "$archive"
 if [ ! -f "$prefix/current.json" ]; then "$tmp/enginebox-install" --prefix "$prefix" activate --version "$version"; fi

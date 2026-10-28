@@ -9,7 +9,8 @@ param(
   [ValidateRange(2,4096)][int]$MemoryGiB=8,
   [ValidateRange(10,65536)][int]$DiskGiB=50,
   [string]$FfmpegPath,
-  [string]$WorkerConfig
+  [string]$WorkerConfig,
+  [switch]$RequireQuic
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -52,6 +53,7 @@ function Find-NodeFfmpeg {
 
 # Dot-sourcing exposes only the download helpers for isolated tests.
 if ($MyInvocation.InvocationName -eq '.') { return }
+if ($RequireQuic -and $Workload -ne 'gpu') { throw '-RequireQuic requires -Workload gpu; build workers do not require a media transport.' }
 if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { throw 'Windows x64 is required.' }
 if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { throw 'This package requires Windows x64.' }
 [Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -88,6 +90,7 @@ try {
     '-ExpectedBinarySha256','@@BINARY_SHA256@@','-FfmpegPath',$FfmpegPath)
   if ($Controller) { $arguments+=@('-Controller',$Controller) }
   if ($WorkerConfig) { $arguments+=@('-WorkerConfig',$WorkerConfig) }
+  if ($RequireQuic) { $arguments+='-RequireQuic' }
   & powershell.exe @arguments
   if ($LASTEXITCODE -ne 0) { throw 'Node setup failed; see the preceding error. Organization-enforced signing policies require an approved signed installer.' }
 } finally {

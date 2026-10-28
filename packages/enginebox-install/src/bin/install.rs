@@ -19,6 +19,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Read-only network checks; never changes VPN, firewall, routes or enrollment.
+    NetworkCheck(enginebox_install::network::Options),
     /// Read-only OS/dependency inspection. No package manager runs without --apply-dependencies.
     Plan {
         #[arg(long, value_enum, default_value = "controller")]
@@ -77,6 +79,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let install = Installation::inspect(args.prefix)?;
     match args.command {
+        Action::NetworkCheck(options) => enginebox_install::network::print(&options).await?,
         Action::Plan {
             role,
             apply_dependencies,
