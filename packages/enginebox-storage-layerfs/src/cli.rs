@@ -199,6 +199,9 @@ enum Command {
         name: String,
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// Record a bounded, argv-free timing receipt (not CI evidence).
+        #[arg(long, value_parser = ["test", "build", "dependencies", "dev", "other"])]
+        measure: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
@@ -419,8 +422,9 @@ pub fn run(args: Storage) -> Result<Value> {
         Command::Exec {
             name,
             timeout,
+            measure,
             argv,
-        } => runtime.operate(&name, "exec", &argv, timeout, ""),
+        } => runtime.execute_measured(&name, &argv, timeout, measure.as_deref()),
         Command::Deps { name } => runtime.operate(&name, "deps", &[], 300, ""),
         Command::Checkpoint { name, message } => {
             runtime.operate(&name, "checkpoint", &[], 120, &message)
@@ -501,6 +505,52 @@ fn delegated_token(
 #[cfg(test)]
 mod credential_tests {
     use super::*;
+    #[test]
+    fn exec_measurement_is_explicit_and_does_not_consume_command_arguments() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            storage: Storage,
+        }
+        let cli = Cli::try_parse_from([
+            "fixture",
+            "layerfs",
+            "exec",
+            "checkout",
+            "--measure",
+            "test",
+            "--",
+            "pnpm",
+            "test",
+            "--measure",
+            "secret-argument",
+        ])
+        .unwrap();
+        let Backend::Layerfs {
+            command: Command::Exec { measure, argv, .. },
+            ..
+        } = cli.storage.backend
+        else {
+            panic!("Expected exec");
+        };
+        assert_eq!(measure.as_deref(), Some("test"));
+        assert_eq!(argv, ["pnpm", "test", "--measure", "secret-argument"]);
+        assert!(
+            Cli::try_parse_from([
+                "fixture",
+                "layerfs",
+                "exec",
+                "checkout",
+                "--measure",
+                "arbitrary-command",
+                "--",
+                "pnpm",
+                "test"
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn stdin_credentials_are_bound_bounded_and_removed_after_transfer() {
         let value = br#"{"schema":1,"repository":"owner/private","branch":"main","token":"ghs_APP.jwt-fixture"}"#;
