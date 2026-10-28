@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import type {
   Allocation,
+  ComputeNode,
   Fleet,
   Host,
   Instance,
@@ -696,6 +697,7 @@ export default function Dashboard() {
   const [password, setPassword] = useState("");
   const [fleet, setFleet] = useState<Fleet | null>(null);
   const [workers, setWorkers] = useState<Contributor[]>([]);
+  const [workerNodes, setWorkerNodes] = useState<ComputeNode[]>([]);
   const [workersLoaded, setWorkersLoaded] = useState(false);
   const [workersError, setWorkersError] = useState("");
   const workerRequest = useRef(0);
@@ -721,16 +723,18 @@ export default function Dashboard() {
   const refreshWorkers = useCallback(async () => {
     const request = ++workerRequest.current;
     try {
-      const result = await api<{ nodes: Contributor[] }>("/api/contributors");
+      const result = await api<{ nodes: Contributor[]; compute_nodes?: ComputeNode[] }>("/api/contributors");
       if (request !== workerRequest.current) return;
       setWorkers(result.nodes);
+      setWorkerNodes(result.compute_nodes ?? []);
       setWorkersLoaded(true);
-      setWorkersError("");
+      setWorkersError(result.compute_nodes ? "" : "Update the controller to load its registered compute nodes.");
     } catch (err) {
       if (request !== workerRequest.current) return;
       if (err instanceof RequestError && err.status === 401) {
         setSession("login");
         setWorkers([]);
+        setWorkerNodes([]);
         setWorkersLoaded(false);
       }
       setWorkersError(`Worker inventory: ${errorMessage(err)}`);
@@ -819,6 +823,7 @@ export default function Dashboard() {
       setFleet(null);
       ++workerRequest.current;
       setWorkers([]);
+      setWorkerNodes([]);
       setWorkersLoaded(false);
       setWorkersError("");
       setJobs([]);
@@ -1176,6 +1181,7 @@ export default function Dashboard() {
                     hosts={fleet?.hosts ?? []}
                     hostsLoaded={fleet !== null}
                     nodes={workers}
+                    machines={[...(fleet?.compute_nodes ?? []), ...workerNodes]}
                     loaded={workersLoaded}
                     loadError={workersError}
                     refresh={refreshWorkers}

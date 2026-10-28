@@ -437,6 +437,16 @@ impl GitHub {
     pub fn configured(&self) -> bool {
         self.config.is_some()
     }
+    /// The selected binding for `owner/name`, when the owner selected it in the GitHub panel.
+    pub fn selected_repository(&self, repository: &str) -> Option<Repository> {
+        self.data
+            .lock()
+            .unwrap()
+            .repositories
+            .values()
+            .find(|r| r.full_name == repository)
+            .cloned()
+    }
 
     /// Private transport-only credential. Never expose through HTTP or job results.
     /// Validate the connected owner's grant before minting a single-repository token.

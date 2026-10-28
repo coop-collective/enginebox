@@ -2,6 +2,7 @@
 pub mod callbacks;
 pub mod ci;
 mod ci_templates;
+mod compute;
 pub mod contributors;
 mod environment;
 pub mod jobs;
@@ -167,7 +168,7 @@ impl Controller {
             ci_jobs: jobs::Jobs::open(&self.root.join("ci-jobs"))?,
             storage: storage::Storage::open(&self.root, self.fleet.clone())?
                 .with_github(github.clone()),
-            github,
+            github: github.clone(),
             contributors: contributors::Contributors::open(&self.root)?,
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles: profiles::Profiles::open(&self.root)?,
@@ -176,7 +177,12 @@ impl Controller {
                     repositories::Repositories::with_transport(&self.root, transport)?
                 }
                 None => repositories::Repositories::open(&self.root)?,
-            },
+            }
+            .with_github_if(
+                github
+                    .configured()
+                    .then(|| Arc::new(github.clone()) as Arc<dyn repositories::GithubLink>),
+            ),
             ci: ci::Ci::open(
                 &self.root,
                 &self
@@ -839,12 +845,25 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
         ["v1", "github", "installations", id, "repositories"] => {
             c.runtime()?.github.repositories(id.parse()?)
         }
-        ["v1", "fleet"] => c.fleet.summary(),
+        ["v1", "fleet"] => {
+            let mut fleet = c.fleet.summary()?;
+            fleet["compute_nodes"] = json!(compute::hosts(&fleet, &c.fleet.hosts()));
+            Ok(fleet)
+        }
+        ["v1", "compute"] => Ok(compute::catalog(
+            &c.fleet.summary()?,
+            &c.fleet.hosts(),
+            &c.runtime()?.contributors.catalog(),
+        )),
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
         ["v1", "ci"] => Ok(c.runtime()?.ci.catalog()),
         ["v1", "ci", "templates"] => Ok(c.runtime()?.ci.template_catalog()),
-        ["v1", "contributors"] => Ok(c.runtime()?.contributors.catalog()),
+        ["v1", "contributors"] => {
+            let mut catalog = c.runtime()?.contributors.catalog();
+            catalog["compute_nodes"] = json!(compute::workers(&catalog));
+            Ok(catalog)
+        }
         ["v1", "ci", "github", owner, repo, "runs", run] => {
             enginebox_ci::github::Github::from_env()?
                 .status(&format!("{owner}/{repo}"), run.parse()?)
@@ -1150,6 +1169,16 @@ async fn write(
             let repositories = runtime.repositories.clone();
             let project = project.to_string();
             let outcome = blocking(move || repositories.create(&project, &body)).await;
+            return Ok(match outcome {
+                Ok((true, v)) => (StatusCode::CREATED, v),
+                Ok((false, v)) => (StatusCode::OK, v),
+                Err(e) => repository_reply(Err(e), StatusCode::OK),
+            });
+        }
+        ["v1", "projects", project, "repositories", "github"] => {
+            let repositories = runtime.repositories.clone();
+            let project = project.to_string();
+            let outcome = blocking(move || repositories.link_github(&project, &body)).await;
             return Ok(match outcome {
                 Ok((true, v)) => (StatusCode::CREATED, v),
                 Ok((false, v)) => (StatusCode::OK, v),
@@ -1565,6 +1594,14 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v1/compute", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         let mut browser = request(Method::POST, "/internal/activate", "{}", true);
         browser
             .headers_mut()
@@ -1846,6 +1883,7 @@ mod tests {
                 "{}".into(),
             ),
             (Method::GET, "/v1/fleet", String::new()),
+            (Method::GET, "/v1/compute", String::new()),
             (Method::GET, "/v1/agents", String::new()),
             (Method::POST, "/v1/agents/codex/login", "{}".into()),
             (
