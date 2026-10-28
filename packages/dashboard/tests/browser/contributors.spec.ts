@@ -44,10 +44,10 @@ test('copies the installer and raw code separately, renews the same identity, an
   await page.getByRole('button',{name:'Refresh',exact:true}).click();
   await expect(command).toHaveCount(0);
   const row=page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem',{name:'Machine Windows RTX',exact:true});
-  await expect(row).toContainText('Online');await expect(row).toContainText('Templates ready');
+  await expect(row).toContainText('Online');await expect(row).toContainText('Runtime ready');
   await expect(row).toContainText('2 CPU · 4 GiB memory');await expect(row).toContainText('20 GiB disk');
   await expect(row.getByRole('button',{name:'Renew registration code'})).toHaveCount(0);
-  await row.locator('summary').filter({hasText:'Manage'}).click();
+  await row.locator('summary').filter({hasText:'Details'}).click();
   await row.getByRole('button',{name:'Revoke machine'}).click();
   await expect(row).toHaveCount(0);
   await page.locator('summary').filter({hasText:'Revoked machines and invitations'}).click();
@@ -60,7 +60,7 @@ test('keeps unfinished and revoked registrations out of the main machine list',a
   const machines=page.getByRole('region',{name:'Registered machines',exact:true});
   await expect(machines.getByRole('listitem')).toHaveCount(4);
   await expect(machines.getByRole('listitem').first()).toContainText('Build machine');
-  await expect(machines.getByRole('listitem',{name:'Machine Render RTX'})).toContainText('Templates ready');
+  await expect(machines.getByRole('listitem',{name:'Machine Render RTX'})).toContainText('Runtime ready');
   await expect(page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Worker machines',exact:true})).toHaveCount(0);
   await expect(page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Fleet overview',exact:true})).toHaveCount(0);
   await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('2');
@@ -114,4 +114,35 @@ test('shows workers when there are no VM hosts without offering an incompatible 
   await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeDisabled();
   await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('1');
   await expect(page.locator('.stat-card').filter({hasText:'VM CPU allocated'}).locator('strong')).toHaveText('0 / 0');
+});
+
+test('uses controller registration and allowances for both runtimes with the same details flow', async ({page, request}) => {
+  await request.post(`${fixtureOrigin}/__test/reset`);
+  await request.post(`${fixtureOrigin}/__test/contributor-inventory`);
+  await request.post(`${fixtureOrigin}/__test/mode`, {data:{mode:'warm'}});
+  await openMachines(page);
+  const machines = page.getByRole('region', {name:'Registered machines',exact:true});
+  const server = machines.getByRole('listitem',{name:'Machine Build machine',exact:true});
+  const windows = machines.getByRole('listitem',{name:'Machine Render RTX',exact:true});
+  await expect(server).toContainText('Registered · Linux · Incus');
+  await expect(windows).toContainText('Registered · Windows · WSL2');
+  await expect(server).toContainText('Online');
+  await expect(server).toContainText('Capacity limited');
+  // The controller allowance is lower than total hardware and must win.
+  await expect(server).toContainText('28 CPU · 112 GiB memory');
+  await expect(server).toContainText('900 GiB disk allowance');
+  for (const row of [server, windows]) {
+    await row.locator('summary').filter({hasText:'Details'}).click();
+    await expect(row).toContainText('Runtime connected');
+    await expect(row).toContainText('Available templates:');
+    await expect(row).toContainText('Machine ID:');
+  }
+  await expect(server).toContainText('host:metal-01');
+  await expect(windows).toContainText(`worker:${'1'.repeat(32)}`);
+  await expect(server).toContainText('Available for new work: 16 CPU · 64 GiB memory · 0 GiB disk');
+  await expect(server.getByRole('button',{name:'Revoke machine'})).toHaveCount(0);
+  await expect(windows.getByRole('button',{name:'Revoke machine'})).toBeVisible();
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+  await page.screenshot({path:'test-results/compute-consistent-mobile.png',fullPage:true});
 });

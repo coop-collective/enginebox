@@ -128,6 +128,23 @@ const environmentCatalog = () => ({
 reset();
 createServer(async (req, res) => {
   function send(status, body) {
+    // Controller-owned Compute projections; the UI must not invent these from
+    // the legacy inventories. Fixture values deliberately differ from hardware.
+    if (status === 200 && req.url === '/v1/fleet') body.compute_nodes = body.hosts.map(h => ({
+      id: `host:${h.id}`, source_id: h.id, label: h.label, backend: 'incus', platform: 'linux', registered: true, online: h.online,
+      registration: {method: 'controller_config'},
+      runtime: {state: !h.online ? 'offline' : poolMode() ? 'capacity_limited' : 'ready', running_workspaces: h.instances.filter(i => i.managed && i.status === 'Running').length, active_job: null, last_seen: h.online ? Math.floor(Date.now()/1000) : null},
+      resources: {budget: h.online ? {cpu: 28, memory_bytes: 112*GiB, disk_bytes: 900*GiB} : null, available: h.online ? {cpu: 16, memory_bytes: 64*GiB, disk_bytes: poolMode() ? 0 : 500*GiB} : null},
+      templates: h.online ? ['native'] : [], capabilities: {vm_workspaces: true, template_workspaces: false, ci_jobs: false},
+      management: {revoke: false, reconcile: false, limits: 'controller_config'}, error: h.error ?? null,
+    }));
+    if (status === 200 && req.url === '/v1/contributors') body.compute_nodes = body.nodes.filter(n => n.enrolled && !n.revoked).map(n => ({
+      id: `worker:${n.id}`, source_id: n.id, label: n.label, backend: n.tools.backend, platform: 'windows', registered: true, online: n.online,
+      registration: {method: 'enrollment'}, runtime: {state: n.blocked ? 'needs_attention' : !n.online ? 'offline' : n.tools.workspace ? 'ready' : 'preparing', running_workspaces: null, active_job: null, last_seen: n.online ? Math.floor(Date.now()/1000) : null},
+      resources: {budget: {cpu:n.budget.cpu,memory_bytes:n.budget.memory_gib*GiB,disk_bytes:n.budget.disk_gib*GiB}, available:null},
+      templates: n.tools.workspace ? ['native-dev'] : [], capabilities: {vm_workspaces:false,template_workspaces:!!n.tools.workspace,ci_jobs:false},
+      management: {revoke:true,reconcile:n.online && n.blocked && n.tools.worker_running === false,limits:'local_installer'},error:null,
+    }));
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(body));
   }

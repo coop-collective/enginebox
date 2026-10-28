@@ -1622,10 +1622,11 @@ input::placeholder {
 @media (max-width: 640px) { .contributor-resources { grid-template-columns: 1fr; } }
 
 .contributor-panel { display: grid; gap: 20px; }
-.compute-host-details summary { cursor: pointer; font-size: 13px; }
-.compute-host-details[open] { grid-column: 1 / -1; }
-.compute-host-details[open] > summary { margin-bottom: 14px; }
-.compute-host-details .host-card { max-width: 100%; }
+.compute-machine-details summary { cursor: pointer; font-size: 13px; }
+.compute-machine-details[open] { grid-column: 1 / -1; min-width: 0; }
+.compute-machine-details[open] > summary { margin-bottom: 14px; }
+.compute-machine-details > div { display: grid; gap: 10px; }
+.compute-machine-details .host-card { max-width: 100%; }
 .compute-host-error { color: #9a422c !important; }
 .contributor-panel + .workspaces-section { margin-top: 32px; }
 .contributor-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }

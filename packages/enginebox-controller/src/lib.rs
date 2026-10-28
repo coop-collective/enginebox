@@ -2,6 +2,7 @@
 pub mod callbacks;
 pub mod ci;
 mod ci_templates;
+mod compute;
 pub mod contributors;
 mod environment;
 pub mod jobs;
@@ -839,12 +840,25 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
         ["v1", "github", "installations", id, "repositories"] => {
             c.runtime()?.github.repositories(id.parse()?)
         }
-        ["v1", "fleet"] => c.fleet.summary(),
+        ["v1", "fleet"] => {
+            let mut fleet = c.fleet.summary()?;
+            fleet["compute_nodes"] = json!(compute::hosts(&fleet, &c.fleet.hosts()));
+            Ok(fleet)
+        }
+        ["v1", "compute"] => Ok(compute::catalog(
+            &c.fleet.summary()?,
+            &c.fleet.hosts(),
+            &c.runtime()?.contributors.catalog(),
+        )),
         ["v1", "templates"] => c.fleet.catalog(),
         ["v1", "storage"] => Ok(c.runtime()?.storage.catalog()),
         ["v1", "ci"] => Ok(c.runtime()?.ci.catalog()),
         ["v1", "ci", "templates"] => Ok(c.runtime()?.ci.template_catalog()),
-        ["v1", "contributors"] => Ok(c.runtime()?.contributors.catalog()),
+        ["v1", "contributors"] => {
+            let mut catalog = c.runtime()?.contributors.catalog();
+            catalog["compute_nodes"] = json!(compute::workers(&catalog));
+            Ok(catalog)
+        }
         ["v1", "ci", "github", owner, repo, "runs", run] => {
             enginebox_ci::github::Github::from_env()?
                 .status(&format!("{owner}/{repo}"), run.parse()?)
@@ -1565,6 +1579,14 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v1/compute", "", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         let mut browser = request(Method::POST, "/internal/activate", "{}", true);
         browser
             .headers_mut()
@@ -1846,6 +1868,7 @@ mod tests {
                 "{}".into(),
             ),
             (Method::GET, "/v1/fleet", String::new()),
+            (Method::GET, "/v1/compute", String::new()),
             (Method::GET, "/v1/agents", String::new()),
             (Method::POST, "/v1/agents/codex/login", "{}".into()),
             (

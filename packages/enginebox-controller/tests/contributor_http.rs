@@ -23,6 +23,20 @@ async fn call(app: &axum::Router, token: &str, path: &str, body: Value) -> (Stat
         serde_json::from_slice(&to_bytes(r.into_body(), 500000).await.unwrap()).unwrap(),
     )
 }
+async fn catalog(app: &axum::Router, token: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/contributors")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(response.into_body(), 500000).await.unwrap()).unwrap()
+}
 #[tokio::test]
 async fn scoped_node_http_credentials_and_drain_admission() {
     let tmp = tempfile::tempdir().unwrap();
@@ -38,6 +52,7 @@ async fn scoped_node_http_credentials_and_drain_admission() {
     let app = router(c.clone());
     let (status,invite)=call(&app,&owner,"/v1/contributors/enrollments",json!({"label":"Windows PC","budget":{"cpu":2,"memory_gib":4,"disk_gib":20},"workloads":{"ci":true,"agents":true}})).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog(&app, &owner).await["compute_nodes"], json!([]));
     let token = format!("{}.{}", invite["id"].as_str().unwrap(), "a".repeat(64));
     let renewal_path = format!(
         "/v1/contributors/{}/renew-enrollment",
@@ -99,6 +114,22 @@ async fn scoped_node_http_credentials_and_drain_admission() {
         call(&app, &owner, &renewal_path, json!({})).await.0,
         StatusCode::BAD_REQUEST
     );
+    let registered = catalog(&app, &owner).await;
+    let machine_id = format!("worker:{}", invite["id"].as_str().unwrap());
+    assert_eq!(registered["compute_nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(registered["compute_nodes"][0]["id"], machine_id);
+    assert_eq!(registered["compute_nodes"][0]["registered"], true);
+    assert_eq!(registered["compute_nodes"][0]["online"], false);
+    assert_eq!(
+        registered["compute_nodes"][0]["resources"]["budget"]["memory_bytes"],
+        4 * enginebox_core::GIB
+    );
+    assert!(!registered.to_string().contains(&token));
+    assert!(
+        !registered
+            .to_string()
+            .contains(renewed["code"].as_str().unwrap())
+    );
     assert_eq!(
         call(&app, &token, "/v1/contributors/enrollments", json!({}))
             .await
@@ -112,12 +143,20 @@ async fn scoped_node_http_credentials_and_drain_admission() {
     let session = uuid::Uuid::new_v4().to_string();
     let (status, hello) = call(&app, &token, "/v1/node/hello", json!({"session":session})).await;
     assert_eq!(status, StatusCode::OK);
-    let body = json!({"session":session,"epoch":hello["epoch"],"tools":{"worker_running":false}});
+    let body = json!({"session":session,"epoch":hello["epoch"],"tools":{"worker_running":false,"backend":"wsl2-layerfs","workspace":true,"templates":["native-dev"]}});
     assert_eq!(
         call(&app, &token, "/v1/node/heartbeat", body.clone())
             .await
             .0,
         StatusCode::OK
+    );
+    let connected = catalog(&app, &owner).await;
+    assert_eq!(connected["compute_nodes"][0]["id"], machine_id);
+    assert_eq!(connected["compute_nodes"][0]["runtime"]["state"], "ready");
+    assert_eq!(connected["compute_nodes"][0]["online"], true);
+    assert_eq!(
+        connected["compute_nodes"][0]["resources"]["available"],
+        Value::Null
     );
     // Draining admits completion traffic only, so the existing owner can finish.
     c.drain();
@@ -130,6 +169,12 @@ async fn scoped_node_http_credentials_and_drain_admission() {
         .0;
     assert!(status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE); // Already drained has no work to finish.
     c.activate().unwrap();
+    // Reloading the durable registration preserves the canonical identity even
+    // while liveness waits for the next authenticated heartbeat.
+    assert_eq!(
+        catalog(&app, &owner).await["compute_nodes"][0]["id"],
+        machine_id
+    );
     assert_eq!(
         call(
             &app,
@@ -141,6 +186,7 @@ async fn scoped_node_http_credentials_and_drain_admission() {
         .0,
         StatusCode::OK
     );
+    assert_eq!(catalog(&app, &owner).await["compute_nodes"], json!([]));
     assert_eq!(
         call(&app, &token, "/v1/node/heartbeat", body).await.0,
         StatusCode::UNAUTHORIZED
