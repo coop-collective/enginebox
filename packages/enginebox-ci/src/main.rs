@@ -2,7 +2,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use enginebox_core::{
-    Fleet, Resources, capacity, capacity::inventory, operation_lock, state, transport::shell_quote,
+    Fleet, Resources, capacity,
+    capacity::inventory,
+    state,
+    transport::{operation_lock_wait, shell_quote},
 };
 use enginebox_storage_layerfs::{
     Runtime as LayerRuntime, config::Config as LayerConfig, incus::Target,
@@ -146,7 +149,13 @@ fn run(config: Config, request: Request) -> Result<Value> {
             &host.id,
             "ci",
             &allocation_request(&request.name, &config.template, config.resources),
-        )?;
+        )
+        .inspect_err(|error| {
+            // Allocation has not received JIT or workflow credentials. Keep its
+            // diagnostic private; stdout and the controller expose no error text.
+            receipt["allocation_error"] =
+                json!(format!("{error:#}").chars().take(2048).collect::<String>());
+        })?;
         let uuid = bx.instance(&request.name)?["config"]["volatile.uuid"]
             .as_str()
             .context("Missing clone identity")?
@@ -214,7 +223,7 @@ fn run(config: Config, request: Request) -> Result<Value> {
             None
         };
         {
-            let _host_lock = operation_lock(&host)?;
+            let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
             owned(&bx.instance(&request.name)?, &receipt)?;
             let room = capacity(&host, &inventory(&host)?)?;
             ensure!(
@@ -345,7 +354,7 @@ exit 0
             runtime.operate(&checkout, "close", &[], 120, "")?;
             receipt["private_checkout_retained"] = json!(true);
         }
-        let _host_lock = operation_lock(&host)?;
+        let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
         let vm = bx.instance(&request.name)?;
         owned(&vm, &receipt)?;
         ensure!(

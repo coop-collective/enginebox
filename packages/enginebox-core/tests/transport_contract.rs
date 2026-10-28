@@ -357,6 +357,65 @@ fn scenario() -> Result<()> {
     let name = std::env::var("EBOX_TEST_SCENARIO")?;
     let f = Fleet::from_hosts(vec![host()], &root.join("controller"))?;
     match name.as_str() {
+        "host-lock-waits" | "host-lock-timeout" => {
+            use fs2::FileExt;
+            use std::time::{Duration, Instant};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join("host.lock"))?;
+            file.try_lock_exclusive()?;
+            let started = Instant::now();
+            if name == "host-lock-waits" {
+                let release = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    FileExt::unlock(&file).unwrap();
+                });
+                let guard = enginebox_core::transport::operation_lock_wait(
+                    &host(),
+                    Duration::from_secs(3),
+                )?;
+                release.join().unwrap();
+                ensure!(
+                    started.elapsed() >= Duration::from_millis(250),
+                    "Lock was not respected"
+                );
+                let probe = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join("host.lock"))?;
+                ensure!(
+                    probe.try_lock_exclusive().is_err(),
+                    "Returned guard did not hold the real lock"
+                );
+                drop(guard);
+                probe.try_lock_exclusive()?;
+            } else {
+                ensure!(
+                    enginebox_core::transport::operation_lock_wait(
+                        &host(),
+                        Duration::from_millis(300)
+                    )
+                    .is_err(),
+                    "Busy lock was admitted"
+                );
+                ensure!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "Lock wait exceeded its bound"
+                );
+                FileExt::unlock(&file)?;
+                let _guard = enginebox_core::transport::operation_lock_wait(
+                    &host(),
+                    Duration::from_secs(2),
+                )?;
+            }
+            ensure!(
+                !root.join("events.jsonl").exists(),
+                "Waiting performed a host mutation"
+            );
+        }
         "prepare-foreign-copy" => {
             ensure!(
                 enginebox_core::preparation::prepare(
@@ -721,6 +780,8 @@ fn scenario() -> Result<()> {
 fn tests() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     for scenario_name in [
+        "host-lock-waits",
+        "host-lock-timeout",
         "prepare-success",
         "prepare-foreign-copy",
         "prepare-copy-failure",

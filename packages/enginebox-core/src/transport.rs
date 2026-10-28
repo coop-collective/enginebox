@@ -586,6 +586,24 @@ impl Drop for HostOperationLock {
     }
 }
 pub fn operation_lock(host: &Host) -> Result<HostOperationLock> {
+    operation_lock_attempt(host, Duration::from_secs(30))
+}
+/// Retry only the non-mutating lock handshake, never the operation it protects.
+pub fn operation_lock_wait(host: &Host, timeout: Duration) -> Result<HostOperationLock> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "Host operation lock wait timed out");
+        match operation_lock_attempt(host, remaining.min(Duration::from_secs(30))) {
+            Ok(guard) => return Ok(guard),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+        }
+    }
+}
+fn operation_lock_attempt(host: &Host, timeout: Duration) -> Result<HostOperationLock> {
     let args = host_command(host, &["enginebox-host".into(), "lock".into()]);
     let mut command = Command::new(&args[0]);
     command
@@ -607,7 +625,7 @@ pub fn operation_lock(host: &Host) -> Result<HostOperationLock> {
         let _ = tx.send(r);
     });
     if rx
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(timeout)
         .ok()
         .and_then(Result::ok)
         .as_deref()

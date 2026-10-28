@@ -28,6 +28,7 @@ jobs:
         run: |
           pnpm exec cargo fmt --all --check
           pnpm exec cargo test --locked -p enginebox-ci
+          pnpm exec cargo test --locked -p enginebox-core --test transport_contract
           pnpm exec cargo clippy --locked -p enginebox-ci --all-targets -- -D warnings
           pnpm exec cargo build --locked --release -p enginebox-ci --bin enginebox-ci-worker
       - name: Record worker source and checksum
