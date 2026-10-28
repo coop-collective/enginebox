@@ -6,6 +6,7 @@ param(
   [string]$FfmpegPath,
   [string]$WorkerConfig,
   [string]$ExpectedBinarySha256,
+  [switch]$RequireQuic,
   [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA 'Enginebox\native-node')
 )
 $ErrorActionPreference = 'Stop'
@@ -78,6 +79,12 @@ if (-not $ExpectedBinarySha256 -or $ExpectedBinarySha256 -notmatch '^[a-fA-F0-9]
   throw 'Supply -ExpectedBinarySha256 from the trusted CI/release checksum before executing the node binary.'
 }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -ne $ExpectedBinarySha256) { throw 'Node binary checksum mismatch.' }
+$networkArgs=@('network-check','--profile','streaming')
+if ($Controller) { $networkArgs+=@('--controller',$Controller) }
+if ($RequireQuic) { $networkArgs+='--require-quic' }
+& $source @networkArgs
+if ($LASTEXITCODE -ne 0) { throw 'Required network preflight failed; installation has not changed this host.' }
+Write-Output 'Network results describe this connection now. Authenticated media, TURN allocation and engine streaming still require qualification. Rerun network-check after VPN/network changes.'
 & $source inspect --profile nvidia-nvenc --ffmpeg $FfmpegPath --qualify
 if ($LASTEXITCODE -ne 0) { throw 'NVIDIA hardware encode/decode qualification failed; installation has not changed this host.' }
 if ($Mode -eq 'Inspect') { exit 0 }

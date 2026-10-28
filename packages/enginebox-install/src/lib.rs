@@ -2,6 +2,7 @@
 pub mod bootstrap;
 pub mod contributor;
 pub mod native_node;
+pub mod network;
 pub mod release;
 pub mod supervisor;
 #[cfg(windows)]

@@ -36,6 +36,28 @@ By default, checksums come from the exact release's `enginebox-VERSION-TARGET.sh
 
 `--install-dependencies` explicitly runs the printed OS package-manager commands. Linux uses an existing apt or dnf; macOS uses an existing Homebrew; Windows uses Windows Package Manager. The installer does not silently add package repositories or install Homebrew. It rechecks the required versions afterward and stops if the distro package or PATH is insufficient. Incus installation never initializes storage, repartitions a disk or changes firewall policy. KVM availability and existing host configuration are separately inspected before provisioning.
 
+For a streaming host, add `--network-profile streaming --require-quic` to the
+terminal bootstrap (`-NetworkProfile streaming -RequireQuic` in PowerShell).
+Use `--network-profile control --controller https://controller.example.com` for
+an agent/build worker's controller connection. A supplied controller must be an
+existing Cloudflare fleet controller; this is not the native supervisor's local
+management endpoint. `--with-tunnel` adds TCP/7844 reachability checks for both
+Cloudflare Tunnel regions. Network checks run after verifying the bootstrap
+executable and before dependency installation, release staging or activation.
+Plan-only bootstrap remains offline. These options require a release containing
+the network-preflight implementation; older published binaries do not support
+them.
+
+The standalone command is `enginebox-node network-check --profile streaming
+--require-quic`, or `enginebox-install --prefix /absolute/owned-prefix
+network-check --profile streaming --require-quic`. Both print bounded,
+credential-free diagnostics and leave the host unchanged. Run in the actual
+engine/container network namespace, and rerun when VPN/network conditions
+change. Failed required checks return a failing exit status; optional failures
+set `hasWarnings`. Transport checks do not qualify authenticated MoQ, a TURN
+allocation, engine rendering/input or viewer connectivity. See
+[network preflight and Tunnel boundaries](NATIVE-GPU-NODES.md#network-preflight).
+
 ## Configure a controller
 
 After staging, native programs are in `PREFIX/releases/VERSION/bin/`. Keep this directory on the service PATH or use its absolute paths. Release directories are immutable; private state stays in `PREFIX/state` and `PREFIX/etc`.

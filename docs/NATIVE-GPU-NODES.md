@@ -2,6 +2,77 @@
 
 This adds a native Rust supervisor (`enginebox-node`), scoped enrollment to the existing fleet controller, Windows installation, and separate Apple VideoToolbox/NVIDIA NVENC qualification profiles. It does not install a second controller or grant a node administrator credentials.
 
+## Network preflight
+
+The native Windows installer runs credential-free network checks before creating
+the node installation or scheduled task. The worker installer checks only its
+controller connection; GPU setup also checks streaming transports. Run the same
+check directly on macOS, Linux, Windows, or inside the container/WSL network where
+the engine will actually run:
+
+```sh
+enginebox-node network-check --profile streaming --controller https://controller.example.com
+enginebox-node network-check --profile streaming --require-quic --with-tunnel
+enginebox-node network-check --profile control --controller https://controller.example.com
+```
+
+For a MoQ host, pass `-RequireQuic` to the Windows native/online GPU installer.
+For the online bootstrap select `-Workload gpu` as well.
+`--require-quic` (or `-RequireQuic`) makes a failed QUIC handshake stop setup.
+Controller health is required whenever a controller is supplied. Other streaming
+failures are reported with `hasWarnings:true`, allowing a build worker or a
+separately qualified WebRTC configuration to be installed without claiming MoQ
+support. No fallback transport is selected automatically.
+
+Each check has an eight-second deadline; checks and address families run
+concurrently. The JSON contains a timestamp, per-check result, diagnostic code,
+scope and remediation hint. It never includes relay tokens, resolved IPs, raw
+provider errors, network logs or private enrollment data. Checks verify:
+
+- HTTPS and the controller's `/health` identity, rejecting redirects and captive
+  portals that return an unrelated successful response.
+- A real QUIC/TLS handshake with certificate verification and `h3` ALPN to the
+  Cloudflare MoQ relay on UDP/443. Merely sending a UDP datagram does not pass.
+- Certificate-verified TLS to Cloudflare TURN on TCP/443, and a separate STUN
+  binding round trip on UDP/3478 with a matching transaction and mapped-address
+  attribute. The address itself is not retained.
+- With `--with-tunnel`, TCP/7844 reachability to both Cloudflare Tunnel regions.
+  This is only a port check; use the connector's own diagnostics for tunnel
+  authentication and protocol negotiation.
+
+These are **transport checks**, not authenticated MoQ sessions, TURN allocations,
+peer connectivity, capture/input tests, or latency/bandwidth qualification.
+`streamingQualified` remains false; `mediaSession`, `turnAllocation` and
+`tunnelAuthorization` are explicitly `not-tested`. Gamejam owns those media and
+engine acceptance tests for Unity, Unreal, Godot and Three.js. Network checks do
+not grant scheduling, session or publication authority.
+
+Results describe the current network only. Rerun after changing VPN, Wi-Fi,
+firewall, container networking or machine location, and before qualifying a new
+streaming session. This change does not add continuous monitoring or persist
+`--require-quic` as a runtime admission policy. A host result does not qualify a
+container or a remote viewer's connection. The check never changes VPN settings,
+routes, firewall policy, certificates or existing engine processes.
+
+### Tunnel and origin privacy
+
+Cloudflare Tunnel can expose authenticated control/admin HTTP services through
+outbound connections, without publishing the host IP or opening inbound ports.
+Its HTTP/2 transport uses TCP/7844 when QUIC is unavailable. That success does
+not establish that MoQ's separate UDP/443 path works. Public Tunnel application
+routes are not general UDP forwarding; do not send engine frames through an HTTP
+or WebSocket tunnel as an implicit media fallback. The MoQ relay already keeps
+viewers connected to Cloudflare rather than directly to the engine host. Direct
+WebRTC candidates have a different privacy contract; use and qualify relay-only
+media when hiding peer addresses is required.
+
+See Cloudflare's [Tunnel routing](https://developers.cloudflare.com/tunnel/concepts/routing/),
+[transport fallback](https://developers.cloudflare.com/tunnel/troubleshooting/),
+[connector prechecks](https://developers.cloudflare.com/changelog/post/2026-05-27-cloudflared-connectivity-prechecks/)
+and [TURN transports](https://developers.cloudflare.com/realtime/turn/).
+The installer reports tunnel reachability; it does not provision or activate a
+tunnel, configure Access, or qualify the WebRTC/TURN fallback.
+
 The Windows package runs a background user service through Task Scheduler at sign-in, with the current user's privileges. It is deliberately not a LocalSystem desktop service: Windows services run in Session 0. The owner-configured rendering worker runs in the user's interactive session. Sign-out stops that session; this is not an unattended login-window graphics qualification. No firewall, GPU driver, disk layout, VM or global profile is changed.
 
 ## Inspect and install Windows
