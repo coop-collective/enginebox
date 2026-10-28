@@ -36,10 +36,32 @@ pub struct App {
 pub struct Config {
     pub schema: u32,
     pub callback_url: String,
-    pub repos: App,
+    /// One registration and one OAuth session for repositories and runners.
+    pub app: Option<App>,
+    /// Legacy, optionally separate registrations.
+    pub repos: Option<App>,
     pub runners: Option<App>,
     #[serde(default)]
     pub pools: Vec<ci::Pool>,
+}
+impl Config {
+    fn account_kind<'a>(&self, kind: &'a str) -> Result<&'a str> {
+        match kind {
+            "repos" | "runners" if self.app.is_some() => Ok("github"),
+            "github" if self.app.is_some() => Ok("github"),
+            "repos" | "runners" => Ok(kind),
+            _ => anyhow::bail!("Unknown GitHub connection"),
+        }
+    }
+    fn app(&self, kind: &str) -> Result<&App> {
+        match self.account_kind(kind)? {
+            "github" => self.app.as_ref(),
+            "repos" => self.repos.as_ref(),
+            "runners" => self.runners.as_ref(),
+            _ => unreachable!(),
+        }
+        .context("GitHub App is not configured for this connection")
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Repository {
@@ -130,7 +152,15 @@ impl GitHub {
                     && callback.fragment().is_none(),
                 "Invalid callback URL"
             );
-            for app in [&c.repos, c.runners.as_ref().unwrap_or(&c.repos)] {
+            ensure!(
+                if c.app.is_some() {
+                    c.repos.is_none() && c.runners.is_none()
+                } else {
+                    c.repos.is_some()
+                },
+                "Configure app for one GitHub App, or repos and optional runners for separate Apps"
+            );
+            for app in c.app.iter().chain(c.repos.iter()).chain(c.runners.iter()) {
                 name(&app.slug)?;
                 ensure!(
                     !app.client_id.is_empty()
@@ -140,10 +170,15 @@ impl GitHub {
                 );
             }
             ensure!(
-                c.runners
+                c.repos
                     .as_ref()
-                    .is_none_or(|r| r.client_id != c.repos.client_id),
-                "Runner permissions require a separate GitHub App"
+                    .zip(c.runners.as_ref())
+                    .is_none_or(|(repos, runners)| repos.client_id != runners.client_id),
+                "Use app to share one registration and OAuth session instead of duplicating repos and runners"
+            );
+            ensure!(
+                c.pools.is_empty() || c.app("runners").is_ok(),
+                "Runner pools require an App with runner access"
             );
             ci::validate_pools(&c.pools)?;
         }
@@ -157,6 +192,20 @@ impl GitHub {
         } else {
             Data::default()
         };
+        if let Some(config) = &config {
+            for (kind, account) in &data.accounts {
+                ensure!(
+                    config
+                        .account_kind(kind)
+                        .is_ok_and(|canonical| canonical == kind)
+                        && config
+                            .app(kind)
+                            .is_ok_and(|app| account["client_id"].is_null()
+                                || account["client_id"] == app.client_id),
+                    "Disconnect existing GitHub accounts before changing App configuration"
+                );
+            }
+        }
         for job in data.jobs.values_mut() {
             if job["status"] == "running" {
                 job["status"] = json!("uncertain");
@@ -182,26 +231,26 @@ impl GitHub {
     }
     pub(crate) fn app(&self, kind: &str) -> Result<&App> {
         let config = self.config.as_ref().context("GitHub is not configured")?;
-        match kind {
-            "repos" => Ok(&config.repos),
-            "runners" => config
-                .runners
-                .as_ref()
-                .context("Runner App is not configured"),
-            _ => anyhow::bail!("Unknown GitHub connection"),
-        }
+        config.app(kind)
+    }
+    fn account_kind<'a>(&self, kind: &'a str) -> Result<&'a str> {
+        self.config
+            .as_ref()
+            .context("GitHub is not configured")?
+            .account_kind(kind)
     }
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
     }
     pub fn status(&self) -> Value {
         let data = self.data.lock().unwrap();
-        json!({"configured": self.config.is_some(), "runner_app_configured":self.config.as_ref().is_some_and(|c|c.runners.is_some()),
+        json!({"configured": self.config.is_some(), "shared_app":self.config.as_ref().is_some_and(|c|c.app.is_some()), "runner_app_configured":self.app("runners").is_ok(),
             "accounts":data.accounts.iter().map(|(kind, a)|json!({"kind":kind,"login":a["login"]})).collect::<Vec<_>>(),
             "repositories":data.repositories.values().collect::<Vec<_>>(), "jobs":data.jobs.values().collect::<Vec<_>>(), "draining":data.draining,
             "pools":self.config.as_ref().map(|c|c.pools.iter().map(|p|json!({"id":p.id,"organization":p.organization,"labels":p.labels,"runner_group_id":p.runner_group_id,"max_runners":p.max_runners,"preparation":p.preparation.as_ref().map(|v|json!({"repository_id":v.repository_id,"workflows":v.workflows}))})).collect::<Vec<_>>()).unwrap_or_default()})
     }
     pub fn connect(&self, kind: &str) -> Result<Value> {
+        let kind = self.account_kind(kind)?;
         let app = self.app(kind)?;
         let state_id = random()?;
         let verifier = random()?;
@@ -213,7 +262,7 @@ impl GitHub {
         ensure!(data.flows.len() < 16, "Too many authorization attempts");
         data.flows.insert(
             state_id.clone(),
-            json!({"kind":kind,"verifier":verifier,"expires":api::now()+600}),
+            json!({"kind":kind,"client_id":app.client_id,"verifier":verifier,"expires":api::now()+600}),
         );
         self.save(&data)?;
         let mut url = url::Url::parse("https://github.com/login/oauth/authorize")?;
@@ -244,6 +293,11 @@ impl GitHub {
         );
         let kind = text(&flow, "kind")?;
         let app = self.app(kind)?;
+        ensure!(
+            self.account_kind(kind)? == kind
+                && (flow["client_id"].is_null() || flow["client_id"] == app.client_id),
+            "GitHub App changed; start authorization again"
+        );
         let token = self.api.oauth(json!({"client_id":app.client_id,"client_secret":app.client_secret,"code":code,"redirect_uri":self.config.as_ref().unwrap().callback_url,"code_verifier":flow["verifier"]}))?;
         let access = text(&token, "access_token").context("GitHub authorization rejected")?;
         let user = self.api.call("GET", "/user", access, None)?;
@@ -257,21 +311,28 @@ impl GitHub {
         let mut account = normalize_token(token)?;
         account["id"] = user["id"].clone();
         account["login"] = user["login"].clone();
+        account["client_id"] = json!(app.client_id);
         data.accounts.insert(kind.into(), account);
         self.save(&data)?;
         Ok(json!({"connected":true,"kind":kind,"login":user["login"]}))
     }
     fn user_token(&self, kind: &str, data: &mut Data) -> Result<String> {
+        let kind = self.account_kind(kind)?;
+        let app = self.app(kind)?;
         let account = data
             .accounts
             .get_mut(kind)
             .context("Connect GitHub first")?;
+        ensure!(
+            account["client_id"].is_null() || account["client_id"] == app.client_id,
+            "GitHub App changed; reconnect the account"
+        );
         if account["expires_at"].as_u64().unwrap_or(0) <= api::now() + 60 {
-            let app = self.app(kind)?;
             let response = self.api.oauth(json!({"client_id":app.client_id,"client_secret":app.client_secret,"grant_type":"refresh_token","refresh_token":text(account,"refresh_token")?}))?;
             let mut next = normalize_token(response)?;
             next["id"] = account["id"].clone();
             next["login"] = account["login"].clone();
+            next["client_id"] = json!(app.client_id);
             *account = next;
             self.save(data)?;
         }
@@ -356,6 +417,7 @@ impl GitHub {
     }
     pub fn disconnect(&self, kind: &str) -> Result<Value> {
         self.app(kind)?;
+        let kind = self.account_kind(kind)?;
         let mut data = self.data.lock().unwrap();
         ensure!(
             !data.jobs.values().any(|j| matches!(
@@ -366,7 +428,7 @@ impl GitHub {
         );
         data.accounts.remove(kind);
         data.flows.retain(|_, v| v["kind"] != kind);
-        if kind == "repos" {
+        if matches!(kind, "repos" | "github") {
             data.repositories.clear();
         }
         self.save(&data)?;

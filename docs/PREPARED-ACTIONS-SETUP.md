@@ -8,7 +8,7 @@ workspaces and the core runtime remain independent of GitHub.
 ## 1. Bind an accelerated pool
 
 Complete [GitHub App and Kitbash secrets setup](GITHUB-SECRETS.md). No new OAuth
-scope injects dependencies into workflows. The runner App supplies organization
+scope injects dependencies into workflows. The connected GitHub App supplies organization
 runner administration and repository Actions read; webhooks supply demand. A
 separate repository-scoped Actions-read token stays in the host verifier and
 never enters the VM. The official runner still runs the workflow.
@@ -30,7 +30,7 @@ Add this field to the corresponding pool in private `github.json`:
 ```
 
 Use [ci-worker-prepared.example.json](../examples/ci-worker-prepared.example.json)
-for that pool's worker. Match the repository and **runner App installation** IDs.
+for that pool's worker. Match the repository and **App installation used for runners** IDs.
 `acceleration.image` must be the installed **registered template manifest digest**,
 not an arbitrary cache label. The worker checks it before cloning. Register and
 synchronize the credential-free template through the existing template service;

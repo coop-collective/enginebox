@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "callback_url": "https://enginebox.example.com/api/github/callback",
+  "repos": {
+    "client_id": "REPOSITORY_APP_CLIENT_ID",
+    "client_secret": {
+      "file": "/etc/enginebox/secrets/github/repos-client-secret"
+    },
+    "slug": "your-enginebox-repositories",
+    "private_key": {
+      "file": "/etc/enginebox/secrets/github/repos-private-key"
+    },
+    "webhook_secret": {
+      "file": "/etc/enginebox/secrets/github/repos-webhook-secret"
+    },
+    "workflows_write": false
+  },
+  "runners": {
+    "client_id": "RUNNER_APP_CLIENT_ID",
+    "client_secret": {
+      "file": "/etc/enginebox/secrets/github/runners-client-secret"
+    },
+    "slug": "your-enginebox-runners",
+    "private_key": {
+      "file": "/etc/enginebox/secrets/github/runners-private-key"
+    },
+    "webhook_secret": {
+      "file": "/etc/enginebox/secrets/github/runners-webhook-secret"
+    }
+  },
+  "pools": [
+    {
+      "id": "linux",
+      "installation_id": 123,
+      "organization": "example-org",
+      "runner_group_id": 456,
+      "labels": [
+        "self-hosted",
+        "Linux",
+        "X64",
+        "enginebox-linux"
+      ],
+      "max_runners": 1,
+      "timeout_seconds": 3600,
+      "worker": [
+        "/opt/enginebox/bin/enginebox-ci-worker",
+        "--config",
+        "/etc/enginebox/ci-worker.json"
+      ]
+    }
+  ]
+}
