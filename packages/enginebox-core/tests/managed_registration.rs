@@ -16,6 +16,13 @@ fn required_registration_fences_all_new_fleet_admission_before_host_commands() {
     };
     let fleet = Fleet::from_hosts(vec![host.clone()], &root.path().join("state")).unwrap();
     assert!(fleet.assert_admission("server").is_err());
+    assert!(
+        fleet
+            .sync_guest_tools("server", "ebox-private")
+            .unwrap_err()
+            .to_string()
+            .contains("registration")
+    );
     for operation in [
         "create",
         "allocate",

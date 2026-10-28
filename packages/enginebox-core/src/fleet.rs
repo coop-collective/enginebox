@@ -115,9 +115,11 @@ impl Fleet {
     }
     /// Explicit, resumable v0.2 guest migration. No provider homes or native CLIs change.
     pub fn sync_guest_tools(&self, id: &str, name: &str) -> Result<Value> {
+        self.assert_admission(id)?;
         let host = self.host(id)?;
         let _controller = self.controller_lock(id)?;
         let _lock = operation_lock(&host)?;
+        self.assert_admission(id)?;
         self.account_workspace(id, name)?;
         crate::guest::ensure_remote_guest_tools(&host.engine_box(), name, true)
     }
@@ -729,4 +731,50 @@ fn wait_ready_mode(bx: &EngineBox, name: &str, host_lock_held: bool) -> Result<V
     bail!(
         "VM started but identity, manifest, network and DNS did not become ready within 180 seconds; inspect before retrying"
     )
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    #[test]
+    fn queued_resume_rechecks_registration_after_the_host_mutex() {
+        let temp = tempfile::tempdir().unwrap();
+        let host = Host {
+            id: "fenced-host".into(),
+            target: "must-not-contact.invalid".into(),
+            managed_registration: true,
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host], &temp.path().join("state")).unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let registered = live.clone();
+        let (checked, observed) = mpsc::channel();
+        fleet.set_admission_guard(Arc::new(move |_| {
+            let allowed = registered.load(Ordering::SeqCst);
+            let _ = checked.send(());
+            ensure!(allowed, "Node revoked while waiting");
+            Ok(())
+        }));
+        let lock = fleet.controller_lock("fenced-host").unwrap();
+        let queued = fleet.clone();
+        let operation = std::thread::spawn(move || {
+            queued.operate("fenced-host", "resume", &json!({"name":"ebox-private"}))
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        live.store(false, Ordering::SeqCst);
+        drop(lock);
+        assert!(
+            operation
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("revoked while waiting")
+        );
+    }
 }

@@ -35,6 +35,7 @@ pub fn prepare(
     let host = fleet.host(host_id)?;
     let _controller = fleet.controller_lock(host_id)?;
     let _lease = operation_lock(&host)?;
+    fleet.assert_admission(host_id)?;
     // Use the same executable resolution as actual inventory/host operations.
     let protocol: Value = serde_json::from_slice(&host_run(
         &host,

@@ -73,6 +73,7 @@ pub const REASONS: &[&str] = &[
     "profile_unavailable",
     "pool_unavailable",
     "workspace_unavailable",
+    "managed_host_unavailable",
     "template_mismatch",
     "lease_unresolved",
     "admission_error",

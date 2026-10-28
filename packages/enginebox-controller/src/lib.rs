@@ -849,6 +849,12 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
 fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
+        ["v1", "hosts", host, "admission"] => {
+            c.fleet.host(host)?;
+            let gate = c.gate.lock().unwrap();
+            let allowed = gate.mode == Mode::Active && c.fleet.assert_admission(host).is_ok();
+            Ok(json!({"host_id":host,"allowed":allowed}))
+        }
         ["v1", "github"] => Ok(c.runtime()?.github.status()),
         ["v1", "github", kind, "installations"] => c.runtime()?.github.list_installations(kind),
         ["v1", "github", "installations", id, "repositories"] => {
@@ -1618,6 +1624,53 @@ mod tests {
         builder.body(Body::from(body.to_owned())).unwrap()
     }
     #[tokio::test]
+    async fn admission_observation_requires_owner_and_fails_closed_during_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("fleet.toml");
+        std::fs::write(&config,"schema_version=1\n[[hosts]]\nid='worker'\ntarget='must-not-contact.invalid'\nmanaged_registration=true\n").unwrap();
+        let c = Controller::new(&config, &temp.path().join("state"), "x".repeat(32)).unwrap();
+        let app = router(c.clone());
+        let route = "/v1/hosts/worker/admission";
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", false)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, observation) = call(&app, request(Method::GET, route, "", true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(observation, json!({"host_id":"worker","allowed":false}));
+        // Standby observation never creates controller state or acquires ownership.
+        assert!(!temp.path().join("state/schema.json").exists());
+        c.activate().unwrap();
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", true)).await.1["allowed"],
+            false
+        );
+        c.fleet.set_admission_guard(Arc::new(|_| Ok(())));
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", true)).await.1["allowed"],
+            true
+        );
+        c.fleet
+            .set_admission_guard(Arc::new(|_| anyhow::bail!("Node revoked")));
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", true)).await.1["allowed"],
+            false
+        );
+        c.fleet.set_admission_guard(Arc::new(|_| Ok(())));
+        let in_flight = c.admit().unwrap();
+        assert_eq!(c.drain()["mode"], "draining");
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", true)).await.1["allowed"],
+            false
+        );
+        drop(in_flight);
+        assert_eq!(c.drain()["drained"], true);
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", true)).await.1["allowed"],
+            false
+        );
+    }
+    #[tokio::test]
     async fn auth_and_origin_are_checked_before_body_or_state() {
         let (_temp, c) = setup();
         let app = router(c);
@@ -1928,6 +1981,7 @@ mod tests {
             (Method::GET, "/v1/fleet", String::new()),
             (Method::GET, "/v1/compute", String::new()),
             (Method::POST, "/v1/hosts/worker/enrollment", "{}".into()),
+            (Method::GET, "/v1/hosts/worker/admission", String::new()),
             (Method::GET, "/v1/agents", String::new()),
             (Method::POST, "/v1/agents/codex/login", "{}".into()),
             (

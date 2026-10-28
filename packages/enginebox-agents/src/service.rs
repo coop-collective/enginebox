@@ -941,6 +941,7 @@ impl AgentService {
         providers: Option<Vec<String>>,
     ) -> Result<Value> {
         let _pending = self.pending_guard()?;
+        self.inner.fleet.assert_admission(host_id)?;
         let host = self.inner.fleet.account_workspace(host_id, name)?;
         let _hostlock = enginebox_core::operation_lock(&host)?;
         self.attach_locked(host_id, name, providers, None, None)
@@ -953,6 +954,7 @@ impl AgentService {
         expected_identity: Option<&str>,
         expected_binding: Option<&str>,
     ) -> Result<Value> {
+        self.inner.fleet.assert_admission(host_id)?;
         let host = self.inner.fleet.account_workspace(host_id, name)?;
         let binding = host_binding(&host)?;
         let key = receipt_key(host_id, name);
@@ -1003,6 +1005,7 @@ impl AgentService {
                 }
                 let mut request = delegation::attachment(&p, &material, false);
                 request["expected_instance_id"] = json!(expected_identity);
+                self.inner.fleet.assert_admission(host_id)?;
                 let delivered = self.transfer(&host, name, &request)?;
                 result["status"] = json!(if delivered["unchanged"] == true {
                     "unchanged"
@@ -1066,9 +1069,11 @@ impl AgentService {
     pub fn adopt(&self, host_id: &str, name: &str, p: &str) -> Result<Value> {
         crate::provider(p)?;
         let _pending = self.pending_guard()?;
+        self.inner.fleet.assert_admission(host_id)?;
         let host = self.inner.fleet.account_workspace(host_id, name)?;
         let _hostlock = enginebox_core::operation_lock(&host)?;
         let _lease = self.provider_lock(p)?;
+        self.inner.fleet.assert_admission(host_id)?;
         let home = self.home(p)?;
         let binding = host_binding(&host)?;
         let pending = security::read_json(&home, "pending-adoption.json")?;
@@ -1099,6 +1104,7 @@ impl AgentService {
         };
         let mut request = delegation::attachment(p, &delegation::material(p, &native)?, true);
         request["expected_instance_id"] = json!(id);
+        self.inner.fleet.assert_admission(host_id)?;
         self.transfer(&host, name, &request)?;
         security::write_json(&home, delegation::native_file(p), &native)?;
         security::remove(&home, delegation::TOKEN_FILE)?;
@@ -2734,6 +2740,12 @@ impl AgentService {
         repository: Option<repository::Access>,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
+            self.inner
+                .fleet
+                .assert_admission(&host.id)
+                .map_err(|error| {
+                    LaunchFailure::from_error(Stage::Place, "managed_host_unavailable", &error)
+                })?;
             // Runs without a profile keep the original guest command and
             // payload, so older guest helpers still serve them.
             let (mode, input) = match (&resolved, repository) {
@@ -3111,6 +3123,45 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
 #[cfg(test)]
 mod run_control_tests {
     use super::*;
+
+    #[test]
+    fn managed_host_fences_delegation_and_last_moment_guest_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("private");
+        let host = Host {
+            id: "fenced-node".into(),
+            target: "must-not-contact.invalid".into(),
+            managed_registration: true,
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host.clone()], &root).unwrap();
+        let service = AgentService::new(&root, fleet.clone()).unwrap();
+        for result in [
+            service.attach("fenced-node", "ebox-private", None),
+            service.attach_after_start("fenced-node", "ebox-private"),
+            service.adopt("fenced-node", "ebox-private", "codex"),
+        ] {
+            assert!(result.unwrap_err().to_string().contains("registration"));
+        }
+        // Execution can have been queued while the lease was live. The final
+        // guest launch rechecks after provider preparation has completed.
+        fleet.set_admission_guard(Arc::new(|_| anyhow::bail!("Node revoked")));
+        let request =
+            native::RunRequest::parse(json!({"provider":"codex","prompt":"never sent"})).unwrap();
+        let failure = service
+            .run_worker_with(
+                host,
+                "ebox-private",
+                request,
+                "11111111111111111111111111111111",
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(failure.stage, Stage::Place);
+        assert_eq!(failure.reason, "managed_host_unavailable");
+        assert!(launch_events::valid_reason(failure.reason));
+    }
 
     #[test]
     fn queued_cancellation_is_scoped_persistent_and_never_starts_guest() {
