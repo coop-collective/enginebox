@@ -29,11 +29,13 @@ pub fn prepare(
     storage_project: &str,
     params: &Value,
 ) -> Result<Value> {
+    fleet.assert_admission(host_id)?;
     crate::identifier(storage_project, false)?;
     fleet.validate_operation(host_id, "create", params)?;
     let host = fleet.host(host_id)?;
     let _controller = fleet.controller_lock(host_id)?;
     let _lease = operation_lock(&host)?;
+    fleet.assert_admission(host_id)?;
     // Use the same executable resolution as actual inventory/host operations.
     let protocol: Value = serde_json::from_slice(&host_run(
         &host,

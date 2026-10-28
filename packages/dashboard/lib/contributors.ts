@@ -2,18 +2,26 @@ import { bodyJson, config, HttpError, json, requireOrigin, requireSession } from
 
 const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result']);
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
-export function installCommand(code: string, expires?: number) {
-  const url = process.env.ENGINEBOX_NODE_INSTALLER_URL ?? '';
-  const hash = process.env.ENGINEBOX_NODE_INSTALLER_SHA256 ?? '';
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+type Platform = 'windows' | 'linux';
+export function installCommand(code: string, expires?: number, platform: Platform = 'windows') {
+  const linux = platform === 'linux';
+  const url = (linux ? process.env.ENGINEBOX_LINUX_NODE_INSTALLER_URL : process.env.ENGINEBOX_NODE_INSTALLER_URL) ?? '';
+  const hash = (linux ? process.env.ENGINEBOX_LINUX_NODE_INSTALLER_SHA256 : process.env.ENGINEBOX_NODE_INSTALLER_SHA256) ?? '';
   const origin = process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN ?? config().origin;
-  if (!/^https:\/\/github\.com\/coop-collective\/enginebox\/releases\/download\/[a-zA-Z0-9_.-]+\/install\.ps1$/.test(url) || !/^[a-f0-9]{64}$/.test(hash))
-    throw new HttpError(503, 'The Windows installer release is not configured on this controller.');
+  const release = linux ? /^https:\/\/github\.com\/coop-collective\/enginebox\/releases\/download\/[a-zA-Z0-9_.-]+\/install-linux-node\.sh$/ : /^https:\/\/github\.com\/coop-collective\/enginebox\/releases\/download\/[a-zA-Z0-9_.-]+\/install\.ps1$/;
+  if (!release.test(url) || !/^[a-f0-9]{64}$/.test(hash))
+    throw new HttpError(503, `The ${linux ? 'Linux' : 'Windows'} installer release is not configured on this controller.`);
   const parsed = new URL(origin);
   if (parsed.protocol !== 'https:' || parsed.origin !== origin || parsed.username || parsed.password)
     throw new HttpError(503, 'Machine registration requires a public HTTPS controller origin.');
   if (!/^[a-f0-9]{32}\.[a-f0-9]{64}$/.test(code))
     throw new HttpError(502, 'Invalid registration response.');
   if (expires !== undefined && (!Number.isSafeInteger(expires) || expires < 1)) throw new HttpError(502, 'Invalid registration expiry.');
+  if (linux) {
+    const args = `--controller ${shellQuote(origin)} --enrollment-code ${shellQuote(code)}`;
+    return `( set -eu; umask 077; p=$(mktemp); trap 'rm -f -- "$p"' EXIT; curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL ${shellQuote(url)} -o "$p"; printf '%s  %s\\n' ${shellQuote(hash)} "$p" | sha256sum --check --status; if [ "$(id -u)" -eq 0 ]; then bash "$p" ${args}; else sudo bash "$p" ${args}; fi )`;
+  }
   return `& { $p=Join-Path $env:TEMP ('enginebox-'+[guid]::NewGuid()+'.ps1'); try { Invoke-WebRequest -UseBasicParsing ${quote(url)} -OutFile $p; if ((Get-FileHash -Algorithm SHA256 $p).Hash -ne ${quote(hash)}) { throw 'Installer checksum mismatch' }; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p -Controller ${quote(origin)} -EnrollmentCode ${quote(code)}${expires === undefined ? '' : ` -EnrollmentExpires ${expires}`} } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }`;
 }
 async function forward(path: string, method: string, token: string, body?: unknown) {
@@ -39,16 +47,50 @@ export async function contributors(request: Request, segments: string[]) {
   if (!allowed) throw new HttpError(404, 'Unknown machine operation.');
   const body = request.method === 'POST' ? await bodyJson(request, 20000) : undefined;
   const enrollment = suffix === 'enrollments' || suffix.endsWith('/renew-enrollment');
-  // Validate release configuration before issuing or rotating an invitation.
+  let platform: Platform = 'windows';
+  let path = `/v1/contributors${suffix ? `/${suffix}` : ''}`;
+  let forwardedBody = body;
+  let expectedHost: string | undefined;
   if (enrollment) {
-    installCommand(`${'0'.repeat(32)}.${'0'.repeat(64)}`);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'Send a registration object.');
+    if (suffix === 'enrollments') {
+      if (body.platform !== undefined && body.platform !== 'windows' && body.platform !== 'linux') throw new HttpError(400, 'Choose Windows or Linux.');
+      platform = body.platform ?? 'windows';
+      if (platform === 'linux') {
+        if (Object.keys(body).some(key => !['platform', 'host_id'].includes(key)) || typeof body.host_id !== 'string' || !/^[a-zA-Z0-9_-]{1,63}$/.test(body.host_id)) throw new HttpError(400, 'Select one configured Linux server.');
+        expectedHost = body.host_id;
+        path = `/v1/hosts/${expectedHost}/enrollment`;
+        forwardedBody = {};
+      } else {
+        const {platform: _platform, ...invitation} = body;
+        forwardedBody = invitation;
+      }
+    } else {
+      if (Object.keys(body).length) throw new HttpError(400, 'Renewal accepts an empty object.');
+      // The durable record decides the installer. Never trust a caller-supplied
+      // platform or rotate a code before validating that platform's release.
+      const catalog = await forward('/v1/contributors', 'GET', config().apiToken);
+      if (!Array.isArray(catalog.nodes)) throw new HttpError(502, 'Invalid registration inventory.');
+      const node = catalog.nodes.find((node: Record<string, unknown>) => node.id === segments[0]);
+      if (!node) throw new HttpError(404, 'Registration unavailable.');
+      if (node.enrolled || node.revoked) throw new HttpError(409, 'Only a pending registration can be renewed.');
+      if (node.kind !== undefined && node.kind !== 'workspace' && node.kind !== 'incus') throw new HttpError(502, 'Unknown registration kind.');
+      platform = node.kind === 'incus' ? 'linux' : 'windows';
+      if (platform === 'linux') {
+        if (typeof node.host_id !== 'string' || !/^[a-zA-Z0-9_-]{1,63}$/.test(node.host_id)) throw new HttpError(502, 'Invalid server registration.');
+        expectedHost = node.host_id;
+      }
+    }
+    installCommand(`${'0'.repeat(32)}.${'0'.repeat(64)}`, undefined, platform);
     const supervisor = await forward('/__enginebox/status', 'GET', config().apiToken);
-    if (supervisor.node_protocol !== 1) throw new HttpError(503, 'The controller supervisor needs the Windows worker protocol update before registration.');
+    if (supervisor.node_protocol !== 1) throw new HttpError(503, 'The controller supervisor needs the node protocol update before registration.');
   }
-  const result = await forward(`/v1/contributors${suffix ? `/${suffix}` : ''}`, request.method, config().apiToken, body);
+  const result = await forward(path, request.method, config().apiToken, forwardedBody);
   if (enrollment) {
-    const command = installCommand(String(result.code), Number(result.expires));
-    return json({ id: result.id, expires: result.expires, code: result.code, command });
+    if ((platform === 'linux' && (result.kind !== 'incus' || result.host_id !== expectedHost)) || (platform === 'windows' && result.kind !== undefined && result.kind !== 'workspace')) throw new HttpError(502, 'The controller returned a different server registration.');
+    const command = installCommand(String(result.code), Number(result.expires), platform);
+    if (typeof result.id !== 'string' || !String(result.code).startsWith(`${result.id}.`)) throw new HttpError(502, 'Invalid registration identity.');
+    return json({ id: result.id, expires: result.expires, code: result.code, command, platform, shell: platform === 'linux' ? 'Bash' : 'PowerShell', host_id: result.host_id ?? null });
   }
   return json(result);
 }

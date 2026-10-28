@@ -120,6 +120,7 @@ pub fn allocate(
     size: Option<&str>,
     custom: Option<&Value>,
 ) -> Result<Value> {
+    f.assert_admission(&h.id)?;
     let facts = inventory(h)?;
     check_name(h, name, &facts)?;
     let t = f.template(h, id)?;
@@ -182,6 +183,7 @@ fn quarantine(h: &Host, name: &str, reason: &str) -> Result<()> {
     Ok(())
 }
 pub fn reconcile_once(f: &Fleet, h: &Host) -> Result<Value> {
+    f.assert_admission(&h.id)?;
     if h.warm_pools.is_empty() {
         return Ok(Value::Null);
     }
@@ -189,6 +191,7 @@ pub fn reconcile_once(f: &Fleet, h: &Host) -> Result<Value> {
     {
         let _controller = f.controller_lock(&h.id)?;
         let _lock = operation_lock(h)?;
+        f.assert_admission(&h.id)?;
         let mut facts = inventory(h)?;
         for p in &h.warm_pools {
             if p.ready == 0 {
@@ -308,6 +311,7 @@ pub fn reconcile_once(f: &Fleet, h: &Host) -> Result<Value> {
         crate::fleet::wait_ready_unlocked(&h.engine_box(), &name)?;
         let _controller = f.controller_lock(&h.id)?;
         let _lock = operation_lock(h)?;
+        f.assert_admission(&h.id)?;
         let facts = inventory(h)?;
         let vm = facts["instances"]
             .as_array()

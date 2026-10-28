@@ -6,6 +6,7 @@ import { check, gatewayConfig, validateRoutes } from './config.mjs';
 import { acceptedSource, copyAccepted } from './accepted.mjs';
 import { layerfsSource } from './layerfs.mjs';
 import { syncFiles, writableDirectories } from './files.mjs';
+import { assertAdmission, admissionBlocked } from './admission.mjs';
 
 import { atomic, load } from './state.mjs';
 import { ProjectBootstrap } from './bootstrap.mjs';
@@ -89,7 +90,11 @@ export class Environments {
   }
   async deleteRoute(id) { await this.updateRoutes(routes => routes.filter(r => r.id !== id)); }
   container(env, suffix = '') { return `ebox-dev-${this.owner}-${env.id}${suffix}`; }
-  async docker(args, options) { return this.run(this.config.docker ?? 'docker', args, options); }
+  async assertAdmission() { await assertAdmission(this.config); }
+  async docker(args, options) {
+    if (['run', 'exec', 'start', 'restart', 'stop', 'pull'].includes(args[0])) await this.assertAdmission();
+    return this.run(this.config.docker ?? 'docker', args, options);
+  }
   async inspect(env, suffix = '') {
     const name = this.container(env, suffix);
     // Listing and exact identity checks distinguish absence from an unavailable daemon.
@@ -100,8 +105,14 @@ export class Environments {
     check(data.length === 1 && data[0].Config.Labels['enginebox.environment.owner'] === this.owner && data[0].Config.Labels['enginebox.environment.id'] === env.id, 'unowned-container-refused');
     return data[0];
   }
-  async remove(env, suffix = '') { if (await this.inspect(env, suffix)) await this.docker(['rm', '-f', this.container(env, suffix)]); }
+  async remove(env, suffix = '', { cleanup = false } = {}) {
+    if (await this.inspect(env, suffix)) {
+      if (!cleanup) await this.assertAdmission();
+      await this.docker(['rm', '-f', this.container(env, suffix)]);
+    }
+  }
   async source(env) {
+    await this.assertAdmission();
     const root = join(this.config.stateDir, env.id); await mkdir(root, { recursive: true, mode: 0o700 });
     if (['accepted', 'layerfs', 'workspace'].includes(env.source.kind)) {
       if (env.source.kind === 'workspace') this.previews.assertSource(env.source);
@@ -125,6 +136,7 @@ export class Environments {
     (state.metrics ??= {})[stage] = { schema: 1, observed_at: new Date().toISOString(), ...value };
   }
   async prepare(env, source) {
+    await this.assertAdmission();
     const started = performance.now();
     const release = join(source.root, source.revision); const marker = join(release, '.enginebox-prepared');
     if (await load(marker, null)) {
@@ -179,6 +191,7 @@ export class Environments {
     return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, ...(env.publicHost ? ['--env', `ENGINEBOX_PUBLIC_HOST=${env.publicHost}`, '--env', `ENGINEBOX_PUBLIC_URL=${env.publicScheme}://${env.publicHost}${env.publicPort ? `:${env.publicPort}` : ''}`] : []), ...Object.entries(env.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--workdir', env.cwd && env.cwd !== '.' ? `/app/${env.cwd}` : '/app'];
   }
   async start(env, revision) {
+    await this.assertAdmission();
     if (env.source.kind === 'workspace') this.previews.assertSource(env.source);
     const root = join(this.config.stateDir, env.id); const data = join(this.config.stateDir, env.dataId ?? env.id, 'data');
     await mkdir(data, { recursive: true, mode: 0o700 });
@@ -209,6 +222,11 @@ export class Environments {
     } while (Date.now() < deadline);
     throw new Error('readiness-timeout');
   }
+  async preserveAdmission(env, state, error) {
+    state.status = 'admission-blocked'; state.error = error.message;
+    try { state.healthy = !!(await this.inspect(env))?.State.Running && await this.healthy(env); }
+    catch { state.healthy = false; }
+  }
   async reconcile(env) {
     if (env.updateMode === 'files') return this.reconcileFiles(env);
     const state = this.states[env.id] ??= { healthy: false, status: 'pending' };
@@ -234,6 +252,7 @@ export class Environments {
       // A slow preparation must not activate a revision already superseded at
       // the authority. The next poll will prepare the newer accepted head.
       if ((await this.source(env)).revision !== source.revision) { state.status = 'superseded'; return; }
+      await this.assertAdmission();
       state.previousRevision = state.revision ?? null;
       state.status = 'updating'; state.healthy = false; await this.save(); await this.render();
       // One writer owns /data. Stop the old process before starting new code.
@@ -243,6 +262,7 @@ export class Environments {
       delete state.failedRevision; delete state.error;
       state.updatedAt = new Date().toISOString();
     } catch (error) {
+      if (admissionBlocked(error)) { await this.preserveAdmission(env, state, error); return; }
       state.error = /^[a-z0-9-]+$/.test(error.message) ? error.message : 'environment-update-failed';
       state.failedRevision = state.desiredRevision;
       state.status = 'update-failed';
@@ -251,7 +271,10 @@ export class Environments {
           const container = await this.inspect(env);
           if (container?.Config.Labels['enginebox.environment.revision'] !== state.revision || !container.State.Running) await this.start(env, state.revision);
           await this.ready(env); state.healthy = true;
-        } catch { state.healthy = false; }
+        } catch (recoveryError) {
+          if (admissionBlocked(recoveryError)) await this.preserveAdmission(env, state, recoveryError);
+          else state.healthy = false;
+        }
       } else { state.healthy = false; await this.remove(env).catch(() => {}); }
     }
   }
@@ -288,6 +311,7 @@ export class Environments {
         try {
           state.fileUpdate = await syncFiles(source, workspace, entries, env.writableDirs ?? [], async pendingEntries => {
             check((await this.source(env)).revision === source.revision, 'source-superseded');
+            await this.assertAdmission();
             receipt.pendingEntries = pendingEntries; await atomic(receiptFile, receipt);
           });
           this.observe(env, 'source_update', { revision: source.revision, status: 'succeeded', elapsed_ms: performance.now() - updateStarted,
@@ -311,6 +335,7 @@ export class Environments {
       state.status = state.healthy ? 'ready' : 'unhealthy';
       delete state.error; delete state.failedRevision;
     } catch (error) {
+      if (admissionBlocked(error)) { await this.preserveAdmission(env, state, error); return; }
       state.error = /^[a-z0-9-]+$/.test(error.message) ? error.message : 'environment-update-failed';
       state.status = 'update-failed';
       // Source failures must not stop, replace or rebuild a live dev process.

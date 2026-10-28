@@ -161,6 +161,10 @@ pub struct Host {
     /// releases still read generated configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_runs: Option<u64>,
+    /// Fail closed unless the controller has a live owner-bound node credential.
+    /// Older strict Host decoders reject this field, preventing unsafe rollback.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub managed_registration: bool,
 }
 impl Default for Host {
     fn default() -> Self {
@@ -182,6 +186,7 @@ impl Default for Host {
             contribution_cpu: None,
             contribution_memory_gib: None,
             max_agent_runs: None,
+            managed_registration: false,
         }
     }
 }

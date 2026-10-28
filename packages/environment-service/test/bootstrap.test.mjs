@@ -8,6 +8,7 @@ import { validateConfig } from '../src/config.mjs';
 import { digest, resolveProject } from '../src/project-template.mjs';
 import { serve } from '../src/main.mjs';
 import { createServer } from 'node:net';
+import { admissionFixture } from './admission-fixture.mjs';
 
 const template = () => ({ schema_version: 1, kind: 'dev', id: 'web', revision: 1, image: `node@sha256:${'a'.repeat(64)}`, prepare: ['install'], command: ['node', 'app.mjs'], installInputs: ['package.json'], ports: [{ name: 'web', protocol: 'http', port: 3000, expose: true }], health: { port: 'web', path: '/health' }, timeoutSeconds: 5 });
 const files = (version = 'one', t = template(), pkg = '{}') => ({ '.enginebox/config.json': JSON.stringify({ schema_version: 1, dev: { template: './templates/web.json' } }), '.enginebox/templates/web.json': JSON.stringify(t), 'package.json': pkg, 'app.mjs': version });
@@ -26,7 +27,7 @@ function config(root) {
 
 async function harness(root) {
   let selected = await snapshot(root, files()); const calls = []; const containers = new Map(); const images = new Set();
-  let setupFailure = false; let startFailure = false; let fetchFailure = false;
+  let setupFailure = false; let startFailure = false; let fetchFailure = false; let afterPrepare = () => {};
   const run = async (program, args) => {
     if (program === resolve('/export')) {
       if (fetchFailure) throw new Error('export-unavailable');
@@ -48,7 +49,7 @@ async function harness(root) {
       if (name.endsWith('-prepare')) {
         assert(!args.some(v => v.includes(',dst=/data')), 'setup must not write live persistent data');
         if (setupFailure) throw new Error('setup-failed');
-        await mkdir(join(directory, 'node_modules')); await writeFile(join(directory, 'node_modules/installed'), 'installed'); return '';
+        await mkdir(join(directory, 'node_modules')); await writeFile(join(directory, 'node_modules/installed'), 'installed'); afterPrepare(); return '';
       }
       const dataMount = args.find(v => v.includes(',dst=/data'));
       assert(![...containers.values()].some(c => c.State.Running && c.dataMount === dataMount), 'old and new runtimes must never write shared data concurrently');
@@ -57,14 +58,62 @@ async function harness(root) {
     }
     throw new Error(`Unexpected fake Docker command: ${args[0]}`);
   };
-  const create = async () => {
-    const manager = new Environments(validateConfig(config(root)), run);
+  const create = async admission => {
+    const manager = new Environments(validateConfig({ ...config(root), ...(admission ? { admission } : {}) }), run);
     manager.healthy = async env => !!(await manager.inspect(env))?.State.Running;
     manager.ready = async env => { if (!await manager.healthy(env)) throw new Error('service-exited'); };
     await manager.init(); return manager;
   };
-  return { create, calls, containers, setSource: async (contents) => { selected = await snapshot(root, contents); }, failSetup: value => { setupFailure = value; }, failStart: () => { startFailure = true; }, failFetch: value => { fetchFailure = value; } };
+  return { create, calls, containers, setSource: async (contents) => { selected = await snapshot(root, contents); }, failSetup: value => { setupFailure = value; }, failStart: () => { startFailure = true; }, failFetch: value => { fetchFailure = value; }, afterPrepare: callback => { afterPrepare = callback; } };
 }
+
+test('managed admission adopts legacy state and fences hot updates and interrupted replacement without changing running containers or routes', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ebox-project-admission-')); const authority = await admissionFixture(root);
+  try {
+    const h = await harness(root); let m = await h.create();
+    await m.projects.register({ host: 'node', project: 'demo' }); await m.tick();
+    const before = m.projects.catalog()[0]; const active = m.config.environments[0];
+    const containers = [...h.containers]; const routes = structuredClone(m.routes);
+    const gateway = await readFile(m.dynamicFile, 'utf8');
+    // Match a pre-preview production state: no preview registry, admission or
+    // workspace exporter. Adding managed enrollment must not alter its recipe.
+    await rm(join(root, 'previews.json'), { force: true });
+    authority.set({ allowed: false });
+    const operations = () => h.calls.filter(a => ['run', 'stop', 'rm', 'pull', 'exec'].includes(a[0]));
+    const initialOperations = operations().length;
+    m = await h.create(authority.config);
+    assert.equal(m.projects.catalog()[0].healthy, true);
+    await h.setSource(files('two')); await m.tick();
+    assert.equal(m.projects.catalog()[0].status, 'admission-blocked');
+    assert.equal(m.projects.catalog()[0].healthy, true);
+    assert.equal(await readFile(join(root, active.id, 'workspace/app.mjs'), 'utf8'), 'one');
+    assert.deepEqual([...h.containers], containers); assert.deepEqual(m.routes, routes);
+    assert.equal(await readFile(m.dynamicFile, 'utf8'), gateway); assert.equal(operations().length, initialOperations);
+    assert(!JSON.stringify(m.catalog()).includes(authority.token)); assert(!JSON.stringify(h.calls).includes(authority.token));
+    authority.set({ allowed: true }); await m.tick();
+    assert.equal(await readFile(join(root, active.id, 'workspace/app.mjs'), 'utf8'), 'two');
+    assert.deepEqual([...h.containers], containers); assert.equal(operations().length, initialOperations);
+    await h.setSource(files('three', template(), '{"changed":true}'));
+    h.afterPrepare(() => authority.set({ allowed: false }));
+    await m.tick();
+    const p = m.projects.records[before.id];
+    assert.equal(p.status, 'admission-blocked'); assert(p.pending);
+    assert.equal(m.projects.catalog()[0].healthy, true); assert.deepEqual([...h.containers], containers); assert.deepEqual(m.routes, routes);
+    assert.equal(await readFile(join(root, active.id, 'workspace/app.mjs'), 'utf8'), 'two');
+    // Recovery must not stop a pending process or restart the old writer while
+    // its machine is fenced, even with an interrupted handoff receipt.
+    p.phase = 'switching'; await m.projects.save();
+    const beforeRecovery = operations().length;
+    m = await h.create(authority.config); await m.tick();
+    assert.equal(operations().length, beforeRecovery); assert.deepEqual([...h.containers], containers);
+    assert.deepEqual(m.routes, routes); assert.equal(await readFile(m.dynamicFile, 'utf8'), gateway);
+    assert.equal(m.projects.records[before.id].phase, 'switching');
+    h.afterPrepare(() => {}); authority.set({ allowed: true }); await m.tick();
+    assert.equal(m.projects.catalog()[0].status, 'ready');
+    assert.notEqual(m.projects.catalog()[0].environment, before.environment);
+    assert.equal([...h.containers.values()].filter(c => c.State.Running).length, 1);
+  } finally { await authority.close(); await rm(root, { recursive: true, force: true }); }
+});
 
 test('project declarations resolve local or registered templates and bind install inputs, never host paths', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ebox-project-schema-'));

@@ -5,6 +5,7 @@ const token = "fixture-api-token-server-only-12345";
 const minimum = { cpu: 2, memory_gib: 2, disk_gib: 30 };
 const recommended = { cpu: 4, memory_gib: 4, disk_gib: 40 };
 let contributors = [];
+let managedHost = false, hostRegistrationCounter = 4;
 let mode,
   jobs,
   instances,
@@ -53,6 +54,7 @@ function manifest(id = "native", revision = 1) {
 function reset() {
   mode = "normal";
   contributors = [];
+  managedHost = false; hostRegistrationCounter = 4;
   jobs = new Map();
   authSessions = new Map();
   connectedAccounts = new Set();
@@ -138,7 +140,20 @@ createServer(async (req, res) => {
       templates: h.online ? ['native'] : [], capabilities: {vm_workspaces: true, template_workspaces: false, ci_jobs: false},
       management: {revoke: false, reconcile: false, limits: 'controller_config'}, error: h.error ?? null,
     }));
-    if (status === 200 && req.url === '/v1/contributors') body.compute_nodes = body.nodes.filter(n => n.enrolled && !n.revoked).map(n => ({
+    if (status === 200 && req.url === '/v1/fleet' && managedHost) {
+      const machine=body.compute_nodes.find(n=>n.source_id==='metal-01');
+      if(machine) {
+        const registrations=contributors.filter(n=>n.kind==='incus' && n.host_id==='metal-01');
+        const node=registrations.find(n=>!n.revoked) ?? registrations.at(-1);
+        const enrolled=!!node?.enrolled && !node.revoked;
+        machine.registration={method:'enrollment',state:!node?'required':node.revoked?'revoked':enrolled?'enrolled':'pending',node_id:node?.id??null};
+        machine.online=machine.online && enrolled && node.online;
+        machine.runtime.state=!enrolled?'needs_attention':!machine.online?'offline':machine.runtime.state;
+        machine.management={revoke:!!node && !node.revoked,reconcile:false,enroll:!registrations.some(n=>!n.revoked),node_id:node?.id??null,limits:'controller_config'};
+        machine.error=!enrolled?'Complete server registration to enable workloads.':null;
+      }
+    }
+    if (status === 200 && req.url === '/v1/contributors') body.compute_nodes = body.nodes.filter(n => n.kind !== 'incus' && n.enrolled && !n.revoked).map(n => ({
       id: `worker:${n.id}`, source_id: n.id, label: n.label, backend: n.tools.backend, platform: 'windows', registered: true, online: n.online,
       registration: {method: 'enrollment'}, runtime: {state: n.blocked ? 'needs_attention' : !n.online ? 'offline' : n.tools.workspace ? 'ready' : 'preparing', running_workspaces: null, active_job: null, last_seen: n.online ? Math.floor(Date.now()/1000) : null},
       resources: {budget: {cpu:n.budget.cpu,memory_bytes:n.budget.memory_gib*GiB,disk_bytes:n.budget.disk_gib*GiB}, available:null},
@@ -157,6 +172,8 @@ createServer(async (req, res) => {
     environmentRoutes = [];
     return send(200, { ok: true });
   }
+  if (req.url === '/__test/managed-host') { managedHost=true; return send(200,{ok:true}); }
+  if (req.url === '/__test/incus-online') { contributors=contributors.map(n=>n.kind==='incus'&&!n.revoked?{...n,enrolled:true,online:true,tools:{backend:'incus',host_ready:true,worker_running:false}}:n); return send(200,{ok:true}); }
   if (req.url === "/__test/contributor-online") { contributors = contributors.map(n => ({...n,enrolled:true,online:true,budget:{cpu:2,memory_gib:4,disk_gib:20},tools:{workspace:true,backend:'wsl2-layerfs'}})); return send(200,{ok:true}); }
   if (req.url === '/__test/contributor-inventory') {
     const base={enrolled:true,revoked:false,blocked:false,online:false,budget:{cpu:4,memory_gib:8,disk_gib:50},workloads:{ci:true,agents:true},tools:{workspace:true,backend:'wsl2-layerfs'}};
@@ -229,6 +246,12 @@ createServer(async (req, res) => {
   if (req.url === '/v1/environments' && req.method === 'GET') return send(200, environmentCatalog());
   if (req.url === '/__enginebox/status') return send(200,{node_protocol:1});
   if (req.url === '/v1/contributors' && req.method === 'GET') return send(200,{nodes:contributors});
+  if (req.url === '/v1/hosts/metal-01/enrollment' && req.method === 'POST') {
+    if(!managedHost || contributors.some(n=>n.kind==='incus' && n.host_id==='metal-01' && !n.revoked)) return send(400,{error:'Server cannot be enrolled twice.'});
+    const id=String(hostRegistrationCounter++).repeat(32),kind='incus',host_id='metal-01';
+    contributors.push({id,kind,host_id,label:'Build machine',enrolled:false,revoked:false,blocked:false,online:false,tools:{},budget:{cpu:28,memory_gib:112,disk_gib:900},workloads:{ci:false,agents:true}});
+    return send(200,{id,kind,host_id,code:`${id}.${'b'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+600});
+  }
   if (req.url === '/v1/contributors/enrollments' && req.method === 'POST') {
     const id='a'.repeat(32); contributors.push({...data,id,enrolled:false,revoked:false,blocked:false,online:false,tools:{}});
     return send(200,{id,code:`${id}.${'b'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+600});
@@ -237,7 +260,7 @@ createServer(async (req, res) => {
   if (renewContributor && req.method === 'POST') {
     const node=contributors.find(n=>n.id===renewContributor[1]);
     if (!node || node.enrolled || node.revoked) return send(400,{error:'Only a pending registration can be renewed.'});
-    return send(200,{id:node.id,code:`${node.id}.${'c'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+3600});
+    return send(200,{id:node.id,kind:node.kind??'workspace',host_id:node.host_id??null,code:`${node.id}.${'c'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+3600});
   }
   const revokeContributor=req.url.match(/^\/v1\/contributors\/([a-f0-9]{32})\/revoke$/);
   if (revokeContributor) { contributors=contributors.map(n=>n.id===revokeContributor[1]?{...n,revoked:true}:n);return send(200,{revoked:true}); }

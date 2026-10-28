@@ -8,3 +8,5 @@ pub mod supervisor;
 mod windows_acl;
 
 pub mod wsl;
+
+pub mod managed_host;

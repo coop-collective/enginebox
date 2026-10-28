@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { check, fields, validateConfig, validateRoutes } from './config.mjs';
 import { atomic, load } from './state.mjs';
 import { digest, projectId, validateTemplate, resolveProject, templateEnvironment } from './project-template.mjs';
+import { admissionBlocked } from './admission.mjs';
 
 // Adding a draft exporter must not invalidate an accepted-main source binding.
 const mainBinding = host => { const value = { ...host }; delete value.workspaceCommand; return digest(value); };
@@ -63,6 +64,10 @@ export class ProjectBootstrap {
     const host = this.policy.hosts.find(h => h.id === value.host); check(host, 'unknown-project-host');
     const key = this.key(value.host, value.project);
     let p = this.records[key];
+    if (!p || value.retry) {
+      await this.manager.assertAdmission();
+      p = this.records[key];
+    }
     if (!p) {
       check(Object.keys(this.records).length < this.policy.maxProjects, 'project-capacity-limit');
       p = this.records[key] = { id: key, host: value.host, project: value.project, binding: mainBinding(host), status: 'queued' };
@@ -77,6 +82,7 @@ export class ProjectBootstrap {
     check(ports.length === count, 'project-port-capacity-limit'); return ports;
   }
   async install(release) {
+    await this.manager.assertAdmission();
     const directory = join(this.config.stateDir, 'dev-templates'); await mkdir(directory, { recursive: true, mode: 0o700 });
     const file = join(directory, `${release.templateDigest}.json`);
     const receipt = { schema: 1, id: release.template.id, revision: release.template.revision, digest: release.templateDigest, image: release.env.image };
@@ -105,14 +111,15 @@ export class ProjectBootstrap {
     await this.manager.updateRoutes(routes => this.routePlan(p, release, routes));
     p.routeIds = release ? release.template.ports.filter(port => port.expose).map(port => this.routeId(p, port)) : [];
   }
-  async discard(release) {
+  async discard(release, options) {
     if (!release) return;
-    await this.manager.remove(release.env);
+    await this.manager.remove(release.env, '', options);
     if (this.manager.states[release.env.id]) this.manager.states[release.env.id].healthy = false;
     // Retain private files/receipts for diagnosis. Do not delete source or data.
     if (!this.manager.routes.some(r => r.environment === release.env.id)) this.config.environments = this.config.environments.filter(e => e.id !== release.env.id);
   }
   async rollback(p) {
+    await this.manager.assertAdmission();
     // Only one process may own the project's persistent data, including recovery.
     if (p.pending) await this.manager.remove(p.pending.env);
     if (p.active) {
@@ -126,10 +133,16 @@ export class ProjectBootstrap {
   }
   async recover() {
     for (const p of Object.values(this.records)) {
-      if (p.phase === 'switching') {
-        await this.rollback(p); p.status = 'failed'; p.error = 'project-switch-interrupted';
+      try {
+        if (p.phase === 'switching' || p.retired) await this.manager.assertAdmission();
+        if (p.phase === 'switching') {
+          await this.rollback(p); p.status = 'failed'; p.error = 'project-switch-interrupted';
+        }
+        if (p.retired) { await this.routes(p, p.active); await this.discard(p.retired); delete p.retired; }
+      } catch (error) {
+        if (!admissionBlocked(error)) throw error;
+        p.status = 'admission-blocked'; p.error = error.message;
       }
-      if (p.retired) { await this.routes(p, p.active); await this.discard(p.retired); delete p.retired; }
     }
     await this.save();
   }
@@ -172,6 +185,7 @@ export class ProjectBootstrap {
       // Dependencies are built away from the live workspace and persistent data.
       if (!await load(join(this.config.stateDir, next.env.id, 'files.json'), null)) await this.manager.prepare(next.env, current);
       check((await this.manager.source(next.env)).revision === current.revision, 'source-superseded');
+      await this.manager.assertAdmission();
       p.phase = 'switching'; await this.save();
       if (p.active) {
         const old = p.active.env; const container = await this.manager.inspect(old);
@@ -180,6 +194,7 @@ export class ProjectBootstrap {
       }
       await this.manager.reconcile(next.env);
       check(this.manager.states[next.env.id]?.healthy && this.manager.states[next.env.id].status === 'ready', this.manager.states[next.env.id]?.error ?? 'project-start-failed');
+      await this.manager.assertAdmission();
       // Record route ownership before publication so crash recovery can restore it.
       p.routeIds = [...new Set([...(p.routeIds ?? []), ...routeIds])];
       await this.save(); await this.routes(p, next);
@@ -187,9 +202,17 @@ export class ProjectBootstrap {
       p.status = 'ready'; delete p.error; delete p.failedRevision; delete p.failedFingerprint;
       await this.save(); await this.discard(p.retired); delete p.retired;
     } catch (error) {
-      p.status = 'failed'; p.error = safeError(error); p.failedRevision = p.desiredRevision; p.failedFingerprint = desired?.fingerprint;
-      if (p.phase === 'switching') {
-        try { await this.rollback(p); } catch { p.error = 'project-recovery-required'; }
+      p.error = safeError(error);
+      if (admissionBlocked(error)) p.status = 'admission-blocked';
+      else {
+        p.status = 'failed'; p.failedRevision = p.desiredRevision; p.failedFingerprint = desired?.fingerprint;
+        if (p.phase === 'switching') {
+          try { await this.rollback(p); }
+          catch (recoveryError) {
+            p.error = admissionBlocked(recoveryError) ? recoveryError.message : 'project-recovery-required';
+            if (admissionBlocked(recoveryError)) p.status = 'admission-blocked';
+          }
+        }
       }
       // A failed preparation/source read leaves the previous runtime and route up.
       if (p.active) {

@@ -26,6 +26,8 @@ export default defineConfig({
         ENGINEBOX_NODE_PUBLIC_ORIGIN: "https://controller.fixture.example",
         ENGINEBOX_NODE_INSTALLER_URL: "https://github.com/coop-collective/enginebox/releases/download/fixture-1/install.ps1",
         ENGINEBOX_NODE_INSTALLER_SHA256: "f".repeat(64),
+        ENGINEBOX_LINUX_NODE_INSTALLER_URL: "https://github.com/coop-collective/enginebox/releases/download/linux-node-preview-fixture/install-linux-node.sh",
+        ENGINEBOX_LINUX_NODE_INSTALLER_SHA256: "d".repeat(64),
         PORT: dashboardPort,
         ENGINEBOX_DASHBOARD_ORIGIN: dashboardOrigin,
         ENGINEBOX_DASHBOARD_PASSWORD: "fixture-dashboard-password",
