@@ -24,6 +24,10 @@ mod preparation;
 mod publication;
 #[path = "recovery.rs"]
 mod recovery;
+#[path = "timings.rs"]
+mod timings;
+#[path = "usage.rs"]
+mod usage;
 #[derive(Clone, Serialize, Deserialize)]
 struct Project {
     schema: u32,
@@ -875,6 +879,37 @@ impl Runtime {
         timeout: u64,
         message: &str,
     ) -> Result<Value> {
+        self.operate_observed(
+            name,
+            operation,
+            argv,
+            timeout,
+            message,
+            (operation == "deps").then_some("dependencies"),
+        )
+    }
+    pub fn execute_measured(
+        &self,
+        name: &str,
+        argv: &[String],
+        timeout: u64,
+        kind: Option<&str>,
+    ) -> Result<Value> {
+        ensure!(
+            kind.is_none_or(|kind| timings::KINDS.contains(&kind)),
+            "Invalid measurement category"
+        );
+        self.operate_observed(name, "exec", argv, timeout, "", kind)
+    }
+    fn operate_observed(
+        &self,
+        name: &str,
+        operation: &str,
+        argv: &[String],
+        timeout: u64,
+        message: &str,
+        measure: Option<&str>,
+    ) -> Result<Value> {
         identifier(name)?;
         ensure!(
             (1..=3600).contains(&timeout),
@@ -948,7 +983,27 @@ impl Runtime {
                     request["_call"] = json!(call);
                     request["argv"] = json!(arguments);
                     request["timeout"] = json!(timeout);
-                    let result = self.bridge(&p, "exec", request, timeout + 10)?;
+                    // Receipts are observational, never replay authority or CI evidence.
+                    // Leave an uncertain marker if the operator dies during execution.
+                    if let Some(kind) = measure {
+                        let _ = self.record_command(&w, kind, "uncertain", None);
+                    }
+                    let started = std::time::Instant::now();
+                    let outcome = self.bridge(&p, "exec", request, timeout + 10);
+                    if let Some(kind) = measure {
+                        let status = match &outcome {
+                            Ok(result) if result["exitCode"] == 0 => "succeeded",
+                            Ok(_) => "failed",
+                            Err(_) => "uncertain",
+                        };
+                        let _ = self.record_command(
+                            &w,
+                            kind,
+                            status,
+                            Some(started.elapsed().as_secs_f64() * 1000.0),
+                        );
+                    }
+                    let result = outcome?;
                     Ok(json!({"ok":result["exitCode"]==0,"workspace":name,"result":result}))
                 }
                 "checkpoint" => {
@@ -1097,6 +1152,7 @@ impl Runtime {
         )
     }
     pub fn list(&self) -> Result<Value> {
+        let usage = self.storage_usage();
         let github = if self.config.root.join("github").exists() {
             crate::github::Repositories::new(&self.config.root)?.list()?
         } else {
@@ -1104,13 +1160,16 @@ impl Runtime {
         };
         let path = self.config.root.join("workspaces");
         if !path.exists() {
-            return Ok(json!({"workspaces":[],"github_projects":github}));
+            return Ok(json!({"workspaces":[],"github_projects":github,"storage_usage":usage}));
         }
         let mut values = state::json_files(&path)?
             .into_iter()
             .map(|p| state::read_json(&p))
             .collect::<Result<Vec<_>>>()?;
         for workspace in &mut values {
+            if let Ok(w) = serde_json::from_value::<Workspace>(workspace.clone()) {
+                workspace["command_timings"] = json!(self.command_timings(&w));
+            }
             for project in &github {
                 if let Some(generation) = project["generations"]
                     .as_array()
@@ -1121,6 +1180,6 @@ impl Runtime {
                 }
             }
         }
-        Ok(json!({"workspaces":values,"github_projects":github}))
+        Ok(json!({"workspaces":values,"github_projects":github,"storage_usage":usage}))
     }
 }

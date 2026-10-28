@@ -9,8 +9,8 @@ async function openStorage(page: Page) {
   const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3_600_000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
   const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
   await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: `${dashboardOrigin}`, httpOnly: true, sameSite: "Strict" }]);
-  await page.goto("/");
-  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Storage", exact: true }).click();
+  await page.goto("/?panel=storage");
+  await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Storage", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Shared checkout storage" })).toBeVisible();
 }
 test.beforeEach(async ({ request }) => { await request.post(`${fixtureOrigin}/__test/reset`); });

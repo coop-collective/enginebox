@@ -4,7 +4,7 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 
 ## What is implemented
 
-- Sidebar navigation for Compute, Agents, Templates, Storage, Environments, GitHub and Connected apps. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
+- Sidebar navigation for Compute, Workspaces, Agents, Templates, Environments and MCP. Workspaces consolidates hosted/GitHub sources and source/storage controls with project activity and measured preparation. MCP teaches local stdio setup and retains OAuth app grant management. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
 - **Compute** combines configured VM hosts and enrolled Windows workers in one machine list. Pending and revoked registrations stay collapsed. Add machine issues the Windows installer command; CPU/memory/disk allowances are selected on that PC. The online count includes both inventories; VM resource cards and VM allocation controls use only VM hosts. Worker allowances are not physical host utilization or additional VM capacity. Either inventory remains visible if the other fails, with a visible error.
 - Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size. The top CPU card shows allocated cores and percentage, not CPU utilization. Host memory usage is total minus available memory, clamped to the reported total.
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.

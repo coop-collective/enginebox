@@ -201,3 +201,45 @@ test('project registration API is authenticated, durable and excludes host-comma
     assert(!JSON.stringify(receipt).includes('/export')); assert(!JSON.stringify(receipt).includes('token'));
   } finally { await service?.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+
+test('workspace metrics measure verified copying, preparation reuse and readiness without exposing commands', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ebox-project-metrics-'));
+  try {
+    const h = await harness(root); let m = await h.create();
+    await m.projects.register({ host: 'node', project: 'demo' }); await m.tick();
+    const first = m.projects.catalog()[0]; const env = m.config.environments[0];
+    const measured = first.metrics;
+    assert.equal(measured.preparation.status, 'succeeded');
+    assert.equal(measured.preparation.revision, first.revision);
+    assert.equal(measured.preparation.source_bytes, Object.values(files()).reduce((sum, value) => sum + Buffer.byteLength(value), 0));
+    assert.equal(measured.preparation_reuse.status, 'reused');
+    for (const stage of ['preparation', 'preparation_reuse', 'startup', 'source_update']) {
+      assert(Number.isFinite(measured[stage].elapsed_ms) && measured[stage].elapsed_ms >= 0);
+      assert(Number.isFinite(Date.parse(measured[stage].observed_at)));
+      assert.equal(measured[stage].schema, 1);
+    }
+    assert(measured.preparation.source_copy_ms >= 0 && measured.preparation.prepare_ms >= 0);
+    assert.equal(measured.startup.status, 'succeeded');
+    const copy = structuredClone(measured.preparation); const startup = structuredClone(measured.startup);
+    await h.setSource(files('changed source')); await m.tick();
+    const updated = m.projects.catalog()[0];
+    assert.deepEqual(updated.metrics.preparation, copy, 'live source updates must not invent another dependency install');
+    assert.deepEqual(updated.metrics.startup, startup, 'a surviving dev process has no new startup sample');
+    assert.equal(updated.metrics.source_update.revision, updated.revision);
+    assert.equal(updated.metrics.source_update.written_files, 1);
+    assert.equal(updated.metrics.source_update.source_bytes, Object.values(files('changed source')).reduce((sum, value) => sum + Buffer.byteLength(value), 0));
+    assert.equal(m.catalog().environments.find(e => e.id === env.id).source.project, 'demo');
+    assert(!JSON.stringify(m.catalog()).includes('/export'));
+    assert(!JSON.stringify(measured).includes('app.mjs'));
+    m = await h.create();
+    assert.deepEqual(m.projects.catalog()[0].metrics, updated.metrics, 'measured samples survive controller recovery');
+    // Failure samples remain failures and cannot masquerade as a cache hit or a successful command.
+    await h.setSource(files('next', template(), '{"dependenciesChanged":true}'));
+    h.failSetup(true); await m.tick();
+    const project = m.projects.records[first.id];
+    const failed = m.states[project.pending.env.id].metrics.preparation;
+    assert.equal(failed.status, 'failed'); assert(failed.prepare_ms >= 0);
+    assert.notEqual(failed.revision, first.revision);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -18,7 +18,7 @@ function Status({ task, run, taskKey }: { task?: StorageTask; run: Run; taskKey:
     {task.uncertain && task.job && <button className="button small" onClick={() => void run(taskKey, task.operation, {}, task.job)}>Check sync job status</button>}
   </div>;
 }
-export function GitHubStorage({ projects, rows, tasks, run, refresh }: { projects: GitHubProject[]; rows: Checkout[]; tasks: Record<string, StorageTask>; run: Run; refresh: () => Promise<void> }) {
+export function GitHubStorage({ projects, rows, tasks, run, refresh, projectId, initialRepository }: { projectId?: string; initialRepository?: string; projects: GitHubProject[]; rows: Checkout[]; tasks: Record<string, StorageTask>; run: Run; refresh: () => Promise<void> }) {
   const [connected, setConnected] = useState<{ id: number; full_name: string; branch: string }[]>([]);
   useEffect(() => {
     let active = true;
@@ -27,14 +27,17 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
       const status = await response.json();
       if (!active || !Array.isArray(status.repositories)) return;
       setConnected(status.repositories);
-      const id = new URLSearchParams(window.location.search).get("github_repository");
-      const selected = status.repositories.find((r: {id: number}) => String(r.id) === id);
+      const params = new URLSearchParams(window.location.search);
+      const workspace = projectId ?? params.get("workspace");
+      if (workspace && /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(workspace)) setProject(workspace);
+      const id = params.get("github_repository");
+      const selected = status.repositories.find((r: {id: number; full_name: string}) => String(r.id) === id || r.full_name === initialRepository);
       if (selected) { setRepository(selected.full_name); setBranch(selected.branch); }
     }).catch(() => {});
     return () => { active = false; };
-  }, []);
-  const [project, setProject] = useState("");
-  const [repository, setRepository] = useState("");
+  }, [projectId, initialRepository]);
+  const [project, setProject] = useState(projectId ?? "");
+  const [repository, setRepository] = useState(initialRepository ?? "");
   const [branch, setBranch] = useState("");
   const [reviewed, setReviewed] = useState(false);
   const [context, setContext] = useState("");
@@ -81,7 +84,7 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
       {connected.length > 0 && <label>Connected repository<select value={connected.some(r => r.full_name === repository) ? repository : ""} onChange={e => { const selected = connected.find(r => r.full_name === e.target.value); if (selected) { setRepository(selected.full_name); setBranch(selected.branch); setReviewed(false); } }}><option value="">Choose an authorized repository</option>{connected.map(r => <option key={r.id} value={r.full_name}>{r.full_name}</option>)}</select></label>}
       <p><a href="/?panel=github">Connect a GitHub account or change repository access</a></p>
       <form className="storage-form" onSubmit={inspect}>
-        <label>GitHub project ID<input value={project} onChange={(e) => { setProject(e.target.value); setReviewed(false); }} pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?" maxLength={48} required placeholder="my-app" /></label>
+        <label>GitHub project ID<input value={project} readOnly={!!projectId} onChange={(e) => { setProject(e.target.value); setReviewed(false); }} pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?" maxLength={48} required placeholder="my-app" /></label>
         <label>GitHub repository<input value={repository} onChange={(e) => { setRepository(e.target.value); setReviewed(false); }} required maxLength={200} placeholder="owner/repository" /></label>
         <label>GitHub branch<input value={branch} onChange={(e) => { setBranch(e.target.value); setReviewed(false); }} maxLength={200} placeholder="Repository default" /></label>
         <button className="button" disabled={busy("github:preview")} type="submit">Fetch and review</button>
@@ -97,7 +100,7 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
       {importedDev?.status && <p role="status">Dev setup: {importedDev.status}. {importedDev.error}</p>}
     </details>
     {!!linked.length && <>
-      <label className="storage-project-select">Connected project<select value={selected} onChange={(e) => setSelected(e.target.value)}>{linked.map((p) => <option key={p.id} value={p.id}>{p.id} · {p.repository}</option>)}</select></label>
+      <label className="storage-project-select">Connected project<select disabled={!!projectId} value={selected} onChange={(e) => setSelected(e.target.value)}>{linked.map((p) => <option key={p.id} value={p.id}>{p.id} · {p.repository}</option>)}</select></label>
       {current && <p className="workspace-hint">GitHub branch: {current.branch}. Import commit: <span className="mono">{current.current?.commit.slice(0, 12)}</span>.</p>}
       <button className="button small" disabled={busy(settingsKey)} onClick={() => void run(settingsKey, "github-settings", { project: selected })}>Refresh connection</button>
       <Status task={tasks[settingsKey]} taskKey={settingsKey} run={run} />
