@@ -51,8 +51,11 @@ export async function githubWebhook(request: Request, kind: string) {
   if (!reader) throw new HttpError(400, "Missing webhook body.");
   const chunks: Uint8Array[] = []; let length = 0;
   while (true) { const { value, done } = await reader.read(); if (done) break; length += value.length; if (length > 1024 * 1024) { await reader.cancel(); throw new HttpError(413, "Webhook too large."); } chunks.push(value); }
-  const { apiUrl } = config();
+  const { apiUrl, apiToken } = config();
   const response = await fetch(`${apiUrl}/v1/github/webhook/${kind}`, { method: "POST", body: Buffer.concat(chunks), headers: {
+    // Admit the server-to-server request through the supervisor. The controller
+    // still validates GitHub's signature before handling this webhook.
+    Authorization: `Bearer ${apiToken}`,
     "Content-Type": "application/json", "X-Hub-Signature-256": request.headers.get("x-hub-signature-256") ?? "", "X-GitHub-Event": request.headers.get("x-github-event") ?? "",
   }, redirect: "error", signal: AbortSignal.timeout(30_000), cache: "no-store" });
   return json(await response.json(), response.status);
