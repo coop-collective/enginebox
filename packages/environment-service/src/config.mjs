@@ -10,8 +10,15 @@ export function fields(value, allowed) {
   check(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => allowed.includes(k)), 'unknown-field');
 }
 export function validateConfig(config) {
-  fields(config, ['schema', 'stateDir', 'listenPort', 'tokenFile', 'docker', 'baseDomains', 'httpEntrypoint', 'httpTls', 'basicAuthUsers', 'transportEntrypoints', 'environments', 'pollSeconds', 'bootstrap']);
+  fields(config, ['schema', 'stateDir', 'listenPort', 'tokenFile', 'docker', 'baseDomains', 'httpEntrypoint', 'httpTls', 'basicAuthUsers', 'transportEntrypoints', 'environments', 'pollSeconds', 'bootstrap', 'admission']);
   check(config.schema === 1 && isAbsolute(config.stateDir) && isAbsolute(config.tokenFile) && port(config.listenPort), 'invalid-config');
+  if (config.admission !== undefined) {
+    const a = config.admission;
+    fields(a, ['controller', 'tokenFile', 'hostId']);
+    check(typeof a.controller === 'string' && typeof a.tokenFile === 'string' && isAbsolute(a.tokenFile) && typeof a.hostId === 'string' && /^[a-z0-9][a-z0-9-]{0,48}$/.test(a.hostId), 'invalid-admission-config');
+    const url = new URL(a.controller);
+    check(['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/' && (url.protocol === 'https:' || ['127.0.0.1', '[::1]'].includes(url.hostname)), 'invalid-admission-controller');
+  }
   check(Array.isArray(config.baseDomains) && config.baseDomains.length > 0 && config.baseDomains.every(hostname), 'base-domains-required');
   check(id(config.httpEntrypoint), 'http-entrypoint-required');
   check(typeof config.httpTls === 'boolean', 'explicit-http-tls-required');
