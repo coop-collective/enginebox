@@ -27,6 +27,8 @@ assert '@@' not in source
 shutil.copyfile(args.binary, args.output / 'enginebox-node')
 for name in ['install-linux-node.sh', 'enginebox-node']:
     (args.output / name).chmod(0o755)
+for name in ['LICENSE', 'NOTICE']:
+    shutil.copyfile(pathlib.Path(__file__).resolve().parents[3] / name, args.output / name)
 (args.output / 'provenance.json').write_text(json.dumps({'source_commit': args.commit, 'target': 'x86_64-unknown-linux-gnu', 'role': 'managed-incus', 'binary_sha256': binary_hash}) + '\n')
 paths = sorted(args.output.iterdir())
 (args.output / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in paths))
