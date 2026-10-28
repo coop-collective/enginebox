@@ -1,13 +1,13 @@
 'use client';
 import { FormEvent, ReactNode, useEffect, useState } from 'react';
 import { api } from '@/lib/client';
-import type { Host } from '@/lib/types';
+import type { ComputeNode, Host } from '@/lib/types';
 type Budget = { cpu: number; memory_gib: number; disk_gib: number };
 export type Contributor = { id: string; label: string; budget: Budget; workloads: { ci: boolean; agents: boolean }; online: boolean; enrolled: boolean; revoked: boolean; blocked: boolean; tools: { ci?: boolean; workspace?: boolean; backend?: string; worker_running?: boolean } };
 type Enrollment = { id: string; expires: number; code: string; command: string };
 
-export function ComputePanel({ hosts, hostsLoaded, nodes, loaded, loadError, refresh, hostDetails }: {
-  hosts: Host[]; hostsLoaded: boolean; nodes: Contributor[]; loaded: boolean; loadError: string;
+export function ComputePanel({ hosts, hostsLoaded, nodes, machines: inventory, loaded, loadError, refresh, hostDetails }: {
+  hosts: Host[]; hostsLoaded: boolean; nodes: Contributor[]; machines: ComputeNode[]; loaded: boolean; loadError: string;
   refresh: () => Promise<void>; hostDetails: (host: Host) => ReactNode;
 }) {
   const [error, setError] = useState('');
@@ -42,13 +42,11 @@ export function ComputePanel({ hosts, hostsLoaded, nodes, loaded, loadError, ref
     try { await navigator.clipboard.writeText(invitation[kind]); setCopied(kind); setError(''); }
     catch { setError(`Clipboard access was denied. Select and copy the ${kind === 'code' ? 'registration code' : 'install command'} below.`); }
   }
-  const registered = nodes.filter(n => n.enrolled && !n.revoked).sort((a, b) => Number(b.online) - Number(a.online) || a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
   const pending = nodes.filter(n => !n.enrolled && !n.revoked), revoked = nodes.filter(n => n.revoked);
-  const machines = [
-    ...hosts.map(host => ({ kind: 'host' as const, machine: host })),
-    ...registered.map(node => ({ kind: 'worker' as const, machine: node })),
-  ].sort((a, b) => Number(b.machine.online) - Number(a.machine.online) || a.machine.label.localeCompare(b.machine.label) || a.machine.id.localeCompare(b.machine.id));
-  const online = machines.filter(({ machine }) => machine.online).length;
+  const machines = inventory.filter(n => n.registered).toSorted((a, b) => Number(b.online) - Number(a.online) || a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
+  const online = machines.filter(n => n.online).length;
+  const runtimeName = (n: ComputeNode) => `${({linux: 'Linux', windows: 'Windows', macos: 'macOS', unknown: 'Platform pending'} as Record<string,string>)[n.platform] ?? n.platform} · ${({incus: 'Incus', 'wsl2-layerfs': 'WSL2', 'legacy-windows-ci': 'Legacy worker', unknown: 'Runtime pending'} as Record<string,string>)[n.backend] ?? n.backend}`;
+  const readiness = (n: ComputeNode) => ({ready: 'Runtime ready', busy: 'Running a workload', preparing: 'Templates unavailable', capacity_limited: 'Capacity limited', needs_attention: 'Needs attention', offline: 'Runtime disconnected'}[n.runtime.state]);
   const bytes = (value: number) => `${(value / 1024 ** 3).toLocaleString(undefined, { maximumFractionDigits: 1 })} GiB`;
   return <section className="contributor-panel" aria-label="Compute machines">
     <div className="contributor-heading">
@@ -71,24 +69,29 @@ export function ComputePanel({ hosts, hostsLoaded, nodes, loaded, loadError, ref
     </section>}
     <section className="worker-surface worker-inventory" aria-label="Registered machines">
       <div className="worker-list-heading"><h2>Machines</h2><span>{machines.length}</span></div>
-      {machines.length ? <ul className="worker-list">{machines.map(entry => {
-        if (entry.kind === 'host') {
-          const h = entry.machine, c = h.capacity;
-          return <li className="worker-row" key={`host:${h.id}`} aria-label={`Machine ${h.label}`}>
-            <div className="worker-name"><strong>{h.label}</strong><small>Linux VM host</small>{h.error && <small className="compute-host-error">{h.error}</small>}</div>
-            <span className={`worker-status ${h.online ? 'online' : ''}`}>{h.online ? 'Online' : 'Offline'}</span>
-            <div className="worker-capacity"><span>{c ? `${c.cpu_total} CPU · ${bytes(c.memory_total_bytes)} memory` : 'Capacity unavailable'}</span><small>{c ? `${c.allocated_cpu} CPU allocated · ${bytes(c.disk_free_bytes)} disk free` : 'Reconnect to read host capacity'}</small></div>
-            <details className="compute-host-details"><summary>Details</summary>{hostDetails(h)}</details>
-          </li>;
-        }
-        const n = entry.machine;
-        return <li className="worker-row" key={`worker:${n.id}`} aria-label={`Machine ${n.label}`}>
-        <div className="worker-name"><strong>{n.label}</strong><small>{n.tools.backend === 'wsl2-layerfs' ? 'Windows · WSL2 templates' : 'Windows · legacy worker'}</small><small>{n.tools.workspace ? 'Templates ready' : n.tools.backend !== 'wsl2-layerfs' ? 'WSL2 upgrade needed' : 'Preparing templates'}</small></div>
-        <span className={`worker-status ${n.blocked ? 'attention' : n.online ? 'online' : ''}`}>{n.blocked ? 'Needs attention' : n.online ? 'Online' : 'Offline'}</span>
-        <div className="worker-capacity"><span>{n.budget.cpu} CPU · {n.budget.memory_gib} GiB memory</span><small>{n.budget.disk_gib} GiB disk allowance · {[n.workloads.ci && 'CI', n.workloads.agents && 'Agents'].filter(Boolean).join(' + ')}</small></div>
-        <details className="worker-manage"><summary>Manage</summary><div><p>Limits chosen on this machine. GPU and native desktop execution require a qualified runtime.</p><p className="worker-identity">Machine ID: <code>{n.id}</code></p>{n.blocked && <button className="button small" disabled={busy || n.tools.worker_running !== false} onClick={() => void change(n.id, 'reconcile')}>Confirm owned worker stopped</button>}<button className="button small" disabled={busy} onClick={() => void change(n.id, 'revoke')}>Revoke machine</button></div></details>
-      </li>;
-      })}</ul> : <div className="worker-empty"><strong>{hostsLoaded && loaded ? 'No machines connected yet' : 'Waiting for machine inventories'}</strong><p>Use Add machine to connect a Windows worker. Dedicated VM hosts appear from the controller’s configured inventory.</p></div>}
+      {machines.length ? <ul className="worker-list">{machines.map(n => {
+        const host = n.registration.method === 'controller_config' ? hosts.find(h => h.id === n.source_id) : undefined;
+        const budget = n.resources.budget, available = n.resources.available;
+        return <li className="worker-row" key={n.id} aria-label={`Machine ${n.label}`}>
+          <div className="worker-name"><strong>{n.label}</strong><small>Registered · {runtimeName(n)}</small><small>{readiness(n)}</small>{n.error && <small className="compute-host-error">{n.error}</small>}</div>
+          <span className={`worker-status ${n.runtime.state === 'needs_attention' ? 'attention' : n.online ? 'online' : ''}`}>{n.online ? 'Online' : 'Offline'}</span>
+          <div className="worker-capacity"><span>{budget ? `${budget.cpu} CPU · ${bytes(budget.memory_bytes)} memory` : 'Allowance unavailable'}</span><small>{budget ? `${bytes(budget.disk_bytes)} disk allowance` : 'Reconnect to read machine allowance'}</small></div>
+          <details className="compute-machine-details"><summary>Details</summary><div>
+            <p className="worker-identity">Machine ID: <code>{n.id}</code></p>
+            <p>{n.registration.method === 'controller_config' ? 'Registered through controller configuration. Resource reserves and limits are configured on the controller.' : 'Registered with a machine credential. Resource limits are chosen in the installer on this machine.'}</p>
+            <p>{n.online ? 'Runtime connected' : 'Runtime disconnected'}{n.runtime.last_seen ? ` · Last verified ${new Date(n.runtime.last_seen * 1000).toLocaleString()}` : ''}</p>
+            {n.templates.length > 0 && <p>Available templates: {n.templates.join(', ')}</p>}
+            {available && <p>Available for new work: {available.cpu} CPU · {bytes(available.memory_bytes)} memory · {bytes(available.disk_bytes)} disk.</p>}
+            {n.runtime.state === 'capacity_limited' && <p>The runtime is connected. Existing work can continue, but new work must fit the remaining CPU, memory, disk and workspace limits.</p>}
+            {n.runtime.running_workspaces !== null && <p>{n.runtime.running_workspaces} running VM workspaces</p>}
+            {n.runtime.active_job && <p>Active job: <code>{n.runtime.active_job}</code></p>}
+            {n.management.limits === 'local_installer' && <p>GPU and native desktop execution require a qualified runtime. Free capacity is checked locally when work is admitted.</p>}
+            {host && hostDetails(host)}
+            {n.runtime.state === 'needs_attention' && n.management.revoke && <button className="button small" disabled={busy || !n.management.reconcile} onClick={() => void change(n.source_id, 'reconcile')}>Confirm owned worker stopped</button>}
+            {n.management.revoke && <button className="button small" disabled={busy} onClick={() => void change(n.source_id, 'revoke')}>Revoke machine</button>}
+          </div></details>
+        </li>;
+      })}</ul> : <div className="worker-empty"><strong>{hostsLoaded && loaded ? 'No machines connected yet' : 'Waiting for machine inventories'}</strong><p>Use Add machine to connect a Windows worker. Configured servers are registered automatically by the controller.</p></div>}
     </section>
     {pending.length > 0 && <details className="worker-surface worker-history"><summary><span>Pending registrations</span><span className="worker-count">{pending.length}</span></summary><p>Unfinished installations. Renew the code for the matching machine ID to continue setup.</p><ul className="worker-list" aria-label="Pending registrations">{pending.map(n => <li className="worker-pending-row" key={n.id} aria-label={`Pending machine ${n.label}`}><div className="worker-name"><strong>{n.label}</strong><code>{n.id}</code></div><div className="worker-actions"><button className="button small" disabled={busy} onClick={() => void renew(n.id)}>Renew registration code</button><button className="button small" disabled={busy} onClick={() => void change(n.id, 'revoke')}>Cancel invitation</button></div></li>)}</ul></details>}
     {revoked.length > 0 && <details className="worker-surface worker-history"><summary><span>Revoked machines and invitations</span><span className="worker-count">{revoked.length}</span></summary><ul className="worker-list" aria-label="Revoked machines and invitations">{revoked.map(n => <li className="worker-pending-row" key={n.id}><div className="worker-name"><strong>{n.label}</strong><code>{n.id}</code></div><span className="worker-status">Revoked</span></li>)}</ul></details>}

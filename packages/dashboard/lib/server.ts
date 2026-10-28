@@ -233,7 +233,7 @@ export async function proxy(request: Request, segments: string[]) {
         // Hosted repositories: the project list (from pools), repositories and the redacted backend state.
         /^v1\/(?:pools|repositories|repository-backends)$/.test(path) ||
         /^v1\/projects\/[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\/repositories(?:\/[a-z0-9][a-z0-9._-]{0,62})?$/.test(path) ||
-        /^v1\/(fleet|templates|storage|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
+        /^v1\/(fleet|compute|templates|storage|jobs\/[a-zA-Z0-9_-]{1,100})$/.test(path)
       : request.method === "POST" &&
         (accountWrite || /^v1\/github\/(?:(?:repos|runners)\/disconnect|select|remove|drain)$/.test(path) ||
           /^v1\/projects\/[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\/repositories$/.test(path) ||

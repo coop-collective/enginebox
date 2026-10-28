@@ -103,6 +103,31 @@ export type Fleet = {
   hosts: Host[];
   templates: PreparedTemplate[];
   sizes: Record<string, { cpu: number; memory_gib: number }>;
+  compute_nodes?: ComputeNode[];
+};
+export type ComputeNode = {
+  id: string;
+  source_id: string;
+  label: string;
+  backend: string;
+  platform: string;
+  registered: boolean;
+  online: boolean;
+  registration: { method: "controller_config" | "enrollment" };
+  runtime: {
+    state: "offline" | "ready" | "busy" | "preparing" | "capacity_limited" | "needs_attention";
+    running_workspaces: number | null;
+    active_job: string | null;
+    last_seen: number | null;
+  };
+  resources: {
+    budget: { cpu: number; memory_bytes: number; disk_bytes: number } | null;
+    available: { cpu: number; memory_bytes: number; disk_bytes: number } | null;
+  };
+  templates: string[];
+  capabilities: { vm_workspaces: boolean; template_workspaces: boolean; ci_jobs: boolean };
+  management: { revoke: boolean; reconcile: boolean; limits: "controller_config" | "local_installer" };
+  error: string | null;
 };
 export type Job = {
   id: string;
