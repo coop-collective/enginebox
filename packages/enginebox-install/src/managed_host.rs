@@ -86,6 +86,48 @@ fn local_identity() -> Result<String> {
     );
     machine_id_hash(&std::fs::read_to_string("/etc/machine-id")?)
 }
+fn fresh_config(controller: &str, id: &str, info: &Value, machine: &str) -> Result<Config> {
+    ensure!(
+        info["id"] == id && info["kind"] == "incus",
+        "Unexpected registration response"
+    );
+    let binding: ManagedHostBinding = serde_json::from_value(info["binding"].clone())?;
+    let budget: Budget = serde_json::from_value(info["budget"].clone())?;
+    binding.validate()?;
+    budget.validate()?;
+    ensure!(
+        machine == binding.machine_id_hash,
+        "This registration code belongs to another machine"
+    );
+    Ok(Config {
+        schema: 1,
+        controller: controller.into(),
+        id: id.into(),
+        token: format!(
+            "{id}.{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+        enrolled: false,
+        budget,
+        binding,
+    })
+}
+fn archive_previous(parent: &Path, previous: &Config) -> Result<()> {
+    let directory = parent.join("retired");
+    private_dir(&directory)?;
+    let archive = directory.join(format!("{}.json", previous.id));
+    reject_symlink_components(&archive)?;
+    if archive.exists() {
+        ensure!(
+            serde_json::to_value(read_config(&archive)?)? == serde_json::to_value(previous)?,
+            "Previous registration archive differs; inspect before retrying"
+        );
+    } else {
+        atomic_json(&archive, previous)?;
+    }
+    Ok(())
+}
 async fn probe(binding: &ManagedHostBinding) -> Result<()> {
     ensure!(
         local_identity()? == binding.machine_id_hash,
@@ -94,12 +136,12 @@ async fn probe(binding: &ManagedHostBinding) -> Result<()> {
     // The pre-existing privileged helper owns Incus discovery. Do not bootstrap
     // or change pools, profiles, projects or the host's other workspaces here.
     let helper = Path::new("/usr/local/bin/enginebox-host");
-    let target = helper
-        .canonicalize()
-        .context("Install the approved Incus host helper first")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let target = helper
+            .canonicalize()
+            .context("Install the approved Incus host helper first")?;
         for path in target.ancestors() {
             let meta = std::fs::metadata(path)?;
             ensure!(
@@ -147,6 +189,17 @@ async fn probe(binding: &ManagedHostBinding) -> Result<()> {
     Ok(())
 }
 pub async fn register(path: &Path, controller: &str, code: &str, test: bool) -> Result<Value> {
+    let machine = local_identity()?;
+    register_checked(path, controller, code, test, &machine, probe).await
+}
+async fn register_checked(
+    path: &Path,
+    controller: &str,
+    code: &str,
+    test: bool,
+    machine: &str,
+    verify: impl AsyncFn(&ManagedHostBinding) -> Result<()>,
+) -> Result<Value> {
     let origin = native_node::controller_origin(controller, test)?.to_string();
     let (id, secret) = code.split_once('.').context("Invalid registration code")?;
     ensure!(
@@ -162,77 +215,80 @@ pub async fn register(path: &Path, controller: &str, code: &str, test: bool) -> 
         .truncate(false)
         .open(parent.join("register.lock"))?;
     lock.try_lock_exclusive()?;
+    let mut previous = None;
     let mut config = if path.exists() {
         let mut c = read_config(path)?;
         ensure!(
-            c.id == id && c.controller == origin,
-            "Existing registration belongs to another controller or identity"
+            native_node::controller_origin(&c.controller, test)?.to_string() == origin,
+            "Existing registration belongs to another controller"
         );
         ensure!(
-            local_identity()? == c.binding.machine_id_hash,
+            machine == c.binding.machine_id_hash,
             "Existing registration belongs to another machine"
         );
-        if !c.enrolled {
-            // A consumed code may have expired after its acknowledgement was
-            // lost. The already persisted scoped credential can prove that
-            // enrollment without issuing or consuming a replacement identity.
-            let session = uuid::Uuid::new_v4().to_string();
-            if let Ok(hello) = request(
-                &c.controller,
-                "hello",
-                &c.token,
-                json!({"session":session}),
+        if c.id != id {
+            let info = request(
+                &origin,
+                "enroll",
+                code,
+                json!({"kind":"incus-replace-info",
+                "previous_id":c.id,"previous_secret_hash":digest(&c.token)}),
                 test,
             )
-            .await
-            {
-                ensure!(
-                    hello["id"] == c.id
-                        && hello["session"] == session
-                        && hello["kind"] == "incus"
-                        && hello["binding"] == serde_json::to_value(&c.binding)?
-                        && hello["budget"] == serde_json::to_value(&c.budget)?,
-                    "Recovered registration binding differs"
-                );
-                c.enrolled = true;
-                atomic_json(path, &c)?;
-            }
-        }
-        if c.enrolled {
-            return Ok(
-                json!({"id":c.id,"enrolled":true,"existing":true,"host_id":c.binding.host_id,"budget":c.budget}),
+            .await?;
+            let next = fresh_config(&origin, id, &info, machine)?;
+            ensure!(
+                info["previous_id"] == c.id
+                    && next.binding.host_id == c.binding.host_id
+                    && next.binding.machine_id_hash == c.binding.machine_id_hash,
+                "Replacement does not match the revoked local registration"
             );
+            previous = Some(c);
+            next
+        } else {
+            if !c.enrolled {
+                // A consumed code may have expired after its acknowledgement was
+                // lost. The already persisted scoped credential can prove that
+                // enrollment without issuing or consuming a replacement identity.
+                let session = uuid::Uuid::new_v4().to_string();
+                if let Ok(hello) = request(
+                    &c.controller,
+                    "hello",
+                    &c.token,
+                    json!({"session":session}),
+                    test,
+                )
+                .await
+                {
+                    ensure!(
+                        hello["id"] == c.id
+                            && hello["session"] == session
+                            && hello["kind"] == "incus"
+                            && hello["binding"] == serde_json::to_value(&c.binding)?
+                            && hello["budget"] == serde_json::to_value(&c.budget)?,
+                        "Recovered registration binding differs"
+                    );
+                    c.enrolled = true;
+                    atomic_json(path, &c)?;
+                }
+            }
+            if c.enrolled {
+                return Ok(
+                    json!({"id":c.id,"enrolled":true,"existing":true,"host_id":c.binding.host_id,"budget":c.budget}),
+                );
+            }
+            c
         }
-        c
     } else {
         let info = request(&origin, "enroll", code, json!({"kind":"incus-info"}), test).await?;
-        ensure!(
-            info["id"] == id && info["kind"] == "incus",
-            "Unexpected registration response"
-        );
-        let binding: ManagedHostBinding = serde_json::from_value(info["binding"].clone())?;
-        let budget: Budget = serde_json::from_value(info["budget"].clone())?;
-        binding.validate()?;
-        budget.validate()?;
-        ensure!(
-            local_identity()? == binding.machine_id_hash,
-            "This registration code belongs to another machine"
-        );
-        Config {
-            schema: 1,
-            controller: origin,
-            id: id.into(),
-            token: format!(
-                "{id}.{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            ),
-            enrolled: false,
-            budget,
-            binding,
-        }
+        fresh_config(&origin, id, &info, machine)?
     };
-    probe(&config.binding).await?;
+    verify(&config.binding).await?;
+    if let Some(previous) = &previous {
+        // The old credential is explicitly revoked at the controller. Keep a
+        // private copy before replacing it, including pending registrations.
+        archive_previous(parent, previous)?;
+    }
     // Persist the identity before the first consuming request. A lost response
     // can retry the same credential; it never creates a second registration.
     atomic_json(path, &config)?;
@@ -314,5 +370,158 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
             );
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use axum::{extract::Request, middleware::Next, response::IntoResponse};
+    use enginebox_controller::{Controller, contributors::Contributors, router};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn revoked_replacement_archives_identity_and_recovers_lost_acknowledgment() {
+        for old_enrolled in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let state = root.join("state");
+            let config = root.join("fleet.toml");
+            std::fs::write(&config, "schema_version=1\n[[hosts]]\nid='host'\ntarget='unused.invalid'\nmanaged_registration=true\n").unwrap();
+            let host = serde_json::from_value(
+                json!({"id":"host","label":"Host","target":"unused.invalid","managed_registration":true}),
+            )
+            .unwrap();
+            let registry = Contributors::open(&state).unwrap();
+            let budget = Budget {
+                cpu: 2,
+                memory_gib: 4,
+                disk_gib: 20,
+            };
+            let machine = "b".repeat(64);
+            let old = registry
+                .issue_host(&host, machine.clone(), budget.clone())
+                .unwrap();
+            let old_id = old["id"].as_str().unwrap();
+            let old_info = registry.host_info(old["code"].as_str().unwrap()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let controller = Controller::new(&config, &state, "x".repeat(32)).unwrap();
+            let path = root.join("private/host.json");
+            private_dir(path.parent().unwrap()).unwrap();
+            // The fixture deliberately persists an origin without a trailing
+            // slash, which must compare equal to its canonical URL form.
+            let mut old_config = fresh_config(&origin, old_id, &old_info, &machine).unwrap();
+            if old_enrolled {
+                registry.enroll_host(old["code"].as_str().unwrap(), &json!({"kind":"incus","secret_hash":digest(&old_config.token),"machine_id_hash":machine})).unwrap();
+                old_config.enrolled = true;
+            }
+            atomic_json(&path, &old_config).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            // The owner explicitly retires either a complete registration or
+            // one left pending before its enrollment request was consumed.
+            registry.revoke(old_id).unwrap();
+            let next = registry.issue_host(&host, machine.clone(), budget).unwrap();
+            let code = next["code"].as_str().unwrap();
+            controller.activate().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let app = router(controller.clone()).layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let calls = calls.clone();
+                    async move {
+                        let enrollment = request.uri().path() == "/v1/node/enroll";
+                        let response = next.run(request).await;
+                        // Replacement-info, then the deliberately rejected probe's
+                        // replacement-info, then consume. Lose only its response.
+                        if enrollment
+                            && response.status().is_success()
+                            && calls.fetch_add(1, Ordering::SeqCst) == 2
+                        {
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        response
+                    }
+                },
+            ));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let other_controller = origin.replace("127.0.0.1", "localhost");
+            assert!(
+                register_checked(
+                    &path,
+                    &other_controller,
+                    code,
+                    true,
+                    &machine,
+                    async |_| Ok(())
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(
+                register_checked(
+                    &path,
+                    &origin,
+                    code,
+                    true,
+                    &machine,
+                    async |_| anyhow::bail!("runtime not ready")
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!path.parent().unwrap().join("retired").exists());
+            // Approved replacement archives first, then persists the new
+            // identity before consuming its one-time code.
+            assert!(
+                register_checked(&path, &origin, code, true, &machine, async |_| Ok(()))
+                    .await
+                    .is_err()
+            );
+            let pending = read_config(&path).unwrap();
+            assert_eq!(pending.id, next["id"]);
+            assert!(!pending.enrolled);
+            let retired_path = path
+                .parent()
+                .unwrap()
+                .join("retired")
+                .join(format!("{old_id}.json"));
+            assert_eq!(
+                serde_json::to_value(read_config(&retired_path).unwrap()).unwrap(),
+                serde_json::to_value(&old_config).unwrap()
+            );
+            let invalid_code = format!("{}.{}", pending.id, "0".repeat(64));
+            let recovered =
+                register_checked(&path, &origin, &invalid_code, true, &machine, async |_| {
+                    anyhow::bail!("recovery must not rerun provisioning")
+                })
+                .await
+                .unwrap();
+            assert_eq!(recovered["enrolled"], true);
+            let complete = read_config(&path).unwrap();
+            assert_eq!(complete.token, pending.token);
+            let complete_bytes = std::fs::read(&path).unwrap();
+            register_checked(&path, &origin, code, true, &machine, async |_| Ok(()))
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), complete_bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(retired_path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o077,
+                    0
+                );
+            }
+            server.abort();
+        }
     }
 }

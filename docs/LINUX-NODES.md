@@ -66,6 +66,16 @@ Use `systemctl status enginebox-managed-node.service` and
 private registration file into logs or support messages. Reinstallation is not a
 substitute for resolving a revoked credential or a changed host binding.
 
+To replace a revoked credential, select **Register server** in Compute and run
+its new command on the same server. The controller must confirm that the prior
+registration was revoked and both identities belong to the same host and Linux
+machine ID. The installer archives the old private registration under
+`private/retired/<old-node-id>.json` before persisting the new pending identity.
+An existing live registration, another controller, or another machine is refused.
+If the enrollment response is lost, rerunning the same command recovers the saved
+credential; renew its pending code in Compute if it was never consumed. No VM or
+workspace state is removed during this process.
+
 ## Publishing and qualification
 
 The **Build registered Linux node installer** workflow tests a disposable Linux

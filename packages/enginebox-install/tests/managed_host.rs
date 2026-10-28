@@ -168,11 +168,11 @@ mod linux {
         // Recover a lost enrollment acknowledgment using the saved credential,
         // even when the one-time code presented again is no longer valid.
         let expired_code = format!("{id}.{}", "0".repeat(64));
+        let recovery = launch_register(&origin, &path, &expired_code).await;
         assert!(
-            launch_register(&origin, &path, &expired_code)
-                .await
-                .status
-                .success()
+            recovery.status.success(),
+            "{}",
+            String::from_utf8_lossy(&recovery.stderr)
         );
         let recovered: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(recovered["enrolled"], true);

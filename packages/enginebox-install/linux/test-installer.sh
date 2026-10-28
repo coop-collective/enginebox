@@ -40,6 +40,7 @@ python3 - <<'PY'
 import json,pathlib,re,time
 unit=pathlib.Path('/etc/systemd/system/enginebox-managed-node.service').read_text()
 config=pathlib.Path(re.search(r'^ExecStart=.* --config (.+)$',unit,re.M)[1]); c=json.loads(config.read_text())
+time.sleep(1)
 (config.parent/'status.json').write_text(json.dumps({'id':c['id'],'online':True,'ready':True,'blocked':False,'last_seen':int(time.time())}))
 PY
 fi
@@ -72,6 +73,11 @@ assert not any(p.glob('private/download.*'))
 PY
 # A copied command for another machine/controller must preserve this identity.
 if bash "$installer" --controller https://other.example --enrollment-code "$code" --prefix "$prefix" >/dev/null 2>&1; then exit 1; fi
+[[ "$before" == "$(sha256sum "$prefix/private/host.json")" ]]
+# A different ID must reach native replacement validation; the shell must not
+# silently reuse an already enrolled identity or archive it on its own.
+different='cccccccccccccccccccccccccccccccc.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+if bash "$installer" --controller https://controller.example --enrollment-code "$different" --prefix "$prefix" >/dev/null 2>&1; then exit 1; fi
 [[ "$before" == "$(sha256sum "$prefix/private/host.json")" ]]
 mkdir "$fixture/unowned"
 echo retain > "$fixture/unowned/owner-file"

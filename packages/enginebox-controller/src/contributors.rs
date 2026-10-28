@@ -282,6 +282,63 @@ impl Contributors {
         let binding = n.host_binding.context("Not an Incus invitation")?;
         Ok(json!({"id":n.id,"kind":"incus","binding":binding,"budget":n.budget}))
     }
+    pub fn replacement_host_info(&self, code: &str, body: &Value) -> Result<Value> {
+        ensure!(
+            body["kind"] == "incus-replace-info",
+            "Invalid replacement kind"
+        );
+        ensure!(
+            body.as_object().is_some_and(|o| o.len() == 3
+                && o.contains_key("kind")
+                && o.contains_key("previous_id")
+                && o.contains_key("previous_secret_hash")),
+            "Invalid replacement request"
+        );
+        let previous_id = body["previous_id"]
+            .as_str()
+            .context("Previous identity required")?;
+        let previous_secret = body["previous_secret_hash"]
+            .as_str()
+            .context("Previous credential required")?;
+        ensure!(
+            id(previous_id) && hash(previous_secret),
+            "Invalid previous identity"
+        );
+        let n = self.invitation_node(code)?;
+        let binding = n.host_binding.as_ref().context("Not an Incus invitation")?;
+        ensure!(
+            n.secret_hash.is_none(),
+            "Replacement invitation has already been consumed"
+        );
+        let nodes = self.nodes.lock().unwrap();
+        let previous = nodes
+            .get(previous_id)
+            .context("Previous registration unavailable")?;
+        let old_binding = previous
+            .host_binding
+            .as_ref()
+            .context("Previous registration is not an Incus host")?;
+        ensure!(
+            previous.id != n.id
+                && previous.revoked
+                && old_binding.host_id == binding.host_id
+                && old_binding.machine_id_hash == binding.machine_id_hash,
+            "Only a revoked registration for this same machine can be replaced"
+        );
+        // Unconsumed invitations have no persisted credential hash yet. Their
+        // explicit owner revocation and immutable machine binding authorize
+        // replacement of a pending local registration as well.
+        ensure!(
+            previous
+                .secret_hash
+                .as_ref()
+                .is_none_or(|hash| equal(hash, previous_secret)),
+            "Previous credential does not match the revoked registration"
+        );
+        Ok(
+            json!({"id":n.id,"kind":"incus","binding":binding,"budget":n.budget,"previous_id":previous.id}),
+        )
+    }
     pub fn enroll_host(&self, code: &str, body: &Value) -> Result<Value> {
         ensure!(body["kind"] == "incus", "Invalid enrollment kind");
         ensure!(
@@ -807,6 +864,69 @@ mod tests {
                 .issue_host(&host, "b".repeat(64), invitation().budget)
                 .is_ok()
         );
+    }
+    #[test]
+    fn replacement_requires_revocation_same_machine_and_the_previous_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let service = Contributors::open(root.path()).unwrap();
+        let host = managed_host();
+        let old = service
+            .issue_host(&host, "b".repeat(64), invitation().budget)
+            .unwrap();
+        let old_id = old["id"].as_str().unwrap();
+        let token = format!("{old_id}.{}", "d".repeat(64));
+        service.enroll_host(old["code"].as_str().unwrap(), &json!({"kind":"incus","secret_hash":secret_hash(&token),"machine_id_hash":"b".repeat(64)})).unwrap();
+        let request = json!({"kind":"incus-replace-info","previous_id":old_id,"previous_secret_hash":secret_hash(&token)});
+        // An existing live identity and another server's invitation never
+        // authorize a reset of the saved credential.
+        assert!(
+            service
+                .replacement_host_info(old["code"].as_str().unwrap(), &request)
+                .is_err()
+        );
+        let mut other_host = host.clone();
+        other_host.id = "other".into();
+        let other = service
+            .issue_host(&other_host, "b".repeat(64), invitation().budget)
+            .unwrap();
+        assert!(
+            service
+                .replacement_host_info(other["code"].as_str().unwrap(), &request)
+                .is_err()
+        );
+        service.revoke(old_id).unwrap();
+        assert!(
+            service
+                .replacement_host_info(other["code"].as_str().unwrap(), &request)
+                .is_err()
+        );
+        let next = service
+            .issue_host(&host, "b".repeat(64), invitation().budget)
+            .unwrap();
+        let code = next["code"].as_str().unwrap();
+        let info = service.replacement_host_info(code, &request).unwrap();
+        assert_eq!(info["previous_id"], old_id);
+        assert_eq!(info["id"], next["id"]);
+        let mut forged = request.clone();
+        forged["previous_secret_hash"] = json!("e".repeat(64));
+        assert!(service.replacement_host_info(code, &forged).is_err());
+        service.enroll_host(code, &json!({"kind":"incus","secret_hash":"a".repeat(64),"machine_id_hash":"b".repeat(64)})).unwrap();
+        assert!(service.replacement_host_info(code, &request).is_err());
+        service.revoke(next["id"].as_str().unwrap()).unwrap();
+        let changed_machine = service
+            .issue_host(&host, "c".repeat(64), invitation().budget)
+            .unwrap();
+        assert!(
+            service
+                .replacement_host_info(changed_machine["code"].as_str().unwrap(), &request)
+                .is_err()
+        );
+        // The owner can also retire a never-consumed pending installation.
+        service.revoke(other["id"].as_str().unwrap()).unwrap();
+        let pending_next = service
+            .issue_host(&other_host, "b".repeat(64), invitation().budget)
+            .unwrap();
+        assert!(service.replacement_host_info(pending_next["code"].as_str().unwrap(), &json!({"kind":"incus-replace-info","previous_id":other["id"],"previous_secret_hash":"f".repeat(64)})).is_ok());
     }
     #[test]
     fn codes_bind_one_identity_with_downward_budgets_expiry_and_revocation() {

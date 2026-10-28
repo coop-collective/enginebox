@@ -830,6 +830,9 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
                         runtime.contributors.host_info(&token)
                     }
                     Some("incus") => runtime.contributors.enroll_host(&token, &body),
+                    Some("incus-replace-info") => {
+                        runtime.contributors.replacement_host_info(&token, &body)
+                    }
                     Some(_) => anyhow::bail!("Unknown enrollment kind"),
                     None => runtime
                         .contributors
