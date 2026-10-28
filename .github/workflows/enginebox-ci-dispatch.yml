@@ -10,9 +10,16 @@ permissions:
   contents: read
 jobs:
   qualify:
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: enginebox-ci
+      labels: enginebox-linux
     timeout-minutes: 10
     steps:
+      - name: Verify disposable Engine Box runner
+        shell: bash
+        run: |
+          [[ "$RUNNER_NAME" == ebox-ci-* ]]
+          printf 'Runner: %s\nOS: %s\nArchitecture: %s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.enginebox_sha }}
