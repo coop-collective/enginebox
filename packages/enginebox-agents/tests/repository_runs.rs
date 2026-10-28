@@ -63,6 +63,7 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
             remote: REMOTE.into(),
             default_branch: "main".into(),
             token: TOKEN.into(),
+            auth: repository::Auth::Bearer,
         },
     };
     let out = native::execute_with_repository(&envelope, &home, &workspace, RUN).unwrap();
@@ -240,6 +241,7 @@ mod service {
                     token: "art_v1_0123456789abcdef0123456789abcdef01234567".into(),
                     token_id: None,
                     expires_at: "2026-10-26T00:00:00Z".into(),
+                    auth: repository::Auth::Bearer,
                 })
             }),
             Arc::new(|_, _| {}),

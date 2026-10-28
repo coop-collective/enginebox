@@ -133,6 +133,27 @@ pub trait Backend: Send + Sync {
     fn revoke(&self, project: &str, name: &str, token_id: &str) -> Result<()>;
 }
 
+/// GitHub repositories linked to a project: the selected bindings of the
+/// controller's GitHub repository App. Tests stand in for GitHub.
+pub trait GithubLink: Send + Sync {
+    /// The selected binding's default branch, or None when it is not selected.
+    fn selected_branch(&self, full_name: &str) -> Option<String>;
+    /// A single-repository installation token (about an hour).
+    fn token(&self, full_name: &str, write: bool) -> Result<String>;
+}
+impl GithubLink for enginebox_github::GitHub {
+    fn selected_branch(&self, full_name: &str) -> Option<String> {
+        self.selected_repository(full_name).map(|r| r.branch)
+    }
+    fn token(&self, full_name: &str, write: bool) -> Result<String> {
+        let minted = self.transfer_credential(full_name, None, write)?;
+        Ok(minted["token"].as_str().unwrap_or("").to_owned())
+    }
+}
+/// GitHub installation tokens last an hour.
+const GITHUB_TOKEN_SECONDS: i64 = 3600;
+pub const GITHUB_KIND: &str = "github";
+
 /// One signed POST to a backend service: (status, JSON body). Separate from
 /// the backend so tests can stand in for the remote service.
 pub trait Transport: Send + Sync {
@@ -509,7 +530,11 @@ impl Record {
                 && repository::valid_name(&self.name)
                 && repository::valid_remote(&self.remote)
                 && repository::valid_branch(&self.default_branch)
-                && self.backend == "artifacts"
+                && (self.backend == "artifacts"
+                    || (self.backend == GITHUB_KIND
+                        && self.backend_id.as_deref().is_some_and(|f| {
+                            self.remote == format!("https://github.com/{f}.git")
+                        })))
                 && self.description.len() <= MAX_DESCRIPTION,
             "Invalid repository record"
         );
@@ -541,6 +566,7 @@ struct Inner {
     /// Serializes creation so one name creates one repository.
     creating: Mutex<()>,
     transport: Arc<dyn Transport>,
+    github: Mutex<Option<Arc<dyn GithubLink>>>,
 }
 impl Repositories {
     pub fn open(root: &Path) -> Result<Self> {
@@ -595,8 +621,30 @@ impl Repositories {
                 worker: Mutex::new(worker),
                 creating: Mutex::new(()),
                 transport,
+                github: Mutex::new(None),
             }),
         })
+    }
+
+    /// Link GitHub: the controller's GitHub repository App (or a test stand-in).
+    pub fn with_github(self, github: Arc<dyn GithubLink>) -> Self {
+        *self.inner.github.lock().unwrap() = Some(github);
+        self
+    }
+    /// `with_github` when GitHub is configured; unchanged otherwise.
+    pub fn with_github_if(self, github: Option<Arc<dyn GithubLink>>) -> Self {
+        match github {
+            Some(g) => self.with_github(g),
+            None => self,
+        }
+    }
+    fn github(&self) -> Result<Arc<dyn GithubLink>> {
+        self.inner
+            .github
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| refuse(409, "GitHub is not configured on this controller."))
     }
 
     // ------------------------------------------------------------ backend config
@@ -791,6 +839,133 @@ impl Repositories {
             .insert((project.to_owned(), name.to_owned()), record);
         Ok((fresh, json!({"repository":public})))
     }
+    /// `POST /v1/projects/:project/repositories/github` (owner): link a GitHub
+    /// repository the owner selected in the GitHub panel as `name` in the
+    /// project. Runs on it get a single-repository installation token.
+    pub fn link_github(&self, project: &str, body: &Value) -> Result<(bool, Value)> {
+        Self::check_project(project)?;
+        let object = body
+            .as_object()
+            .ok_or_else(|| invalid("Expected an object."))?;
+        if !object
+            .keys()
+            .all(|k| ["name", "full_name", "description"].contains(&k.as_str()))
+        {
+            return Err(invalid("Accepted fields: name, full_name, description."));
+        }
+        let full_name = body["full_name"].as_str().unwrap_or("");
+        let valid_part = |p: &str| {
+            !p.is_empty()
+                && p.len() <= 100
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                && !p.starts_with('.')
+        };
+        if !full_name
+            .split_once('/')
+            .is_some_and(|(o, r)| valid_part(o) && valid_part(r) && !r.ends_with(".git"))
+        {
+            return Err(invalid("full_name must be owner/repository."));
+        }
+        let name = match body.get("name") {
+            None | Some(Value::Null) => full_name.split_once('/').unwrap().1.to_ascii_lowercase(),
+            Some(Value::String(n)) => n.clone(),
+            Some(_) => return Err(invalid("name must be a string.")),
+        };
+        if !repository::valid_name(&name) {
+            return Err(invalid(
+                "name must be 1-63 lowercase letters, digits, '.', '_' or '-', starting with a letter or digit and not ending in .git.",
+            ));
+        }
+        let description = match body.get("description") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(d))
+                if d.len() <= MAX_DESCRIPTION && !d.chars().any(char::is_control) =>
+            {
+                d.clone()
+            }
+            Some(_) => return Err(invalid("description must be at most 512 printable bytes.")),
+        };
+        let github = self.github()?;
+        let branch = github.selected_branch(full_name).ok_or_else(|| {
+            refuse(
+                409,
+                "Select this repository in the dashboard's GitHub panel first.",
+            )
+        })?;
+        let _creating = self.inner.creating.lock().unwrap();
+        if let Ok(existing) = self.record(project, &name) {
+            if existing.backend == GITHUB_KIND && existing.backend_id.as_deref() == Some(full_name)
+            {
+                return Ok((false, json!({"repository":existing.public(None)})));
+            }
+            return Err(refuse(
+                409,
+                "A repository of that name already exists in this project.",
+            ));
+        }
+        let record = Record {
+            project: project.to_owned(),
+            name: name.clone(),
+            backend: GITHUB_KIND.to_owned(),
+            description,
+            remote: format!("https://github.com/{full_name}.git"),
+            default_branch: branch,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            backend_id: Some(full_name.to_owned()),
+        };
+        record
+            .validate()
+            .map_err(|_| invalid("The GitHub repository cannot be linked under that name."))?;
+        state::write_json(
+            &self
+                .inner
+                .records_root
+                .join(project)
+                .join(format!("{name}.json")),
+            &serde_json::to_value(&record)?,
+        )?;
+        let public = record.public(None);
+        self.inner
+            .records
+            .lock()
+            .unwrap()
+            .insert((project.to_owned(), name), record);
+        Ok((true, json!({"repository":public})))
+    }
+    /// A token for a record, from its own backend.
+    fn mint_for(
+        &self,
+        record: &Record,
+        access: Access,
+        ttl: u64,
+    ) -> Result<(MintedToken, repository::Auth)> {
+        if record.backend == GITHUB_KIND {
+            let full_name = record.backend_id.as_deref().unwrap_or("");
+            let token = self
+                .github()?
+                .token(full_name, access == Access::Write)
+                .map_err(|_| refuse(502, "GitHub did not issue a token for this repository; check the App installation and the panel selection."))?;
+            if !repository::valid_token(&token) {
+                return Err(upstream());
+            }
+            let expires = chrono::Utc::now()
+                + chrono::Duration::seconds(GITHUB_TOKEN_SECONDS.min(ttl as i64));
+            return Ok((
+                MintedToken {
+                    id: None,
+                    token,
+                    expires_at: expires.to_rfc3339(),
+                },
+                repository::Auth::GithubToken,
+            ));
+        }
+        Ok((
+            self.backend()?
+                .mint(&record.project, &record.name, access, ttl)?,
+            repository::Auth::Bearer,
+        ))
+    }
     /// `GET /v1/projects/:project/repositories`. Last push times come from the
     /// backend when it answers; records are listed either way.
     pub fn list(&self, project: &str) -> Result<Value> {
@@ -839,12 +1014,15 @@ impl Repositories {
     /// `GET /v1/projects/:project/repositories/:name`.
     pub fn get(&self, project: &str, name: &str) -> Result<Value> {
         let record = self.record(project, name)?;
-        let last_push = self
-            .backend()
-            .and_then(|b| b.get(project, name))
-            .ok()
-            .flatten()
-            .and_then(|r| r.last_push_at);
+        let last_push = if record.backend == GITHUB_KIND {
+            None
+        } else {
+            self.backend()
+                .and_then(|b| b.get(project, name))
+                .ok()
+                .flatten()
+                .and_then(|r| r.last_push_at)
+        };
         Ok(json!({"repository":record.public(last_push.as_deref())}))
     }
     /// Parse a token request: `{access, ttl_seconds?}`.
@@ -884,7 +1062,7 @@ impl Repositories {
     /// caller's own short use. Nothing about it is stored.
     pub fn mint(&self, project: &str, name: &str, access: Access, ttl: u64) -> Result<Value> {
         let record = self.record(project, name)?;
-        let minted = self.backend()?.mint(project, name, access, ttl)?;
+        let (minted, _) = self.mint_for(&record, access, ttl)?;
         Ok(json!({
             "token":minted.token,
             "expires_at":minted.expires_at,
@@ -897,13 +1075,14 @@ impl Repositories {
     pub fn run_credential(&self, reference: &str, ttl: u64) -> Result<repository::Credential> {
         let (project, name) = repository::parse_ref(reference)?;
         let record = self.record(&project, &name)?;
-        let minted = self.backend()?.mint(&project, &name, Access::Write, ttl)?;
+        let (minted, auth) = self.mint_for(&record, Access::Write, ttl)?;
         Ok(repository::Credential {
             remote: record.remote,
             default_branch: record.default_branch,
             token: minted.token,
             token_id: minted.id,
             expires_at: minted.expires_at,
+            auth,
         })
     }
     /// Revoke a run's token when the run ends. Failures are logged without
@@ -1327,6 +1506,122 @@ mod tests {
         assert!(
             message.contains("secret") && !message.contains("0123456789abcdef"),
             "{message}"
+        );
+    }
+
+    struct FakeGithub {
+        selected: BTreeMap<String, String>,
+        minted: Mutex<Vec<(String, bool)>>,
+    }
+    impl GithubLink for FakeGithub {
+        fn selected_branch(&self, full_name: &str) -> Option<String> {
+            self.selected.get(full_name).cloned()
+        }
+        fn token(&self, full_name: &str, write: bool) -> Result<String> {
+            self.minted
+                .lock()
+                .unwrap()
+                .push((full_name.to_owned(), write));
+            Ok("ghs_fixture0123456789abcdefghijklmnop".to_owned())
+        }
+    }
+
+    #[test]
+    fn linked_github_repositories_mint_single_repository_tokens_as_github_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repos, _gateway) = open(temp.path());
+        // GitHub not configured: linking is refused with 409, nothing is written.
+        assert_eq!(
+            status_of(
+                &repos
+                    .link_github("alpha", &json!({"full_name":"null-shot/inference-market"}))
+                    .unwrap_err()
+            )
+            .0,
+            409
+        );
+        let github = Arc::new(FakeGithub {
+            selected: BTreeMap::from([(
+                "null-shot/inference-market".to_owned(),
+                "main".to_owned(),
+            )]),
+            minted: Mutex::new(vec![]),
+        });
+        let repos = repos.with_github(github.clone());
+        for bad in [
+            json!({"full_name":"no-slash"}),
+            json!({"full_name":"a/b.git"}),
+            json!({"full_name":"../x"}),
+            json!({"full_name":"null-shot/inference-market","name":"Bad Name"}),
+            json!({"full_name":"null-shot/inference-market","token":"x"}),
+        ] {
+            assert_eq!(
+                status_of(&repos.link_github("alpha", &bad).unwrap_err()).0,
+                400,
+                "{bad}"
+            );
+        }
+        // Not selected in the GitHub panel: refused.
+        assert_eq!(
+            status_of(
+                &repos
+                    .link_github("alpha", &json!({"full_name":"null-shot/other"}))
+                    .unwrap_err()
+            )
+            .0,
+            409
+        );
+        let (created, linked) = repos
+            .link_github("alpha", &json!({"full_name":"null-shot/inference-market"}))
+            .unwrap();
+        assert!(created);
+        assert_eq!(linked["repository"]["name"], "inference-market");
+        assert_eq!(linked["repository"]["backend"], "github");
+        assert_eq!(
+            linked["repository"]["remote"],
+            "https://github.com/null-shot/inference-market.git"
+        );
+        assert_eq!(linked["repository"]["default_branch"], "main");
+        // Linking again is idempotent; the GitHub record needs no Artifacts backend.
+        assert!(
+            !repos
+                .link_github("alpha", &json!({"full_name":"null-shot/inference-market"}))
+                .unwrap()
+                .0
+        );
+        assert_eq!(
+            repos.get("alpha", "inference-market").unwrap()["repository"]["backend"],
+            "github"
+        );
+        let credential = repos
+            .run_credential("alpha/inference-market", 7200)
+            .unwrap();
+        assert_eq!(credential.auth, repository::Auth::GithubToken);
+        assert_eq!(
+            credential.remote,
+            "https://github.com/null-shot/inference-market.git"
+        );
+        assert!(credential.token_id.is_none());
+        let expires = chrono::DateTime::parse_from_rfc3339(&credential.expires_at).unwrap();
+        assert!(
+            expires <= chrono::Utc::now() + chrono::Duration::seconds(GITHUB_TOKEN_SECONDS + 5)
+        );
+        let read = repos
+            .mint("alpha", "inference-market", Access::Read, 600)
+            .unwrap();
+        assert_eq!(read["access"], "read");
+        assert_eq!(
+            github.minted.lock().unwrap().clone(),
+            [
+                ("null-shot/inference-market".to_owned(), true),
+                ("null-shot/inference-market".to_owned(), false)
+            ]
+        );
+        // The record survives a reopen (its validation accepts github records).
+        let (reopened, _) = open(temp.path());
+        assert_eq!(
+            reopened.get("alpha", "inference-market").unwrap()["repository"]["backend"],
+            "github"
         );
     }
 

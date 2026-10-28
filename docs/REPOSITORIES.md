@@ -127,9 +127,21 @@ A run request may add `"repository":"<project>/<name>"` (see [FLEET.md](FLEET.md
 | Backend | Status |
 |---|---|
 | `artifacts_worker` (Cloudflare Artifacts through the gateway Worker's bindings) | Implemented |
-| `github-app` | Next |
+| `github` (linked GitHub repositories through the controller's GitHub repository App) | Implemented: link and per-run tokens; creation stays on GitHub |
 
 A backend implements `repositories::Backend` in `packages/enginebox-controller/src/repositories.rs`: `create` (idempotent, reports whether it created), `get`, `list` (with last push times), `mint(project, name, access, ttl)` and `revoke(project, name, token_id)`. HTTP goes through a `Transport` trait so tests replace the remote service. Exactly one backend is configured at a time. A GitHub App backend would map a project to an installation and organization, create repositories through the App, and mint installation tokens restricted to one repository with `contents: read|write`; its configuration would be another owner-only `PUT /v1/repository-backends/github-app`.
+
+### Linked GitHub repositories
+
+A GitHub repository is linked, not created. The owner configures the GitHub repository App ([GitHub secrets](GITHUB-SECRETS.md)), connects their account and selects the repository in the dashboard's GitHub panel, then links it to a project:
+
+```
+POST /v1/projects/{project}/repositories/github   {"full_name":"owner/repo", "name"?: "repo", "description"?: "..."}
+```
+
+Owner-only (service tokens get 403). The record has `backend: "github"`, remote `https://github.com/owner/repo.git` and the panel selection's branch as `default_branch`. Linking again with the same `full_name` returns the record (200); a different repository under a taken name is 409, and an unselected repository is 409.
+
+Runs naming `project/repo` and `POST .../tokens` get an installation token restricted to that one repository (`contents: write`, or `read` for read tokens; `workflows: write` only when `repos.workflows_write` is set), after the controller re-checks that the owner's account still has push access. GitHub installation tokens last about an hour, so a run's push window is the first hour; they are not revoked early. The guest writes them as `Authorization: Basic base64("x-access-token:<token>")` (GitHub's git endpoints refuse Bearer), using the envelope's `auth: "github_token"`; Artifacts tokens stay `Bearer` and older envelopes without `auth` mean Bearer. A write token can push any branch: protect the default branch on GitHub (a ruleset) so agent runs push feature branches and humans merge.
 
 An earlier draft of this feature called the Artifacts REST API with a Cloudflare account API token; it was replaced by the gateway so no account-wide credential is stored on the controller.
 
@@ -152,4 +164,5 @@ Repository handles are disposed after each call. Git clients use the full `art_v
 - Deleting or renaming repositories through Engine Box (records only grow; delete in Artifacts and the record stays until removed by hand).
 - Per-repository grants (grants are per project).
 - Branch protection or push policies; anyone holding a write token can push any branch.
-- The GitHub App backend.
+- Opening pull requests from a run (agents push branches; PRs are opened outside the run).
+- Tokens longer than GitHub's one hour for long runs.
