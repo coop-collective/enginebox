@@ -192,6 +192,30 @@ enginebox-fleet-mcp
 
 Register that command through your client's ordinary MCP configuration. The current stdio implementation supports handshake revisions through `2025-11-25`; it does not advertise the separate `2026-07-28` discovery/per-request versioning protocol. It exposes `fleet_inventory`, `fleet_allocate`, `fleet_create`, `fleet_action`, `fleet_job`, `template_catalog`, `template_register`, `template_install`, `template_sync`, `agent_connections`, `agent_launch`, `agent_runs`, `agent_run` and `agent_cancel`. Creation and lifecycle tools return jobs to poll; they use the API's queue, locks and admission checks rather than bypassing them. Native launches have a separate durable run queue and private result endpoint; see [the run queue](QUEUE.md) and [native runs and state](TENANT-AGENT-STATE.md).
 
+The dashboard's **MCP** section explains this local connection and retains OAuth
+app-grant management. The dashboard origin is not a remote MCP URL: the supported
+operator transport is the installed `enginebox-fleet-mcp` command over stdio,
+connecting to the controller origin above. OAuth app integrations use the
+separate scoped REST API described in [OAuth](OAUTH.md).
+
+For project work, start with `workspace_catalog` and `repository_list` (a
+`project` argument). `repository_create` takes `project`, `name`, and an optional
+`description`; the configured hosted backend must already support that project.
+`repository_link_github` takes `project`, `name`, and `full_name` (`owner/repo`),
+with an optional description. GitHub linking remains owner-only and requires the
+source to have been selected through the existing GitHub connection. A source
+record does not automatically prepare a LayerFS environment.
+
+Use the existing `storage_*` tools for reviewed source preparation and storage
+operations, polling `fleet_job` for asynchronous results. `pool_agent_launch`
+takes `pool`, `provider`, `prompt`, optional `repository` (`project/name`),
+`timeout_seconds`, and `model`. Use `pool_agent_run` or `pool_agent_cancel` with
+`pool` and `run_id`; `agent_runs` helps reconcile an unconfirmed submission.
+Never automatically replay an uncertain launch. Pool grants, source grants,
+resource admission and native credential delegation are enforced by the same
+controller as the dashboard. Timing receipts do not approve results or replace
+the existing review and acceptance flow.
+
 The MCP client only permits HTTP for loopback origins, requires HTTPS for remote origins, rejects URL credentials and disables redirects and ambient forward proxies. A redirect must not forward the bearer token to another service. Use a direct API connection or SSH tunnel. Do not install fleet API tokens or operator SSH authority inside agent guests; guest computer/browser MCP is a separate interface.
 
 ## Verification and current limits
