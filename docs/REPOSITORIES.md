@@ -119,8 +119,25 @@ A run request may add `"repository":"<project>/<name>"` (see [FLEET.md](FLEET.md
 
   Git sends the header only to URLs under that remote. The CLI process gets `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=include.path` and `GIT_CONFIG_VALUE_0=<that file>` (the user's own git config still applies), plus `ENGINEBOX_REPO_REMOTE` and `ENGINEBOX_REPO_DEFAULT_BRANCH`, so `git clone "$ENGINEBOX_REPO_REMOTE"` and `git push` just work. A repository run refuses caller `env` names starting with `GIT_CONFIG` and `GIT_ASKPASS`.
 - The token never enters run records, sidecars, queue files, logs, launch events or callbacks; launch failure messages and returned output scrub it. The directory is removed when the run ends, and the token is revoked through the gateway (`/tokens.revoke`); if revocation fails it still expires on its own.
-- Repository runs use the guest command `run-repository`. A workspace whose guest helper does not list it fails the run before anything starts, with `failure: {"stage":"bootstrap","reason":"guest_outdated"}`. A token that cannot be minted fails it with `{"stage":"resolve","reason":"repository_unavailable"}`.
+- Repository runs use the guest command `run-repository`. A workspace whose guest helper does not list it, or is older than the controller and cannot be refreshed (see [guest helper refresh](#guest-helper-refresh)), fails the run before anything starts, with `failure: {"stage":"bootstrap","reason":"guest_outdated"}`. A token that cannot be minted fails it with `{"stage":"resolve","reason":"repository_unavailable"}`.
 - Codex runs in its `workspace-write` sandbox, which normally has no network access; pushing from Codex needs a profile or workspace that allows it.
+
+### Run directories
+
+Each repository run works in its own directory, so files one run leaves in the workspace never break the next (for example a `git clone` into a directory that already exists):
+
+- A fresh run (no `resume_id`) starts in an empty directory, `<workspace>/runs/<run_id>` (for the default guest configuration, `/workspace/runs/<run_id>`, mode 0700). It is the CLI's cwd, and the CLI process gets its absolute path as `ENGINEBOX_RUN_DIR`. A request's `workdir` is resolved inside it and created if missing. Callers cannot set `ENGINEBOX_RUN_DIR` (the `ENGINEBOX_` prefix is reserved).
+- When the run ends without a native session to resume (it failed to start, or the CLI reported no session), the directory is removed. Otherwise it is kept so a resume can continue with its files.
+- A resume (`resume_id`, which already pins a pool run to the workspace that holds the session) works in the directory of the run that started the session, with whatever that run left there, because native CLIs such as Claude Code look a session up by its cwd. If that directory was pruned meanwhile, the resume gets an empty one at the same path. A session started before run directories existed resumes in the workspace itself, as before.
+- Kept directories are pruned at the start of later repository runs on the workspace: those unused for 48 hours, then the oldest beyond 16. A directory whose run is still going (its lease under `~/.local/state/enginebox/agent-runs/work-dirs/` is held) is never pruned, and nothing under `runs/` that is not named like a run ID is touched.
+- The run's sidecar records the directory's ID as `run_dir`. Runs without a repository keep working in the workspace (`<workspace>/<workdir>`), unchanged.
+- Run directories need a guest helper from the controller's release. With an older helper that cannot be refreshed, a repository run fails with `guest_outdated` instead.
+
+### Guest helper refresh
+
+Templates are rebuilt only when their manifest `revision` changes, so workspaces can carry an older `/usr/local/bin/enginebox-guest` than the controller. At placement, under the host lock, the controller compares the workspace's `enginebox-guest --version` with its own release. When they differ it refreshes the guest's Engine Box helpers through the host helper's `sync-guest-tools` (checksummed copy of root-owned release binaries, staged and moved into place atomically; provider homes, native CLIs and running sessions are not touched). On a host that is the controller's own machine it copies from the controller's release `bin` directory, falling back to the host helper's own release. The result is cached for 10 minutes per workspace.
+
+Each refresh attempt is one `guest_refresh` [launch event](QUEUE.md#launch-events): `succeeded` with reason `ok`, or `failed` with reason `guest_outdated` and a message naming the versions and why (the refresh failed, or the host helper's release is older: run `enginebox-install expose-host --apply` from the current release on that host). After a failed refresh a repository run fails with `guest_outdated`; a run without a repository proceeds on the older helper.
 
 ## Backends
 

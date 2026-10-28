@@ -25,6 +25,9 @@ const QUEUE_ENTRY_LIMIT: usize = 128 * 1024;
 const RETAINED_FINISHED: usize = 100;
 /// Wait after a failed pool workspace creation before trying again.
 const CREATE_BACKOFF: Duration = Duration::from_secs(60);
+/// How long a workspace's guest helper, once seen at this release, is
+/// trusted before placement checks it again.
+const GUEST_CHECK_TTL: Duration = Duration::from_secs(600);
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<Inner>,
@@ -61,6 +64,9 @@ struct Inner {
     /// Lease probes of workspaces fenced by an uncertain run, per
     /// (host, workspace). A leaf lock: nothing else is taken while held.
     probes: Mutex<BTreeMap<(String, String), Probe>>,
+    /// The last guest helper check per workspace: when, and why it is
+    /// outdated (`None`: it is this release's). A leaf lock.
+    guests: Mutex<BTreeMap<(String, String), GuestCheck>>,
     hooks: Hooks,
     /// Runs interrupted by a restart whose callback is still owed.
     owed_callbacks: Mutex<Vec<String>>,
@@ -92,6 +98,8 @@ struct Measure {
     at: Instant,
     load: Option<HostLoad>,
 }
+/// When a workspace's guest helper was checked, and why it is outdated.
+type GuestCheck = (Instant, Option<String>);
 /// The last lease probe of a fenced workspace.
 struct Probe {
     /// When the last probe finished; `None` before the first.
@@ -443,6 +451,7 @@ impl AgentService {
                 dispatcher: AtomicBool::new(false),
                 measures: Mutex::new(BTreeMap::new()),
                 probes: Mutex::new(BTreeMap::new()),
+                guests: Mutex::new(BTreeMap::new()),
                 hooks: Hooks::default(),
                 owed_callbacks: Mutex::new(owed),
                 launch_events,
@@ -2518,22 +2527,32 @@ impl AgentService {
             }
             return;
         }
-        let prepared = self.prepare(run, template.as_deref()).and_then(|host| {
-            if run.repository_access.is_some() {
-                self.check_guest_supports_repository(&host, &run.name)?;
-            }
-            Ok(host)
-        });
+        let prepared = self
+            .prepare(run, template.as_deref(), resolved.as_ref())
+            .and_then(|(host, guest_current)| {
+                if run.repository_access.is_some() {
+                    self.check_guest_supports_repository(&host, &run.name)?;
+                }
+                Ok((host, guest_current))
+            });
         match prepared {
-            Ok(host) => {
+            Ok((host, guest_current)) => {
                 let request = run.request.clone();
+                // Run directories need a guest helper from this release;
+                // an older one keeps the previous in-workspace behavior.
+                let run_dir = (run.repository_access.is_some() && guest_current)
+                    .then(|| self.run_dir_for(run))
+                    .flatten();
+                if let Some(dir) = &run_dir {
+                    self.record_run_dir(&run.id, dir);
+                }
                 if let Err(failure) = self.run_worker_with(
                     host,
                     &run.name,
                     request,
                     &run.id,
                     resolved.clone(),
-                    run.repository_access.clone(),
+                    run.repository_access.clone().map(|a| (a, run_dir)),
                 ) {
                     self.launch_failed(
                         run,
@@ -2551,6 +2570,159 @@ impl AgentService {
                 &failure,
                 started,
             ),
+        }
+    }
+    /// The run directory a repository run works in: its own run ID, or for a
+    /// resume the directory of the run on this workspace that started the
+    /// session. A session started without a run directory resumes in the
+    /// workspace as before (`None`), so the native CLI still finds it.
+    fn run_dir_for(&self, run: &AdmittedRun) -> Option<String> {
+        let Some(session) = &run.request.resume_id else {
+            return Some(run.id.clone());
+        };
+        let origin = {
+            let records = self.inner.records.lock().unwrap();
+            records
+                .values()
+                .filter(|v| {
+                    v["id"] != run.id.as_str()
+                        && v["host_id"] == run.host_id.as_str()
+                        && v["name"] == run.name.as_str()
+                        && v["native_session_id"] == session.as_str()
+                })
+                .max_by(|a, b| {
+                    a["created_at"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b["created_at"].as_str().unwrap_or(""))
+                })
+                .and_then(|v| v["id"].as_str().map(str::to_owned))
+        };
+        match origin {
+            None => Some(run.id.clone()),
+            Some(origin) => self
+                .inner
+                .details
+                .lock()
+                .unwrap()
+                .get(&origin)
+                .and_then(|d| d["run_dir"].as_str().map(str::to_owned)),
+        }
+    }
+    fn record_run_dir(&self, id: &str, dir: &str) {
+        if let Some(detail) = self.inner.details.lock().unwrap().get_mut(id) {
+            detail["run_dir"] = json!(dir);
+            let _ = self.save_detail(id, detail);
+        }
+    }
+    /// Make sure the workspace's guest helper is this release's, refreshing
+    /// it through the host helper when it is not. Returns whether it is
+    /// current. A repository run with an outdated helper fails here, before
+    /// anything starts; other runs proceed on the old helper. Each refresh is
+    /// a `guest_refresh` launch event. The caller holds the host lock.
+    fn ensure_guest(
+        &self,
+        host: &Host,
+        run: &AdmittedRun,
+        template: Option<&str>,
+        resolved: Option<&ResolvedProfile>,
+    ) -> std::result::Result<bool, LaunchFailure> {
+        let key = (host.id.clone(), run.name.clone());
+        let outdated = |why: String| -> std::result::Result<bool, LaunchFailure> {
+            if run.repository_access.is_some() {
+                Err(LaunchFailure::new(Stage::Bootstrap, "guest_outdated", why))
+            } else {
+                Ok(false)
+            }
+        };
+        // Checked recently: no new probe or refresh attempt (and no event).
+        let cached = self
+            .inner
+            .guests
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < GUEST_CHECK_TTL)
+            .map(|(_, why)| why.clone());
+        match cached {
+            Some(None) => return Ok(true),
+            Some(Some(why)) => return outdated(why),
+            None => {}
+        }
+        let started = Instant::now();
+        let bx = host.engine_box();
+        let name = run.name.as_str();
+        let outcome = refresh_guest(
+            &expected_guest_version(),
+            || {
+                let bytes = bx.execute(
+                    name,
+                    &["enginebox-guest".into(), "--version".into()],
+                    Duration::from_secs(15),
+                )?;
+                Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+            },
+            || {
+                let dir = release_bin_dir(host);
+                enginebox_core::guest::ensure_remote_guest_tools_from(
+                    &bx,
+                    name,
+                    true,
+                    dir.as_deref(),
+                )
+                .or_else(|error| match dir {
+                    // The host helper may refuse this release's directory
+                    // (ownership); its own release is the fallback.
+                    Some(_) => {
+                        enginebox_core::guest::ensure_remote_guest_tools_from(&bx, name, true, None)
+                    }
+                    None => Err(error),
+                })
+                .map(|_| ())
+            },
+        );
+        let why = (!outcome.current).then(|| outcome.event().unwrap_or_default());
+        self.inner
+            .guests
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), why.clone()));
+        if let Some(event) = outcome.event() {
+            self.record_launch(LaunchEvent {
+                kind: "guest_refresh".into(),
+                outcome: if outcome.current {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+                .into(),
+                run_id: Some(run.id.clone()),
+                pool: run.pool.clone(),
+                host_id: Some(host.id.clone()),
+                workspace: Some(run.name.clone()),
+                template: template.map(str::to_owned),
+                template_revision: template.and_then(|t| self.template_revision(&host.id, t)),
+                profile: resolved
+                    .map(|p| p.name.clone())
+                    .or_else(|| run.profile.clone()),
+                profile_revision: resolved.map(|p| p.revision),
+                provider: Some(run.request.provider.clone()),
+                stage: Stage::Bootstrap.as_str().into(),
+                reason: if outcome.current {
+                    "ok"
+                } else {
+                    "guest_outdated"
+                }
+                .into(),
+                message: launch_events::clip_message(&event, &BTreeMap::new()),
+                duration_ms: started.elapsed().as_millis() as u64,
+                queue_wait_ms: Some(run.queue_wait_ms),
+                ..Default::default()
+            });
+        }
+        match why {
+            None => Ok(true),
+            Some(why) => outdated(why),
         }
     }
     /// Older guest helpers do not know `run-repository`; refuse the run with
@@ -2578,7 +2750,8 @@ impl AgentService {
         &self,
         run: &AdmittedRun,
         template: Option<&str>,
-    ) -> std::result::Result<Host, LaunchFailure> {
+        resolved: Option<&ResolvedProfile>,
+    ) -> std::result::Result<(Host, bool), LaunchFailure> {
         let (host_id, name) = (run.host_id.as_str(), run.name.as_str());
         let host = self
             .inner
@@ -2616,6 +2789,7 @@ impl AgentService {
                 "Previous native run must release its guest lease.",
             ));
         }
+        let guest_current = self.ensure_guest(&host, run, template, resolved)?;
         let attached = self
             .attach_locked(
                 host_id,
@@ -2637,7 +2811,7 @@ impl AgentService {
                 "The provider could not be delegated to this workspace.",
             ));
         }
-        Ok(host)
+        Ok((host, guest_current))
     }
     /// Record a launch failure: a structured log line and event, the run's
     /// `failure` (stage and reason code), and its terminal state. A failure
@@ -2933,7 +3107,8 @@ impl AgentService {
         request: native::RunRequest,
         id: &str,
         resolved: Option<ResolvedProfile>,
-        repository: Option<repository::Access>,
+        // The repository access and the run directory, for repository runs.
+        repository: Option<(repository::Access, Option<String>)>,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
             self.inner
@@ -2945,7 +3120,7 @@ impl AgentService {
             // Runs without a profile keep the original guest command and
             // payload, so older guest helpers still serve them.
             let (mode, input) = match (&resolved, repository) {
-                (p, Some(access)) => (
+                (p, Some((access, run_dir))) => (
                     repository::GUEST_MODE,
                     serde_json::to_vec(&repository::Envelope {
                         request: request.clone(),
@@ -2955,7 +3130,7 @@ impl AgentService {
                             files: p.files.clone(),
                         }),
                         repository: access,
-                        run_dir: None,
+                        run_dir,
                     })?,
                 ),
                 (None, None) => ("run", serde_json::to_vec(&request)?),
@@ -3229,6 +3404,94 @@ pub fn new_run_entries(
     let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false,"started_by":started_by,"env_keys":request.env_keys()});
     (record, detail)
 }
+/// What `enginebox-guest --version` prints for this release.
+pub fn expected_guest_version() -> String {
+    format!("enginebox-guest {}", env!("CARGO_PKG_VERSION"))
+}
+/// This controller release's `bin` directory, when the host is this machine
+/// and the release ships the guest helpers there. The host helper copies
+/// from it (it accepts only root-owned, non-writable sources), so a host
+/// helper linked to an older release still installs this release's guest.
+fn release_bin_dir(host: &Host) -> Option<std::path::PathBuf> {
+    if host.target != "local" {
+        return None;
+    }
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    ["enginebox-host", "enginebox-guest", "enginebox-mcp"]
+        .iter()
+        .all(|b| dir.join(b).is_file())
+        .then_some(dir)
+}
+/// What placement found and did about a workspace's guest helper.
+#[derive(Debug, PartialEq)]
+pub struct GuestRefresh {
+    pub expected: String,
+    /// `--version` before any refresh (`None`: it could not be read).
+    pub before: Option<String>,
+    /// The refresh error, when one was attempted and failed.
+    pub sync_error: Option<String>,
+    /// `--version` after a refresh, when one was attempted.
+    pub after: Option<String>,
+    pub current: bool,
+}
+impl GuestRefresh {
+    /// The launch event message, when a refresh was attempted.
+    pub fn event(&self) -> Option<String> {
+        if self.before.as_deref() == Some(self.expected.as_str()) {
+            return None;
+        }
+        let found = |v: &Option<String>| v.clone().unwrap_or_else(|| "unreadable".into());
+        Some(if self.current {
+            format!(
+                "Refreshed the workspace's guest helper from {} to {}.",
+                found(&self.before),
+                self.expected
+            )
+        } else {
+            let why = match &self.sync_error {
+                Some(error) => format!("the refresh failed: {error}"),
+                None => "the host helper supplied an older release; update the host's \
+                    enginebox-host (enginebox-install expose-host --apply)"
+                    .into(),
+            };
+            format!(
+                "Workspace guest helper is {} but this controller needs {}; {why}.",
+                found(if self.after.is_some() {
+                    &self.after
+                } else {
+                    &self.before
+                }),
+                self.expected
+            )
+        })
+    }
+}
+/// Compare the guest helper's version with `expected` and refresh it once
+/// when they differ.
+pub fn refresh_guest(
+    expected: &str,
+    probe: impl Fn() -> Result<String>,
+    sync: impl FnOnce() -> Result<()>,
+) -> GuestRefresh {
+    let before = probe().ok();
+    let mut outcome = GuestRefresh {
+        expected: expected.to_owned(),
+        current: before.as_deref() == Some(expected),
+        before,
+        sync_error: None,
+        after: None,
+    };
+    if outcome.current {
+        return outcome;
+    }
+    if let Err(error) = sync() {
+        outcome.sync_error = Some(format!("{error:#}"));
+        return outcome;
+    }
+    outcome.after = probe().ok();
+    outcome.current = outcome.after.as_deref() == Some(expected);
+    outcome
+}
 pub fn guest_command(host: &Host, name: &str, args: &[String]) -> Result<Vec<String>> {
     let mut argv = vec![
         "exec".into(),
@@ -3320,6 +3583,150 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
 #[cfg(test)]
 mod run_control_tests {
     use super::*;
+
+    #[test]
+    fn a_current_guest_helper_is_left_alone() {
+        let expected = expected_guest_version();
+        let out = refresh_guest(&expected, || Ok(expected.clone()), || panic!("no refresh"));
+        assert!(out.current);
+        assert_eq!(out.event(), None);
+    }
+
+    #[test]
+    fn a_stale_guest_helper_is_refreshed_once() {
+        let expected = "enginebox-guest 0.3.1-live.42";
+        let version = Mutex::new("enginebox-guest 0.3.1-live.40".to_owned());
+        let syncs = AtomicUsize::new(0);
+        let out = refresh_guest(
+            expected,
+            || Ok(version.lock().unwrap().clone()),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                *version.lock().unwrap() = expected.into();
+                Ok(())
+            },
+        );
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        assert!(out.current);
+        assert_eq!(
+            out.event().unwrap(),
+            "Refreshed the workspace's guest helper from enginebox-guest 0.3.1-live.40 to enginebox-guest 0.3.1-live.42."
+        );
+    }
+
+    #[test]
+    fn a_guest_helper_that_stays_stale_is_reported() {
+        let expected = "enginebox-guest 0.3.1-live.42";
+        // The host helper's own release is older: the copy changes nothing.
+        let out = refresh_guest(
+            expected,
+            || Ok("enginebox-guest 0.3.1-live.10".into()),
+            || Ok(()),
+        );
+        assert!(!out.current);
+        let event = out.event().unwrap();
+        assert!(
+            event.starts_with("Workspace guest helper is enginebox-guest 0.3.1-live.10 but this controller needs enginebox-guest 0.3.1-live.42; the host helper supplied an older release"),
+            "{event}"
+        );
+        // A failed refresh says so, and an unreadable helper is named as such.
+        let out = refresh_guest(
+            expected,
+            || anyhow::bail!("exec failed"),
+            || anyhow::bail!("sudo: a password is required"),
+        );
+        assert!(!out.current);
+        assert_eq!(out.before, None);
+        assert!(
+            out.event()
+                .unwrap()
+                .contains("is unreadable but this controller needs enginebox-guest 0.3.1-live.42; the refresh failed: sudo: a password is required"),
+            "{:?}",
+            out.event()
+        );
+    }
+
+    #[test]
+    fn a_resume_reuses_the_run_directory_of_its_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let host = Host {
+            id: "h1".into(),
+            target: "offline.invalid".into(),
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host], &root).unwrap();
+        let service = AgentService::new(&root, fleet).unwrap();
+        let session = "0b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a";
+        let legacy_session = "1b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a";
+        let add = |id: &str, session: &str, run_dir: Option<&str>| {
+            let request =
+                native::RunRequest::parse(json!({"provider":"claude","prompt":"x"})).unwrap();
+            let (mut record, mut detail) = new_run_entries(id, "h1", "ebox-w", &request, "owner");
+            record["status"] = json!("succeeded");
+            record["native_session_id"] = json!(session);
+            if let Some(dir) = run_dir {
+                detail["run_dir"] = json!(dir);
+            }
+            service
+                .inner
+                .records
+                .lock()
+                .unwrap()
+                .insert(id.into(), record);
+            service
+                .inner
+                .details
+                .lock()
+                .unwrap()
+                .insert(id.into(), detail);
+        };
+        let first = "a".repeat(32);
+        add(&first, session, Some(&first));
+        add(&"b".repeat(32), legacy_session, None);
+        let run = |id: &str, resume: Option<&str>| AdmittedRun {
+            id: id.into(),
+            host_id: "h1".into(),
+            name: "ebox-w".into(),
+            pool: None,
+            request: native::RunRequest::parse(
+                json!({"provider":"claude","prompt":"x","resume_id":resume}),
+            )
+            .unwrap(),
+            profile: None,
+            queue_wait_ms: 0,
+            repository: Some("alpha/game".into()),
+            repository_access: None,
+        };
+        let fresh = "c".repeat(32);
+        // A fresh run gets its own directory.
+        assert_eq!(service.run_dir_for(&run(&fresh, None)), Some(fresh.clone()));
+        // A resume works where its session was started...
+        assert_eq!(
+            service.run_dir_for(&run(&fresh, Some(session))),
+            Some(first.clone())
+        );
+        // ...in the workspace itself for a session from before run directories...
+        assert_eq!(
+            service.run_dir_for(&run(&fresh, Some(legacy_session))),
+            None
+        );
+        // ...and in a fresh directory for a session this workspace never recorded.
+        assert_eq!(
+            service.run_dir_for(&run(&fresh, Some("2b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a"))),
+            Some(fresh.clone())
+        );
+        service.record_run_dir(&first, &first);
+        assert_eq!(
+            service.inner.details.lock().unwrap()[&first]["run_dir"],
+            first.as_str()
+        );
+    }
 
     #[test]
     fn managed_host_fences_delegation_and_last_moment_guest_execution() {

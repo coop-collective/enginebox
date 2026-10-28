@@ -1197,20 +1197,41 @@ pub fn ensure_remote_guest_tools(
     name: &str,
     host_lock_held: bool,
 ) -> Result<Value> {
-    let binaries = ["enginebox-host", "enginebox-guest", "enginebox-mcp"];
-    let current = binaries.iter().all(|binary| {
-        bx.execute(
-            name,
-            &[(*binary).into(), "--version".into()],
-            Duration::from_secs(15),
-        )
-        .is_ok_and(|bytes| {
-            String::from_utf8_lossy(&bytes).trim()
-                == format!("{binary} {}", env!("CARGO_PKG_VERSION"))
+    ensure_remote_guest_tools_from(bx, name, host_lock_held, None)
+}
+
+/// True when every native helper in the guest reports this release.
+pub fn remote_guest_tools_current(bx: &crate::transport::EngineBox, name: &str) -> bool {
+    ["enginebox-host", "enginebox-guest", "enginebox-mcp"]
+        .iter()
+        .all(|binary| {
+            bx.execute(
+                name,
+                &[(*binary).into(), "--version".into()],
+                Duration::from_secs(15),
+            )
+            .is_ok_and(|bytes| {
+                String::from_utf8_lossy(&bytes).trim()
+                    == format!("{binary} {}", env!("CARGO_PKG_VERSION"))
+            })
         })
-    });
-    if current {
-        return Ok(json!({"changed":[]}));
+}
+
+/// Bring the guest's native helpers to this release through the host
+/// helper's `sync-guest-tools` (checksummed, atomic, root-owned sources only).
+/// `binary_dir` names a release `bin` directory on the host to copy from
+/// instead of the host helper's own; the host helper still refuses sources
+/// that are not root-owned or are group/world writable. The result's
+/// `current` says whether the guest reports this release afterwards: a host
+/// helper from an older release copies its own, older helpers.
+pub fn ensure_remote_guest_tools_from(
+    bx: &crate::transport::EngineBox,
+    name: &str,
+    host_lock_held: bool,
+    binary_dir: Option<&Path>,
+) -> Result<Value> {
+    if remote_guest_tools_current(bx, name) {
+        return Ok(json!({"changed":[],"current":true}));
     }
     let h = Host {
         id: "helper-sync".into(),
@@ -1230,8 +1251,16 @@ pub fn ensure_remote_guest_tools(
     if host_lock_held {
         args.push("--already-locked".into());
     }
+    if let Some(dir) = binary_dir {
+        args.push("--binary-dir".into());
+        args.push(dir.to_str().context("Invalid release binary path")?.into());
+    }
     let data = crate::transport::host_run(&h, &args, None, Duration::from_secs(180))?;
-    Ok(serde_json::from_slice(&data)?)
+    let mut report: Value = serde_json::from_slice(&data)?;
+    if report.is_object() {
+        report["current"] = json!(remote_guest_tools_current(bx, name));
+    }
+    Ok(report)
 }
 
 pub fn validate_helper_target(vm: &Value, project: &str) -> Result<()> {

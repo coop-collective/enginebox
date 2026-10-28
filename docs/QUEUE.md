@@ -90,16 +90,16 @@ Service tokens are granted pools with `"pools":["workers"]` at mint time. Adding
 
 ## Launch events
 
-Every admission or placement failure of a run, every pool member creation (success or failure), and every change in the lease check of a [fenced workspace](#workspaces-fenced-by-an-uncertain-run) produces one structured log line on the controller's stderr (`{"event":"enginebox.launch",…}`) and one event in a bounded history: the newest 500, kept in memory and in the private file `launch-events.json` (mode 0600) under the controller root, so it survives restarts.
+Every admission or placement failure of a run, every pool member creation (success or failure), every change in the lease check of a [fenced workspace](#workspaces-fenced-by-an-uncertain-run), and every [guest helper refresh](REPOSITORIES.md#guest-helper-refresh) attempt produces one structured log line on the controller's stderr (`{"event":"enginebox.launch",…}`) and one event in a bounded history: the newest 500, kept in memory and in the private file `launch-events.json` (mode 0600) under the controller root, so it survives restarts.
 
-Each event has `at`, `kind` (`run_admission_failed`, `pool_member_created`, `pool_member_create_failed`, `uncertain_lease_probe`), `outcome` (`failed` or `succeeded`), `run_id`, `pool`, `project`, `host_id`, `workspace`, `template`, `template_revision` (when the registry knows it), `profile`, `profile_revision`, `provider`, `stage`, `reason`, `message`, `duration_ms` (time in the step that produced the event) and `queue_wait_ms` (runs: acceptance to admission). Fields that do not apply are null.
+Each event has `at`, `kind` (`run_admission_failed`, `pool_member_created`, `pool_member_create_failed`, `uncertain_lease_probe`, `guest_refresh`), `outcome` (`failed` or `succeeded`), `run_id`, `pool`, `project`, `host_id`, `workspace`, `template`, `template_revision` (when the registry knows it), `profile`, `profile_revision`, `provider`, `stage`, `reason`, `message`, `duration_ms` (time in the step that produced the event) and `queue_wait_ms` (runs: acceptance to admission). Fields that do not apply are null.
 
 | Stage | Meaning | Reason codes |
 |---|---|---|
 | `resolve` | The profile (after a restart) or the pool could not be resolved, or the run's [repository](REPOSITORIES.md) token could not be minted | `profile_unavailable`, `pool_unavailable`, `repository_unavailable` |
 | `place` | The chosen workspace cannot take the run | `workspace_unavailable` (missing or not running), `template_mismatch`, `lease_unresolved`, `admission_error` (bookkeeping failed; the run stays queued and is retried); for `uncertain_lease_probe` events (`run_id` is the uncertain run): `lease_inactive` (succeeded: the workspace is released), `lease_active`, `lease_probe_failed` |
 | `create` | A pool member could not be created | `create_failed`, `pool_has_no_template`, `name_unavailable`; `ok` on success |
-| `bootstrap` | The workspace could not be prepared for the run, or a created member could not be recorded | `workspace_locked`, `member_record_failed`, `guest_outdated` (the guest helper does not support repository runs) |
+| `bootstrap` | The workspace could not be prepared for the run, or a created member could not be recorded | `workspace_locked`, `member_record_failed`, `guest_outdated` (the guest helper is older than the controller and could not be [refreshed](REPOSITORIES.md#guest-helper-refresh), or does not support repository runs); for `guest_refresh` events: `ok` (refreshed) or `guest_outdated` |
 | `delegate` | The provider credential could not be delegated to the workspace | `delegation_failed`, `provider_not_delegable` |
 | `start` | The guest helper failed to launch the run (the run is `execution_uncertain`, as before) | `guest_launch_failed` |
 

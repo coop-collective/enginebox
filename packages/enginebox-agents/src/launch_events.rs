@@ -124,7 +124,7 @@ impl LaunchFailure {
                 return "Run could not start: its repository is unavailable or a repository token could not be issued.";
             }
             "guest_outdated" => {
-                return "Run could not start: the workspace's guest helper does not support repository runs; update enginebox-guest in its template.";
+                return "Run could not start: the workspace's guest helper is older than this controller and could not be refreshed; see the guest_refresh launch event.";
             }
             _ => {}
         }
@@ -200,7 +200,7 @@ pub fn clip_message(message: &str, secrets: &BTreeMap<String, String>) -> String
 }
 
 /// One launch event. `kind` is `run_admission_failed`, `pool_member_created`,
-/// `pool_member_create_failed` or `uncertain_lease_probe`.
+/// `pool_member_create_failed`, `uncertain_lease_probe` or `guest_refresh`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchEvent {
