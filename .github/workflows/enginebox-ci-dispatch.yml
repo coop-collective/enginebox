@@ -6,6 +6,11 @@ on:
         description: Exact source revision requested by Engine Box
         required: true
         type: string
+      mode:
+        description: Test successful execution, intentional failure, or cancellation cleanup
+        type: choice
+        default: test
+        options: [test, fail, cancel]
 permissions:
   contents: read
 jobs:
@@ -40,3 +45,14 @@ jobs:
           name: enginebox-dispatch-evidence
           path: evidence/
           if-no-files-found: error
+      - name: Exercise selected lifecycle outcome
+        env:
+          CANARY_MODE: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          case "$CANARY_MODE" in
+            test) echo 'Environment service tests passed on Engine Box.' ;;
+            fail) echo 'Intentional failure to verify disposable runner cleanup.'; exit 42 ;;
+            cancel) echo 'Waiting for the operator to cancel this canary.'; sleep 480 ;;
+            *) echo 'Unknown canary mode'; exit 1 ;;
+          esac
