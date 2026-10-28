@@ -13,14 +13,13 @@ import type {
 import { api, errorMessage, RequestError } from "@/lib/client";
 import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
-import { GitHubPanel } from "@/components/github-panel";
 import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { StoragePanel } from "@/components/storage-panel";
 import { ComputePanel, type Contributor } from "@/components/compute-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
-import { RepositoriesPanel } from "@/components/repositories-panel";
+import { WorkspacesPanel } from "@/components/workspaces-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -34,7 +33,8 @@ const bytes = (value?: number) =>
     : "—";
 const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const sections = {
-  github: { title: "GitHub", description: "Connect repositories and run GitHub Actions on your infrastructure.", icon: "terminal" },
+  workspaces: { title: "Workspaces", description: "Project sources, environments, agent activity and measured preparation.", icon: "box" },
+  github: { title: "Workspaces", description: "Project sources, environments, agent activity and measured preparation.", icon: "box" },
   environments: {
     title: "Environments",
     description: "Run persistent development services and manage their endpoints.",
@@ -61,8 +61,8 @@ const sections = {
     icon: "server",
   },
   repositories: {
-    title: "Repositories",
-    description: "Host Git repositories per project for agents to clone and push.",
+    title: "Workspaces",
+    description: "Project sources, environments, agent activity and measured preparation.",
     icon: "box",
   },
   apps: {
@@ -712,7 +712,7 @@ export default function Dashboard() {
   const loading = useRef(false);
   useEffect(() => {
     const panel = new URLSearchParams(window.location.search).get("panel");
-    if (panel === "github" || panel === "storage") setSection(panel);
+    if (panel && Object.hasOwn(sections, panel)) setSection(panel as DashboardSection);
     api<{ authenticated: boolean }>("/api/session")
       .then((data) => setSession(data.authenticated ? "ready" : "login"))
       .catch((err) => {
@@ -943,14 +943,14 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "agents", "templates", "storage", "environments", "repositories", "github", "apps"] as const)
+          {(["fleet", "workspaces", "agents", "templates", "storage", "environments", "apps"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
                 key={item}
                 type="button"
-                className={`nav-item${section === item ? " active" : ""}`}
-                aria-current={section === item ? "page" : undefined}
+                className={`nav-item${section === item || (item === "workspaces" && ["github", "repositories"].includes(section)) ? " active" : ""}`}
+                aria-current={section === item || (item === "workspaces" && ["github", "repositories"].includes(section)) ? "page" : undefined}
                 onClick={() => navigate(item)}
               >
                 <Icon name={sections[item].icon} />
@@ -1092,7 +1092,7 @@ export default function Dashboard() {
                   </button>
                 </div>
               )}
-              {section === "github" && <GitHubPanel />}
+              {["workspaces", "github", "repositories"].includes(section) && <WorkspacesPanel fleet={fleet} initialConnections={section === "github"} />}
               {section === "agents" && (
                 <AgentsPanel close={() => navigate("fleet")} />
               )}
@@ -1111,7 +1111,6 @@ export default function Dashboard() {
               )}
               {section === "environments" && <EnvironmentsPanel />}
               {section === "apps" && <ConnectedAppsPanel />}
-              {section === "repositories" && <RepositoriesPanel />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

@@ -179,6 +179,10 @@ function NodeStorage({ node }: { node: StorageNode }) {
   const [github, setGithub] = useState<GitHubProject[]>([]);
   const [rows, setRows] = useState<Checkout[] | null>(null);
   const [project, setProject] = useState(node.projects[0]?.id ?? "");
+  useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get("workspace");
+    if (requested && node.projects.some(p => p.id === requested)) setProject(requested);
+  }, [node.projects]);
   const [revision, setRevision] = useState("HEAD");
   const [reviewed, setReviewed] = useState(false);
   const [previewContext, setPreviewContext] = useState("");

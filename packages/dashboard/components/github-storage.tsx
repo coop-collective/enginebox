@@ -27,7 +27,10 @@ export function GitHubStorage({ projects, rows, tasks, run, refresh }: { project
       const status = await response.json();
       if (!active || !Array.isArray(status.repositories)) return;
       setConnected(status.repositories);
-      const id = new URLSearchParams(window.location.search).get("github_repository");
+      const params = new URLSearchParams(window.location.search);
+      const workspace = params.get("workspace");
+      if (workspace && /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(workspace)) setProject(workspace);
+      const id = params.get("github_repository");
       const selected = status.repositories.find((r: {id: number}) => String(r.id) === id);
       if (selected) { setRepository(selected.full_name); setBranch(selected.branch); }
     }).catch(() => {});

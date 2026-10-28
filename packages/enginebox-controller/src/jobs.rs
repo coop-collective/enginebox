@@ -126,6 +126,28 @@ impl Jobs {
             .cloned()
             .context("Unknown job")
     }
+    /// Private snapshot for the redacted owner workspace projection.
+    pub(crate) fn snapshot(&self) -> Vec<Value> {
+        self.records
+            .lock()
+            .unwrap()
+            .values()
+            .map(crate::workspaces::job_observation)
+            .collect()
+    }
+    pub fn submit_project<F>(
+        &self,
+        host: &str,
+        operation: &str,
+        name: &str,
+        project: Option<&str>,
+        work: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce() -> Result<Value> + Send + 'static,
+    {
+        self.submit_inner(host, operation, name, project, None, work)
+    }
     pub fn existing_request(&self, key: &str, digest: &str) -> Result<Option<Value>> {
         let id =
             enginebox_core::state::digest(&json!({"namespace":"ci-v1","key":key}))[..32].to_owned();
@@ -141,7 +163,7 @@ impl Jobs {
     where
         F: FnOnce() -> Result<Value> + Send + 'static,
     {
-        self.submit_inner(host, operation, name, None, work)
+        self.submit_inner(host, operation, name, None, None, work)
     }
     /// A durable caller identity prevents a merge delivery or lost HTTP reply
     /// from replaying a build/deploy trigger. Keyed records are never pruned.
@@ -156,13 +178,14 @@ impl Jobs {
     where
         F: FnOnce() -> Result<Value> + Send + 'static,
     {
-        self.submit_inner(host, operation, name, Some(identity), work)
+        self.submit_inner(host, operation, name, None, Some(identity), work)
     }
     fn submit_inner<F>(
         &self,
         host: &str,
         operation: &str,
         name: &str,
+        project: Option<&str>,
         identity: Option<(&str, &str)>,
         work: F,
     ) -> Result<Value>
@@ -214,6 +237,9 @@ impl Jobs {
             bail!("Fleet queue is full; wait for existing jobs");
         }
         let mut record = json!({"id":id,"host_id":host,"operation":operation,"name":name,"status":"queued","created_at":Utc::now().to_rfc3339()});
+        if let Some(project) = project {
+            record["project"] = json!(project);
+        }
         if let Some((key, digest)) = identity {
             record["request_id"] = json!(key);
             record["request_digest"] = json!(digest);
@@ -251,6 +277,7 @@ impl Jobs {
                 return;
             };
             v["status"] = json!("running");
+            v["started_at"] = json!(Utc::now().to_rfc3339());
             let persisted = this.save(&id, v);
             let result = if persisted.is_ok() {
                 tokio::task::spawn_blocking(work)
@@ -276,6 +303,7 @@ impl Jobs {
                     );
                 }
             }
+            v["finished_at"] = json!(Utc::now().to_rfc3339());
             v["duration_seconds"] = json!(started.elapsed().as_secs_f64());
             // Keep a terminal result in memory if the disk becomes unavailable;
             // the durable running record recovers as uncertain after restart.
@@ -320,6 +348,29 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn project_timing_receipt_survives_restart_without_projecting_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("jobs");
+        let jobs = Jobs::open(&root).unwrap();
+        let job = jobs
+            .submit_project("node", "storage_deps", "checkout", Some("app"), || {
+                Ok(json!({"result":{"output":"SECRET"}}))
+            })
+            .unwrap();
+        wait_idle(&jobs).await;
+        let recovered = Jobs::open(&root).unwrap();
+        let record = recovered.get(job["id"].as_str().unwrap()).unwrap();
+        assert_eq!(record["project"], "app");
+        assert!(record["started_at"].is_string());
+        assert!(record["finished_at"].is_string());
+        assert!(record["duration_seconds"].as_f64().unwrap() >= 0.0);
+        assert!(
+            !serde_json::to_string(&recovered.snapshot())
+                .unwrap()
+                .contains("SECRET")
+        );
+    }
     #[tokio::test]
     async fn ci_history_does_not_evict_workspace_operation_results() {
         let tmp = tempfile::tempdir().unwrap();

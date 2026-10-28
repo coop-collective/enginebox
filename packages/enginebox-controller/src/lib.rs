@@ -10,6 +10,7 @@ pub mod profiles;
 pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
+mod workspaces;
 
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -913,6 +914,31 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
         ["v1", "repository-backends", "artifacts-worker"] => {
             Ok(c.runtime()?.repositories.get_worker())
         }
+        ["v1", "workspaces"] => {
+            let runtime = c.runtime()?;
+            let listing = runtime.agents.list_pools();
+            let pools = listing["pools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|pool| {
+                    runtime
+                        .agents
+                        .pool_status(pool["name"].as_str().unwrap_or(""))
+                        .map(|v| v["pool"].clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(workspaces::catalog(
+                &runtime.repositories.list_all(),
+                &pools,
+                &runtime.storage.catalog(),
+                &runtime.agents.list_runs(),
+                &runtime
+                    .agents
+                    .launch_events(&enginebox_agents::launch_events::Filter::default()),
+                &runtime.jobs.snapshot(),
+            ))
+        }
         ["v1", "repositories"] => Ok(c.runtime()?.repositories.list_all()),
         ["v1", "projects", project, "repositories"] => c.runtime()?.repositories.list(project),
         ["v1", "projects", project, "repositories", name] => {
@@ -1095,7 +1121,17 @@ async fn write(
             let operation = plan.operation.clone();
             let name = plan.name.clone();
             code = StatusCode::ACCEPTED;
-            json!({"job":runtime.jobs.submit(host,&operation,&name,move||plan.execute())?})
+            // The plan has already validated the project. Never accept caller-supplied
+            // telemetry for operations which do not take a project.
+            let project = body["project"].as_str().map(str::to_owned).or_else(|| {
+                matches!(
+                    operation.trim_start_matches("storage_"),
+                    "deps" | "checkpoint" | "remount" | "close" | "recover"
+                )
+                .then(|| workspaces::checkout_project(&runtime.jobs.snapshot(), host, &name))
+                .flatten()
+            });
+            json!({"job":runtime.jobs.submit_project(host,&operation,&name,project.as_deref(),move||plan.execute())?})
         }
         ["v1", "agents", provider, "login"] => {
             empty(&body)?;
@@ -1884,6 +1920,7 @@ mod tests {
             ),
             (Method::GET, "/v1/fleet", String::new()),
             (Method::GET, "/v1/compute", String::new()),
+            (Method::GET, "/v1/workspaces", String::new()),
             (Method::GET, "/v1/agents", String::new()),
             (Method::POST, "/v1/agents/codex/login", "{}".into()),
             (
@@ -3050,6 +3087,18 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "create is idempotent on name");
         let (_, all) = call(&app, request(Method::GET, "/v1/repositories", "", true)).await;
         assert_eq!(all["repositories"][0]["project"], "alpha");
+        let (status, workspaces) =
+            call(&app, request(Method::GET, "/v1/workspaces", "", true)).await;
+        assert_eq!(status, StatusCode::OK);
+        let alpha = workspaces["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"] == "alpha")
+            .unwrap();
+        assert_eq!(alpha["repositories"][0]["name"], "game");
+        assert_eq!(alpha["pools"][0]["name"], "alpha-w");
+        assert!(!workspaces.to_string().contains(API_TOKEN));
 
         let ops = json!(["agent_runs.start", "agent_runs.get"]);
         let (_, none) = mint(&app, json!({"label":"none","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":ops})).await;
@@ -3076,6 +3125,7 @@ mod tests {
             (Method::PUT, backend, config.as_str()),
             (Method::DELETE, backend, ""),
             (Method::GET, "/v1/repositories", ""),
+            (Method::GET, "/v1/workspaces", ""),
         ] {
             let (status, _) = call(&app, bearer(method.clone(), path, body, &none)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
@@ -3113,6 +3163,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        // Account-level selection is not project-source delegation. A write
+        // grant must not link another selected private repository into its project.
+        for token in [&none, &read, &write] {
+            let (status, _) = call(
+                &app,
+                bearer(
+                    Method::POST,
+                    "/v1/projects/alpha/repositories/github",
+                    r#"{"name":"gh","full_name":"fixture/private"}"#,
+                    token,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
         let tokens = "/v1/projects/alpha/repositories/game/tokens";
         let (status, minted) = call(
             &app,
