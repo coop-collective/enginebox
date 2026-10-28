@@ -1,32 +1,19 @@
 {
   "schema": 1,
   "callback_url": "https://enginebox.example.com/api/github/callback",
-  "repos": {
-    "client_id": "REPOSITORY_APP_CLIENT_ID",
-    "client_secret": {
-      "file": "/etc/enginebox/secrets/github/repos-client-secret"
-    },
-    "slug": "your-enginebox-repositories",
-    "private_key": {
-      "file": "/etc/enginebox/secrets/github/repos-private-key"
-    },
-    "webhook_secret": {
-      "file": "/etc/enginebox/secrets/github/repos-webhook-secret"
-    },
-    "workflows_write": false
-  },
-  "runners": {
-    "client_id": "RUNNER_APP_CLIENT_ID",
+  "app": {
+    "client_id": "GITHUB_APP_CLIENT_ID",
     "client_secret": {
       "file": "/etc/enginebox/secrets/github/runners-client-secret"
     },
-    "slug": "your-enginebox-runners",
+    "slug": "your-enginebox",
     "private_key": {
       "file": "/etc/enginebox/secrets/github/runners-private-key"
     },
     "webhook_secret": {
       "file": "/etc/enginebox/secrets/github/runners-webhook-secret"
-    }
+    },
+    "workflows_write": false
   },
   "pools": [
     {

@@ -5,7 +5,7 @@ use std::{fs, io::Read, path::Path};
 
 pub fn load(path: &Path) -> Result<super::Config> {
     let mut value = enginebox_core::state::read_json(path)?;
-    for kind in ["repos", "runners"] {
+    for kind in ["app", "repos", "runners"] {
         if value[kind].is_null() {
             continue;
         }
@@ -58,41 +58,47 @@ mod tests {
     use serde_json::json;
     #[test]
     fn private_file_references_load_without_values_in_config() {
-        let temp = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let secret = temp.path().join("secret");
-        fs::write(&secret, "fixture-private-secret\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let config = temp.path().join("github.json");
-        let mut value = json!({"schema":1,"callback_url":"https://example.test/api/github/callback","repos":{"client_id":"fixture","slug":"fixture","client_secret":{"file":secret},"private_key":{"file":secret},"webhook_secret":{"file":secret}},"pools":[]});
-        enginebox_core::state::write_json(&config, &value).unwrap();
-        assert_eq!(
-            load(&config).unwrap().repos.client_secret,
-            "fixture-private-secret"
-        );
-        assert!(
-            !fs::read_to_string(&config)
-                .unwrap()
-                .contains("fixture-private-secret")
-        );
-        value["repos"]["client_secret"] = json!({"file":"relative"});
-        enginebox_core::state::write_json(&config, &value).unwrap();
-        assert!(load(&config).is_err());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            value["repos"]["client_secret"] = json!({"file":secret});
+        for kind in ["repos", "app"] {
+            let temp = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let secret = temp.path().join("secret");
+            fs::write(&secret, "fixture-private-secret\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let config = temp.path().join("github.json");
+            let mut value = json!({"schema":1,"callback_url":"https://example.test/api/github/callback","repos":{"client_id":"fixture","slug":"fixture","client_secret":{"file":secret},"private_key":{"file":secret},"webhook_secret":{"file":secret}},"pools":[]});
+            if kind == "app" {
+                let app = value.as_object_mut().unwrap().remove("repos").unwrap();
+                value["app"] = app;
+            }
             enginebox_core::state::write_json(&config, &value).unwrap();
-            fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                load(&config).unwrap().app("repos").unwrap().client_secret,
+                "fixture-private-secret"
+            );
+            assert!(
+                !fs::read_to_string(&config)
+                    .unwrap()
+                    .contains("fixture-private-secret")
+            );
+            value[kind]["client_secret"] = json!({"file":"relative"});
+            enginebox_core::state::write_json(&config, &value).unwrap();
             assert!(load(&config).is_err());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                value[kind]["client_secret"] = json!({"file":secret});
+                enginebox_core::state::write_json(&config, &value).unwrap();
+                fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+                assert!(load(&config).is_err());
+            }
         }
     }
 }

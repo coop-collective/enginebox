@@ -66,6 +66,37 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
 test("GitHub disabled state explains configuration without offering a broken connection", async ({ page }) => {
   await page.route("**/api/control/v1/github", route => route.fulfill({ json: { configured: false } }));
   await signIn(page);
-  await expect(page.getByText("Configure the repository GitHub App", { exact: false })).toBeVisible();
+  await expect(page.getByText("Configure your GitHub App", { exact: false })).toBeVisible();
   await expect(page.getByRole("button", { name: "Connect GitHub account" })).toHaveCount(0);
+});
+
+test("one App shares the connection and reviews permissions without another OAuth flow", async ({ page }) => {
+  const status = { configured: true, shared_app: true, runner_app_configured: true, accounts: [{kind:"github",login:"fixture"}], repositories: [{id:12,installation_id:4,full_name:"fixture/private",private:true,branch:"main"}], pools: [], jobs: [], draining: false };
+  const permissions: Record<string,string> = { contents:"write", actions:"read" };
+  let disconnected = false;
+  await page.route("**/api/control/v1/github**", async route => {
+    const path = new URL(route.request().url()).pathname;
+    let value: unknown = status;
+    if (path.endsWith("/installations")) value = {installations:[{id:4,account:"fixture",permissions,suspended:false}],install_url:"https://github.com/apps/fixture-shared/installations/new"};
+    if (path.endsWith("/repos/disconnect")) { disconnected=true; status.accounts=[]; status.repositories=[]; }
+    await route.fulfill({json:value});
+  });
+  await signIn(page);
+  await expect(page.getByRole("heading", {name:"GitHub connection",exact:true})).toBeVisible();
+  await expect(page.getByRole("button", {name:"Reconnect GitHub",exact:true})).toBeVisible();
+  await expect(page.getByRole("button", {name:"Connect runner administration"})).toHaveCount(0);
+  await page.getByRole("button", {name:"Choose repositories"}).click();
+  await expect(page.getByText("fixture: Repository sync approved", {exact:true})).toBeVisible();
+  await page.getByRole("button", {name:"Review runner permissions"}).click();
+  await expect(page.getByText("fixture: Organization approval required", {exact:true})).toBeVisible();
+  await expect(page.getByRole("link", {name:"Approve permissions for the connected App on GitHub"})).toHaveAttribute("href","https://github.com/apps/fixture-shared/installations/new");
+  permissions.organization_self_hosted_runners="write";
+  await page.getByRole("button", {name:"Review runner permissions"}).click();
+  await expect(page.getByText("fixture: Runner administration approved", {exact:true})).toBeVisible();
+  await page.getByRole("button", {name:"Disconnect GitHub",exact:true}).click();
+  await expect(page.getByRole("button", {name:"Review runner permissions"})).toBeDisabled();
+  await expect(page.getByRole("button", {name:"Choose repositories"})).toBeDisabled();
+  await expect(page.getByText("No repositories selected.", {exact:true})).toBeVisible();
+  await expect(page.getByText("fixture: Runner administration approved", {exact:true})).toHaveCount(0);
+  expect(disconnected).toBe(true);
 });

@@ -1,6 +1,6 @@
 # GitHub connections, repository sync and Actions service
 
-Implementation added October 24, 2026. This is an optional, single-owner GitHub.com integration. It has offline protocol, state, Git and dashboard tests. **Real OAuth approval, organization JIT registration and a disposable Linux workflow have not been qualified in this change.** No existing runner, organization setting or developer workspace was changed.
+Implementation added October 24, 2026; single-App configuration added October 28, 2026. This is an optional, single-owner GitHub.com integration. It has offline protocol, state, Git and dashboard tests. **Real OAuth approval, organization JIT registration and a disposable Linux workflow have not been qualified in this change.** No existing runner, organization setting or developer workspace was changed.
 
 [Required LayerFS preparation](GITHUB-ACTIONS-ACCELERATION.md) is now implemented
 as an opt-in accelerated profile with repository-safe admission, a mandatory
@@ -11,23 +11,27 @@ LayerFS work root and a post-checkout pnpm dependency action. See
 
 ## Product contract
 
-Engine Box supplies disposable execution environments and prepared storage; GitHub keeps workflows, scheduling, secrets, checks and job logs. An account connects through GitHub App OAuth, chooses an installation and selects private or public repositories. An independent runner connection grants organization administration. The core runtime remains usable with no GitHub configuration.
+Engine Box supplies disposable execution environments and prepared storage; GitHub keeps workflows, scheduling, secrets, checks and job logs. An account connects through GitHub App OAuth, chooses an installation and selects private or public repositories. One App installation and one OAuth account connection support both repository access and organization runner administration. Separate Apps remain an optional isolation choice. The core runtime remains usable with no GitHub configuration.
 
-The existing [LayerFS GitHub adapter](GITHUB-SYNC.md) owns import, review, main acceptance, conflict handling and conditional export. The new account connection selects the repositories and branch that adapter may access. Normal project workspaces contain no native Git checkout. The repository App revalidates the connected owner's access before each transfer and mints an installation token restricted to that single repository and the required Contents permission. The token crosses private node stdin, is checked against the node's repository/branch binding, and lives in a temporary owner-only credential file until the command returns. Refresh tokens and App private keys stay at the controller. No parallel controller checkout or force-push path is added.
+The existing [LayerFS GitHub adapter](GITHUB-SYNC.md) owns import, review, main acceptance, conflict handling and conditional export. The new account connection selects the repositories and branch that adapter may access. Normal project workspaces contain no native Git checkout. The connected App revalidates the connected owner's access before each transfer and mints an installation token restricted to that single repository and the required Contents permission. The token crosses private node stdin, is checked against the node's repository/branch binding, and lives in a temporary owner-only credential file until the command returns. Refresh tokens and App private keys stay at the controller. No parallel controller checkout or force-push path is added.
 
 The service uses GitHub Apps instead of a classic OAuth App's broad `repo`/`admin:org` scopes. GitHub App installations support selected repositories and permission separation. User OAuth authenticates the owner; it does not itself install an App or override organization approval. [GitHub App and OAuth differences](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/differences-between-github-apps-and-oauth-apps)
 
 ## Permission upgrade
 
-Configure two App registrations so repository users do not have to accept runner management:
+Use one GitHub App with the permissions needed by the enabled features:
 
-| App | Permissions | Purpose |
+| Feature | Permissions | Purpose |
 |---|---|---|
-| Repository App | Metadata read, Contents read/write | Selected private repos and ordinary Git pull/push |
-| Repository App, optional | Workflows write | Only if the owner wants pushes that edit `.github/workflows`; otherwise GitHub can reject those pushes |
-| Runner App | Metadata read, Actions read, organization Self-hosted runners read/write | `workflow_job` events, job inspection and organization JIT registration |
+| Repository sync | Metadata read, Contents read/write | Selected private repos and ordinary Git pull/push |
+| Workflow edits, optional | Workflows write | Exports that edit `.github/workflows`; set `app.workflows_write: true` |
+| Actions runners | Metadata read, Actions read, organization Self-hosted runners read/write | `workflow_job` events, job inspection and organization JIT registration |
 
-Both use the same dashboard callback URL. The runner App subscribes to `workflow_job`. Its installation must include each CI repository, and an organization administrator must approve its permissions. The dashboard exposes separate connection, installation and permission-review actions. An App's requested permissions are registration settings, not arbitrary scopes the browser can upgrade in an OAuth URL. [Permission selection and Git access](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app)
+An existing runner App can add Contents read/write; an existing repository App can add Actions read and organization Self-hosted runners read/write. Keep its Client ID, private key, client secret, webhook secret and installation. The installation owner must accept added permissions before they take effect. OAuth cannot request arbitrary additional App permissions through a scope parameter. [Permission selection](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app), [updating an existing installation](https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration#changing-the-permissions-of-a-github-app).
+
+Configure the registration once under `app` in `github.json`. The dashboard exposes one account connection, repository selection and a runner permission review. Both capabilities share one serialized refresh-token record; repository transfers still receive only a single-repository Contents token, runner management receives only Actions/runner permissions, and prepared-job verification receives only single-repository Actions read. No App credentials enter workload VMs. Contents write is needed for sync, not for running an Actions job itself.
+
+Existing `repos` plus optional `runners` configuration remains supported, with independent OAuth accounts and webhook secrets. Use [the separate-App example](../examples/github-separate-apps.example.json) only when that separation is desired. Do not combine it with `app` or duplicate the same registration in both slots. To switch an already connected configuration, drain and resolve jobs, disconnect existing accounts, change configuration during a supervised handoff, then connect once and reselect repositories. This prevents reusing an unrelated App's tokens or another user's selections. LayerFS project files remain intact.
 
 OAuth uses a random state, S256 PKCE, a ten-minute signed browser flow cookie and a single-use controller record. User access and refresh tokens stay in private controller state. Expiring tokens are required; refresh is serialized. Git receives the short-lived installation token only in its child environment; it is never embedded in a remote URL or Git config. Node delegation accepts both legacy and current stateless token formats. [Installation token scope and lifetime](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app) User/install grant access is checked again before transfer. [GitHub App user authorization](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app), [token refresh](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens)
 
@@ -67,12 +71,12 @@ Drain stops new provisioning while admitted workers finish. Controller handoff a
 
 ## Setup and supported interfaces
 
-1. Register the repository App and, when enabling CI, the separate runner App. Enable expiring user tokens. Set callback to `https://YOUR-DASHBOARD/api/github/callback`. Set the runner webhook to `https://YOUR-DASHBOARD/api/github/webhook/runners`; its random secret must match controller configuration. The repository webhook endpoint also validates signatures but currently only acknowledges events; it does not mutate checkouts on a `push` event.
-2. Follow [the Kitbash secret setup](GITHUB-SECRETS.md). Copy [github.example.json](../examples/github.example.json) to `<controller-state>/github.json`, fill non-secret App metadata and reference private secret files, and keep the configuration private to the controller user (0700 parent/0600 file on Unix). The example has no credential values. Setting `runners` to null and `pools` to `[]` enables repository-only operation. Restart through the normal standby/drain/activation release procedure.
-3. Open **GitHub** in the dashboard. Connect the repository account, approve only desired repositories in its installation, refresh installations, choose the repository and branch, and add it. **Import or sync in Storage** opens the existing LayerFS flow with that selection. Fetch/review the source, approve its credential-free import, then use LayerFS workspaces and accepted-main export. Install the updated `ebox` on registered storage nodes: OAuth delegation requires `--token-stdin` and repository/branch metadata in `github-settings`. When the account module is configured it takes precedence over manually configured node tokens; a revoked or deselected repository cannot silently fall back to a broader static credential.
+1. Register one GitHub App, or update the existing registration with the permissions above. Enable expiring user tokens. Set callback to `https://YOUR-DASHBOARD/api/github/callback`. Set the App webhook to `https://YOUR-DASHBOARD/api/github/webhook/runners`; its random secret must match controller configuration. The single App uses this endpoint for all its events. In shared mode `/api/github/webhook/repos` is also a signed alias, so an existing repository webhook URL can stay in place. Other event types are acknowledged; `push` events do not mutate checkouts.
+2. Follow [the Kitbash secret setup](GITHUB-SECRETS.md). Copy [github.example.json](../examples/github.example.json) to `<controller-state>/github.json`, fill non-secret App metadata and reference private secret files, and keep the configuration private to the controller user (0700 parent/0600 file on Unix). The example has no credential values. Use `app` with `pools: []` for one App without runner provisioning. A legacy repository-only configuration can retain `repos`, `runners: null` and `pools: []`. Restart through the normal standby/drain/activation release procedure.
+3. Open **GitHub** in the dashboard. Connect the GitHub account once, approve only desired repositories in its installation, refresh installations, choose the repository and branch, and add it. **Import or sync in Storage** opens the existing LayerFS flow with that selection. Fetch/review the source, approve its credential-free import, then use LayerFS workspaces and accepted-main export. Install the updated `ebox` on registered storage nodes: OAuth delegation requires `--token-stdin` and repository/branch metadata in `github-settings`. When the account module is configured it takes precedence over manually configured node tokens; a revoked or deselected repository cannot silently fall back to a broader static credential.
 
 4. For CI, provision a separate local Linux CI inventory using the ordinary bootstrap/template procedure. Use a dedicated project named `enginebox-ci-<name>`, no warm pools, a clean prepared snapshot and the guest's configured non-root account. Provision the official runner under `/opt/actions-runner` in that base before snapshotting it. Verify the downloaded archive against the selected release's checksum and record the resolved version. Configure the separate [worker file](../examples/ci-worker.example.json) with the same version. The example version 2.337.0 is an upstream reference, **not a live-tested Engine Box runner version**. [Official runner releases](https://github.com/actions/runner/releases)
-5. Provision a runner group in the organization with access restricted to the intended repositories/workflows; use its actual numeric group ID and the runner App installation ID in the pool. Connect runner administration in the dashboard and approve its installation. The controller verifies the connected user's installation visibility and actual runner permission before provisioning. [Runner group API and permissions](https://docs.github.com/en/rest/actions/self-hosted-runner-groups)
+5. Provision a runner group in the organization with access restricted to the intended repositories/workflows; use its actual numeric group ID and the App installation ID in the pool. Use **Review runner permissions** and approve the installation permissions. Shared mode uses the same connected account; only separate-App mode needs another OAuth connection. The controller verifies the connected user's installation visibility and actual runner permission before provisioning. [Runner group API and permissions](https://docs.github.com/en/rest/actions/self-hosted-runner-groups)
 6. Run one disposable, non-deploying workflow first. Use the group name and label in workflow YAML, for example:
 
 ```yaml
@@ -95,14 +99,14 @@ Implemented controller API (owner bearer authentication except signed webhooks):
 
 | Method/path | Operation |
 |---|---|
-| `GET /v1/github` | Safe connection, repo, pool and CI status |
-| `POST /v1/github/{repos,runners}/connect` | Begin OAuth; dashboard uses its dedicated cookie-setting route |
+| `GET /v1/github` | Safe connection, repo, pool and CI status; `shared_app` identifies the unified mode and its account has kind `github` |
+| `POST /v1/github/{repos,runners}/connect` | Begin OAuth; both routes use the same account in shared mode; dashboard uses its dedicated cookie-setting route |
 | `POST /v1/github/callback` | Consume state/code; server-to-server only |
 | `GET /v1/github/{repos,runners}/installations` | Paginated installations and App install link |
 | `GET /v1/github/installations/<id>/repositories` | Paginated repo picker from owner access |
 | `POST /v1/github/select` | `{installation_id, repository_id, branch}` |
 | `POST /v1/github/remove` | `{repository_id}`; preserves checkout |
-| `POST /v1/github/{repos,runners}/disconnect` | `{}`; remove local connection after CI drains; remote App uninstall/revocation remains in GitHub |
+| `POST /v1/github/{repos,runners}/disconnect` | `{}`; remove local connection after CI drains; either route disconnects both capabilities in shared mode; remote uninstall/revocation remains in GitHub |
 | `POST /v1/github/drain` | `{draining: true or false}` |
 | `POST /v1/github/webhook/{repos,runners}` | Signed raw webhook body, independent of dashboard session |
 
