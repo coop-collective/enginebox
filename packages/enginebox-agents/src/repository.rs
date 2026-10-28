@@ -32,6 +32,19 @@ pub const GUEST_MODE: &str = "run-repository";
 /// prefix, so a caller can never set them).
 pub const ENV_REMOTE: &str = "ENGINEBOX_REPO_REMOTE";
 pub const ENV_DEFAULT_BRANCH: &str = "ENGINEBOX_REPO_DEFAULT_BRANCH";
+/// The run's working directory, which is also its cwd.
+pub const ENV_RUN_DIR: &str = "ENGINEBOX_RUN_DIR";
+/// Where repository runs get their working directories, relative to the
+/// workspace: `<workspace>/runs/<run_dir>`.
+pub const WORK_DIRS: &str = "runs";
+/// Per-directory leases, relative to the native home. A directory whose lease
+/// is held is in use and never pruned.
+pub const WORK_DIR_LEASES: &str = ".local/state/enginebox/agent-runs/work-dirs";
+/// A retained directory (its run left a resumable session) is pruned once it
+/// has not been used for this long...
+pub const WORK_DIR_RETENTION: std::time::Duration = std::time::Duration::from_secs(48 * 3600);
+/// ...or when more than this many retained directories exist (oldest first).
+pub const MAX_RETAINED_WORK_DIRS: usize = 16;
 /// Largest repository envelope the guest accepts on stdin.
 pub const MAX_ENVELOPE_BYTES: usize = profile::MAX_ENVELOPE_BYTES + 8192;
 
@@ -216,6 +229,15 @@ pub struct Envelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfilePart>,
     pub repository: Access,
+    /// The run directory's ID (a controller run ID): the run works in
+    /// `<workspace>/runs/<run_dir>`. A fresh run gets its own run ID and an
+    /// empty directory; a resume gets the directory of the run that started
+    /// its session, so the native CLI finds the session under the same cwd.
+    /// Absent for controllers before run directories, and for resumes of
+    /// sessions started without one: the run then works in the workspace as
+    /// before. Omitted when absent so older guest helpers still accept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_dir: Option<String>,
 }
 impl Envelope {
     /// The profile part as the profile module's own envelope, if any.
@@ -231,6 +253,9 @@ impl Envelope {
     pub fn validate(&self) -> Result<Option<BTreeMap<String, Vec<u8>>>> {
         self.request.validate()?;
         self.repository.validate()?;
+        if let Some(dir) = &self.run_dir {
+            native::validate_run_id(dir)?;
+        }
         ensure!(
             !self.request.env.keys().any(|k| reserved_env_key(k)),
             "env cannot set git configuration variables in a repository run."
@@ -309,6 +334,128 @@ pub fn remove_run_dir(home: &Path, run_id: &str) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// `<workspace>/runs/<id>`.
+pub fn work_dir(workspace: &Path, id: &str) -> Result<PathBuf> {
+    native::validate_run_id(id)?;
+    Ok(workspace.join(WORK_DIRS).join(id))
+}
+fn work_dir_lease(id: &str) -> String {
+    format!("{WORK_DIR_LEASES}/{id}.lock")
+}
+/// A directory owned by this user that is not a link, created 0700 if missing.
+fn owned_dir(path: &Path) -> Result<()> {
+    security::check_components(path)?;
+    if !path.exists() {
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(path)?;
+    }
+    let m = std::fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_dir() && !m.file_type().is_symlink(),
+        "Run directory path must be a directory, not a link."
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            m.uid() == unsafe { libc::geteuid() },
+            "Run directory owner mismatch."
+        );
+    }
+    Ok(())
+}
+/// Open the run's working directory under its lease. A fresh run (no
+/// resume) always starts in an empty directory; a resume reuses what its
+/// session's run left, or an empty directory if that was pruned.
+pub fn open_work_dir(
+    home: &Path,
+    workspace: &Path,
+    id: &str,
+    fresh: bool,
+) -> Result<(PathBuf, security::Lease)> {
+    let dir = work_dir(workspace, id)?;
+    owned_dir(&workspace.join(WORK_DIRS))?;
+    let lease = security::Lease::acquire(home, &work_dir_lease(id))
+        .map_err(|_| anyhow::anyhow!("The run directory is in use by another run."))?;
+    lease.touch()?;
+    if fresh {
+        remove_tree(&dir)?;
+    }
+    owned_dir(&dir)?;
+    Ok((dir, lease))
+}
+fn remove_tree(dir: &Path) -> Result<()> {
+    security::check_components(dir)?;
+    match std::fs::symlink_metadata(dir) {
+        // `remove_dir_all` removes links inside without following them.
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(dir)?,
+        Ok(_) => std::fs::remove_file(dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+/// Remove a run's working directory and its lease file.
+pub fn remove_work_dir(home: &Path, workspace: &Path, id: &str) -> Result<()> {
+    remove_tree(&work_dir(workspace, id)?)?;
+    security::remove(home, &work_dir_lease(id))
+}
+/// Prune retained run directories other than `keep`: those unused for
+/// [`WORK_DIR_RETENTION`], then the oldest beyond [`MAX_RETAINED_WORK_DIRS`].
+/// A directory whose lease is held (a run is using it) is never touched, nor
+/// is anything under `runs/` that is not named like a run ID. Returns the
+/// IDs removed.
+pub fn prune_work_dirs(
+    home: &Path,
+    workspace: &Path,
+    keep: &str,
+    now: std::time::SystemTime,
+) -> Result<Vec<String>> {
+    let root = workspace.join(WORK_DIRS);
+    security::check_components(&root)?;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    let mut retained = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if id == keep || native::validate_run_id(&id).is_err() {
+            continue;
+        }
+        let lease = work_dir_lease(&id);
+        if security::Lease::active(home, &lease)? {
+            continue;
+        }
+        let used = security::safe_path(home, &lease, false)
+            .ok()
+            .and_then(|p| std::fs::symlink_metadata(p).ok())
+            .or_else(|| entry.metadata().ok())
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        retained.push((used, id));
+    }
+    retained.sort();
+    let excess = retained.len().saturating_sub(MAX_RETAINED_WORK_DIRS);
+    let mut removed = Vec::new();
+    for (index, (used, id)) in retained.into_iter().enumerate() {
+        let stale = now.duration_since(used).unwrap_or_default() >= WORK_DIR_RETENTION;
+        if (stale || index < excess) && remove_work_dir(home, workspace, &id).is_ok() {
+            removed.push(id);
+        }
+    }
+    Ok(removed)
 }
 
 /// The variables a repository run adds to the CLI process: git includes the
@@ -446,6 +593,7 @@ mod tests {
             request,
             profile: None,
             repository: access(),
+            run_dir: None,
         };
         assert!(envelope.validate().is_err());
         let mut ok = envelope.clone();

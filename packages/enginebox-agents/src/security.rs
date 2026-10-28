@@ -248,6 +248,11 @@ impl Lease {
             .map_err(|_| anyhow::anyhow!("Native provider already has an active operation."))?;
         Ok(Self { file: f })
     }
+    /// Record a use of the leased resource in the lease file's mtime.
+    pub fn touch(&self) -> Result<()> {
+        self.file.set_modified(std::time::SystemTime::now())?;
+        Ok(())
+    }
     #[cfg(unix)]
     pub fn fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;

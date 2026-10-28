@@ -2955,6 +2955,7 @@ impl AgentService {
                             files: p.files.clone(),
                         }),
                         repository: access,
+                        run_dir: None,
                     })?,
                 ),
                 (None, None) => ("run", serde_json::to_vec(&request)?),

@@ -65,6 +65,7 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
             token: TOKEN.into(),
             auth: repository::Auth::Bearer,
         },
+        run_dir: None,
     };
     let out = native::execute_with_repository(&envelope, &home, &workspace, RUN).unwrap();
     assert_eq!(out.exit_code, 0, "{}", out.output);
@@ -111,6 +112,153 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
     assert!(native::execute_with_repository(&envelope, &home, &workspace, "bad").is_err());
     // An older helper's `run` refuses the envelope instead of running without it.
     assert!(native::RunRequest::parse(serde_json::to_value(&envelope).unwrap()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn each_repository_run_works_in_its_own_clean_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    security::safe_path(&home, ".local/bin/claude", true).unwrap();
+    let exe = home.join(".local/bin/claude");
+    // Like an agent that clones into ./repo: it fails if the directory exists.
+    let script = "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.310 (Claude Code)'; exit 0; fi\nprompt=$(cat)\n\
+        echo \"cwd=$(pwd) dir=$ENGINEBOX_RUN_DIR\"\n\
+        case \"$prompt\" in *continue*) [ -d repo ] && echo resumed-with-repo ;; *) mkdir repo || exit 3 ;; esac\n\
+        case \"$prompt\" in *nosession*) ;; *) echo '{\"type\":\"result\",\"session_id\":\"0b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a\"}' ;; esac\n";
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let envelope =
+        |prompt: &str, resume: Option<&str>, run_dir: Option<&str>| repository::Envelope {
+            request: native::RunRequest::parse(
+                json!({"provider":"claude","prompt":prompt,"resume_id":resume}),
+            )
+            .unwrap(),
+            profile: None,
+            repository: repository::Access {
+                remote: REMOTE.into(),
+                default_branch: "main".into(),
+                token: TOKEN.into(),
+                auth: repository::Auth::Bearer,
+            },
+            run_dir: run_dir.map(str::to_owned),
+        };
+    let id = |c: char| c.to_string().repeat(32);
+    let dir = |c: char| workspace.join("runs").join(id(c));
+    let run = |c: char, e: repository::Envelope| {
+        native::execute_with_repository(&e, &home, &workspace, &id(c)).unwrap()
+    };
+    // Two fresh runs: each starts empty in its own directory, so the second
+    // clone does not trip over the first one's files.
+    for c in ['a', 'b'] {
+        let out = run(c, envelope("work", None, Some(&id(c))));
+        assert_eq!(out.exit_code, 0, "{}", out.output);
+        let path = dir(c);
+        assert!(
+            out.output
+                .contains(&format!("cwd={} dir={}", path.display(), path.display())),
+            "{}",
+            out.output
+        );
+        // It left a resumable session, so its directory stays for a resume.
+        assert!(path.join("repo").is_dir());
+    }
+    // A run without a session leaves nothing behind.
+    let out = run('c', envelope("work nosession", None, Some(&id('c'))));
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    assert!(!dir('c').exists());
+    // A fresh run never inherits files, even if its directory exists.
+    std::fs::create_dir_all(dir('d').join("repo")).unwrap();
+    let out = run('d', envelope("work nosession", None, Some(&id('d'))));
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    // A resume works in its session's directory, with its files.
+    let out = run(
+        'e',
+        envelope(
+            "continue",
+            Some("0b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a"),
+            Some(&id('a')),
+        ),
+    );
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    assert!(out.output.contains(&format!("cwd={}", dir('a').display())));
+    assert!(out.output.contains("resumed-with-repo"), "{}", out.output);
+    assert!(dir('a').join("repo").is_dir());
+    // Without a run directory (older controllers, legacy sessions) the run
+    // works in the workspace as before and gets no ENGINEBOX_RUN_DIR.
+    let out = run('f', envelope("work nosession", None, None));
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    assert!(
+        out.output
+            .contains(&format!("cwd={} dir=\n", workspace.display())),
+        "{}",
+        out.output
+    );
+    assert!(workspace.join("repo").is_dir());
+    // A caller cannot set ENGINEBOX_RUN_DIR.
+    let mut injected = envelope("work", None, Some(&id('g')));
+    injected.request.env = [("ENGINEBOX_RUN_DIR".to_owned(), "/".to_owned())].into();
+    assert!(native::execute_with_repository(&injected, &home, &workspace, &id('g')).is_err());
+    // An invalid run directory ID is refused.
+    let bad = envelope("work", None, Some("../../etc"));
+    assert!(native::execute_with_repository(&bad, &home, &workspace, &id('g')).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_run_directories_are_pruned_by_age_and_count_but_never_while_in_use() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    let now = std::time::SystemTime::now();
+    let hour = std::time::Duration::from_secs(3600);
+    let lease = |id: &str| format!("{}/{id}.lock", repository::WORK_DIR_LEASES);
+    let make = |id: &str, age: std::time::Duration| {
+        let (path, l) = repository::open_work_dir(&home, &workspace, id, true).unwrap();
+        std::fs::write(path.join("file"), "x").unwrap();
+        drop(l);
+        std::fs::File::options()
+            .write(true)
+            .open(home.join(lease(id)))
+            .unwrap()
+            .set_modified(now - age)
+            .unwrap();
+    };
+    let ids: Vec<String> = (0..20).map(|i| format!("{i:032x}")).collect();
+    // ids[0]: stale (3 days); ids[1]: stale but in use; ids[2..20]: recent.
+    make(&ids[0], 72 * hour);
+    make(&ids[1], 72 * hour);
+    for (i, id) in ids.iter().enumerate().skip(2) {
+        make(id, hour * (30 - i as u32));
+    }
+    std::fs::create_dir_all(workspace.join("runs/notes")).unwrap();
+    let held = security::Lease::acquire(&home, &lease(&ids[1])).unwrap();
+    let keep = "f".repeat(32);
+    let removed = repository::prune_work_dirs(&home, &workspace, &keep, now).unwrap();
+    // The stale one, then the oldest recent ones beyond 16 retained (19
+    // candidates; the one in use is not a candidate).
+    assert_eq!(
+        removed,
+        vec![ids[0].clone(), ids[2].clone(), ids[3].clone()]
+    );
+    assert!(workspace.join("runs").join(&ids[1]).is_dir(), "in use");
+    assert!(workspace.join("runs/notes").is_dir(), "not a run directory");
+    assert!(!home.join(lease(&ids[0])).exists());
+    for id in &ids[4..] {
+        assert!(workspace.join("runs").join(id).is_dir());
+    }
+    drop(held);
 }
 
 mod service {
