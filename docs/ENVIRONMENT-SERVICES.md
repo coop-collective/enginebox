@@ -12,6 +12,51 @@ private API token never reaches the browser. CI and agent execution remain separ
 services from accepted LayerFS source. When the optional controller handoff is
 configured, UI/MCP imports queue setup automatically and return separate dev status.
 
+## Managed node admission
+
+When this optional service runs on a host with managed machine registration, add
+the following operator-owned configuration to fence its independent Docker
+workloads through the same controller authority:
+
+```json
+"admission": {
+  "controller": "http://127.0.0.1:8787",
+  "tokenFile": "/private/controller-owner-token",
+  "hostId": "dedicated"
+}
+```
+
+Use the controller's actual owner API address and a private regular token file
+(mode `0600`, no symlink). HTTPS is supported; plain HTTP is restricted to literal
+loopback addresses. The trusted service calls owner-only
+`GET /v1/hosts/<hostId>/admission` and requires the matching host ID and
+`allowed: true`. Each check has a 1.5-second timeout, rejects redirects and bounds
+the response size. Missing registration, revocation, drain, unauthorized or
+unavailable authority, and invalid responses block new work. No successful
+admission result is cached.
+
+The gate covers source-export execution, dependency preparation, starts,
+replacement and recovery, Docker exec, live file updates, new project/preview
+registrations and retries. It checks again after preparation and before touching
+the current runtime. Admission failure reports `admission-blocked` and preserves
+existing containers, source files, persistent data and healthy routes; restoring
+admission lets reconciliation continue. It does not stop running containers or
+revoke existing preview leases. Preview lease expiration and explicit revocation
+retain their separate authority to withdraw that preview and clean up its owned
+containers. These are checks before operations, not a transaction spanning a
+controller decision and Docker: a fence arriving during an admitted operation
+blocks its next checked step without forcibly interrupting the running command.
+
+Keep the controller token outside application source, mounted directories and
+exporter configuration. The service reads it itself and never includes it in
+Docker arguments, environment values, status, receipts or exporter commands.
+The optional field does not change environment recipes or persisted identities;
+an upgrade can adopt existing containers without replacement. Configurations
+without `admission` retain their legacy behavior. Older service versions reject
+the new field instead of silently ignoring the gate. This setting must be
+deployed with the controller's admission endpoint before claiming the optional
+Docker service follows managed node fencing.
+
 ## Source and data ownership
 
 An operator provisions static recipes, or enables repository bootstrap with

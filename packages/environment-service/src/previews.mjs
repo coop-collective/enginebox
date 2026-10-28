@@ -60,6 +60,11 @@ export class WorkspacePreviews extends ProjectBootstrap {
     if (value.revoke === true) { check(value.ttlSeconds === undefined && value.retry === undefined, 'invalid-preview-request'); p.revoked = true; }
     else {
       check(value.revoke === undefined && (value.retry === undefined || typeof value.retry === 'boolean'), 'invalid-preview-request');
+      await this.manager.assertAdmission();
+      // Admission is asynchronous; another renewal/revocation may win while it
+      // is in flight. Preserve optimistic lease ownership across that boundary.
+      check(value.expectedRevision === p.revision, 'stale-preview-lease');
+      check(this.live(p), 'preview-lease-expired');
       p.expiresAt = this.expiry(value.ttlSeconds); if (value.retry === true) p.retry = true;
     }
     // Fence immediately, even while a slow immutable export is in flight.
@@ -78,6 +83,7 @@ export class WorkspacePreviews extends ProjectBootstrap {
       check(host?.workspaceCommand, 'workspace-preview-not-configured');
       const current = Object.values(this.records).find(p => this.live(p) && ['host', 'project', 'workspace', 'task'].every(k => p[k] === value[k]));
       if (current) return this.summary(current);
+      await this.manager.assertAdmission();
       check(Object.values(this.records).filter(p => this.live(p)).length < this.policy.maxProjects && Object.keys(this.records).length < 256, 'preview-capacity-limit');
       const p = { id: `w-${randomBytes(10).toString('hex')}`, host: value.host, project: value.project, workspace: value.workspace, task: value.task,
         binding: digest(host), lease: randomBytes(32).toString('hex'), revision: 1, expiresAt, status: 'queued' };
@@ -122,7 +128,9 @@ export class WorkspacePreviews extends ProjectBootstrap {
     const releases = [p.active, p.pending, p.retired].filter(Boolean);
     clearTimeout(this.timers.get(p.id)); this.timers.delete(p.id);
     await this.withdraw(p);
-    for (const release of releases) { await this.manager.remove(release.env, '-prepare'); await this.discard(release); }
+    // Lease expiry/revocation remains an independent cleanup authority. A node
+    // admission failure never enters this path or cancels a live preview lease.
+    for (const release of releases) { await this.manager.remove(release.env, '-prepare', { cleanup: true }); await this.discard(release, { cleanup: true }); }
     delete p.active; delete p.pending; delete p.retired; delete p.phase; p.routeIds = [];
     p.status = p.revoked ? 'revoked' : 'expired'; await this.save();
   }
