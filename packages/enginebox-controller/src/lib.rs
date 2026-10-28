@@ -168,7 +168,7 @@ impl Controller {
             ci_jobs: jobs::Jobs::open(&self.root.join("ci-jobs"))?,
             storage: storage::Storage::open(&self.root, self.fleet.clone())?
                 .with_github(github.clone()),
-            github,
+            github: github.clone(),
             contributors: contributors::Contributors::open(&self.root)?,
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles: profiles::Profiles::open(&self.root)?,
@@ -177,7 +177,12 @@ impl Controller {
                     repositories::Repositories::with_transport(&self.root, transport)?
                 }
                 None => repositories::Repositories::open(&self.root)?,
-            },
+            }
+            .with_github_if(
+                github
+                    .configured()
+                    .then(|| Arc::new(github.clone()) as Arc<dyn repositories::GithubLink>),
+            ),
             ci: ci::Ci::open(
                 &self.root,
                 &self
@@ -1164,6 +1169,16 @@ async fn write(
             let repositories = runtime.repositories.clone();
             let project = project.to_string();
             let outcome = blocking(move || repositories.create(&project, &body)).await;
+            return Ok(match outcome {
+                Ok((true, v)) => (StatusCode::CREATED, v),
+                Ok((false, v)) => (StatusCode::OK, v),
+                Err(e) => repository_reply(Err(e), StatusCode::OK),
+            });
+        }
+        ["v1", "projects", project, "repositories", "github"] => {
+            let repositories = runtime.repositories.clone();
+            let project = project.to_string();
+            let outcome = blocking(move || repositories.link_github(&project, &body)).await;
             return Ok(match outcome {
                 Ok((true, v)) => (StatusCode::CREATED, v),
                 Ok((false, v)) => (StatusCode::OK, v),
