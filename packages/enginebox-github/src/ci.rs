@@ -150,7 +150,7 @@ impl GitHub {
     pub fn webhook(&self, kind: &str, event: &str, supplied: &str, body: &[u8]) -> Result<Value> {
         signature(&self.app(kind)?.webhook_secret, supplied, body)?;
         let payload: Value = serde_json::from_slice(body)?;
-        if kind != "runners" || event != "workflow_job" {
+        if (kind != "runners" && self.account_kind(kind)? != "github") || event != "workflow_job" {
             return Ok(json!({"accepted":true,"ignored":true}));
         }
         let config = self.config.as_ref().context("GitHub disabled")?;
@@ -276,7 +276,7 @@ impl GitHub {
                         .is_some_and(|s| s.eq_ignore_ascii_case(&pool.organization))
                     && i["suspended_at"].is_null()
                     && i["permissions"]["organization_self_hosted_runners"] == "write"),
-                "Approve organization self-hosted runners permission in the runner App installation"
+                "Approve organization self-hosted runners permission in the GitHub App installation"
             );
             let token=self.api.call("POST",&format!("/app/installations/{}/access_tokens",pool.installation_id),&api::jwt(self.app("runners")?)?,Some(json!({"permissions":{"organization_self_hosted_runners":"write","actions":"read"}})))?;
             (data.jobs[key].clone(), text(&token, "token")?.to_owned())
@@ -462,6 +462,29 @@ fn job_persistence_failure(data: &mut crate::Data, key: &str) {
 mod tests {
     use super::*;
     #[test]
+    fn shared_session_does_not_bypass_org_approval_or_suspension() {
+        for installation in [
+            json!({"id":2,"account":{"login":"fixture"},"permissions":{"contents":"write"}}),
+            json!({"id":2,"account":{"login":"fixture"},"permissions":{"organization_self_hosted_runners":"write"},"suspended_at":"2026-01-01"}),
+        ] {
+            let (_root, mut g) = crate::tests::shared_service();
+            crate::tests::account(&g);
+            let (api, server) = crate::tests::api_fixture(vec![(
+                "/user/installations?",
+                json!({"installations":[installation]}),
+            )]);
+            g.api = api;
+            assert!(
+                g.run_job("2-99", &g.config.as_ref().unwrap().pools[0])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Approve organization")
+            );
+            server.join().unwrap();
+            assert!(g.status()["jobs"].as_array().unwrap().is_empty());
+        }
+    }
+    #[test]
     fn prepared_groups_enforce_repo_and_workflow_scope() {
         let preparation = Preparation {
             repository_id: 10,
@@ -477,18 +500,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn jit_worker_cleanup_is_owned_and_worker_output_is_filtered() {
-        jit_fixture(false);
-        jit_fixture(true);
+        for shared in [false, true] {
+            jit_fixture(false, shared);
+            jit_fixture(true, shared);
+        }
     }
     #[cfg(unix)]
-    fn jit_fixture(prepared: bool) {
-        use crate::tests::{account, api_fixture, service};
+    fn jit_fixture(prepared: bool, shared: bool) {
+        use crate::tests::{account, api_fixture, service, shared_service};
         use std::{
             fs,
             os::unix::fs::PermissionsExt,
             process::{Command, Stdio},
         };
-        let (root, mut g) = service();
+        let (root, mut g) = if shared { shared_service() } else { service() };
         account(&g);
         let key = Command::new("openssl")
             .args(["genrsa", "2048"])
@@ -496,11 +521,11 @@ mod tests {
             .output()
             .unwrap();
         assert!(key.status.success());
-        g.config
+        let config = g.config.as_mut().unwrap();
+        config
+            .app
             .as_mut()
-            .unwrap()
-            .runners
-            .as_mut()
+            .or(config.runners.as_mut())
             .unwrap()
             .private_key = String::from_utf8(key.stdout).unwrap();
         let worker = root.path().join("fixture-worker");
@@ -519,13 +544,15 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         g.config.as_mut().unwrap().pools[0].worker = vec![worker.to_str().unwrap().into()];
         {
             let mut data = g.data.lock().unwrap();
-            let repo_account = data.accounts["repos"].clone();
-            data.accounts.insert("runners".into(), repo_account);
+            if !shared {
+                let repo_account = data.accounts["repos"].clone();
+                data.accounts.insert("runners".into(), repo_account);
+            }
             data.repositories.insert(
                 101,
                 crate::Repository {
                     id: 101,
-                    installation_id: 4,
+                    installation_id: if shared { 2 } else { 4 },
                     full_name: "fixture/private".into(),
                     private: true,
                     branch: "main".into(),
@@ -543,7 +570,11 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
                 json!({"token":"fixture-installation-token"}),
             ),
             (
-                "/user/installations/4/repositories?",
+                if shared {
+                    "/user/installations/2/repositories?"
+                } else {
+                    "/user/installations/4/repositories?"
+                },
                 json!({"repositories":[{"id":101}]}),
             ),
             (

@@ -1,79 +1,147 @@
-# GitHub App setup with Kitbash and Infisical
+# GitHub App setup with Kitbash
 
-This follows the local Kitbash checkout at `~/Workspace/feature-registry`: [secret setup](https://github.com/coop-collective/kitbash/blob/main/docs/SECRETS-BROKER.md), [operator workflow](https://github.com/coop-collective/kitbash/blob/main/bootstraps/shared/files/docs/secrets.md), and its `kitbash-secrets` skill. Infisical owns application secrets; the isolated broker returns names/status only. Real provider credentials must come from GitHub. Nothing in this change registers an App, writes a vault, changes organization runners or deploys credentials.
+One GitHub App supports repository sync and Actions runners. Reuse the existing
+runner App and its three credentials; a second repository App is optional.
+Kitbash supports Cloudflare Secrets Store and the Infisical adapter below. Both
+keep credential values outside chat and normal CI jobs. GitHub issues App
+credentials; Kitbash generates webhook secrets and returns metadata through MCP.
 
-## 1. Register two GitHub Apps
+## 1. Configure one App and installation
 
-Use organization **Settings → Developer settings → GitHub Apps → New GitHub App**, or personal developer settings for a repository-only trial. Choose distinct App names/slugs for repository access and runner administration. Use separate registrations and credentials for staging and production.
-
-For both Apps:
+In organization **Settings → Developer settings → GitHub Apps**, edit your existing
+App or create one. Use separate registrations for staging and production.
 
 - Homepage: your dashboard origin, matching `ENGINEBOX_DASHBOARD_ORIGIN`.
 - Callback: `https://YOUR-DASHBOARD/api/github/callback`, with no query string.
-- Enable expiring user access tokens. Engine Box requests `offline_access` and uses PKCE; no device-flow configuration is needed.
-- Record **Client ID** and App slug as configuration metadata. Generate a **client secret** and download an **RSA private key** through GitHub. Store these directly in Infisical from your trusted operator session; do not paste them into chat or GitHub Actions logs.
-- Enable the webhook, use JSON, and configure the corresponding URL below. Copy its broker-generated secret from Infisical into GitHub using your trusted operator session.
+- Enable expiring user access tokens. Engine Box uses PKCE and refresh tokens;
+  no device-flow configuration is needed. Start authorization from the dashboard.
+- Webhook: `https://YOUR-DASHBOARD/api/github/webhook/runners`, JSON, active,
+  with the existing matching webhook secret. Subscribe to **Workflow job**.
+- Repository permissions: **Metadata read**, **Contents read/write** for sync,
+  **Actions read** for runners. **Workflows write** is optional for exporting
+  edits to `.github/workflows`; also set `app.workflows_write: true` when enabling it.
+- Organization permissions: **Self-hosted runners read/write** for organization runners.
+- Install on the organization and include the intended repositories. When adding
+  permissions to an existing App, accept the new permissions on that installation.
+  Keep the installation, Client ID, private key and client secret.
 
-| Registration | Repository permissions | Organization permissions | Webhook URL/events |
-|---|---|---|---|
-| Repository App | Metadata read; Contents read/write; optional Workflows write | None | `/api/github/webhook/repos`; authorization events are delivered by GitHub, source push events are not needed |
-| Runner App | Metadata read; Actions read | Self-hosted runners read/write | `/api/github/webhook/runners`; subscribe to **Workflow job** |
+A GitHub App can request repository and organization permissions together. Added
+permissions take effect after the installation owner approves them; reconnecting
+OAuth alone cannot approve them. [Permission selection](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app),
+[permission updates](https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration#changing-the-permissions-of-a-github-app).
 
-When enabling Workflows write, also set `repos.workflows_write: true` in controller configuration. Otherwise delegated exports request Contents only. Install the repository App on **only selected repositories**. Install the runner App in the organization and include the CI repositories. Organization owners must approve runner permissions. OAuth authorization and App installation are distinct steps.
+Contents write is for repository sync, not required by the self-hosted runner protocol.
+Record the **Client ID** and slug as metadata. Generate a client secret and RSA private
+key only if you do not already have them. Keep provider values in private files or
+the trusted vault, never chat or Git. OAuth authorization and installation remain
+separate GitHub steps, but both features use the same App and account authorization.
 
-GitHub App user permissions are the intersection of the App grant and the user's access. [User authorization](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app), [permission selection](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app).
+## 2. Deliver existing credentials through Cloudflare
 
-## 2. Register the secrets policy
+Use Kitbash's [MCP file uploads and controller delivery](https://github.com/coop-collective/kitbash/blob/main/docs/BROKER-SETUP.md#deliver-uploaded-credentials-to-a-native-controller)
+from the trusted `~/Workspace/kitbash` checkout. Register these three names for the
+chosen target with `kitbash_register_secrets`:
 
-Use [github-secrets.kitbash.json](../examples/github-secrets.kitbash.json) as the operator helper's `.kitbash/secrets.json`, replacing the project UUID/domain with your existing Infisical project. It contains names and identifiers only. Targets are explicit: `local → dev`, `staging → staging`, `production → production`, each using the dedicated `/github` folder.
-
-| Infisical name | Source | Controller filename |
+| Secret name | Source | Controller filename |
 |---|---|---|
-| `ENGINEBOX_GITHUB_REPOS_CLIENT_SECRET` | GitHub repository App | `repos-client-secret` |
-| `ENGINEBOX_GITHUB_REPOS_PRIVATE_KEY` | Downloaded repository App PEM | `repos-private-key` |
-| `ENGINEBOX_GITHUB_REPOS_WEBHOOK_SECRET` | Broker-generated 32 random bytes | `repos-webhook-secret` |
-| `ENGINEBOX_GITHUB_RUNNERS_CLIENT_SECRET` | GitHub runner App | `runners-client-secret` |
-| `ENGINEBOX_GITHUB_RUNNERS_PRIVATE_KEY` | Downloaded runner App PEM | `runners-private-key` |
-| `ENGINEBOX_GITHUB_RUNNERS_WEBHOOK_SECRET` | Broker-generated 32 random bytes | `runners-webhook-secret` |
+| `ENGINEBOX_GITHUB_RUNNERS_CLIENT_SECRET` | Existing GitHub App | `runners-client-secret` |
+| `ENGINEBOX_GITHUB_RUNNERS_PRIVATE_KEY` | Existing GitHub App PEM | `runners-private-key` |
+| `ENGINEBOX_GITHUB_RUNNERS_WEBHOOK_SECRET` | Existing matching secret, or broker-generated for a new App | `runners-webhook-secret` |
 
-Ask the broker operator to register the `enginebox` project alias with these six policies, the intended environment and `/github` source folder. Its policy uses `secretPath`; the helper example uses `path`. The example does not authorize itself. Provider-issued entries have `generate: false`; webhook entries have `generate: true`, `bytes: 32`. For repository-only operation, omit runner entries from the policy/helper configuration and set `runners: null`, `pools: []` in `github.json`.
+The `RUNNERS` prefix is retained for compatibility; these credentials now serve
+both features. Do not duplicate or rename stored secrets. If already delivered,
+reuse the private file references from the receiver receipt and skip uploading.
 
-After that alias and the agent's scoped grant are configured, use Kitbash:
+For a new delivery, generate only a missing webhook secret, then enroll the trusted
+controller using `pnpm run setup:controller` in Kitbash. Discover the destination
+with `kitbash_secret_deliveries`, then use `kitbash_upload_secrets` and its Python
+helper to send private credential files. The existing App and webhook value are
+preserved. No human upload page is needed.
+
+The receiver decrypts on the controller, sets the matching GitHub webhook secret,
+and stages owner-only files plus a `runners.json` App fragment with absolute file
+references. It does not attach credentials to application Workers or Actions VMs.
+
+A delivered receipt is **staging evidence only**. Put the fragment's App fields under
+**`app`** in the complete private `<controller-state>/github.json`, alongside `schema`,
+`callback_url` and `pools`; see [github.example.json](../examples/github.example.json).
+The fragment's filename does not require a separate `runners` registration in the
+configuration. Use `pools: []` until the dedicated CI worker and runner group are ready.
+The helper does not activate Enginebox configuration or restart a developer workspace.
+
+## 3. Optional Infisical adapter
+
+Use [github-secrets.kitbash.json](../examples/github-secrets.kitbash.json) for the
+operator helper's `.kitbash/secrets.json`. Fill the real project UUID/domain and
+map each target to your existing environment slug and `/github` folder. The
+example's `production` environment is illustrative; use `prod` if that is the
+actual Infisical environment. The helper uses `path`; broker policies use `secretPath`.
+
+Register the `enginebox` alias, target and scoped principal grant with the broker.
+Provider entries use `generate: false`, `rotation: provider`; webhook generation
+uses `generate: true`, `bytes: 32`, `rotation: migration-required`. Existing values
+must be preserved. `setup` reports missing provider values as pending; GitHub must
+issue them. The example does not grant authorization to itself.
 
 ```text
 /kit:secrets setup enginebox staging
 /kit:secrets status enginebox staging
 ```
 
-Or invoke `kitbash_secrets` with `{"operation":"setup","project":"enginebox","target":"staging"}`. `setup` generates missing webhook secrets, preserves existing values, and reports missing provider names as **pending**. Enter the four GitHub-issued values through the trusted Infisical UI/provider connection, then check status again. Keep PEM newlines intact. No broker was connected or provisioned by this implementation.
-
-For this native-controller integration, register secret storage/generation only. Kitbash's Cloudflare Worker sync does **not** install files on a Linux controller. The existing code-deployment workflow does not need these App secrets and must not receive them at build time. If you later automate trusted credential staging with GitHub Actions, configure an exact repository/environment/workflow OIDC identity with read access to `/github`, a protected environment, and reviewed credential-consuming code. Keep deployment keys in a separate `/ci` folder. Do not grant ordinary Actions workload VMs access to `/github`.
-
-## 3. Install credentials on the trusted controller host
-
-Run this as the controller service identity from a **trusted operator checkout**, outside the coding agent's filesystem/process boundary. The parent directory must already be private and writable. Set up the operator's `.kitbash/secrets.json` as above and log in to Infisical using the configured domain. The existing Kitbash helper injects only registered application values into this adapter; the adapter writes files and prints names/status, never values:
+From a trusted operator checkout with the target's Infisical login, stage the three
+existing runner names into a **new** private directory:
 
 ```sh
-# KITBASH_ROOT points to the trusted Kitbash installation (locally: ~/Workspace/feature-registry).
-# Run from the trusted Engine Box checkout containing .kitbash/secrets.json.
+# KITBASH_ROOT is the trusted Kitbash installation.
 node "$KITBASH_ROOT/bootstraps/shared/files/scripts/secrets.mjs" run --env staging -- \
   node packages/enginebox-deploy/src/github-secrets.mjs \
-  --directory /etc/enginebox/secrets/github
+  --directory /etc/enginebox/secrets/github --single-app
 ```
 
-Use `--env production` only for the production identity/project target. Add `--repos-only` after the destination for repository-only setup. The destination must be new: this command refuses to overwrite an existing directory, validates all required names before writing, creates mode-0700/0600 files on Unix, and removes newly staged files on a write failure. For Windows controllers use a private NTFS directory with an owner-only ACL established by the operator; Unix mode bits do not enforce Windows ACLs. An existing vault/secret agent may instead materialize these same files under the controller's private runtime identity.
+Use `--env production` only for the production target. The adapter validates all
+three values before creating mode-0700/0600 files, refuses to overwrite an existing
+directory, cleans newly staged files on write failure and prints names/status only.
+On Windows use a private NTFS directory with an owner-only ACL; Unix mode bits do
+not enforce Windows ACLs. A trusted vault agent can supply the same files instead.
+Never expose this directory to project processes, reusable images or normal CI jobs.
 
-Copy [github.example.json](../examples/github.example.json) to `<controller-state>/github.json`, mode 0600 with a private parent. Set the callback, both Client IDs/slugs, and secret file references. Inline values are supported for existing private configurations, but the example uses `{"file":"/absolute/private/path"}` so application configuration contains no credentials. Unix secret files must be regular, non-symlink files with owner-only access. They are read on controller activation, not on every request. Avoid exposing this directory to project processes or reusable images.
+For existing separate-App deployments, the adapter without a mode flag still stages
+all six `ENGINEBOX_GITHUB_{REPOS,RUNNERS}_*` names. Register those six in your helper
+policy and use [github-separate-apps.example.json](../examples/github-separate-apps.example.json).
+`--repos-only` still stages only repository credentials. Neither is needed for the
+single-App configuration.
 
-For runner pools, set the actual organization installation ID, runner group ID and private worker configuration path. Follow [runner setup](GITHUB-ACTIONS.md#setup-and-supported-interfaces). Stage the release in standby, drain the current owner, then activate through the normal supervisor procedure. Updating files alone does not activate a new configuration. Do not restart a developer workspace as a qualification fixture.
+## 4. Activate and verify
 
-## 4. Verify and rotate deliberately
+Copy the single-App example to `<controller-state>/github.json`, with an owner-only
+parent and mode 0600. Set the callback, one Client ID/slug and private file references.
+Inline values remain supported for existing private configurations, but file references
+keep secrets out of configuration. Secret files must be regular, non-symlink files
+and owner-only on Unix. They are read when the controller activates.
 
-1. Open the dashboard **GitHub** panel; connect repository access and select one disposable private test repository/branch.
-2. Open **Import or sync in Storage**. Fetch/review and import its credential-free source into LayerFS. Publish an accepted test change and verify its actual GitHub commit. Removing the grant must prevent the next transfer.
-3. Connect runner administration, approve the installation, and verify the expected group/pool. Opt one non-deploying test workflow into its `enginebox-<pool>` label. Verify GitHub's real conclusion, private diagnostics, VM deletion and runner cleanup.
-4. Test cancellation and drain before migrating selected workflow routing from an existing runner group. Keep old capacity until the canary succeeds.
+If switching an already connected two-App or repository-only configuration to `app`,
+first drain and resolve CI jobs and disconnect the old accounts. Then update the
+configuration and connect once after activation. Enginebox refuses to reuse the old
+accounts across modes. Repository selections must be added again; LayerFS files remain.
+Use the normal standby, drain and activation release procedure; staging files alone
+is not an active integration.
 
-Provider keys rotate through GitHub, then Infisical and a **new** private credential directory. Repoint the configuration during a drained release handoff, test, and revoke the previous provider key only after the new one works. The current webhook verifier accepts one secret per App: changing it needs a coordinated GitHub/controller cutover and inspection/redelivery of failed deliveries. Random replacement is not a seamless rotation protocol.
+1. Open dashboard **GitHub**, connect once and select a disposable private repository.
+2. **Choose repositories** shows Contents approval. **Review runner permissions** checks
+   Actions and organization runner permissions on the same App; no second login is needed.
+3. Open **Import or sync in Storage**, review/import credential-free source, then export
+   an accepted test revision and verify its GitHub commit. Revocation must stop transfers.
+4. Configure the actual installation/group IDs and dedicated CI worker according to
+   [runner setup](GITHUB-ACTIONS.md#setup-and-supported-interfaces). Route a non-deploying
+   canary to its `enginebox-<pool>` label. Verify the real conclusion, private diagnostics,
+   VM deletion and runner cleanup. Exercise cancellation and drain before migrating traffic.
 
-User OAuth refresh tokens and issued JIT configurations are runtime state, not entries to copy into the setup vault or CI secrets. They remain private to the controller/one-use worker respectively. The setup tests use fixtures; they do not establish real OAuth approval, vault access, successful hosted Actions execution or performance savings.
+Shared mode has one OAuth refresh record. Disconnecting either connection API removes
+both capabilities and repository selections only after jobs are resolved. Short-lived
+installation tokens remain scoped to each operation; App keys never enter Actions VMs.
+
+Rotate provider keys through GitHub and a new private credential directory, then
+repoint configuration during a drained handoff. Revoke the old key after verification.
+Webhook-secret replacement needs coordinated GitHub/controller activation and inspection
+of failed deliveries. Runtime OAuth refresh tokens and JIT configurations are not setup
+vault entries. Offline tests do not prove live OAuth, an Actions job or performance savings.

@@ -26,3 +26,20 @@ test("GitHub credential staging is private, create-only, and returns metadata", 
     await assert.rejects(materialize("relative", env), /absolute/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("single App staging needs only the existing runner credentials", async () => {
+  const root = await mkdtemp(join(tmpdir(), "enginebox-single-app-test-"));
+  try {
+    const env = Object.fromEntries(Object.keys(secretFiles).filter(name => name.includes("_RUNNERS_")).map(name => [name, name.endsWith("PRIVATE_KEY") ? "-----BEGIN PRIVATE KEY-----\nfixture-format-only\n-----END PRIVATE KEY-----" : "fixture-private-value-at-least-32-characters"]));
+    const directory = join(root,"shared");
+    const result = await materialize(directory, env, "single-app");
+    assert.equal(result.files, 3);
+    assert.ok(result.names.every(name => name.includes("_RUNNERS_")));
+    await assert.rejects(stat(join(directory,"repos-private-key")), /ENOENT/);
+    assert.equal(await readFile(join(directory,"runners-private-key"),"utf8"), env.ENGINEBOX_GITHUB_RUNNERS_PRIVATE_KEY);
+    assert.ok(!JSON.stringify(result).includes("fixture-private"));
+    await assert.rejects(materialize(directory,env,"single-app"), /EEXIST/);
+    await assert.rejects(materialize(join(root,"missing"),{},"single-app"), /Missing or invalid ENGINEBOX_GITHUB_RUNNERS_CLIENT_SECRET/);
+    await assert.rejects(stat(join(root,"missing")), /ENOENT/);
+  } finally { await rm(root, { recursive:true, force:true }); }
+});

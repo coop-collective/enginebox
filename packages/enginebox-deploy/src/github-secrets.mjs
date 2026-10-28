@@ -13,9 +13,10 @@ export const secretFiles = Object.freeze({
   ENGINEBOX_GITHUB_RUNNERS_WEBHOOK_SECRET: "runners-webhook-secret",
 });
 
-export async function materialize(directory, env = process.env, reposOnly = false) {
+export async function materialize(directory, env = process.env, mode = false) {
   if (!directory || !isAbsolute(directory)) throw new Error("Choose a new absolute private credential directory.");
-  const entries = Object.entries(secretFiles).filter(([name]) => !reposOnly || name.includes("_REPOS_"));
+  if (![false, true, "single-app"].includes(mode)) throw new Error("Unknown GitHub credential mode.");
+  const entries = Object.entries(secretFiles).filter(([name]) => mode === "single-app" ? name.includes("_RUNNERS_") : !mode || name.includes("_REPOS_"));
   for (const [name] of entries) {
     const value = env[name];
     if (typeof value !== "string" || !value.trim() || value.length > 65536 || value.includes("\0")) throw new Error(`Missing or invalid ${name}.`);
@@ -36,8 +37,8 @@ export async function materialize(directory, env = process.env, reposOnly = fals
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2);
-    if (args[0] !== "--directory" || ![2, 3].includes(args.length) || (args.length === 3 && args[2] !== "--repos-only")) throw new Error("Usage: github-secrets.mjs --directory /private/new-directory [--repos-only]");
-    console.log(JSON.stringify(await materialize(args[1], process.env, args[2] === "--repos-only")));
+    if (args[0] !== "--directory" || ![2, 3].includes(args.length) || (args.length === 3 && !["--repos-only", "--single-app"].includes(args[2]))) throw new Error("Usage: github-secrets.mjs --directory /private/new-directory [--single-app | --repos-only]");
+    console.log(JSON.stringify(await materialize(args[1], process.env, args[2] === "--single-app" ? "single-app" : args[2] === "--repos-only")));
   } catch {
     console.error("GitHub secret staging failed. Check registered secret names, file formats, and a new writable absolute destination; existing directories are preserved.");
     process.exitCode = 1;
