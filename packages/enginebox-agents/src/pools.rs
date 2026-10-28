@@ -40,6 +40,20 @@ fn default_project() -> String {
     DEFAULT_PROJECT.into()
 }
 
+/// The platform org: owner of every record written before orgs existed and of
+/// records that name none. Matches the dashboard's identity store.
+pub const DEFAULT_ORG: &str = "default";
+
+/// An org ID: `default` (the platform org) or `org_` + 24 lowercase hex.
+pub fn valid_org(org: &str) -> bool {
+    org == DEFAULT_ORG
+        || (org.len() == 28
+            && org.starts_with("org_")
+            && org[4..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
 /// `^[a-z][a-z0-9-]{0,31}$`: short enough that `ebox-<pool>-<n>` stays a
 /// valid instance name.
 pub fn valid_name(name: &str) -> bool {
@@ -70,6 +84,10 @@ pub struct Pool {
     /// existed load as [`DEFAULT_PROJECT`].
     #[serde(default = "default_project")]
     pub project: String,
+    /// The org that owns the pool. Absent (and never written) for the
+    /// platform org, so records stay readable by releases before orgs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
     #[serde(default)]
     pub description: String,
     /// Profile every run in the pool uses. A run may omit it or name it.
@@ -106,6 +124,10 @@ impl Pool {
             .cloned()
             .collect()
     }
+    /// The owning org (the platform org when unset).
+    pub fn org(&self) -> &str {
+        self.org_id.as_deref().unwrap_or(DEFAULT_ORG)
+    }
     pub fn max_workspaces(&self) -> usize {
         self.autoscale
             .as_ref()
@@ -120,6 +142,12 @@ impl Pool {
             valid_project(&self.project),
             "project must match ^[a-z0-9](?:[a-z0-9-]{{0,46}}[a-z0-9])?$"
         );
+        if let Some(org) = &self.org_id {
+            ensure!(
+                valid_org(org) && org != DEFAULT_ORG,
+                "org_id must be an org ID other than the platform org (omit it for the platform org)"
+            );
+        }
         ensure!(
             self.description.len() <= 512 && !self.description.chars().any(char::is_control),
             "description must be at most 512 printable bytes"
@@ -173,6 +201,7 @@ impl Pool {
         json!({
             "name":self.name,
             "project":self.project,
+            "org_id":self.org(),
             "description":self.description,
             "profile":self.profile,
             "template":self.template,
@@ -249,6 +278,7 @@ impl Pools {
             object.keys().all(|k| [
                 "name",
                 "project",
+                "org_id",
                 "description",
                 "profile",
                 "template",
@@ -259,6 +289,7 @@ impl Pools {
             "Unsupported pool fields"
         );
         let named_project = object.contains_key("project");
+        let named_org = object.contains_key("org_id");
         let mut pool: Pool = serde_json::from_value(body)?;
         let mut pools = self.pools.lock().unwrap();
         let now = crate::now();
@@ -267,6 +298,10 @@ impl Pools {
                 // Replacing a pool without naming a project keeps its project.
                 if !named_project {
                     pool.project = existing.project.clone();
+                }
+                // Likewise its org: a pool changes org only when a request names one.
+                if !named_org {
+                    pool.org_id = existing.org_id.clone();
                 }
                 pool.created = existing.created.clone();
                 pool.next_index = existing.next_index;

@@ -1,7 +1,9 @@
-import { bodyJson, HttpError, json, requireOrigin, requireSession } from './server';
+import { bodyJson, HttpError, json, requireOrigin, requireRole, requireSession } from './server';
 
 export async function environmentProxy(request: Request, path: string) {
-  requireSession(request);
+  // Reading needs membership; publishing a route changes shared infrastructure (admin).
+  if (request.method === 'GET') requireSession(request);
+  else requireRole(request, 'admin');
   if (request.method !== 'GET') requireOrigin(request);
   if (!((request.method === 'GET' && path === 'v1/environments') || (request.method === 'POST' && path === 'v1/environments/routes')))
     throw new HttpError(404, 'Unknown environment operation.');

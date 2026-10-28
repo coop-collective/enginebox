@@ -7,10 +7,12 @@
   "compatibility_date": "2026-09-01",
   "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "404-page", "run_worker_first": true },
   // ARTIFACTS: the Artifacts gateway (packages/artifacts-gateway), RPC only;
-  // deploy the gateway first.
+  // deploy the gateway first. EMAIL_GATEWAY: the email gateway
+  // (packages/email-gateway) for dashboard sign-in mail, RPC only; deploy it first.
   "services": [
     { "binding": "DASHBOARD", "service": "enginebox-dashboard-edge" },
-    { "binding": "ARTIFACTS", "service": "enginebox-artifacts-gateway", "entrypoint": "ArtifactsGateway" }
+    { "binding": "ARTIFACTS", "service": "enginebox-artifacts-gateway", "entrypoint": "ArtifactsGateway" },
+    { "binding": "EMAIL_GATEWAY", "service": "enginebox-email-gateway", "entrypoint": "EmailGateway" }
   ],
   "observability": { "enabled": true, "traces": { "enabled": true, "head_sampling_rate": 0.1 } },
   "routes": [{ "pattern": "enginebox.coopcollective.dev", "custom_domain": true }]

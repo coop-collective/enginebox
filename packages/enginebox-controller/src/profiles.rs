@@ -96,6 +96,7 @@ impl Profiles {
         ensure!(
             object.keys().all(|k| [
                 "name",
+                "org_id",
                 "description",
                 "template",
                 "providers",
@@ -104,11 +105,16 @@ impl Profiles {
             .contains(&k.as_str())),
             "Unsupported profile fields"
         );
+        let named_org = object.contains_key("org_id");
         let mut profile: Profile = serde_json::from_value(body)?;
         let mut profiles = self.profiles.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         match profiles.get(&profile.name) {
             Some(existing) => {
+                // A profile changes org only when a request names one.
+                if !named_org {
+                    profile.org_id = existing.org_id.clone();
+                }
                 profile.revision = existing.revision + 1;
                 profile.created_at = existing.created_at.clone();
             }

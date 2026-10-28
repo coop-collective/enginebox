@@ -70,6 +70,15 @@ fn main() -> Result<()> {
                     "ENGINEBOX_NODE_PUBLIC_ORIGIN",
                     "ENGINEBOX_OAUTH_STATE_DIR",
                     "ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS",
+                    // Orgs and email sign-in (docs/ORGS.md).
+                    "ENGINEBOX_IDENTITY_STATE_DIR",
+                    "ENGINEBOX_OWNER_EMAIL",
+                    "ENGINEBOX_ORG_NAME",
+                    "ENGINEBOX_EMAIL_ENDPOINT",
+                    "ENGINEBOX_EMAIL_SECRET",
+                    "ENGINEBOX_CLIENT_IP_HEADER",
+                    "ENGINEBOX_TENANCY_MODE",
+                    "ENGINEBOX_OPEN_SIGNUP",
                     // Run queue and admission tuning (docs/QUEUE.md).
                     "ENGINEBOX_RUN_QUEUE_MAX_TOTAL",
                     "ENGINEBOX_RUN_QUEUE_MAX_PER_PRINCIPAL",

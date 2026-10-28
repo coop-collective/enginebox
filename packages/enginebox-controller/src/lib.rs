@@ -6,10 +6,12 @@ mod compute;
 pub mod contributors;
 mod environment;
 pub mod jobs;
+pub mod metering;
 pub mod profiles;
 pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
+pub mod tenancy;
 mod workspaces;
 
 use anyhow::{Context, Result, ensure};
@@ -61,6 +63,8 @@ struct Runtime {
     service_tokens: service_tokens::ServiceTokens,
     profiles: profiles::Profiles,
     repositories: repositories::Repositories,
+    tenancy: tenancy::Tenancy,
+    usage: Arc<dyn metering::UsageSink>,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -84,6 +88,8 @@ pub struct Controller {
     reconcile_error: Mutex<Option<(String, String)>>,
     /// Test harnesses stand in for the repository backend's API.
     repository_transport: Mutex<Option<Arc<dyn repositories::Transport>>>,
+    /// Where usage events go (metering.rs); discarded unless a deployment sets one.
+    usage_sink: Mutex<Arc<dyn metering::UsageSink>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -118,7 +124,13 @@ impl Controller {
             observations: Mutex::new(std::collections::BTreeMap::new()),
             reconcile_error: Mutex::new(None),
             repository_transport: Mutex::new(None),
+            usage_sink: Mutex::new(metering::noop()),
         }))
+    }
+    /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
+    pub fn with_usage_sink(self: &Arc<Self>, sink: Arc<dyn metering::UsageSink>) -> Arc<Self> {
+        *self.usage_sink.lock().unwrap() = sink;
+        self.clone()
     }
     pub fn activate(self: &Arc<Self>) -> Result<Value> {
         let mut gate = self.gate.lock().unwrap();
@@ -173,6 +185,8 @@ impl Controller {
             contributors: contributors::Contributors::open(&self.root)?,
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles: profiles::Profiles::open(&self.root)?,
+            tenancy: tenancy::Tenancy::open(&self.root)?,
+            usage: self.usage_sink.lock().unwrap().clone(),
             repositories: match self.repository_transport.lock().unwrap().clone() {
                 Some(transport) => {
                     repositories::Repositories::with_transport(&self.root, transport)?
@@ -544,6 +558,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         Ok(principal) => principal,
         Err((code, message)) => return error(code, message),
     };
+    let org = match acting_org(&principal, request.headers()) {
+        Ok(org) => org,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let project_of = |pool: &str| {
         controller
             .runtime()
@@ -745,7 +763,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         })
         .await
     } else {
-        admitted(admission, write(controller, parts, body, principal)).await
+        admitted(admission, write(controller, parts, body, principal, org)).await
     };
     match result {
         Ok((StatusCode::TOO_MANY_REQUESTS, v)) => {
@@ -897,6 +915,7 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
                 .status(&format!("{owner}/{repo}"), run.parse()?)
         }
         ["v1", "agents"] => c.runtime()?.agents.status(),
+        ["v1", "tenancy"] => Ok(c.runtime()?.tenancy.view()),
         ["v1", "agent-runs"] => {
             let agents = c.runtime()?.agents;
             let project_of = |pool: &str| agents.pools().project_of(pool);
@@ -1012,11 +1031,45 @@ fn string<'a>(body: &'a Value, key: &str) -> Result<&'a str> {
     body[key].as_str().context("Expected string field")
 }
 
+/// The org a request acts for. A service token acts for its own org. The owner
+/// token acts for the platform org unless the dashboard, which holds it and has
+/// authenticated the member, names another org in `X-EngineBox-Org`.
+fn acting_org(
+    principal: &Principal,
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<String, &'static str> {
+    match principal {
+        Principal::Service(token) => Ok(token.org().to_owned()),
+        Principal::Owner => match headers.get(tenancy::ORG_HEADER) {
+            None => Ok(enginebox_agents::pools::DEFAULT_ORG.into()),
+            Some(value) => value
+                .to_str()
+                .ok()
+                .filter(|o| enginebox_agents::pools::valid_org(o))
+                .map(str::to_owned)
+                .ok_or("X-EngineBox-Org must be an org ID."),
+        },
+    }
+}
+
+/// New pools, profiles and repositories belong to the acting org. The platform
+/// org is never written, so default-org records stay as they were before orgs.
+fn stamp_org(body: &mut Value, org: &str) {
+    if org != enginebox_agents::pools::DEFAULT_ORG
+        && let Some(object) = body.as_object_mut()
+    {
+        object
+            .entry("org_id")
+            .or_insert_with(|| Value::String(org.to_owned()));
+    }
+}
+
 async fn write(
     c: Arc<Controller>,
     parts: Vec<String>,
-    body: Value,
+    mut body: Value,
     principal: Principal,
+    org: String,
 ) -> Result<(StatusCode, Value)> {
     if parts.get(1).is_some_and(|p| p == "github") {
         let github = c.runtime()?.github;
@@ -1242,11 +1295,11 @@ async fn write(
             identifier(host, false)?;
             identifier(name, true)?;
             let target = RunTarget::Workspace(host.to_string(), name.to_string());
-            return start_run(&runtime, target, body, &principal).await;
+            return start_run(&runtime, target, body, &principal, &org).await;
         }
         ["v1", "pools", pool, "agent-runs"] => {
             let target = RunTarget::Pool(pool.to_string());
-            return start_run(&runtime, target, body, &principal).await;
+            return start_run(&runtime, target, body, &principal, &org).await;
         }
         ["v1", "pools", pool, "agent-runs", id, "cancel"] => {
             empty(&body)?;
@@ -1255,6 +1308,7 @@ async fn write(
             json!({"run":blocking(move||runtime.agents.cancel_pool_run(&pool,&id)).await?})
         }
         ["v1", "pools"] => {
+            stamp_org(&mut body, &org);
             let fleet = c.fleet.clone();
             if let Some(profile) = body.get("profile").and_then(Value::as_str) {
                 ensure!(runtime.profiles.exists(profile), "Unknown profile");
@@ -1269,6 +1323,7 @@ async fn write(
             runtime.agents.delete_pool(pool)?
         }
         ["v1", "projects", project, "repositories"] => {
+            stamp_org(&mut body, &org);
             let repositories = runtime.repositories.clone();
             let project = project.to_string();
             let outcome = blocking(move || repositories.create(&project, &body)).await;
@@ -1313,7 +1368,28 @@ async fn write(
             code = StatusCode::CREATED;
             runtime.profiles.upload(&body)?
         }
-        ["v1", "profiles"] => runtime.profiles.put(body)?,
+        ["v1", "profiles"] => {
+            stamp_org(&mut body, &org);
+            runtime.profiles.put(body)?
+        }
+        ["v1", "tenancy", "hosts", host, "org"] => {
+            let fleet = c.fleet.clone();
+            let contributors = runtime.contributors.clone();
+            runtime.tenancy.assign_host(host, &body, &|h| {
+                fleet.hosts().iter().any(|x| x.id == h) || contributors.knows(h)
+            })?
+        }
+        ["v1", "tenancy", "grants"] => {
+            let agents = runtime.agents.clone();
+            code = StatusCode::CREATED;
+            runtime.tenancy.grant(&body, &|p| {
+                agents.pools().get(p).map(|pool| pool.org().to_owned())
+            })?
+        }
+        ["v1", "tenancy", "grants", id, "revoke"] => {
+            empty(&body)?;
+            runtime.tenancy.revoke_grant(id)?
+        }
         ["v1", "profiles", name, "delete"] => {
             empty(&body)?;
             runtime.profiles.delete(name)?
@@ -1432,7 +1508,40 @@ async fn start_run(
     target: RunTarget,
     mut body: Value,
     principal: &Principal,
+    org: &str,
 ) -> Result<(StatusCode, Value)> {
+    // Tenancy (tenancy.rs): an org runs on its own hosts and pools, or on
+    // platform pools under a capacity grant. Everything before orgs is the
+    // platform org's, so the owner token and existing service tokens are unchanged.
+    let (capacity_org, grant_id, metered_pool, metered_host) = match &target {
+        RunTarget::Pool(pool) => {
+            let Some(pool_org) = runtime.agents.pools().get(pool).map(|p| p.org().to_owned())
+            else {
+                return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown pool."})));
+            };
+            match runtime.tenancy.admit_pool_run(org, pool, &pool_org) {
+                tenancy::Admission::Own => (pool_org, None, Some(pool.clone()), None),
+                tenancy::Admission::Granted { grant_id, .. } => {
+                    (pool_org, Some(grant_id), Some(pool.clone()), None)
+                }
+                tenancy::Admission::Denied => {
+                    return Ok((
+                        StatusCode::FORBIDDEN,
+                        json!({"error":"This organization has no access to that pool."}),
+                    ));
+                }
+            }
+        }
+        RunTarget::Workspace(host, _) => {
+            if !runtime.tenancy.admit_host_run(org, host) {
+                return Ok((
+                    StatusCode::FORBIDDEN,
+                    json!({"error":"This organization does not own that host."}),
+                ));
+            }
+            (org.to_owned(), None, None, Some(host.clone()))
+        }
+    };
     let object = body.as_object_mut().context("Expected object")?;
     // v2 fields are controller-side; the native request stays as before.
     let mut profile_name = match object.remove("profile") {
@@ -1509,7 +1618,8 @@ async fn start_run(
                 json!({"error":"A pool run may use only a repository in the pool's project."}),
             ));
         }
-        if !runtime.repositories.exists(&project, &name) {
+        // Another org's repository is reported as unknown, never used.
+        if runtime.repositories.org_of(&project, &name).as_deref() != Some(org) {
             return Ok((
                 StatusCode::NOT_FOUND,
                 json!({"error":"Unknown repository."}),
@@ -1553,6 +1663,7 @@ async fn start_run(
         repository,
     };
     let started_by = principal.started_by();
+    let metered_by = started_by.clone();
     let agents = runtime.agents.clone();
     let outcome = blocking(move || {
         Ok(match target {
@@ -1565,7 +1676,21 @@ async fn start_run(
     .await?;
     match outcome {
         Ok((run, true)) => Ok((StatusCode::OK, json!({"run":run,"replayed":true}))),
-        Ok((run, false)) => Ok((StatusCode::ACCEPTED, json!({"run":run}))),
+        Ok((run, false)) => {
+            runtime.usage.record(&metering::UsageEvent {
+                kind: metering::UsageKind::RunAdmitted,
+                org_id: org.to_owned(),
+                capacity_org,
+                grant_id,
+                run_id: run["id"].as_str().map(str::to_owned),
+                credential_id: None,
+                pool: metered_pool,
+                host_id: metered_host,
+                started_by: metered_by,
+                at: chrono::Utc::now().to_rfc3339(),
+            });
+            Ok((StatusCode::ACCEPTED, json!({"run":run})))
+        }
         Err(error) => match error.downcast_ref::<enginebox_agents::queue::QueueFull>() {
             Some(full) => Ok((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1957,6 +2082,118 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(body.to_owned()))
             .unwrap()
+    }
+    #[tokio::test]
+    async fn tenancy_scopes_records_and_runs_by_acting_org() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        const TENANT: &str = "org_0123456789abcdef01234567";
+        let as_org = |method: Method, path: &str, body: &str, org: &str| {
+            let mut r = request(method, path, body, true);
+            r.headers_mut()
+                .insert(tenancy::ORG_HEADER, org.parse().unwrap());
+            r
+        };
+        let (status, view) = call(&app, request(Method::GET, "/v1/tenancy", "", true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["mode"], "self_hosted");
+        assert_eq!(view["host_orgs"], json!({}));
+        // A malformed org header is refused before any state.
+        assert_eq!(
+            call(&app, as_org(Method::GET, "/v1/pools", "", "../other"))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // A pool created while acting for an org belongs to it; the platform org cannot run in it.
+        let pool =
+            json!({"name":"mine","workspaces":[{"host_id":"worker","name":"ebox-a"}]}).to_string();
+        let (status, created) = call(&app, as_org(Method::POST, "/v1/pools", &pool, TENANT)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["pool"]["org_id"], TENANT);
+        let run = json!({"provider":"codex","prompt":"hi"}).to_string();
+        let (status, refused) = call(
+            &app,
+            request(Method::POST, "/v1/pools/mine/agent-runs", &run, true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        // Records of the platform org are written exactly as before orgs (no org_id field).
+        let plain =
+            json!({"name":"plain","workspaces":[{"host_id":"worker","name":"ebox-b"}]}).to_string();
+        assert_eq!(
+            call(&app, request(Method::POST, "/v1/pools", &plain, true))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let stored = std::fs::read_to_string(c.root.join("agent-pools/plain.json")).unwrap();
+        assert!(!stored.contains("org_id"));
+        // A host assigned to an org: the platform org can no longer start runs on it.
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/tenancy/hosts/worker/org",
+                &json!({"org_id":TENANT}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, refused) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/hosts/worker/instances/ebox-a/agent-runs",
+                &run,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(
+            call(
+                &app,
+                request(
+                    Method::POST,
+                    "/v1/tenancy/hosts/nowhere/org",
+                    &json!({"org_id":TENANT}).to_string(),
+                    true
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Capacity grants: only platform pools, to other orgs.
+        let (status, grant) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/tenancy/grants",
+                &json!({"tenant_org":TENANT,"pool":"plain","limits":{"max_concurrent_runs":1}})
+                    .to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{grant}");
+        assert_eq!(
+            call(
+                &app,
+                request(
+                    Method::POST,
+                    "/v1/tenancy/grants",
+                    &json!({"tenant_org":TENANT,"pool":"mine"}).to_string(),
+                    true
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
     }
     async fn call(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
         let response = app.clone().oneshot(request).await.unwrap();

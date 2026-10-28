@@ -1,0 +1,16 @@
+{
+  "name": "@enginebox/email-gateway",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "scripts": {
+    "configure": "node configure.mjs",
+    "check": "node --check src/gateway.mjs && node --check src/index.mjs && node --check configure.mjs",
+    "test": "node --test test/*.test.mjs",
+    "dry-run": "wrangler deploy --dry-run --config ../../.state/email-gateway/wrangler.json",
+    "deploy": "wrangler deploy --config ../../.state/email-gateway/wrangler.json",
+    "secret": "wrangler secret put EMAIL_GATEWAY_SECRET --config ../../.state/email-gateway/wrangler.json"
+  },
+  "devDependencies": { "wrangler": "4.152.0" }
+}

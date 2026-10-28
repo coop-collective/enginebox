@@ -16,6 +16,7 @@ Engine Box is in early development; each guide states what is implemented, quali
 - [Runtime](RUNTIME.md): current runtime configuration and capability boundaries.
 - [Fleet API and MCP](FLEET.md): REST and operator MCP operations.
 - [Dashboard](DASHBOARD.md): the authenticated Vinext fleet dashboard.
+- [Organizations](ORGS.md): orgs, members, email sign-in, tenancy and the managed-offering extension points; [self-hosting checklist](SELF-HOSTING-ORGS.md).
 - [Templates](TEMPLATES.md): portable workspace templates and resource presets.
 - [Warm pools](WARM-POOLS.md): prebooted fresh workspaces.
 - [Browser access](BROWSER.md): per-workspace headless Chromium over Playwright MCP.

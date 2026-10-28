@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { bodyJson, config, HttpError, json, requireOrigin, requireSession } from "./server";
+import { bodyJson, config, HttpError, json, requireOrigin, requireRole } from "./server";
 
 const flowName = "enginebox_github_flow";
 function seal(value: string) { return createHmac("sha256", config().secret).update(`github:${value}`).digest("hex"); }
@@ -25,7 +25,7 @@ async function controller(path: string, body: unknown) {
   return response.json();
 }
 export async function connectGitHub(request: Request) {
-  requireSession(request); requireOrigin(request);
+  requireRole(request, "admin"); requireOrigin(request);
   const { kind } = await bodyJson(request);
   if (!["repos", "runners"].includes(kind)) throw new HttpError(400, "Unknown GitHub connection.");
   const result = await controller(`${kind}/connect`, {});

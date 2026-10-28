@@ -415,6 +415,14 @@ impl Contributors {
                     .is_some_and(|h| equal(h, &secret_hash(token)))
         })
     }
+    /// True for a registered (not revoked) node ID: an org can own it (docs/ORGS.md).
+    pub fn knows(&self, id: &str) -> bool {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|n| !n.revoked)
+    }
     pub fn catalog(&self) -> Value {
         let rows=self.nodes.lock().unwrap().values().map(|n|json!({"id":n.id,"label":n.invitation.label,
             "budget":n.budget,"workloads":n.invitation.workloads,"os":n.os,"architecture":n.architecture,
