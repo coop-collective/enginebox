@@ -63,4 +63,5 @@ export async function copyAccepted(source, checkout) {
     await symlink(entry.target, output);
   }
   for (const { output } of links) check((await realpath(output)).startsWith(`${checkout}${sep}`), 'source-link-chain-escape');
+  return { bytes };
 }
