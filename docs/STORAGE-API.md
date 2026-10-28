@@ -64,7 +64,7 @@ There is no API for general `exec`, arbitrary cache preparation, forced discard,
 
 ## MCP and terminal
 
-The dashboard's **Storage** sidebar uses the same API. It shows enrolled nodes and their receipts, lets an operator review the exact source commit before attesting and importing, and forks from the base or a completed prepared checkpoint. Checkout actions track independent jobs, so work on one checkout does not disable its siblings. Status polling stops after 15 minutes or an observation failure; the UI can check an existing job again without resubmitting its command. Leaving the page stops observation, not the node operation.
+The dashboard's **Workspaces → Source and storage** controls use the same API. Within a workspace, project selectors and checkout receipts are limited to that project; the all-workspace setup view remains available for new imports and legacy `?panel=storage` links. The controls show enrolled nodes and their receipts, lets an operator review the exact source commit before attesting and importing, and forks from the base or a completed prepared checkpoint. Checkout actions track independent jobs, so work on one checkout does not disable its siblings. Status polling stops after 15 minutes or an observation failure; the UI can check an existing job again without resubmitting its command. Leaving the page stops observation, not the node operation.
 
 The built-in `enginebox-fleet-mcp` server exposes six local storage tools:
 

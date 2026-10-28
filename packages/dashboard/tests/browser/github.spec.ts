@@ -36,7 +36,7 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
   await expect(page.getByLabel("Sync branch")).toHaveValue("main");
   await page.getByRole("button", { name: "Add repository" }).click();
   await expect(page.getByText("fixture/private", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Import or sync in Storage" })).toHaveAttribute("href", "/?panel=storage&github_repository=12");
+  await expect(page.getByRole("link", { name: "Prepare source and sync" })).toHaveAttribute("href", "/?panel=workspaces&storage=1&github_repository=12");
   await page.getByLabel("Prepared runner profile").selectOption("linux");
   await page.getByLabel("Runner group name").fill("fixture-prepared");
   await page.getByLabel("Enginebox action at commit SHA").fill(`fixture/enginebox/packages/enginebox-actions@${"a".repeat(40)}`);
@@ -51,7 +51,7 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
   expect(writes.find(w => w.path.endsWith("/select"))?.body.repository_id).toBe(12);
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-  await page.getByRole("link", { name: "Import or sync in Storage" }).click();
+  await page.getByRole("link", { name: "Prepare source and sync" }).click();
   await expect(page.getByLabel("GitHub repository", { exact: true })).toHaveValue("fixture/private");
   await expect(page.getByLabel("GitHub branch", { exact: true })).toHaveValue("main");
   await page.getByLabel("GitHub project ID", { exact: true }).fill("private-app");

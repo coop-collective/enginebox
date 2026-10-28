@@ -15,7 +15,6 @@ import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
 import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
-import { StoragePanel } from "@/components/storage-panel";
 import { ComputePanel, type Contributor } from "@/components/compute-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
@@ -56,8 +55,8 @@ const sections = {
     icon: "box",
   },
   storage: {
-    title: "Storage",
-    description: "Reuse project checkouts and prepared dependencies across agents.",
+    title: "Workspaces",
+    description: "Project source, storage, environments and measured preparation.",
     icon: "server",
   },
   repositories: {
@@ -65,9 +64,10 @@ const sections = {
     description: "Project sources, environments, agent activity and measured preparation.",
     icon: "box",
   },
+  mcp: { title: "MCP", description: "Connect a client, control workspaces and review app access.", icon: "terminal" },
   apps: {
-    title: "Connected apps",
-    description: "Review and disconnect apps you approved to run agents.",
+    title: "MCP",
+    description: "Connect a client, control workspaces and review app access.",
     icon: "terminal",
   },
 };
@@ -943,14 +943,14 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "workspaces", "agents", "templates", "storage", "environments", "apps"] as const)
+          {(["fleet", "workspaces", "agents", "templates", "environments", "mcp"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
                 key={item}
                 type="button"
-                className={`nav-item${section === item || (item === "workspaces" && ["github", "repositories"].includes(section)) ? " active" : ""}`}
-                aria-current={section === item || (item === "workspaces" && ["github", "repositories"].includes(section)) ? "page" : undefined}
+                className={`nav-item${section === item || (item === "workspaces" && ["github", "repositories", "storage"].includes(section)) || (item === "mcp" && section === "apps") ? " active" : ""}`}
+                aria-current={section === item || (item === "workspaces" && ["github", "repositories", "storage"].includes(section)) || (item === "mcp" && section === "apps") ? "page" : undefined}
                 onClick={() => navigate(item)}
               >
                 <Icon name={sections[item].icon} />
@@ -1092,7 +1092,7 @@ export default function Dashboard() {
                   </button>
                 </div>
               )}
-              {["workspaces", "github", "repositories"].includes(section) && <WorkspacesPanel fleet={fleet} initialConnections={section === "github"} />}
+              {["workspaces", "github", "repositories", "storage"].includes(section) && <WorkspacesPanel key={section} fleet={fleet} initialConnections={section === "github"} initialStorage={section === "storage"} refreshToken={updated?.getTime() ?? 0} />}
               {section === "agents" && (
                 <AgentsPanel close={() => navigate("fleet")} />
               )}
@@ -1106,11 +1106,8 @@ export default function Dashboard() {
                 <CiTemplates />
                 </>
               )}
-              {section === "storage" && (
-                <StoragePanel refreshToken={updated?.getTime() ?? 0} />
-              )}
               {section === "environments" && <EnvironmentsPanel />}
-              {section === "apps" && <ConnectedAppsPanel />}
+              {["mcp", "apps"].includes(section) && <ConnectedAppsPanel />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

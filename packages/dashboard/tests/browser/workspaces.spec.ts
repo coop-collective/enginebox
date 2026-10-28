@@ -1,6 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 import { createHmac, randomBytes } from "node:crypto";
-import { dashboardOrigin } from "./urls";
+import { dashboardOrigin, fixtureOrigin } from "./urls";
 import type { Workspace } from "../../lib/workspaces";
 async function signIn(page: Page, path = "/?panel=workspaces") {
   const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3600000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
@@ -55,7 +55,7 @@ test("one workspace source list creates hosted sources, links approved GitHub an
   await page.getByLabel("Source type").selectOption("github");
   await page.getByLabel("Selected GitHub repository").selectOption("fixture/private");
   await page.getByRole("button", { name: "Link GitHub source" }).click();
-  await expect(page.getByRole("link", { name: "Review and prepare source" })).toHaveAttribute("href", "/?panel=storage&workspace=app&github_repository=7");
+  await expect(page.getByRole("link", { name: "Review and prepare source" })).toHaveAttribute("href", "/?panel=workspaces&storage=1&workspace=app&github_repository=7");
   await page.getByLabel("Agent pool").selectOption("app-pool");
   await page.getByLabel("Repository access").selectOption("app/main");
   await page.getByLabel("Task", { exact: true }).fill("Inspect the code and propose a change");
@@ -82,4 +82,30 @@ test("partial unavailable observations remain unknown and old repository URLs op
   await expect(page.getByText(/Development state unavailable/)).toBeVisible();
   await expect(page.getByText(/No project-attributed storage operations measured yet/)).toBeVisible();
   await expect(page.getByText(/No agent pool is assigned/)).toBeVisible();
+});
+
+test("workspace storage controls cannot operate on another project's checkouts", async ({ page, request }) => {
+  await request.post(`${fixtureOrigin}/__test/reset`);
+  await page.route("**/api/control/v1/jobs/storage-*", async route => {
+    const response = await route.fetch();
+    const value = await response.json();
+    if (Array.isArray(value.job?.result?.result?.workspaces)) {
+      value.job.result.result.workspaces.push({ name: "demo-private", project: "demo", status: "ready" });
+      value.job.result.result.github_projects.push({ id: "other", repository: "private/other", branch: "main", current: { project: "native-other", commit: "a".repeat(40) } });
+    }
+    await route.fulfill({ response, json: value });
+  });
+  await signIn(page, "/?panel=workspaces&workspace=game&storage=1");
+  await expect(page.getByRole("heading", { name: "Source and storage · game" })).toBeVisible();
+  const control = page.getByRole("region", { name: "Source and storage · game" });
+  await expect(control.getByRole("combobox", { name: "Project", exact: true })).toBeDisabled();
+  await expect(control.getByRole("combobox", { name: "Project", exact: true })).toHaveValue("game");
+  await expect(control.getByRole("combobox", { name: "Project", exact: true }).locator("option")).toHaveCount(1);
+  await control.getByText("Import a GitHub repository", { exact: true }).click();
+  await expect(control.getByLabel("GitHub project ID")).toHaveValue("game");
+  await expect(control.getByLabel("GitHub project ID")).toHaveAttribute("readonly", "");
+  await expect(control.getByRole("region", { name: "Checkout worker-a", exact: true })).toBeVisible();
+  await expect(control.getByRole("region", { name: "Checkout demo-private", exact: true })).toHaveCount(0);
+  await expect(control.getByText("private/other", { exact: false })).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Storage", exact: true })).toHaveCount(0);
 });
