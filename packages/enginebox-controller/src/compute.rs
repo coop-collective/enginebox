@@ -2,7 +2,7 @@
 //!
 //! This is a projection of the existing registration authorities, not a second
 //! scheduler or credential store. In particular, an Incus host must not also be
-//! enrolled as a contributor just to appear in Compute.
+//! given a second Compute row when its machine credential is enrolled.
 use enginebox_core::{GIB, Host, capacity::number};
 use serde_json::{Value, json};
 
@@ -52,18 +52,87 @@ pub fn hosts(fleet: &Value, configured: &[Host]) -> Vec<Value> {
         } else { Value::Null };
         json!({"id":format!("host:{}",host.id),"source_id":host.id,"label":host.label,
             "backend":"incus","platform":"linux","registered":true,"online":online,
-            "registration":{"method":"controller_config"},
+            "registration":{"method":"controller_config","state":"configured","node_id":null},
             "runtime":{"state":state,"running_workspaces":if online {json!(running)} else {Value::Null},"active_job":null,"last_seen":if online {json!(now)} else {Value::Null}},
             "resources":{"budget":budget,"available":available},"templates":templates,
             "capabilities":{"vm_workspaces":true,"template_workspaces":false,"ci_jobs":false},
-            "management":{"revoke":false,"reconcile":false,"limits":"controller_config"},
+            "management":{"revoke":false,"reconcile":false,"enroll":false,"node_id":null,"limits":"controller_config"},
             "error":row.get("error").cloned().unwrap_or(Value::Null)})
     }).collect()
 }
 
+/// Link a managed server's scoped enrollment to its existing host identity.
+/// A credential is never a second source of machine capacity or VM ownership.
+pub fn enrolled_hosts(fleet: &Value, configured: &[Host], catalog: &Value) -> Vec<Value> {
+    let mut projected = hosts(fleet, configured);
+    for (host, machine) in configured.iter().zip(&mut projected) {
+        if !host.managed_registration {
+            continue;
+        }
+        let binding = enginebox_core::state::digest(&host.binding());
+        let registrations: Vec<_> = catalog["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|n| n["kind"] == "incus" && n["host_id"] == host.id)
+            .collect();
+        let current = registrations
+            .iter()
+            .find(|n| n["revoked"] != true)
+            .copied()
+            .or_else(|| registrations.last().copied());
+        let bound = current.is_some_and(|n| n["binding_digest"] == binding);
+        let enrolled =
+            current.is_some_and(|n| n["enrolled"] == true && n["revoked"] != true) && bound;
+        let registration_state = match current {
+            None => "required",
+            Some(n) if n["revoked"] == true => "revoked",
+            Some(_) if !bound => "binding_changed",
+            Some(n) if n["enrolled"] != true => "pending",
+            Some(_) => "enrolled",
+        };
+        let ssh_online = machine["online"] == true;
+        let online = ssh_online && enrolled && current.is_some_and(|n| n["online"] == true);
+        let needs_attention = !enrolled
+            || current.is_some_and(|n| n["blocked"] == true || n["tools"]["host_ready"] != true);
+        machine["registration"] = json!({"method":"enrollment","state":registration_state,"node_id":current.map(|n| &n["id"])});
+        machine["online"] = json!(online);
+        machine["runtime"]["last_seen"] = current.map_or(Value::Null, |n| n["last_seen"].clone());
+        machine["runtime"]["inventory_online"] = json!(ssh_online);
+        if !enrolled || (online && needs_attention) {
+            machine["runtime"]["state"] = json!("needs_attention");
+        } else if !online {
+            machine["runtime"]["state"] = json!("offline");
+        }
+        machine["management"] = json!({"revoke":current.is_some_and(|n| n["revoked"] != true),
+            "reconcile":false,"enroll":!registrations.iter().any(|n| n["revoked"] != true),
+            "node_id":current.map(|n| &n["id"]),"limits":"controller_config"});
+        machine["error"] = match registration_state {
+            "required" => json!("Register this server to enable managed workloads."),
+            "pending" => {
+                json!("Complete this server's installation with its pending registration code.")
+            }
+            "revoked" => {
+                json!("Machine credential revoked. Register this server again to enable workloads.")
+            }
+            "binding_changed" => json!(
+                "Server configuration changed. Revoke the old registration before registering this server again."
+            ),
+            _ if current.is_some_and(|n| n["blocked"] == true) => {
+                json!("Machine registration requires operator attention.")
+            }
+            _ if online && needs_attention => {
+                json!("The machine is connected but its local Incus runtime is not ready.")
+            }
+            _ => machine["error"].clone(),
+        };
+    }
+    projected
+}
+
 pub fn workers(catalog: &Value) -> Vec<Value> {
     catalog["nodes"].as_array().into_iter().flatten()
-        .filter(|n| n["enrolled"] == true && n["revoked"] != true)
+        .filter(|n| n["kind"] != "incus" && n["enrolled"] == true && n["revoked"] != true)
         .map(|n| {
             let online = n["online"] == true;
             let blocked = n["blocked"] == true;
@@ -77,18 +146,18 @@ pub fn workers(catalog: &Value) -> Vec<Value> {
             json!({"id":format!("worker:{}",n["id"].as_str().unwrap_or_default()),"source_id":n["id"],"label":n["label"],
                 "backend":tools["backend"].as_str().unwrap_or("unknown"),
                 "platform":if tools["backend"] == "wsl2-layerfs" {"windows"} else {n["os"].as_str().unwrap_or("unknown")},
-                "registered":true,"online":online,"registration":{"method":"enrollment"},
+                "registered":true,"online":online,"registration":{"method":"enrollment","state":"enrolled","node_id":n["id"]},
                 "runtime":{"state":state,"running_workspaces":null,"active_job":n["active_job"],"last_seen":n["last_seen"]},
                 "resources":{"budget":resources(number(&budget["cpu"]),number(&budget["memory_gib"])*GIB,number(&budget["disk_gib"])*GIB),"available":null},
                 "templates":tools["templates"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>(),
                 "capabilities":{"vm_workspaces":false,"template_workspaces":workspace,"ci_jobs":ci},
-                "management":{"revoke":true,"reconcile":online && blocked && tools["worker_running"] == false,"limits":"local_installer"},
+                "management":{"revoke":true,"reconcile":online && blocked && tools["worker_running"] == false,"enroll":false,"node_id":n["id"],"limits":"local_installer"},
                 "error":null})
         }).collect()
 }
 
 pub fn catalog(fleet: &Value, configured: &[Host], contributors: &Value) -> Value {
-    let mut nodes = hosts(fleet, configured);
+    let mut nodes = enrolled_hosts(fleet, configured, contributors);
     nodes.extend(workers(contributors));
     nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     json!({"schema_version":1,"nodes":nodes})
@@ -97,6 +166,72 @@ pub fn catalog(fleet: &Value, configured: &[Host], contributors: &Value) -> Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_host_enrollment_links_one_identity_and_gates_readiness() {
+        let host = Host {
+            id: "metal".into(),
+            managed_registration: true,
+            ..Host::default()
+        };
+        let binding = enginebox_core::state::digest(&host.binding());
+        let fleet = json!({"hosts":[{"id":"metal","online":true,"instances":[],"capacity":{
+            "cpu_total":8,"memory_total_bytes":16*GIB,"pool_total_bytes":100*GIB,
+            "cpu_available":4,"memory_budget_available_bytes":8*GIB,"disk_budget_available_bytes":50*GIB,"instance_slots_available":2}}],
+            "templates":[{"id":"native","host_ids":["metal"],"minimum":{"cpu":2,"memory_gib":2,"disk_gib":30}}]});
+        let mut registration = json!({"id":"credential","kind":"incus","host_id":"metal","binding_digest":binding,
+            "enrolled":false,"revoked":false,"online":false,"tools":{}});
+        let project = |node: &Value| {
+            catalog(
+                &fleet,
+                std::slice::from_ref(&host),
+                &json!({"nodes":[node]}),
+            )
+        };
+        let missing = enrolled_hosts(&fleet, std::slice::from_ref(&host), &json!({"nodes":[]}));
+        assert_eq!(missing[0]["id"], "host:metal");
+        assert_eq!(missing[0]["management"]["enroll"], true);
+        assert_eq!(missing[0]["runtime"]["state"], "needs_attention");
+        assert_eq!(missing[0]["online"], false);
+        let pending = project(&registration);
+        assert_eq!(pending["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(pending["nodes"][0]["registration"]["state"], "pending");
+        assert_eq!(pending["nodes"][0]["management"]["enroll"], false);
+        registration["enrolled"] = json!(true);
+        registration["online"] = json!(true);
+        registration["tools"] = json!({"backend":"incus","host_ready":true,"worker_running":false});
+        let live = project(&registration);
+        assert_eq!(live["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(live["nodes"][0]["id"], "host:metal");
+        assert_eq!(live["nodes"][0]["source_id"], "metal");
+        assert_eq!(live["nodes"][0]["management"]["node_id"], "credential");
+        assert_eq!(live["nodes"][0]["runtime"]["state"], "ready");
+        assert_eq!(live["nodes"][0]["online"], true);
+        registration["tools"]["host_ready"] = json!(false);
+        assert_eq!(
+            project(&registration)["nodes"][0]["runtime"]["state"],
+            "needs_attention"
+        );
+        registration["online"] = json!(false);
+        assert_eq!(
+            project(&registration)["nodes"][0]["runtime"]["state"],
+            "offline"
+        );
+        registration["binding_digest"] = json!("stale-binding");
+        let stale = project(&registration);
+        assert_eq!(
+            stale["nodes"][0]["registration"]["state"],
+            "binding_changed"
+        );
+        assert_eq!(stale["nodes"][0]["management"]["enroll"], false);
+        assert_eq!(stale["nodes"][0]["management"]["revoke"], true);
+        registration["revoked"] = json!(true);
+        let revoked = project(&registration);
+        assert_eq!(revoked["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(revoked["nodes"][0]["registration"]["state"], "revoked");
+        assert_eq!(revoked["nodes"][0]["management"]["enroll"], true);
+        assert_eq!(revoked["nodes"][0]["runtime"]["state"], "needs_attention");
+    }
 
     #[test]
     fn existing_authorities_have_stable_distinct_identities_without_copying_state() {
