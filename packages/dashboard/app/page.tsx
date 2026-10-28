@@ -180,10 +180,10 @@ function HostCard({ host }: { host: Host }) {
           <Icon name="server" />
         </div>
         <div>
-          <h3>{host.label}</h3>
+          <h3>Host resources</h3>
           <span className="mono subtle">{host.id}</span>
         </div>
-        <Status status={host.online ? "Online" : "Offline"} />
+        <span className="subtle">{host.online ? "Inventory available" : "Inventory unavailable"}</span>
       </div>
       {!host.online || !c ? (
         <p className="host-error" role="status">
@@ -409,6 +409,12 @@ function WorkspaceRow({
   );
 }
 
+function hostAdmitting(fleet: Fleet, host: Host) {
+  const machine = fleet.compute_nodes?.find(node => node.backend === "incus" && node.source_id === host.id);
+  return host.online && (machine?.registration.method !== "enrollment" ||
+    (machine.online && ["ready", "capacity_limited"].includes(machine.runtime.state)));
+}
+
 function CreateWorkspace({
   fleet,
   busy,
@@ -421,7 +427,7 @@ function CreateWorkspace({
   create: (host: string, request: Allocation) => Promise<void>;
 }) {
   const [host, setHost] = useState(
-    fleet.hosts.find((item) => item.online)?.id ?? "",
+    fleet.hosts.find((item) => hostAdmitting(fleet, item))?.id ?? "",
   );
   const available = fleet.templates.filter(
     (item) => !item.host_ids || item.host_ids.includes(host),
@@ -490,7 +496,7 @@ function CreateWorkspace({
   const ready = pools.reduce((sum, pool) => sum + pool.ready, 0);
   const preparing = pools.reduce((sum, pool) => sum + pool.preparing, 0);
   const valid =
-    !!selectedHost?.online &&
+    !!selectedHost && hostAdmitting(fleet, selectedHost) &&
     !!selectedTemplate &&
     !!size &&
     resourceValid &&
@@ -546,9 +552,9 @@ function CreateWorkspace({
                 Select a host
               </option>
               {fleet.hosts.map((item) => (
-                <option key={item.id} value={item.id} disabled={!item.online}>
+                <option key={item.id} value={item.id} disabled={!hostAdmitting(fleet, item)}>
                   {item.label}
-                  {!item.online ? " (offline)" : ""}
+                  {!hostAdmitting(fleet, item) ? " (unavailable)" : ""}
                 </option>
               ))}
             </select>
@@ -889,9 +895,10 @@ export default function Dashboard() {
     window.scrollTo({ top: 0 });
   }
   const online = fleet?.hosts.filter((host) => host.online) ?? [];
-  const registeredWorkers = workers.filter(worker => worker.enrolled && !worker.revoked);
-  const onlineMachines = online.length + registeredWorkers.filter(worker => worker.online).length;
-  const machineCount = (fleet?.hosts.length ?? 0) + registeredWorkers.length;
+  const admittingHosts = fleet ? fleet.hosts.filter(host => hostAdmitting(fleet, host)) : [];
+  const computeMachines = [...(fleet?.compute_nodes ?? []), ...workerNodes].filter(node => node.registered);
+  const onlineMachines = computeMachines.filter(node => node.online).length;
+  const machineCount = computeMachines.length;
   const instances =
     fleet?.hosts.flatMap((host) =>
       host.instances.map((instance) => ({ host, instance })),
@@ -1076,7 +1083,7 @@ export default function Dashboard() {
                     <button
                       className="button primary"
                       onClick={() => setCreating((value) => !value)}
-                      disabled={!fleet || !online.length}
+                      disabled={!fleet || !admittingHosts.length}
                     >
                       <Icon name="plus" size={17} />
                       New workspace
@@ -1181,10 +1188,10 @@ export default function Dashboard() {
                     hosts={fleet?.hosts ?? []}
                     hostsLoaded={fleet !== null}
                     nodes={workers}
-                    machines={[...(fleet?.compute_nodes ?? []), ...workerNodes]}
+                    machines={computeMachines}
                     loaded={workersLoaded}
                     loadError={workersError}
-                    refresh={refreshWorkers}
+                    refresh={refresh}
                     hostDetails={(host) => <HostCard host={host} />}
                   />
                   <section className="workspaces-section">

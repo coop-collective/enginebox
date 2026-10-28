@@ -113,7 +113,7 @@ export type ComputeNode = {
   platform: string;
   registered: boolean;
   online: boolean;
-  registration: { method: "controller_config" | "enrollment" };
+  registration: { method: "controller_config" | "enrollment"; state?: "configured" | "required" | "pending" | "enrolled" | "revoked" | "binding_changed"; node_id?: string | null };
   runtime: {
     state: "offline" | "ready" | "busy" | "preparing" | "capacity_limited" | "needs_attention";
     running_workspaces: number | null;
@@ -126,7 +126,7 @@ export type ComputeNode = {
   };
   templates: string[];
   capabilities: { vm_workspaces: boolean; template_workspaces: boolean; ci_jobs: boolean };
-  management: { revoke: boolean; reconcile: boolean; limits: "controller_config" | "local_installer" };
+  management: { revoke: boolean; reconcile: boolean; enroll?: boolean; node_id?: string | null; limits: "controller_config" | "local_installer" };
   error: string | null;
 };
 export type Job = {
