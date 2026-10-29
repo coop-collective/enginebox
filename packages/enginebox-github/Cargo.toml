@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+crypto_box = { version = "0.9", features = ["seal"] }
 enginebox-core = { path = "../enginebox-core" }
 enginebox-storage-layerfs = { path = "../enginebox-storage-layerfs" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

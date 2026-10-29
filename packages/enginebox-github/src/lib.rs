@@ -1,4 +1,5 @@
 //! Optional GitHub integration. The runtime has no dependency on this crate.
+pub mod actions_secrets;
 pub mod api;
 pub mod ci;
 mod config;
