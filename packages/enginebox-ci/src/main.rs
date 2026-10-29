@@ -137,7 +137,28 @@ fn run(config: Config, request: Request) -> Result<Value> {
     let started = Instant::now();
     let mut receipt = json!({"schema":1,"name":request.name,"job_id":request.job_id,"repository":request.repository,"status":"preparing","runner_version":config.runner_version,"cleaned":false});
     state::write_json(&receipt_path, &receipt)?;
+    let mut waiting_for_capacity = false;
     let outcome = (|| -> Result<()> {
+        {
+            let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
+            let facts = inventory(&host)?;
+            ensure!(
+                !facts["instances"]
+                    .as_array()
+                    .context("Host inventory lacks instances")?
+                    .iter()
+                    .any(|vm| vm["project"] == host.project && vm["name"] == request.name),
+                "Disposable name already exists; inspect instead of reporting clean admission"
+            );
+            if !enginebox_core::capacity::resource_fits(&host, &facts, config.resources)? {
+                // No allocation, checkout, guest or JIT delivery has been attempted.
+                // The controller must remove its unused registration before retrying.
+                waiting_for_capacity = true;
+                receipt["allocation_started"] = json!(false);
+                receipt["cleaned"] = json!(true);
+                return Ok(());
+            }
+        }
         if let Some(profile) = &config.acceleration {
             ensure!(
                 fleet.template(&host, &config.template)?["manifest_digest"] == profile.image,
@@ -367,7 +388,9 @@ exit 0
         Ok(())
     })();
     receipt["duration_seconds"] = json!(started.elapsed().as_secs_f64());
-    receipt["status"] = json!(if outcome.is_ok() {
+    receipt["status"] = json!(if waiting_for_capacity {
+        "waiting_capacity"
+    } else if outcome.is_ok() {
         "finished"
     } else {
         "uncertain"
