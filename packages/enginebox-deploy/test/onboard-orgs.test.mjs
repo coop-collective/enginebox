@@ -76,3 +76,13 @@ test("the printed dashboard environment uses a placeholder for the secret", () =
   assert.equal(env.ENGINEBOX_EMAIL_ENDPOINT, "https://enginebox.coopcollective.dev/_email/send");
   assert.match(env.ENGINEBOX_EMAIL_SECRET, /^</);
 });
+
+test("Email Sending already enabled on the domain is detected, so a re-run skips enabling it", async () => {
+  const { sendingEnabled } = await import("../src/onboard-orgs.mjs");
+  const table = "│ zone │ name │ enabled │\n│ coopcollective.dev │ coopcollective.dev │ yes │\n│ other.dev │ other.dev │ no │\n";
+  const fake = (out, status = 0) => () => ({ status, stdout: out });
+  assert.equal(sendingEnabled({ domain: "coopcollective.dev", account: "a" }, fake(table)), true);
+  assert.equal(sendingEnabled({ domain: "other.dev", account: "a" }, fake(table)), false);
+  assert.equal(sendingEnabled({ domain: "missing.dev", account: "a" }, fake(table)), false);
+  assert.equal(sendingEnabled({ domain: "coopcollective.dev", account: "a" }, fake(table, 1)), false);
+});
