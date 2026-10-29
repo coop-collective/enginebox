@@ -172,13 +172,22 @@ choose a workspace template, run setup commands or start CI from them.
 
 ### Where the controller reads the config
 
-The controller uses the config last **registered** for the repository:
-`POST /v1/projects/{project}/repositories/{name}/agent-config {commit, config}`,
-or the `repo_config_register` MCP tool. Callers with access to the repository may
-register, typically the checkout that is about to run, or CI on the default
-branch. Who registers does not affect security, because a config only declares.
-Reading `.enginebox/config.json` automatically at the exact commit a run checks
-out (from the guest checkout or the repository backend) is not implemented yet.
+Before each run on a repository the controller reads `.enginebox/config.json`
+at the head of the repository's **default branch** and registers it (as
+`registered_by: "repository"`). It uses a five-minute read token sent as a git
+header from the environment (never argv), `git ls-remote` to see whether the
+head moved, and a blobless shallow fetch only when it did; a head read in the
+last 30 seconds is not read again. If the read fails, the last registered
+config stays in force and `enginebox.repo_config.source_read_failed` is logged.
+If the file is removed, a config that came from the repository is unregistered.
+
+A config can also be **registered** through
+`POST /v1/projects/{project}/repositories/{name}/agent-config {commit, config}`
+or the `repo_config_register` MCP tool, for a repository without the file (or
+before it lands). The repository's own file replaces it on the next run. Who
+registers does not affect security, because a config only declares. A run on
+another branch still uses the default branch's config: changes to what a
+repository asks for take effect when they are merged.
 
 ### API and tools
 

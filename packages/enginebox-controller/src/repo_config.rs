@@ -391,7 +391,14 @@ pub struct Snapshot {
 pub struct RepoRequirements {
     root: PathBuf,
     mappings: Arc<Mutex<BTreeMap<String, Mapping>>>,
+    /// repository -> (the head last read from its source, when).
+    checked: Arc<Mutex<BTreeMap<String, (String, std::time::Instant)>>>,
 }
+
+/// Who registers a config read from the repository itself.
+pub const SOURCE_ACTOR: &str = "repository";
+/// How long a source read stands before the next run reads the head again.
+const SOURCE_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the repository requirements contribute to one run.
 #[derive(Default, Debug)]
@@ -424,16 +431,88 @@ impl RepoRequirements {
         Ok(Self {
             root,
             mappings: Arc::new(Mutex::new(mappings)),
+            checked: Arc::default(),
         })
     }
     pub fn snapshot(&self, repository: &str) -> Option<Snapshot> {
-        let path = self
-            .root
-            .join("snapshots")
-            .join(format!("{}.json", file_key(repository)));
-        state::read_json(&path)
+        state::read_json(&self.snapshot_path(repository))
             .ok()
             .and_then(|v| serde_json::from_value(v).ok())
+    }
+    /// Bring the registered config up to date with the repository's default
+    /// branch head before a run (`read` reads it, given the head already
+    /// known). A failure keeps the last registered config and is logged
+    /// without detail that could carry a token. A config removed from the
+    /// repository unregisters one that came from it; one registered through
+    /// the API stays until the repository has its own.
+    pub fn refresh_from_source(
+        &self,
+        org: &str,
+        repository: &str,
+        read: impl FnOnce(Option<&str>) -> Result<crate::repo_source::Head>,
+    ) {
+        use crate::repo_source::Head;
+        let known = {
+            let checked = self.checked.lock().unwrap();
+            match checked.get(repository) {
+                Some((_, at)) if at.elapsed() < SOURCE_RECHECK => return,
+                Some((commit, _)) => Some(commit.clone()),
+                None => self
+                    .snapshot(repository)
+                    .filter(|s| s.org_id == org && s.registered_by == SOURCE_ACTOR)
+                    .and_then(|s| s.commit),
+            }
+        };
+        let outcome = read(known.as_deref()).and_then(|head| {
+            let commit = match head {
+                Head::Unchanged => known.clone().unwrap_or_default(),
+                Head::Fetched {
+                    commit,
+                    config: Some(config),
+                } => {
+                    self.register(
+                        org,
+                        SOURCE_ACTOR,
+                        repository,
+                        &json!({"commit": commit, "config": config}),
+                    )?;
+                    commit
+                }
+                Head::Fetched {
+                    commit,
+                    config: None,
+                } => {
+                    if self
+                        .snapshot(repository)
+                        .is_some_and(|s| s.registered_by == SOURCE_ACTOR)
+                    {
+                        std::fs::remove_file(self.snapshot_path(repository))?;
+                    }
+                    commit
+                }
+            };
+            self.checked
+                .lock()
+                .unwrap()
+                .insert(repository.to_owned(), (commit, std::time::Instant::now()));
+            Ok(())
+        });
+        if let Err(error) = outcome {
+            // Retry on the next run only after the recheck interval.
+            self.checked.lock().unwrap().insert(
+                repository.to_owned(),
+                (known.unwrap_or_default(), std::time::Instant::now()),
+            );
+            eprintln!(
+                "{}",
+                json!({"event":"enginebox.repo_config.source_read_failed","repository":repository,"reason":error.to_string().chars().take(200).collect::<String>()})
+            );
+        }
+    }
+    fn snapshot_path(&self, repository: &str) -> PathBuf {
+        self.root
+            .join("snapshots")
+            .join(format!("{}.json", file_key(repository)))
     }
     /// Record the config of `repository` at `commit` (validated). Who sends
     /// it does not matter for security: a config only declares.
@@ -466,10 +545,7 @@ impl RepoRequirements {
             registered_at: chrono::Utc::now().to_rfc3339(),
         };
         state::write_json(
-            &self
-                .root
-                .join("snapshots")
-                .join(format!("{}.json", file_key(repository))),
+            &self.snapshot_path(repository),
             &serde_json::to_value(&snapshot)?,
         )?;
         Ok(json!({"registered": repository, "commit": snapshot.commit}))
@@ -947,5 +1023,42 @@ pub(crate) mod tests {
         ] {
             assert!(RepoConfig::parse(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_source_head_registers_unregisters_and_survives_failures() {
+        use crate::repo_source::Head;
+        let t = tempfile::tempdir().unwrap();
+        let reqs = RepoRequirements::open(t.path()).unwrap();
+        let repo = "alpha/site";
+        let fetched = |commit: &str, config: Option<Value>| {
+            let commit = commit.to_owned();
+            move |_: Option<&str>| Ok(Head::Fetched { commit, config })
+        };
+        reqs.refresh_from_source("o", repo, fetched("aaaaaaa", Some(workers_config())));
+        let s = reqs.snapshot(repo).unwrap();
+        assert_eq!(
+            (s.commit.as_deref(), s.registered_by.as_str()),
+            (Some("aaaaaaa"), SOURCE_ACTOR)
+        );
+        // Within the recheck interval the head is not read again.
+        reqs.refresh_from_source("o", repo, |_| panic!("read again"));
+        // A failed read keeps the registered config.
+        reqs.checked.lock().unwrap().clear();
+        reqs.refresh_from_source("o", repo, |known| {
+            assert_eq!(known, Some("aaaaaaa"));
+            anyhow::bail!("offline")
+        });
+        assert!(reqs.snapshot(repo).is_some());
+        // The file removed from the repository unregisters it.
+        reqs.checked.lock().unwrap().clear();
+        reqs.refresh_from_source("o", repo, fetched("bbbbbbb", None));
+        assert!(reqs.snapshot(repo).is_none());
+        // A config registered through the API stays while the repository has none.
+        reqs.register("o", "owner", repo, &json!({"config": workers_config()}))
+            .unwrap();
+        reqs.checked.lock().unwrap().clear();
+        reqs.refresh_from_source("o", repo, fetched("ccccccc", None));
+        assert_eq!(reqs.snapshot(repo).unwrap().registered_by, "owner");
     }
 }

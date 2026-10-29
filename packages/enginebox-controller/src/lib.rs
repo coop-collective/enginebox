@@ -14,6 +14,7 @@ pub mod kitbash;
 pub mod metering;
 pub mod profiles;
 pub mod repo_config;
+pub mod repo_source;
 pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
@@ -2011,6 +2012,18 @@ async fn start_run(
     match &repository {
         None => ensure!(repo_profile.is_none(), "repo_profile needs a repository"),
         Some(reference) => {
+            // The config follows the repository's default branch head.
+            let (requirements, repositories) =
+                (runtime.repo_config.clone(), runtime.repositories.clone());
+            let (source_org, source_ref) = (org.to_owned(), reference.clone());
+            blocking(move || {
+                requirements.refresh_from_source(&source_org, &source_ref, |known| {
+                    let credential = repositories.read_credential(&source_ref, 300)?;
+                    repo_source::read(&credential, known)
+                });
+                Ok(())
+            })
+            .await?;
             let granted = match runtime.repo_config.grant(
                 org,
                 reference,
