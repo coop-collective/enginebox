@@ -4,7 +4,7 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 
 ## What is implemented
 
-- Sidebar navigation for Compute, Workspaces, Agents, Templates, Environments and MCP. Workspaces consolidates hosted/GitHub sources and source/storage controls with project activity and measured preparation. MCP teaches local stdio setup and retains OAuth app grant management. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
+- Sidebar navigation for Compute, Workspaces, Agents, Profiles, Connections, Templates, Environments and MCP. Workspaces consolidates hosted/GitHub sources and source/storage controls with project activity and measured preparation. MCP teaches local stdio setup and retains OAuth app grant management. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
 - **Compute** combines configured VM hosts and enrolled Windows workers in one machine list. Pending and revoked registrations stay collapsed. Add machine issues the Windows installer command; CPU/memory/disk allowances are selected on that PC. The online count includes both inventories; VM resource cards and VM allocation controls use only VM hosts. Worker allowances are not physical host utilization or additional VM capacity. Either inventory remains visible if the other fails, with a visible error.
 - Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size. The top CPU card shows allocated cores and percentage, not CPU utilization. Host memory usage is total minus available memory, clamped to the reported total.
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.
@@ -29,6 +29,12 @@ The controller stores the canonical template. Registration automatically queues 
 Each catalog record's **Export JSON** button downloads `{id}-r{revision}.json` with only the supported v1 manifest fields. Host inventory, deployment receipts, snapshot references and catalog digests are excluded. The exported file can be registered in another Engine Box installation through JSON import or an HTTPS URL.
 
 The app has no demo mode and no production fallback to synthetic inventory. Test fixtures live only in `packages/dashboard/tests/fixtures/`.
+
+## Profiles and connections
+
+**Connections** lists the org's [connections catalog](CONNECTIONS.md): MCP servers and secret sources, where each value comes from (by name), the profiles that use each, and when a run last used it. Owners and admins add connections (HTTP or stdio MCP servers, stored or Kitbash secret sources), test them (reachability and auth, never values), set a secret, or delete an unused one. Secret inputs are password fields; values are sent once and never shown again.
+
+**Profiles** shows each profile's template, per-provider permissions, skills, plugins, own MCP servers and env names, its attached connections, the per-run-kind policy (tick which connections each run kind gets), and recent runs with the kind and connection revisions they used. Owners and admins attach, detach and edit the policy; members read. Both views go through `/api/catalog/*`, which forwards the member's user ID as `X-EngineBox-Actor` for the audit log.
 
 ## Agents and native accounts
 

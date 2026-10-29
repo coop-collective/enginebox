@@ -130,6 +130,9 @@ impl Catalog {
             ["v1", "profiles", name, "connections", "detach"] => {
                 ("profile.detach_connection", name.to_string(), 200)
             }
+            ["v1", "profiles", name, "connections", "policy"] => {
+                ("profile.set_policy", name.to_string(), 200)
+            }
             ["v1", "catalog", "apply"] => ("catalog.apply", String::new(), 200),
             _ => return None,
         };
@@ -197,6 +200,17 @@ impl Catalog {
                 crate::keys(body, &["connection"], &["connection"])?;
                 let connection = crate::string(body, "connection")?.to_owned();
                 self.detach(org, name, &connection)
+            }
+            ["v1", "profiles", name, "connections", "policy"] => {
+                crate::keys(body, &["connection_policy"], &["connection_policy"])?;
+                let policy: std::collections::BTreeMap<String, Vec<String>> =
+                    serde_json::from_value(body["connection_policy"].clone())
+                        .context("connection_policy maps run kinds to connection names.")?;
+                self.own_profile(org, name)?;
+                self.profiles.modify(name, move |p| {
+                    p.connection_policy = policy;
+                    Ok(())
+                })
             }
             ["v1", "catalog", "apply"] => {
                 crate::keys(body, &["document", "dry_run", "prune"], &["document"])?;
