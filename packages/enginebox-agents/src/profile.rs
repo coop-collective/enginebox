@@ -156,6 +156,15 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     pub providers: BTreeMap<String, ProviderProfile>,
+    /// Org catalog connections (docs/CONNECTIONS.md) by name, resolved at
+    /// launch into each provider's MCP config and the run's env. Omitted when
+    /// empty so profiles without connections stay readable by older releases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<String>,
+    /// Run kind (or `*`) -> the subset of `connections` that applies to runs
+    /// of that kind. A kind not listed uses `*`, else every connection.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connection_policy: BTreeMap<String, Vec<String>>,
     /// HMAC key for run callbacks started by the owner with this profile.
     /// Write-only: never returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +186,28 @@ impl std::fmt::Debug for Profile {
 }
 fn owner() -> String {
     OWNER.into()
+}
+
+/// Most connections one profile may reference.
+pub const MAX_CONNECTIONS: usize = 32;
+/// A run kind as a start request names it (`planner`, `builder`, `debug`...).
+pub fn valid_run_kind(kind: &str) -> bool {
+    regex::Regex::new(r"^[a-z][a-z0-9_-]{0,31}$")
+        .unwrap()
+        .is_match(kind)
+}
+/// The connections that apply to a run of `run_kind` (docs/CONNECTIONS.md,
+/// "Policy per kind of run"). No kind, or a kind the policy does not list and
+/// no `*` entry: every connection of the profile.
+pub fn connections_for<'a>(
+    connections: &'a [String],
+    policy: &'a BTreeMap<String, Vec<String>>,
+    run_kind: Option<&str>,
+) -> &'a [String] {
+    match run_kind.and_then(|k| policy.get(k).or_else(|| policy.get("*"))) {
+        Some(subset) => subset,
+        None => connections,
+    }
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -227,7 +258,7 @@ fn valid_tool(tool: &str) -> bool {
 fn bare_tool(tool: &str) -> &str {
     tool.split('(').next().unwrap_or(tool)
 }
-fn valid_mcp_url(url: &str) -> bool {
+pub fn valid_mcp_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
@@ -271,6 +302,34 @@ impl Profile {
             !self.providers.is_empty(),
             "providers must configure at least one native client."
         );
+        ensure!(
+            self.connections.len() <= MAX_CONNECTIONS,
+            "connections accepts at most {MAX_CONNECTIONS} names."
+        );
+        let mut seen = BTreeSet::new();
+        for name in &self.connections {
+            ensure!(
+                valid_name(name) && seen.insert(name.as_str()),
+                "connections must be distinct connection names."
+            );
+        }
+        ensure!(
+            self.connection_policy.len() <= 32,
+            "connection_policy accepts at most 32 run kinds."
+        );
+        for (kind, subset) in &self.connection_policy {
+            ensure!(
+                kind == "*" || valid_run_kind(kind),
+                "connection_policy keys must be run kinds matching ^[a-z][a-z0-9_-]{{0,31}}$ or *."
+            );
+            let mut once = BTreeSet::new();
+            ensure!(
+                subset
+                    .iter()
+                    .all(|c| seen.contains(c.as_str()) && once.insert(c.as_str())),
+                "connection_policy may list only the profile's own connections, once each."
+            );
+        }
         for (provider, block) in &self.providers {
             crate::provider(provider)?;
             block.validate(provider, file_exists)?;
@@ -301,6 +360,8 @@ impl Profile {
             "description":self.description,
             "template":self.template,
             "providers":providers,
+            "connections":self.connections,
+            "connection_policy":self.connection_policy,
             "has_callback_secret":self.callback_secret.is_some(),
             "revision":self.revision,
             "created_at":self.created_at,
@@ -993,4 +1054,44 @@ pub fn forbidden_flag(arg: &str) -> bool {
         || lower.contains("bypasspermissions")
         || lower.contains("danger-full-access")
         || lower == "--bare"
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    fn profile(value: Value) -> Profile {
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn connection_policy_selects_per_run_kind_and_validates() {
+        let p = profile(json!({"name":"coder","providers":{"codex":{}},
+            "connections":["a","b","c"],
+            "connection_policy":{"planner":[],"builder":["b"],"*":["a"]}}));
+        p.validate(&|_| true).unwrap();
+        let pick = |kind| connections_for(&p.connections, &p.connection_policy, kind).to_vec();
+        assert_eq!(pick(None), vec!["a", "b", "c"]);
+        assert!(pick(Some("planner")).is_empty());
+        assert_eq!(pick(Some("builder")), vec!["b"]);
+        assert_eq!(pick(Some("deploy")), vec!["a"]);
+        let open = profile(
+            json!({"name":"coder","providers":{"codex":{}},"connections":["a"],"connection_policy":{"planner":[]}}),
+        );
+        assert_eq!(
+            connections_for(&open.connections, &open.connection_policy, Some("debug")),
+            ["a".to_string()]
+        );
+        for bad in [
+            json!({"name":"x","providers":{"codex":{}},"connections":["a","a"]}),
+            json!({"name":"x","providers":{"codex":{}},"connections":["A"]}),
+            json!({"name":"x","providers":{"codex":{}},"connections":["a"],"connection_policy":{"debug":["b"]}}),
+            json!({"name":"x","providers":{"codex":{}},"connections":["a"],"connection_policy":{"Bad Kind":[]}}),
+        ] {
+            assert!(profile(bad).validate(&|_| true).is_err());
+        }
+        // Profiles without connections serialize exactly as before.
+        let legacy = profile(json!({"name":"x","providers":{"codex":{}}}));
+        let text = serde_json::to_string(&legacy).unwrap();
+        assert!(!text.contains("connection"));
+        assert!(valid_run_kind("builder") && !valid_run_kind("Builder") && !valid_run_kind(""));
+    }
 }

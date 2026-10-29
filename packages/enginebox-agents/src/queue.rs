@@ -205,6 +205,10 @@ pub struct Entry {
     /// unset so older releases still read the entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// The run's stated kind; re-resolves the profile's connection policy
+    /// after a restart. Omitted when unset so older releases still read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_kind: Option<String>,
 }
 impl Entry {
     pub fn validate(&self) -> Result<()> {

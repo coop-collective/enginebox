@@ -247,6 +247,8 @@ fn a_profile_gone_after_a_restart_fails_at_resolve() {
         template: None,
         block: ProviderProfile::default(),
         files: BTreeMap::new(),
+        run_kind: None,
+        connections: Vec::new(),
     };
     let (run, _) = first
         .launch_with(
@@ -264,7 +266,7 @@ fn a_profile_gone_after_a_restart_fails_at_resolve() {
     first.close();
     drop(first);
     let second = service(&root);
-    second.set_profile_resolver(Arc::new(|_, _| Err(anyhow::anyhow!("Unknown profile"))));
+    second.set_profile_resolver(Arc::new(|_, _, _| Err(anyhow::anyhow!("Unknown profile"))));
     measure(&second, true);
     second.start_scheduler();
     wait_for("resolve failure", || {

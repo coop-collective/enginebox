@@ -79,6 +79,7 @@ export function ConnectedAppsPanel() {
           <dt>Inspect source and activity</dt><dd><code>workspace_catalog</code> and <code>repository_list</code> show project sources, observations and repository bindings.</dd>
           <dt>Create or map source</dt><dd><code>repository_create</code> creates a hosted source. <code>repository_link_github</code> maps an owner-selected GitHub source; this requires owner authority.</dd>
           <dt>Prepare and reuse storage</dt><dd><code>storage_catalog</code>, <code>storage_github_preview</code> and <code>storage_github_import</code> support reviewed imports. <code>storage_fork</code> creates an independent checkout; use <code>fleet_job</code> to observe operations.</dd>
+          <dt>Set up connections and profiles</dt><dd><code>connection_create</code>, <code>connection_test</code> and <code>profile_attach_connection</code> share an MCP server or secret source across profiles; <code>catalog_apply</code> applies a reviewed catalog file. These require owner authority; secret values are never returned.</dd>
           <dt>Run and follow an agent</dt><dd><code>pool_agent_launch</code> submits to a granted project pool. Follow it with <code>pool_agent_run</code> or <code>pool_agent_cancel</code>. <code>agent_runs</code> lists permitted work; <code>agent_launch</code> targets an explicitly selected environment.</dd>
         </dl>
         <p>Tool availability follows the installed CLI and controller versions. If a listed tool is missing, update both to a version that includes it and reconnect the client.</p>

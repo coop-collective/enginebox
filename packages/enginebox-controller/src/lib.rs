@@ -1,8 +1,11 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
+pub mod audit;
 pub mod callbacks;
+pub mod catalog;
 pub mod ci;
 mod ci_templates;
 mod compute;
+pub mod connections;
 pub mod contributors;
 pub mod credentials;
 mod environment;
@@ -63,6 +66,7 @@ struct Runtime {
     contributors: contributors::Contributors,
     service_tokens: service_tokens::ServiceTokens,
     profiles: profiles::Profiles,
+    catalog: catalog::Catalog,
     repositories: repositories::Repositories,
     tenancy: tenancy::Tenancy,
     usage: Arc<dyn metering::UsageSink>,
@@ -175,6 +179,12 @@ impl Controller {
         // Reload under exclusive ownership on every activation, including rollback.
         // A standby process must never recover another process's active jobs.
         let github = enginebox_github::GitHub::open(&self.root)?;
+        let profiles = profiles::Profiles::open(&self.root)?;
+        let catalog = catalog::Catalog::new(
+            connections::Connections::open(&self.root)?,
+            profiles.clone(),
+            audit::Audit::open(&self.root)?,
+        );
         let runtime = Runtime {
             agents: AgentService::new(&self.root, self.fleet.clone())?,
             jobs: jobs::Jobs::open(&self.root.join("jobs"))?,
@@ -186,7 +196,8 @@ impl Controller {
             github: github.clone(),
             contributors: contributors::Contributors::open(&self.root)?,
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
-            profiles: profiles::Profiles::open(&self.root)?,
+            profiles,
+            catalog,
             tenancy: tenancy::Tenancy::open(&self.root)?,
             credentials: credentials::Credentials::open(
                 &self.root,
@@ -218,11 +229,13 @@ impl Controller {
         self.fleet
             .set_admission_guard(Arc::new(move |host| registration.assert_host(host)));
         let resolver = runtime.profiles.clone();
+        let catalog = runtime.catalog.connections.clone();
         runtime
             .agents
-            .set_profile_resolver(Arc::new(move |name, provider| {
-                resolver.resolve(name, provider)
+            .set_profile_resolver(Arc::new(move |name, provider, run_kind| {
+                resolver.resolve(name, provider, run_kind, &catalog)
             }));
+        runtime.catalog.seed_from_env();
         callbacks::install(&runtime.agents);
         let minter = runtime.repositories.clone();
         let revoker = runtime.repositories.clone();
@@ -568,6 +581,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         Ok(org) => org,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
+    let actor = match acting_actor(&principal, request.headers()) {
+        Ok(actor) => actor,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let project_of = |pool: &str| {
         controller
             .runtime()
@@ -730,9 +747,12 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     } else if path == "/v1/profile-files" {
         // One file of up to 1 MiB, base64-encoded.
         1536 * 1024
-    } else if path == "/v1/profiles" {
+    } else if path == "/v1/profiles" || path == "/v1/catalog/apply" {
         256 * 1024
-    } else if path == "/v1/ci/templates" || path == "/v1/pools" {
+    } else if path == "/v1/ci/templates"
+        || path == "/v1/pools"
+        || path.starts_with("/v1/connections")
+    {
         65536
     } else {
         16384
@@ -770,7 +790,11 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         })
         .await
     } else {
-        admitted(admission, write(controller, parts, body, principal, org)).await
+        admitted(
+            admission,
+            write(controller, parts, body, principal, org, actor),
+        )
+        .await
     };
     match result {
         Ok((StatusCode::TOO_MANY_REQUESTS, v)) => {
@@ -1001,8 +1025,31 @@ fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Resul
         ["v1", "projects", project, "repositories", name] => {
             c.runtime()?.repositories.get(project, name)
         }
-        ["v1", "profiles"] => Ok(c.runtime()?.profiles.list()),
-        ["v1", "profiles", name] => c.runtime()?.profiles.get(name),
+        ["v1", "profiles"] => {
+            let runtime = c.runtime()?;
+            let mut listed = runtime.profiles.list();
+            if let Some(rows) = listed["profiles"].as_array_mut() {
+                rows.retain(|p| {
+                    runtime
+                        .catalog
+                        .profile_visible(org, p["name"].as_str().unwrap_or(""))
+                });
+            }
+            Ok(listed)
+        }
+        ["v1", "profiles", name] => {
+            let runtime = c.runtime()?;
+            ensure!(
+                runtime.catalog.profile_visible(org, name),
+                "Unknown profile"
+            );
+            runtime.profiles.get(name)
+        }
+        ["v1", "connections"] | ["v1", "connections", _] | ["v1", "audit"] => c
+            .runtime()?
+            .catalog
+            .read(org, &s)
+            .context("Unknown endpoint")?,
         ["v1", "agents", provider, "usage"] => {
             Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
         }
@@ -1063,6 +1110,27 @@ fn acting_org(
     }
 }
 
+/// Who performed an operation, for the audit log and `created_by`: the member
+/// the dashboard names in `X-EngineBox-Actor` (owner token only), else `owner`;
+/// a service token is its own principal.
+fn acting_actor(
+    principal: &Principal,
+    headers: &axum::http::HeaderMap,
+) -> std::result::Result<String, &'static str> {
+    match principal {
+        Principal::Service(token) => Ok(token.principal()),
+        Principal::Owner => match headers.get(catalog::ACTOR_HEADER) {
+            None => Ok("owner".into()),
+            Some(value) => value
+                .to_str()
+                .ok()
+                .filter(|a| audit::valid_actor(a))
+                .map(str::to_owned)
+                .ok_or("X-EngineBox-Actor must be a user ID."),
+        },
+    }
+}
+
 /// New pools, profiles and repositories belong to the acting org. The platform
 /// org is never written, so default-org records stay as they were before orgs.
 fn stamp_org(body: &mut Value, org: &str) {
@@ -1081,7 +1149,33 @@ async fn write(
     mut body: Value,
     principal: Principal,
     org: String,
+    actor: String,
 ) -> Result<(StatusCode, Value)> {
+    let routed: Vec<&str> = parts.iter().map(String::as_str).collect();
+    if matches!(
+        routed.as_slice(),
+        ["v1", "connections", ..] | ["v1", "catalog", ..] | ["v1", "profiles", _, "connections", _]
+    ) {
+        let catalog = c.runtime()?.catalog;
+        let (status, value) = blocking(move || {
+            let p: Vec<&str> = parts.iter().map(String::as_str).collect();
+            catalog
+                .write(&org, &actor, &p, &body)
+                .context("Unknown catalog operation")
+        })
+        .await?;
+        return Ok((StatusCode::from_u16(status)?, value));
+    }
+    if routed.as_slice() == ["v1", "profiles"] {
+        stamp_org(&mut body, &org);
+        let catalog = c.runtime()?.catalog;
+        if let Err(error) = catalog.check_profile_put(&org, &body) {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                json!({"error": catalog::message(&error)}),
+            ));
+        }
+    }
     if parts.get(1).is_some_and(|p| p == "github") {
         let github = c.runtime()?.github;
         let value = blocking(move || -> Result<Value> {
@@ -1379,10 +1473,7 @@ async fn write(
             code = StatusCode::CREATED;
             runtime.profiles.upload(&body)?
         }
-        ["v1", "profiles"] => {
-            stamp_org(&mut body, &org);
-            runtime.profiles.put(body)?
-        }
+        ["v1", "profiles"] => runtime.profiles.put(body)?,
         ["v1", "tenancy", "hosts", host, "org"] => {
             let fleet = c.fleet.clone();
             let contributors = runtime.contributors.clone();
@@ -1586,6 +1677,11 @@ async fn start_run(
         Some(Value::String(k)) => Some(k),
         Some(_) => anyhow::bail!("idempotency_key must be a string"),
     };
+    let run_kind = match object.remove("run_kind") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(k)) if enginebox_agents::profile::valid_run_kind(&k) => Some(k),
+        Some(_) => anyhow::bail!("run_kind must match ^[a-z][a-z0-9_-]{{0,31}}$"),
+    };
     let repository = match object.remove("repository") {
         None | Some(Value::Null) => None,
         Some(Value::String(r)) => Some(r),
@@ -1665,11 +1761,21 @@ async fn start_run(
         }
     }
     let resolved = match &profile_name {
-        Some(profile) => Some(
-            runtime
-                .profiles
-                .resolve(profile, string(&body, "provider")?)?,
-        ),
+        Some(profile) => match runtime.profiles.resolve(
+            profile,
+            string(&body, "provider")?,
+            run_kind.as_deref(),
+            &runtime.catalog.connections,
+        ) {
+            Ok(resolved) => Some(resolved),
+            // Connection problems name the connection and the rule, never a value.
+            Err(error) => {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    json!({"error": catalog::message(&error)}),
+                ));
+            }
+        },
         None => None,
     };
     let callback = match callback_url {
@@ -1693,6 +1799,7 @@ async fn start_run(
         idempotency_key,
         callback,
         repository,
+        run_kind,
     };
     let started_by = principal.started_by();
     let metered_by = started_by.clone();
@@ -2652,11 +2759,18 @@ mod tests {
         // Profiles survive a controller reload.
         drop(app);
         let reopened = profiles::Profiles::open(&c.root).unwrap();
+        let no_connections = connections::Connections::open(&c.root).unwrap();
         assert!(reopened.exists("verifier") && !reopened.exists("coder"));
-        let resolved = reopened.resolve("verifier", "claude").unwrap();
+        let resolved = reopened
+            .resolve("verifier", "claude", None, &no_connections)
+            .unwrap();
         assert_eq!(resolved.revision, 2);
         assert_eq!(resolved.files.len(), 1);
-        assert!(reopened.resolve("verifier", "cursor").is_err());
+        assert!(
+            reopened
+                .resolve("verifier", "cursor", None, &no_connections)
+                .is_err()
+        );
         // A stored file that no longer matches its digest is refused.
         let path = c.root.join("profile-files").join(&sha);
         enginebox_agents::security::write_bytes(
@@ -2667,7 +2781,11 @@ mod tests {
         )
         .unwrap();
         assert!(path.exists());
-        assert!(reopened.resolve("verifier", "claude").is_err());
+        assert!(
+            reopened
+                .resolve("verifier", "claude", None, &no_connections)
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn service_tokens_see_and_cancel_only_runs_on_their_workspaces() {
@@ -3821,5 +3939,406 @@ mod tests {
             assert!(leaks.is_empty(), "token persisted in {leaks:?}");
         }
         assert!(events.to_string().contains("guest_launch_failed"));
+    }
+
+    #[tokio::test]
+    async fn connections_are_shared_resolved_per_run_kind_write_only_and_owner_only() {
+        let (temp, c) = setup();
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let post = |path: &str, body: Value| request(Method::POST, path, &body.to_string(), true);
+        let secret = "cf-readonly-token-value-0001";
+        let staging = "postgres://staging-value-0002";
+        for body in [
+            json!({"name":"cf-readonly","kind":"secret_source","source":{"provider":"stored","project":"canvalytics","environment":"production"},"secrets":{"CLOUDFLARE_API_TOKEN":secret}}),
+            json!({"name":"staging-secrets","kind":"secret_source","source":{"provider":"stored","environment":"staging"},"secrets":{"DATABASE_URL":staging}}),
+            json!({"name":"kitbash","kind":"mcp_http","url":"https://kitbash.example.com/mcp","headers":{"Authorization":{"secret_source":"cf-readonly","name":"CLOUDFLARE_API_TOKEN","prefix":"Bearer "}}}),
+        ] {
+            let (status, created) = call(&app, post("/v1/connections", body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            assert!(
+                !created.to_string().contains(secret) && !created.to_string().contains(staging)
+            );
+        }
+        // A profile naming an unknown connection is refused with a reason.
+        let (status, refused) = call(
+            &app,
+            post(
+                "/v1/profiles",
+                json!({"name":"bad","providers":{"codex":{}},"connections":["nope"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(refused["error"].as_str().unwrap().contains("nope"));
+        // Two profiles share one connection; a per-run-kind policy on one.
+        for body in [
+            json!({"name":"coder","providers":{"codex":{},"claude":{}},"connections":["kitbash","staging-secrets","cf-readonly"],
+                   "connection_policy":{"planner":[],"builder":["staging-secrets"],"debug":["cf-readonly","kitbash"]}}),
+            json!({"name":"reviewer","providers":{"claude":{}},"connections":["kitbash"]}),
+        ] {
+            let (status, saved) = call(&app, post("/v1/profiles", body)).await;
+            assert_eq!(status, StatusCode::OK, "{saved}");
+        }
+        let runtime = c.runtime().unwrap();
+        let resolve = |profile: &str, kind: Option<&str>| {
+            runtime
+                .profiles
+                .resolve(profile, "claude", kind, &runtime.catalog.connections)
+                .unwrap()
+        };
+        let all = resolve("coder", None);
+        assert_eq!(all.connections.len(), 3);
+        assert_eq!(all.block.env["DATABASE_URL"], staging);
+        assert_eq!(
+            all.block.env["CONN_KITBASH_AUTHORIZATION"],
+            format!("Bearer {secret}")
+        );
+        let planner = resolve("coder", Some("planner"));
+        assert!(
+            planner.connections.is_empty()
+                && planner.block.env.is_empty()
+                && planner.block.mcp_servers.is_empty()
+        );
+        let builder = resolve("coder", Some("builder"));
+        assert_eq!(
+            builder.block.env.keys().collect::<Vec<_>>(),
+            vec!["DATABASE_URL"]
+        );
+        assert!(builder.block.mcp_servers.is_empty());
+        let debug = resolve("coder", Some("debug"));
+        assert!(!debug.block.env.contains_key("DATABASE_URL"));
+        assert_eq!(debug.block.mcp_servers[0].name, "kitbash");
+        // An unlisted kind gets every connection.
+        assert_eq!(resolve("coder", Some("deploy")).connections.len(), 3);
+        // Editing the connection changes every profile that uses it.
+        let (status, _) = call(
+            &app,
+            post(
+                "/v1/connections/kitbash",
+                json!({"url":"https://kitbash2.example.com/mcp"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for profile in ["coder", "reviewer"] {
+            let r = resolve(profile, Some("debug"));
+            assert_eq!(
+                r.block.mcp_servers[0].url.as_deref(),
+                Some("https://kitbash2.example.com/mcp")
+            );
+            assert_eq!(
+                r.connections
+                    .iter()
+                    .find(|u| u["name"] == "kitbash")
+                    .unwrap()["revision"],
+                2
+            );
+        }
+        // Reads list usage and secret names, never values.
+        let (_, listed) = call(&app, request(Method::GET, "/v1/connections", "", true)).await;
+        let text = listed.to_string();
+        assert!(!text.contains(secret) && !text.contains(staging));
+        let kitbash = listed["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "kitbash")
+            .unwrap();
+        assert_eq!(kitbash["used_by"], json!(["coder", "reviewer"]));
+        let (_, profile) = call(&app, request(Method::GET, "/v1/profiles/coder", "", true)).await;
+        assert_eq!(
+            profile["profile"]["connection_policy"]["planner"],
+            json!([])
+        );
+        // A run states its kind; an invalid kind is refused.
+        let (status, run) = call(
+            &app,
+            post(
+                RUNS_A,
+                json!({"provider":"claude","prompt":"plan","profile":"coder","run_kind":"planner"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{run}");
+        let (status, _) = call(
+            &app,
+            post(
+                RUNS_B,
+                json!({"provider":"claude","prompt":"x","profile":"coder","run_kind":"Bad Kind"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Delete is refused while profiles use it; detach then delete.
+        let (status, _) = call(&app, post("/v1/connections/kitbash/delete", json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, detached) = call(
+            &app,
+            post(
+                "/v1/profiles/reviewer/connections/detach",
+                json!({"connection":"kitbash"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detached}");
+        assert_eq!(detached["profile"]["revision"], 2);
+        // Attaching for one kind keeps it away from the others.
+        let (status, attached) = call(
+            &app,
+            post(
+                "/v1/profiles/reviewer/connections/attach",
+                json!({"connection":"cf-readonly","run_kinds":["debug"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{attached}");
+        assert!(resolve("reviewer", Some("review")).connections.is_empty());
+        assert_eq!(resolve("reviewer", Some("debug")).connections.len(), 1);
+        // A missing secret refuses the run with the connection's name only.
+        let (status, _) = call(
+            &app,
+            post(
+                "/v1/connections/cf-readonly",
+                json!({"remove_secrets":["CLOUDFLARE_API_TOKEN"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, refused) = call(
+            &app,
+            post(
+                RUNS_B,
+                json!({"provider":"claude","prompt":"debug","profile":"coder","run_kind":"debug"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("cf-readonly"));
+        // Service tokens (OAuth access tokens included) never reach the catalog.
+        let (_, token) = mint(&app, json!({"label":"runner","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.start"]})).await;
+        for (method, path) in [
+            (Method::GET, "/v1/connections"),
+            (Method::POST, "/v1/connections"),
+            (Method::POST, "/v1/catalog/apply"),
+            (Method::POST, "/v1/profiles/coder/connections/attach"),
+            (Method::GET, "/v1/audit"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        // Every operation is audited, by name, never with a value.
+        let (_, audit) = call(&app, request(Method::GET, "/v1/audit", "", true)).await;
+        let actions: Vec<_> = audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap().to_owned())
+            .collect();
+        for action in [
+            "connection.create",
+            "connection.update",
+            "connection.delete",
+            "profile.attach_connection",
+            "profile.detach_connection",
+        ] {
+            assert!(actions.iter().any(|a| a == action), "{action}");
+        }
+        assert!(audit.to_string().contains("CLOUDFLARE_API_TOKEN"));
+        // No value is written anywhere but the private secret files.
+        for value in [secret, staging] {
+            let leaks: Vec<_> = files_contain(&temp.path().join("state"), value)
+                .into_iter()
+                .filter(|p| !p.starts_with(temp.path().join("state/connections/secrets")))
+                .collect();
+            assert!(leaks.is_empty(), "{leaks:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_apply_is_idempotent_with_dry_run_and_prune() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let post = |path: &str, body: Value| request(Method::POST, path, &body.to_string(), true);
+        // The shape of Ideator's ideator-agent.profile.json, its MCP server
+        // as a shared connection with per-run env headers.
+        let document = json!({
+            "schema":"enginebox.catalog/v1",
+            "connections":[
+                {"name":"hq","kind":"mcp_http","url":"https://ideator.example.com/mcp",
+                 "headers":{"Authorization":{"env":"HQ_AUTHORIZATION"},"X-HQ-Machine":{"env":"HQ_MACHINE"},"X-HQ-Org":{"env":"HQ_ORG"}}},
+                {"name":"kitbash-staging","kind":"secret_source","source":{"provider":"kitbash","integration":"ideator-staging","project":"ideator","environment":"staging"},"names":["CLOUDFLARE_API_TOKEN"]}
+            ],
+            "profiles":[{
+                "$comment":"notes are ignored",
+                "name":"ideator-agent","description":"Ideator agent runs.","template":"native-dev",
+                "providers":{"codex":{"permission_profile":"edit","network_access":true,
+                    "env":{"GIT_AUTHOR_NAME":"engine-box-runners[bot]"}},
+                  "claude":{"max_turns":300,"allowed_tools":["Read","Write","Edit","Bash","mcp__hq__*"]}},
+                "connections":["hq","kitbash-staging"],
+                "connection_policy":{"planner":["hq"]}
+            }]
+        });
+        let (status, plan) = call(
+            &app,
+            post(
+                "/v1/catalog/apply",
+                json!({"document":document,"dry_run":true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        assert!(
+            plan["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["action"] == "create")
+        );
+        let (_, listed) = call(&app, request(Method::GET, "/v1/connections", "", true)).await;
+        assert!(
+            listed["connections"].as_array().unwrap().is_empty(),
+            "dry run wrote"
+        );
+        let (status, applied) = call(
+            &app,
+            post("/v1/catalog/apply", json!({"document":document})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        let (_, again) = call(
+            &app,
+            post("/v1/catalog/apply", json!({"document":document})),
+        )
+        .await;
+        assert!(
+            again["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["action"] == "unchanged"),
+            "{again}"
+        );
+        let (_, profile) = call(
+            &app,
+            request(Method::GET, "/v1/profiles/ideator-agent", "", true),
+        )
+        .await;
+        assert_eq!(profile["profile"]["revision"], 1);
+        // A changed document updates only what changed; extra records stay.
+        let (status, _) = call(
+            &app,
+            post(
+                "/v1/connections",
+                json!({"name":"extra","kind":"mcp_http","url":"https://extra.example.com/mcp"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let mut changed = document.clone();
+        changed["connections"][0]["url"] = json!("https://ideator2.example.com/mcp");
+        let (_, applied) = call(&app, post("/v1/catalog/apply", json!({"document":changed}))).await;
+        let actions: Vec<_> = applied["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().to_owned(),
+                    c["action"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert!(actions.contains(&("hq".into(), "update".into())));
+        assert!(actions.contains(&("ideator-agent".into(), "unchanged".into())));
+        assert!(
+            c.runtime()
+                .unwrap()
+                .catalog
+                .connections
+                .exists("default", "extra")
+        );
+        // prune removes what the document does not mention.
+        let (_, pruned) = call(
+            &app,
+            post(
+                "/v1/catalog/apply",
+                json!({"document":changed,"prune":true}),
+            ),
+        )
+        .await;
+        assert!(
+            pruned["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "extra" && c["action"] == "delete")
+        );
+        assert!(
+            !c.runtime()
+                .unwrap()
+                .catalog
+                .connections
+                .exists("default", "extra")
+        );
+        // Values never go in a file.
+        let mut leaky = document.clone();
+        leaky["connections"][0]["secrets"] = json!({"HQ_TOKEN":"never-in-a-file-value"});
+        let (status, refused) =
+            call(&app, post("/v1/catalog/apply", json!({"document":leaky}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!refused.to_string().contains("never-in-a-file-value"));
+        // A wrong schema is refused.
+        let (status, _) = call(
+            &app,
+            post(
+                "/v1/catalog/apply",
+                json!({"document":{"schema":"enginebox.catalog/v9"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn existing_profiles_keep_working_and_their_records_are_unchanged() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let body = json!({"name":"legacy","providers":{"claude":{"mcp_servers":[{"name":"docs","url":"https://docs.example.com/mcp","headers_from_env":{"Authorization":"DOCS_AUTHORIZATION"}}],"env":{"MODE":"x"}}}});
+        let (status, _) = call(
+            &app,
+            request(Method::POST, "/v1/profiles", &body.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let stored = std::fs::read_to_string(c.root.join("profiles/legacy.json")).unwrap();
+        assert!(!stored.contains("connections") && !stored.contains("connection_policy"));
+        let runtime = c.runtime().unwrap();
+        let resolved = runtime
+            .profiles
+            .resolve(
+                "legacy",
+                "claude",
+                Some("builder"),
+                &runtime.catalog.connections,
+            )
+            .unwrap();
+        assert!(resolved.connections.is_empty());
+        assert_eq!(resolved.block.mcp_servers.len(), 1);
+        assert_eq!(resolved.block.env["MODE"], "x");
     }
 }

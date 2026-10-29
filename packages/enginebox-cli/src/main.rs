@@ -132,6 +132,12 @@ enum Commands {
     Tasks(enginebox_cli::tasks::Options),
     /// Serve ACP v1 over stdio using native agents in assigned remote workspaces.
     Acp(enginebox_cli::acp::Options),
+    /// Apply a declarative catalog file (connections and profiles; see
+    /// docs/CONNECTIONS.md) to the controller's org catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
     /// Run a named fleet MCP tool with JSON arguments from stdin.
     Tool {
         name: String,
@@ -140,6 +146,19 @@ enum Commands {
     Browser {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// Make the org's catalog match FILE (JSON, schema enginebox.catalog/v1).
+    Apply {
+        file: PathBuf,
+        /// Show the changes without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete connections and profiles the file does not mention.
+        #[arg(long)]
+        prune: bool,
     },
 }
 fn companion(binary: &str, args: &[String]) -> Result<()> {
@@ -172,6 +191,28 @@ fn output(v: Value) -> Result<()> {
 }
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Commands::Catalog {
+        command:
+            CatalogCommand::Apply {
+                file,
+                dry_run,
+                prune,
+            },
+    } = &args.command
+    {
+        let bytes = std::fs::read(file)?;
+        ensure!(
+            bytes.len() <= 256 * 1024,
+            "Catalog files are at most 256 KiB"
+        );
+        let document: Value =
+            serde_json::from_slice(&bytes).context("The catalog file is not JSON")?;
+        let client = enginebox_cli::FleetClient::from_env()?;
+        return output(client.request(
+            "/v1/catalog/apply",
+            Some(json!({"document":document,"dry_run":dry_run,"prune":prune})),
+        )?);
+    }
     match args.command {
         Commands::Ci(ci) => {
             ensure!(

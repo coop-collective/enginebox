@@ -49,6 +49,8 @@ Owner token only. The controller admits a tenant's pool run only for its own poo
 | Record | Where the org lives |
 | --- | --- |
 | Pools, profiles (controller) | `org_id` on the record; absent means the platform org and is never written for it, so releases before orgs still read every platform record. |
+| Connections (controller) | `org_id` on every record (`connections/`); names are unique per org and a profile resolves connections only in its own org. See [CONNECTIONS.md](CONNECTIONS.md). |
+| Audit log (controller) | `org_id` on every entry (`audit/events.jsonl`); `GET /v1/audit` returns the acting org's. |
 | Hosted repositories | `org_id` on the record. Creating a repository whose name another org already uses in that project is refused instead of returning the other org's record. |
 | Service tokens / OAuth access tokens | `org_id` on the token, from the OAuth grant's org. |
 | OAuth grants (dashboard) | `org_id` on the grant (absent: platform org). The approver keeps managing it; so do that org's admins. |
@@ -71,6 +73,10 @@ Each org keeps its own agent accounts (`GET/POST /v1/credentials`, acting org fr
 Members see team accounts, keys (metadata only), their own personal accounts and others' shared ones; admins see all metadata and can remove any credential. The controller-scope accounts (`GET /v1/agents`) remain the platform org's team accounts.
 
 Runs do not select from these yet. `credentials::Credentials::candidates(org, provider, member)` is the selection interface the credential-pool work will call: connected credentials of the org for the provider, in order: the requesting member's own personal accounts, then personal accounts their owners shared, then team accounts, then API keys. An org pool run without a member skips unshared personal accounts. Usage events already carry `credential_id`.
+
+## Connections
+
+Each org has its own [connections catalog](CONNECTIONS.md): MCP servers and secret sources that the org's profiles share by name. Only org **owners and admins** create, change, test, delete or attach connections and apply catalog files; the dashboard enforces the role and forwards the member's user ID as `X-EngineBox-Actor`, which the controller records as `created_by`/`updated_by` and in the audit log. Members see which connections a profile uses, never a secret value (nobody does: values are write-only). Kitbash deliveries belong to the platform org unless the delivery names another org ([CONNECTIONS.md](CONNECTIONS.md#kitbash)). Connection tests from orgs other than the platform org only reach public addresses.
 
 ## Sign-in
 
