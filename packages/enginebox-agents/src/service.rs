@@ -3195,14 +3195,14 @@ impl AgentService {
             }
         };
         self.finish(id, |v| {
-            v["status"] = json!(if result["exit_code"] == 0
-                && result["timed_out"] == false
-                && result["output_truncated"] == false
-            {
-                "succeeded"
-            } else {
-                "failed"
-            });
+            // A truncated transcript (head plus rolling tail) is not a failure: the run went on to its own exit.
+            v["status"] = json!(
+                if result["exit_code"] == 0 && result["timed_out"] == false {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            );
             if let Some(session) = native::session_id(result["output"].as_str().unwrap_or(""))
                 .or_else(|| request.resume_id.clone())
             {
