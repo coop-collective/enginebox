@@ -1310,7 +1310,6 @@ async fn generate_config(
         "timeout_seconds": repo_generate::TIMEOUT_SECONDS,
         "repository": repository,
         "run_kind": repo_generate::RUN_KIND,
-        "idempotency_key": format!("config-generate:{}:{}", repository.replace('/', ":"), started_at.timestamp()),
     });
     let (status, value) = start_run(
         runtime,
