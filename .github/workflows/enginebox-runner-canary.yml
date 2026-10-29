@@ -24,6 +24,11 @@ jobs:
         run: |
           [[ "$RUNNER_NAME" == ebox-ci-* ]]
           printf 'Runner: %s\nOS: %s\nArchitecture: %s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
+      - name: Verify passwordless sudo inside the disposable VM
+        shell: bash
+        run: |
+          test "$(id -u)" -ne 0
+          test "$(sudo -n id -u)" -eq 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
