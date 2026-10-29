@@ -76,6 +76,7 @@ test("members read the catalog; only admins write it, as themselves; values pass
   await assert.rejects(catalog(req("/api/catalog/connections", "POST", member, { name: "x", kind: "mcp_http" }), ["connections"]), forbidden);
   await assert.rejects(catalog(req("/api/catalog/profiles/coder/connections/attach", "POST", member, { connection: "kitbash" }), ["profiles", "coder", "connections", "attach"]), forbidden);
   await assert.rejects(catalog(req("/api/catalog/audit", "GET", member), ["audit"]), forbidden);
+  await assert.rejects(catalog(req("/api/catalog/repositories/alpha/site/approve", "POST", member, { repo_profile: "deploy", requirement: "X" }), ["repositories", "alpha", "site", "approve"]), forbidden);
   assert.ok(!sent.some((s) => s.method === "POST"), "a member write reached the controller");
 
   const value = "secret-value-never-returned-1";
@@ -100,4 +101,6 @@ test("members read the catalog; only admins write it, as themselves; values pass
   await assert.rejects(catalog(req("/api/catalog/connections/x/rename", "POST", owner, {}), ["connections", "x", "rename"]), unknown);
   await assert.rejects(catalog(req("/api/catalog/connections/..", "GET", owner), ["connections", ".."]), unknown);
   await assert.rejects(catalog(req("/api/catalog/catalog/apply", "POST", owner, {}), ["catalog", "apply"]), unknown);
+  // Proposals are not a dashboard write: only approve and revoke are.
+  await assert.rejects(catalog(req("/api/catalog/repositories/alpha/site/propose", "POST", owner, {}), ["repositories", "alpha", "site", "propose"]), unknown);
 });

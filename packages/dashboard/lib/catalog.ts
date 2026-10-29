@@ -14,7 +14,9 @@ import { DEFAULT_ORG } from "./identity/store";
  * - Secret values are write-only: the dashboard forwards them once and the
  *   controller never returns them.
  */
-const NAME = /^[a-z][a-z0-9-]{0,62}$/;
+const NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const PROJECT = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
+const REPO = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 
 async function controller(path: string, who: Principal, method: string, body?: unknown) {
   const { apiUrl, apiToken } = config();
@@ -52,6 +54,7 @@ export async function catalog(request: Request, segments: string[]) {
   if (segments.some((s) => s.includes("/") || s.includes("..")) || segments.length > 4) throw new HttpError(404, "Unknown catalog operation.");
   const [kind, name, sub, action] = segments;
   if (name !== undefined && !NAME.test(name)) throw new HttpError(404, "Unknown catalog operation.");
+  if (kind === "repositories" && sub !== undefined && !REPO.test(sub)) throw new HttpError(404, "Unknown catalog operation.");
   const admin = atLeast(who, "admin");
 
   if (request.method === "GET") {
@@ -79,6 +82,15 @@ export async function catalog(request: Request, segments: string[]) {
       const runs = (Array.isArray(value.runs) ? (value.runs as Run[]) : []).filter((r) => r.profile?.name === name).slice(0, 25);
       return json({ runs });
     }
+    if (kind === "repositories" && segments.length === 1) {
+      const { status, value } = await forward("v1/repositories");
+      const own = (Array.isArray(value.repositories) ? value.repositories : []).filter((r: { org_id?: string }) => (r.org_id ?? DEFAULT_ORG) === who.org_id);
+      return json({ repositories: own, can_manage: admin }, status);
+    }
+    if (kind === "repositories" && name && sub && segments.length === 3 && PROJECT.test(name) && REPO.test(sub)) {
+      const { status, value } = await forward(`v1/projects/${name}/repositories/${sub}/requirements`);
+      return json({ ...value, can_manage: admin }, status);
+    }
     if (kind === "audit" && segments.length === 1) {
       if (!admin) throw new HttpError(403, "The audit log needs the admin role in your organization.");
       const { status, value } = await forward("v1/audit");
@@ -95,6 +107,8 @@ export async function catalog(request: Request, segments: string[]) {
   else if (kind === "connections" && name && !sub) path = `v1/connections/${name}`;
   else if (kind === "connections" && name && (sub === "delete" || sub === "test") && !action) path = `v1/connections/${name}/${sub}`;
   else if (kind === "profiles" && name && sub === "connections" && ["attach", "detach", "policy"].includes(action ?? "")) path = `v1/profiles/${name}/connections/${action}`;
+  else if (kind === "repositories" && name && sub && PROJECT.test(name) && REPO.test(sub) && ["approve", "revoke"].includes(action ?? ""))
+    path = `v1/projects/${name}/repositories/${sub}/requirements/${action}`;
   if (!path) throw new HttpError(404, "Unknown catalog operation.");
   const { status, value } = await controller(path, who, "POST", body);
   return json(value, status);

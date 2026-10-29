@@ -200,6 +200,9 @@ pub struct LaunchOptions {
     /// The kind of run (docs/CONNECTIONS.md): selects which of the profile's
     /// connections apply.
     pub run_kind: Option<String>,
+    /// The repository profile the run used and which of its requirements
+    /// were met (names only; docs/PROJECT-CONFIG.md). Stored in the details.
+    pub repo_profile: Option<Value>,
 }
 /// Handed to the finish hook once a run with a callback reaches a terminal state.
 #[derive(Debug, Clone)]
@@ -2031,6 +2034,9 @@ impl AgentService {
                 "key_digest":scoped_key_digest(started_by, &target, key),
                 "request_digest":request_digest,
             });
+        }
+        if let Some(repo_profile) = &options.repo_profile {
+            detail["repo_profile"] = repo_profile.clone();
         }
         if let Some(callback) = &options.callback {
             detail["callback"] = json!({

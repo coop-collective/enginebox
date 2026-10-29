@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod kitbash;
 pub mod metering;
 pub mod profiles;
+pub mod repo_config;
 pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
@@ -68,6 +69,7 @@ struct Runtime {
     service_tokens: service_tokens::ServiceTokens,
     profiles: profiles::Profiles,
     catalog: catalog::Catalog,
+    repo_config: repo_config::RepoRequirements,
     repositories: repositories::Repositories,
     tenancy: tenancy::Tenancy,
     usage: Arc<dyn metering::UsageSink>,
@@ -203,6 +205,7 @@ impl Controller {
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles,
             catalog,
+            repo_config: repo_config::RepoRequirements::open(&self.root)?,
             tenancy: tenancy::Tenancy::open(&self.root)?,
             credentials: credentials::Credentials::open(
                 &self.root,
@@ -504,6 +507,23 @@ fn service_allows(
         | (&Method::POST, ["v1", "projects", project, "repositories", _, "tokens"]) => {
             token.repository_access(project).is_some()
         }
+        // Repository config: any grant on the project reads requirements,
+        // registers the config it checked out and proposes mappings. Only
+        // the owner approves or revokes.
+        (&Method::GET, ["v1", "projects", project, "repositories", _, "requirements"])
+        | (&Method::POST, ["v1", "projects", project, "repositories", _, "agent-config"])
+        | (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "repositories",
+                _,
+                "requirements",
+                "propose",
+            ],
+        ) => token.repository_access(project).is_some(),
         (&Method::POST, ["v1", "projects", project, "repositories"]) => {
             token.repository_access(project) == Some(repositories::Access::Write)
         }
@@ -757,6 +777,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     } else if path == "/v1/ci/templates"
         || path == "/v1/pools"
         || path == "/v1/actions-secrets"
+        || path.ends_with("/agent-config")
         || path.starts_with("/v1/connections")
     {
         65536
@@ -1031,6 +1052,24 @@ fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Resul
         ["v1", "projects", project, "repositories", name] => {
             c.runtime()?.repositories.get(project, name)
         }
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "requirements",
+        ] => {
+            let runtime = c.runtime()?;
+            ensure!(
+                repo_config::same_org(org, runtime.repositories.org_of(project, name))
+                    && runtime.repositories.exists(project, name),
+                "Unknown repository"
+            );
+            runtime
+                .repo_config
+                .report(org, &repo_config::repository_ref(project, name))
+        }
         ["v1", "profiles"] => {
             let runtime = c.runtime()?;
             let mut listed = runtime.profiles.list();
@@ -1116,6 +1155,81 @@ fn acting_org(
     }
 }
 
+/// Repository config writes (docs/PROJECT-CONFIG.md): register the config a
+/// checkout saw, propose a mapping (anyone with access), approve or revoke one
+/// (owner token only; the dashboard limits it to org owners and admins).
+#[allow(clippy::too_many_arguments)]
+fn repo_requirement_write(
+    runtime: &Runtime,
+    org: &str,
+    actor: &str,
+    project: &str,
+    name: &str,
+    rest: &[String],
+    body: &Value,
+    owner: bool,
+) -> (StatusCode, Value) {
+    let repository = repo_config::repository_ref(project, name);
+    let action = match rest.last().map(String::as_str) {
+        Some("agent-config") => "repo.config_register",
+        Some("propose") => "repo.requirement_propose",
+        Some("approve") => "repo.requirement_approve",
+        _ => "repo.requirement_revoke",
+    };
+    let result = (|| -> Result<Value> {
+        ensure!(
+            runtime.repositories.exists(project, name)
+                && repo_config::same_org(org, runtime.repositories.org_of(project, name)),
+            "Unknown repository."
+        );
+        let connections = &runtime.catalog.connections;
+        match action {
+            "repo.config_register" => runtime.repo_config.register(org, actor, &repository, body),
+            "repo.requirement_propose" => {
+                runtime
+                    .repo_config
+                    .map(org, actor, &repository, body, false, connections)
+            }
+            _ => {
+                ensure!(
+                    owner,
+                    "Only an owner or admin approves or revokes a mapping."
+                );
+                if action == "repo.requirement_approve" {
+                    runtime
+                        .repo_config
+                        .map(org, actor, &repository, body, true, connections)
+                } else {
+                    runtime.repo_config.revoke(org, &repository, body)
+                }
+            }
+        }
+    })();
+    let mut detail = json!({
+        "repo_profile": body.get("repo_profile"),
+        "requirement": body.get("requirement"),
+        "connection": body.get("connection"),
+    });
+    if let Err(error) = &result {
+        detail["reason"] = json!(catalog::message(error));
+    }
+    runtime
+        .catalog
+        .audit
+        .record(org, actor, action, &repository, result.is_ok(), detail);
+    match result {
+        Ok(value) => (StatusCode::OK, value),
+        Err(error) => (
+            if catalog::message(&error).starts_with("Only an owner") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            json!({"error": catalog::message(&error)}),
+        ),
+    }
+}
+
 /// `POST /v1/actions-secrets`: write one GitHub Actions secret on a selected
 /// repository (or one of its environments) through the repository GitHub App.
 /// Platform org, owner token only. The value comes from the write-only request
@@ -1189,6 +1303,14 @@ fn actions_secret(runtime: &Runtime, org: &str, actor: &str, body: &Value) -> (S
     }
 }
 
+fn regex_free_profile_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Who performed an operation, for the audit log and `created_by`: the member
 /// the dashboard names in `X-EngineBox-Actor` (owner token only), else `owner`;
 /// a service token is its own principal.
@@ -1244,6 +1366,23 @@ async fn write(
         })
         .await?;
         return Ok((StatusCode::from_u16(status)?, value));
+    }
+    if let ["v1", "projects", project, "repositories", name, rest @ ..] = routed.as_slice()
+        && matches!(
+            rest,
+            ["agent-config"] | ["requirements", "propose" | "approve" | "revoke"]
+        )
+    {
+        let runtime = c.runtime()?;
+        let (project, name) = (project.to_string(), name.to_string());
+        let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        let owner = matches!(principal, Principal::Owner);
+        return blocking(move || {
+            Ok(repo_requirement_write(
+                &runtime, &org, &actor, &project, &name, &rest, &body, owner,
+            ))
+        })
+        .await;
     }
     if routed.as_slice() == ["v1", "actions-secrets"] {
         let runtime = c.runtime()?;
@@ -1765,6 +1904,11 @@ async fn start_run(
         Some(Value::String(k)) if enginebox_agents::profile::valid_run_kind(&k) => Some(k),
         Some(_) => anyhow::bail!("run_kind must match ^[a-z][a-z0-9_-]{{0,31}}$"),
     };
+    let repo_profile = match object.remove("repo_profile") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if regex_free_profile_name(&p) => Some(p),
+        Some(_) => anyhow::bail!("repo_profile must name a repository agent profile"),
+    };
     let repository = match object.remove("repository") {
         None | Some(Value::Null) => None,
         Some(Value::String(r)) => Some(r),
@@ -1843,7 +1987,7 @@ async fn start_run(
             ));
         }
     }
-    let resolved = match &profile_name {
+    let mut resolved = match &profile_name {
         Some(profile) => match runtime.profiles.resolve(
             profile,
             string(&body, "provider")?,
@@ -1861,6 +2005,76 @@ async fn start_run(
         },
         None => None,
     };
+    // Repository profile (docs/PROJECT-CONFIG.md): the repository declares,
+    // approved mappings satisfy, and a repository never widens access.
+    let mut repo_record = None;
+    match &repository {
+        None => ensure!(repo_profile.is_none(), "repo_profile needs a repository"),
+        Some(reference) => {
+            let granted = match runtime.repo_config.grant(
+                org,
+                reference,
+                repo_profile.as_deref(),
+                run_kind.as_deref(),
+                resolved.is_some(),
+                &runtime.catalog.connections,
+            ) {
+                Ok(granted) => granted,
+                Err(error) => {
+                    return Ok((
+                        StatusCode::CONFLICT,
+                        json!({"error": catalog::message(&error)}),
+                    ));
+                }
+            };
+            if let Some(granted) = granted {
+                // The run's own env wins, as it does over a profile's.
+                let env = body
+                    .as_object_mut()
+                    .context("Expected object")?
+                    .entry("env")
+                    .or_insert_with(|| json!({}));
+                let env = env.as_object_mut().context("env must be an object")?;
+                for (key, value) in granted.env {
+                    env.entry(key).or_insert(Value::String(value));
+                }
+                if let Some(r) = resolved.as_mut() {
+                    let profile_org = runtime
+                        .profiles
+                        .org_of(&r.name)
+                        .unwrap_or_else(|| org.to_owned());
+                    let extra = granted
+                        .catalog_mcp
+                        .iter()
+                        .filter(|c| !r.connections.iter().any(|u| u["name"] == **c))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let applied = runtime.catalog.connections.apply(
+                        &profile_org,
+                        &extra,
+                        string(&body, "provider")?,
+                        r.template.as_deref(),
+                        &mut r.block,
+                    );
+                    match applied {
+                        Ok(applied) => r.connections.extend(applied.used),
+                        Err(error) => {
+                            return Ok((
+                                StatusCode::CONFLICT,
+                                json!({"error": catalog::message(&error)}),
+                            ));
+                        }
+                    }
+                    for server in granted.servers {
+                        if !r.block.mcp_servers.iter().any(|s| s.name == server.name) {
+                            r.block.mcp_servers.push(server);
+                        }
+                    }
+                }
+                repo_record = Some(granted.record);
+            }
+        }
+    }
     let callback = match callback_url {
         Some(url) => {
             callbacks::validate_url(&url)?;
@@ -1883,6 +2097,7 @@ async fn start_run(
         callback,
         repository,
         run_kind,
+        repo_profile: repo_record,
     };
     let started_by = principal.started_by();
     let metered_by = started_by.clone();
@@ -4521,5 +4736,252 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    }
+
+    #[tokio::test]
+    async fn repository_profiles_declare_and_approved_mappings_satisfy() {
+        const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+        let (temp, c) = setup();
+        let api = repositories::mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]);
+        c.set_repository_transport(api.clone());
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let post = |path: &str, body: Value| request(Method::POST, path, &body.to_string(), true);
+        let config = json!({"url":repositories::mock::URL,"namespace_prefix":"eb","secret":repositories::mock::SECRET}).to_string();
+        call(
+            &app,
+            request(
+                Method::PUT,
+                "/v1/repository-backends/artifacts-worker",
+                &config,
+                true,
+            ),
+        )
+        .await;
+        call(&app, post("/v1/pools", json!({"name":"alpha-w","project":"alpha","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}))).await;
+        let (status, _) = call(
+            &app,
+            post("/v1/projects/alpha/repositories", json!({"name":"site"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let staging = "postgres://staging-value-0004";
+        let deploy = "cf-deploy-value-0005";
+        for body in [
+            json!({"name":"staging-db","kind":"secret_source","source":{"provider":"stored","environment":"staging"},"secrets":{"DATABASE_URL":staging}}),
+            json!({"name":"cf-deploy","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"CLOUDFLARE_API_TOKEN":deploy}}),
+            json!({"name":"kitbash","kind":"mcp_http","url":"https://kitbash.example.com/mcp"}),
+        ] {
+            assert_eq!(
+                call(&app, post("/v1/connections", body)).await.0,
+                StatusCode::CREATED
+            );
+        }
+        let base = "/v1/projects/alpha/repositories/site";
+        // Before any config: nothing declared.
+        let (_, report) = call(
+            &app,
+            request(Method::GET, &format!("{base}/requirements"), "", true),
+        )
+        .await;
+        assert_eq!(report["configured"], false);
+        let (status, registered) = call(
+            &app,
+            post(
+                &format!("{base}/agent-config"),
+                json!({"commit":"0123abcd","config":repo_config::tests::workers_config()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{registered}");
+        let (_, report) = call(
+            &app,
+            request(Method::GET, &format!("{base}/requirements"), "", true),
+        )
+        .await;
+        let default = &report["profiles"]["default"]["requirements"];
+        assert!(
+            default
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["status"] == "unmet"),
+            "{report}"
+        );
+        // A run without approvals starts and records what was unmet.
+        let run = |kind: &str, profile: Option<&str>| {
+            let mut body = json!({"provider":"claude","prompt":"work","repository":"alpha/site","run_kind":kind});
+            if let Some(p) = profile {
+                body["repo_profile"] = json!(p);
+            }
+            body
+        };
+        let (status, started) = call(
+            &app,
+            post("/v1/pools/alpha-w/agent-runs", run("builder", None)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        // A required requirement without a mapping refuses the run.
+        let (status, refused) = call(
+            &app,
+            post(
+                "/v1/pools/alpha-w/agent-runs",
+                run("deploy", Some("deploy")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("CLOUDFLARE_API_TOKEN")
+        );
+        // An agent (service token with repository access) may propose, never approve.
+        let (_, token) = mint(&app, json!({"label":"agent","scopes":[],"operations":["agent_runs.start"],"repositories":[{"project":"alpha","access":"read"}]})).await;
+        let as_token = |path: &str, body: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let mapping = json!({"repo_profile":"deploy","requirement":"CLOUDFLARE_API_TOKEN","connection":"cf-deploy"});
+        let (status, proposed) = call(
+            &app,
+            as_token(&format!("{base}/requirements/propose"), mapping.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        assert_eq!(proposed["mapping"]["status"], "proposed");
+        let (status, _) = call(
+            &app,
+            as_token(&format!("{base}/requirements/approve"), mapping.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (_, report) = call(
+            &app,
+            request(Method::GET, &format!("{base}/requirements"), "", true),
+        )
+        .await;
+        assert_eq!(
+            report["profiles"]["deploy"]["requirements"][0]["status"],
+            "proposed"
+        );
+        // The owner approves; the deploy run now gets the value in its env only.
+        let (status, approved) = call(
+            &app,
+            post(&format!("{base}/requirements/approve"), mapping.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{approved}");
+        assert_eq!(approved["mapping"]["qualifier"], "deploy");
+        let (status, started) = call(
+            &app,
+            post(
+                "/v1/pools/alpha-w/agent-runs",
+                run("deploy", Some("deploy")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        assert!(!started.to_string().contains(deploy));
+        // A run of another kind does not get a requirement scoped to deploy.
+        let approve_db = json!({"repo_profile":"default","requirement":"DATABASE_URL","connection":"staging-db"});
+        assert_eq!(
+            call(
+                &app,
+                post(&format!("{base}/requirements/approve"), approve_db)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // Changing the qualifier in the repo invalidates the approval.
+        let mut widened = repo_config::tests::workers_config();
+        widened["agents"]["profiles"]["deploy"]["secrets"][0]["qualifier"] =
+            json!("deploy-production-write");
+        call(
+            &app,
+            post(&format!("{base}/agent-config"), json!({"config":widened})),
+        )
+        .await;
+        let (_, report) = call(
+            &app,
+            request(Method::GET, &format!("{base}/requirements"), "", true),
+        )
+        .await;
+        assert_eq!(
+            report["profiles"]["deploy"]["requirements"][0]["status"],
+            "needs_reapproval"
+        );
+        assert_eq!(
+            report["profiles"]["default"]["requirements"][0]["status"],
+            "met"
+        );
+        let (status, _) = call(
+            &app,
+            post(
+                "/v1/pools/alpha-w/agent-runs",
+                run("deploy", Some("deploy")),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a widened qualifier must not reuse the old approval"
+        );
+        // A repo cannot grant itself a connection: an unknown repo profile is refused,
+        // and a config can only name requirements, never values.
+        let (status, _) = call(
+            &app,
+            post(
+                "/v1/pools/alpha-w/agent-runs",
+                run("deploy", Some("prod-admin")),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let mut leaky = repo_config::tests::workers_config();
+        leaky["agents"]["profiles"]["default"]["secrets"][0]["value"] = json!("x");
+        assert_eq!(
+            call(
+                &app,
+                post(&format!("{base}/agent-config"), json!({"config":leaky}))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Every step is audited; values appear nowhere but the secret files and the run queue.
+        let (_, audit) = call(&app, request(Method::GET, "/v1/audit", "", true)).await;
+        let actions: Vec<_> = audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap().to_owned())
+            .collect();
+        for action in [
+            "repo.config_register",
+            "repo.requirement_propose",
+            "repo.requirement_approve",
+        ] {
+            assert!(actions.iter().any(|a| a == action), "{action}");
+        }
+        for value in [staging, deploy] {
+            let leaks: Vec<_> = files_contain(&temp.path().join("state"), value)
+                .into_iter()
+                .filter(|p| {
+                    !p.starts_with(temp.path().join("state/connections/secrets"))
+                        && !p.starts_with(temp.path().join("state/agent-run-queue"))
+                })
+                .collect();
+            assert!(leaks.is_empty(), "{leaks:?}");
+        }
     }
 }

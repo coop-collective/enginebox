@@ -467,6 +467,24 @@ pub fn tools() -> Vec<Value> {
             &["repository", "name"],
         ),
         tool(
+            "repo_requirements_get",
+            "Read what a repository's .enginebox/config.json (schema 2) declares per agent profile: secret requirements by name with qualifier and run kinds, MCP connections and servers, and whether each is met, unmet, proposed or needs re-approval. Never values.",
+            json!({"project":{"type":"string"},"name":{"type":"string"}}),
+            &["project", "name"],
+        ),
+        tool(
+            "repo_config_register",
+            "Register the .enginebox/config.json a checkout of this repository contains (and its commit), so its requirements can be reviewed and mapped. A config only declares; it never grants access.",
+            json!({"project":{"type":"string"},"name":{"type":"string"},"commit":{"type":"string"},"config":{"type":"object"}}),
+            &["project", "name", "config"],
+        ),
+        tool(
+            "repo_requirement_propose_mapping",
+            "Propose which catalog connection should satisfy a repository requirement (repo_profile, requirement, kind secret|mcp|mcp_server, connection, optional source_name). Only an org owner or admin can approve it; until then the requirement stays unmet.",
+            json!({"project":{"type":"string"},"name":{"type":"string"},"repo_profile":{"type":"string"},"kind":{"type":"string","enum":["secret","mcp","mcp_server"]},"requirement":{"type":"string"},"connection":{"type":"string"},"source_name":{"type":"string"}}),
+            &["project", "name", "repo_profile", "requirement"],
+        ),
+        tool(
             "catalog_apply",
             "Owner/admin: make the org's connections and profiles match a declarative catalog document (schema enginebox.catalog/v1; secret references only, never values). Idempotent. dry_run returns the diff without writing; prune deletes records the document does not mention. Audited.",
             json!({"document":{"type":"object"},"dry_run":{"type":"boolean"},"prune":{"type":"boolean"}}),
@@ -594,6 +612,22 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
             )
         }
         "catalog_apply" => ("/v1/catalog/apply".into(), Some(args.clone())),
+        "repo_requirements_get" | "repo_config_register" | "repo_requirement_propose_mapping" => {
+            let base = format!(
+                "/v1/projects/{}/repositories/{}",
+                storage_id(args, "project")?,
+                repository_name(field(args, "name")?)?
+            );
+            let mut body = args.clone();
+            let map = body.as_object_mut().unwrap();
+            map.remove("project");
+            map.remove("name");
+            match name {
+                "repo_requirements_get" => (format!("{base}/requirements"), None),
+                "repo_config_register" => (format!("{base}/agent-config"), Some(body)),
+                _ => (format!("{base}/requirements/propose"), Some(body)),
+            }
+        }
         "github_actions_secret_set" => {
             ensure!(
                 args.get("value").is_some() != args.get("from").is_some(),
@@ -1114,6 +1148,24 @@ mod tests {
         assert_eq!(body.unwrap()["dry_run"], true);
         // Names cannot traverse paths; unknown arguments are refused.
         assert!(tool_request("connection_delete", &json!({"name":"../profiles"})).is_err());
+        let (path, body) = tool_request(
+            "repo_requirement_propose_mapping",
+            &json!({"project":"alpha","name":"site","repo_profile":"deploy","requirement":"CLOUDFLARE_API_TOKEN","connection":"cf-deploy"}),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            "/v1/projects/alpha/repositories/site/requirements/propose"
+        );
+        assert!(body.as_ref().unwrap().get("project").is_none());
+        let (path, _) = tool_request(
+            "repo_requirements_get",
+            &json!({"project":"alpha","name":"site"}),
+        )
+        .unwrap();
+        assert_eq!(path, "/v1/projects/alpha/repositories/site/requirements");
+        // There is no approve tool: approval is an owner/admin action in the dashboard or API.
+        assert!(tool_request("repo_requirement_approve", &json!({})).is_err());
         assert!(tool_request("profile_get", &json!({"profile":"Coder"})).is_err());
         assert!(
             tool_request(
@@ -1255,7 +1307,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            55
+            58
         );
     }
     #[test]

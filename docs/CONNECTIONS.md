@@ -236,6 +236,10 @@ Rotation is a new delivery: the receiver refuses a different delivery ID without
 - **Audit.** `github.actions_secret_set` with target `owner/repo[:environment]/NAME` and the source (`request` or `connection:<name>`).
 - **App permission.** The repository GitHub App needs **Secrets: read and write** (repository permission). Add it in the App settings and approve it on the installation ([GITHUB-SECRETS.md](GITHUB-SECRETS.md#1-configure-one-app-and-installation)). Without it the token request fails and the call reports that the permission is missing.
 
+## Repository requirements
+
+A repository's `.enginebox/config.json` (schema version 2) can declare agent profiles with secret requirements by name, catalog MCP connections and its own MCP servers. Connections satisfy those requirements only through mappings an owner or admin approved for that repository, profile, requirement and qualifier. See [PROJECT-CONFIG.md](PROJECT-CONFIG.md#agent-profiles-and-secret-requirements-schema-version-2).
+
 ## Migration and rollback
 
 - **Existing profiles are unchanged.** `connections` and `connection_policy` are written only when non-empty, so every stored profile keeps its exact bytes and resolves exactly as before. Inline `mcp_servers` and `env` keep working alongside connections.

@@ -33,6 +33,11 @@ function catalogFixture(page: Page) {
           return route.fulfill({ json: { ok: true } });
         }
         if (url === "/api/catalog/connections") return route.fulfill({ json: { connections, can_manage: true, role: "owner" } });
+        if (url === "/api/catalog/repositories") return route.fulfill({ json: { repositories: [{ project: "alpha", name: "site" }], can_manage: true } });
+        if (url === "/api/catalog/repositories/alpha/site")
+          return route.fulfill({ json: { configured: true, commit: "0123abcd", can_manage: true, dev: [], profiles: {
+            deploy: { default: false, requirements: [{ kind: "secret", name: "CLOUDFLARE_API_TOKEN", qualifier: "deploy-production-write", run_kinds: ["deploy"], required: true, status: "needs_reapproval", mapping: { connection: "staging-secrets", qualifier: "deploy", proposed_by: "owner" } }] },
+          } } });
         if (url === "/api/catalog/profiles") return route.fulfill({ json: { profiles: [profile], can_manage: true, role: "owner" } });
         if (url === "/api/catalog/profiles/coder/runs") return route.fulfill({ json: { runs: [{ id: "0123456789abcdef", status: "succeeded", provider: "claude", created_at: "2026-10-29T01:00:00Z", profile: { run_kind: "debug", connections: [{ name: "kitbash", revision: 2 }] } }] } });
         return route.fulfill({ status: 404, json: { error: "Unknown" } });
@@ -68,6 +73,11 @@ test("Connections lists, tests and creates connections with write-only secret in
   expect(created).toMatchObject({ name: "docs", kind: "mcp_http", headers: { Authorization: { secret: "DOCS_TOKEN", prefix: "Bearer " } }, secrets: { DOCS_TOKEN: SECRET } });
   await expect(panel.getByLabel("Secret value")).toHaveValue("");
   expect(await page.content()).not.toContain(SECRET);
+  // Repository requirements: a widened qualifier needs a new approval.
+  await expect(panel.getByRole("cell", { name: "Needs re-approval approved for deploy" })).toBeVisible();
+  await panel.getByLabel("Connection for CLOUDFLARE_API_TOKEN").selectOption("staging-secrets");
+  await panel.getByRole("button", { name: "Approve" }).click();
+  await expect.poll(() => fixture.posts.find((p) => p.url.endsWith("/alpha/site/approve"))?.body).toEqual({ repo_profile: "deploy", kind: "secret", requirement: "CLOUDFLARE_API_TOKEN", connection: "staging-secrets" });
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
