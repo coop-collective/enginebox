@@ -237,6 +237,13 @@ pub fn bounded_controlled(
     let mut timed_out = false;
     let mut cancelled = false;
     let mut truncated = false;
+    const MARKER: &[u8] = b"\n[... output truncated ...]\n";
+    // A real flood (an endless print loop) is still stopped: at most this much
+    // is read in total before the process is ended, besides its timeout.
+    let flood_limit = max.saturating_mul(256);
+    let mut read_total: usize = 0;
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let result = (|| -> Result<()> {
         readers?;
         loop {
@@ -249,12 +256,30 @@ pub fn bounded_controlled(
                 break;
             }
             match rx.recv_timeout(Duration::from_millis(25)) {
+                // Past the bound the process keeps running: a long agent run
+                // must not be killed for being chatty. The output keeps its
+                // head (session IDs and early events) and a rolling tail (the
+                // final result), and is marked truncated.
                 Ok(b) => {
-                    let keep = b.len().min(max.saturating_sub(output.len()));
-                    output.extend_from_slice(&b[..keep]);
-                    if keep < b.len() {
-                        truncated = true;
-                        break;
+                    read_total = read_total.saturating_add(b.len());
+                    let head_max = max / 2;
+                    if !truncated && output.len() + b.len() <= max {
+                        output.extend_from_slice(&b);
+                    } else {
+                        if !truncated {
+                            truncated = true;
+                            head = output[..head_max.min(output.len())].to_vec();
+                            tail.extend(output[head.len()..].iter().copied());
+                            output.clear();
+                        }
+                        tail.extend(b.iter().copied());
+                        let tail_max = max.saturating_sub(head.len() + MARKER.len());
+                        while tail.len() > tail_max {
+                            tail.pop_front();
+                        }
+                        if read_total > flood_limit {
+                            break;
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -282,6 +307,11 @@ pub fn bounded_controlled(
     };
     #[cfg(not(unix))]
     let code = status.code().unwrap_or(-1);
+    if truncated {
+        output = head;
+        output.extend_from_slice(MARKER);
+        output.extend(tail);
+    }
     Ok(Output {
         exit_code: if cancelled { CANCELLED_EXIT_CODE } else { code },
         output: String::from_utf8_lossy(&output).into_owned(),
@@ -413,4 +443,38 @@ pub fn native_rpc_with_lease(
     drop(rx);
     let _ = handle.join();
     result
+}
+
+#[cfg(all(test, unix))]
+mod output_bound_tests {
+    use super::*;
+    #[test]
+    fn a_chatty_process_runs_to_completion_and_keeps_its_head_and_tail() {
+        // Writes ~2 MB, far past the 64 KiB bound, then a final line, then exits 0.
+        let script = "printf 'START\\n'; i=0; while [ $i -lt 20000 ]; do printf '%0100d\\n' $i; i=$((i+1)); done; printf 'FINAL-RESULT\\n'; exit 0";
+        let argv = vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()];
+        let out = bounded(&argv, None, None, b"", Duration::from_secs(60), 65536, None).unwrap();
+        assert_eq!(
+            out.exit_code, 0,
+            "the process must not be killed at the bound"
+        );
+        assert!(out.output_truncated);
+        assert!(out.output.starts_with("START"));
+        assert!(out.output.trim_end().ends_with("FINAL-RESULT"));
+        assert!(out.output.contains("[... output truncated ...]"));
+        assert!(out.output.len() <= 65536);
+    }
+    #[test]
+    fn small_output_is_kept_whole() {
+        let argv = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'hello'".to_owned(),
+        ];
+        let out = bounded(&argv, None, None, b"", Duration::from_secs(10), 65536, None).unwrap();
+        assert_eq!(
+            (out.exit_code, out.output.as_str(), out.output_truncated),
+            (0, "hello", false)
+        );
+    }
 }

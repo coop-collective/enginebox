@@ -20,6 +20,9 @@ use std::{
     time::{Duration, Instant},
 };
 /// Largest private queue entry: a 16 KiB request plus callback and bookkeeping.
+/// How long a run waits for the host operation lock (pool creations hold it
+/// while a workspace is cloned and prepared).
+const HOST_LOCK_WAIT: Duration = Duration::from_secs(600);
 const QUEUE_ENTRY_LIMIT: usize = 128 * 1024;
 /// Finished runs retained (records and unplaced pool runs each).
 const RETAINED_FINISHED: usize = 100;
@@ -2734,7 +2737,9 @@ impl AgentService {
                 ));
             }
         }
-        let _hostlock = enginebox_core::operation_lock(&host)
+        // Pool scale-ups hold the host lock for minutes while they create a
+        // workspace; a run placed meanwhile waits for it instead of failing.
+        let _hostlock = enginebox_core::operation_lock_wait(&host, HOST_LOCK_WAIT)
             .map_err(|e| LaunchFailure::from_error(Stage::Bootstrap, "workspace_locked", &e))?;
         let uncertain = self.inner.records.lock().unwrap().values().any(|v| {
             v["execution_uncertain"] == true && v["host_id"] == host_id && v["name"] == name
