@@ -21,6 +21,7 @@ import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
 import { WorkspacesPanel } from "@/components/workspaces-panel";
 import { EmailSignIn } from "@/components/email-sign-in";
 import { OrgPanel } from "@/components/org-panel";
+import { CredentialsPanel } from "@/components/credentials-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -1123,6 +1124,9 @@ export default function Dashboard() {
               {["workspaces", "github", "repositories", "storage"].includes(section) && <WorkspacesPanel key={section} fleet={fleet} initialConnections={section === "github"} initialStorage={section === "storage"} refreshToken={updated?.getTime() ?? 0} />}
               {section === "agents" && (
                 <AgentsPanel close={() => navigate("fleet")} />
+              )}
+              {section === "agents" && emailSignIn && (
+                <CredentialsPanel />
               )}
               {section === "templates" && (
                 <>

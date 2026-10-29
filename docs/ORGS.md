@@ -53,9 +53,24 @@ Owner token only. The controller admits a tenant's pool run only for its own poo
 | Service tokens / OAuth access tokens | `org_id` on the token, from the OAuth grant's org. |
 | OAuth grants (dashboard) | `org_id` on the grant (absent: platform org). The approver keeps managing it; so do that org's admins. |
 | Hosts and nodes | `tenancy.json`. |
-| Controller-scope agent accounts | The platform org's team accounts. Per-member credentials are the follow-up. |
+| Controller-scope agent accounts | The platform org's team accounts. |
+| Org agent credentials | `org_id` on each record (`agent-credentials/`), see below. |
 
 The dashboard holds the owner token. For orgs other than the platform org it sends `X-EngineBox-Org: <org>` with it; the controller stamps new pools, profiles and repositories with that org and refuses runs on another org's hosts or pools. Platform-org requests carry no header and are byte-for-byte what they were before orgs. The public `/v1` owner-token API therefore keeps acting as the platform org's owner, and existing OAuth integrations such as Ideator keep working unchanged.
+
+## Agent credentials
+
+Each org keeps its own agent accounts (`GET/POST /v1/credentials`, acting org from `X-EngineBox-Org`; dashboard **Agents → Your and your team's agent accounts**):
+
+| Kind | Who adds it | Connect | Sharing |
+| --- | --- | --- | --- |
+| `personal` | any member, under their own identity | the provider's native sign-in (the same flow as controller accounts) into a private home of its own; only its owner can sign it in | the owner alone decides **Share into org pools** |
+| `team` | org admins | native sign-in by an admin | org-owned |
+| `api_key` | org admins | the key is sent once, stored in a 0600 file and never returned or logged | org-owned |
+
+Members see team accounts, keys (metadata only), their own personal accounts and others' shared ones; admins see all metadata and can remove any credential. The controller-scope accounts (`GET /v1/agents`) remain the platform org's team accounts.
+
+Runs do not select from these yet. `credentials::Credentials::candidates(org, provider, member)` is the selection interface the credential-pool work will call: connected credentials of the org for the provider, in order: the requesting member's own personal accounts, then personal accounts their owners shared, then team accounts, then API keys. An org pool run without a member skips unshared personal accounts. Usage events already carry `credential_id`.
 
 ## Sign-in
 
@@ -131,7 +146,7 @@ The core (controller, guest, node agent and dashboard with orgs) is complete and
 - **Metering**: `enginebox_controller::metering::UsageSink`. The controller emits a `UsageEvent` (org, capacity org, grant, run, credential, pool or host, who started it) when it admits a run. The default sink discards events. A deployment installs its own with `Controller::with_usage_sink`. Pricing, aggregation and invoices are not in the core.
 - **Quotas**: `tenancy::Tenancy::admit_pool_run` returns `Admission::Granted { grant_id, limits }`; a quota layer enforces the limits (and resolves capacity-class grants) before or around admission.
 - **Mode**: `ENGINEBOX_TENANCY_MODE=managed` turns off instance-owner powers for tenants, hides the platform org from them and enables open sign-up.
-- **Credential selection** (next): runs will pick an agent credential through an interface keyed by org, member and provider; usage events already carry `credential_id`.
+- **Credential selection** (next): runs will pick an agent credential through `Credentials::candidates`; usage events already carry `credential_id`.
 
 ## Migration and rollback
 
