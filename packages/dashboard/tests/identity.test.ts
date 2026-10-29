@@ -95,8 +95,11 @@ test("bootstrap: the platform org exists, the env owner is instance owner with a
     state.members.filter((m) => m.user_id === owner.id).map((m) => [m.org_id === DEFAULT_ORG ? "platform" : "personal", m.role]).sort(),
     [["personal", "owner"], ["platform", "owner"]],
   );
-  assert.equal(statSync(join(dir, "identity.json")).mode & 0o777, 0o600);
-  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  // POSIX permissions; Windows has no mode bits.
+  if (process.platform !== "win32") {
+    assert.equal(statSync(join(dir, "identity.json")).mode & 0o777, 0o600);
+    assert.equal(statSync(dir).mode & 0o777, 0o700);
+  }
   // Idempotent: a second bootstrap adds nothing.
   withIdentity(() => {});
   assert.equal(readIdentity().users.length, 1);
