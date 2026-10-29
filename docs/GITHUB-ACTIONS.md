@@ -67,6 +67,15 @@ Worker execution uses a separate `enginebox-ci-*` Incus project and state root. 
 
 The worker verifies its pinned runner version, starts `run.sh --jitconfig`, bounds execution time, exports private diagnostics and removes only the VM with its recorded Incus UUID and allocation ID. After the worker proves deletion, the controller removes only its own matching, non-busy leftover JIT registration if GitHub has not already removed it. Uncertain provisioning, execution, log export, registration cleanup or detach retains its receipts/resources for inspection. The controller records uncertainty, holds that pool's capacity and does not replay the job. A workflow cancellation is delivered by GitHub to its native runner; the worker timeout is a fallback bound.
 
+Before allocating, the worker checks host capacity under the host lock. A known
+shortage returns `waiting_capacity` with explicit proof that no allocation was
+attempted. The controller removes the unused JIT registration, rechecks that the
+GitHub job is still queued, and defers the whole pool for 60 seconds before a new
+capacity attempt. This also applies to prepared runners before any checkout or
+assignment exists. A failure after allocation starts, an incomplete inventory, or
+unconfirmed registration cleanup still requires operator reconciliation. Existing
+uncertain attempts are never automatically reclassified or replayed.
+
 Drain stops new provisioning while admitted workers finish. Controller handoff also waits for workers, so a long job can delay an upgrade. Standby does not recover GitHub state. Running records found after an active-owner restart become uncertain. The first implementation has no takeover of an orphaned worker, uncertain-job repair button or periodic GitHub queue backfill. Failed webhook deliveries must be inspected/redelivered in GitHub; the integration does not promise recovery of events it never received.
 
 ## Setup and supported interfaces

@@ -218,6 +218,15 @@ impl GitHub {
             return Ok(());
         }
         for pool in &config.pools {
+            // A host shortage applies to the whole pool, not just one demand.
+            // Retain queued jobs without minting a new JIT registration every tick.
+            if data.jobs.values().any(|job| {
+                job["pool"] == pool.id
+                    && job["status"] == "queued"
+                    && job["capacity_retry_at"].as_u64().unwrap_or(0) > api::now()
+            }) {
+                continue;
+            }
             let active = data
                 .jobs
                 .values()
@@ -234,7 +243,9 @@ impl GitHub {
                 .map(|(k, _)| k.clone())
                 .collect::<Vec<_>>();
             for key in keys {
-                data.jobs.get_mut(&key).unwrap()["status"] = json!("running");
+                let job = data.jobs.get_mut(&key).unwrap();
+                job["status"] = json!("running");
+                job.as_object_mut().unwrap().remove("capacity_retry_at");
                 self.save(&data)?;
                 self.pending.fetch_add(1, Ordering::SeqCst);
                 let this = self.clone();
@@ -402,7 +413,8 @@ impl GitHub {
                     .is_some_and(|v| v.is_finite() && v >= 0.0),
             "Worker did not prove cleanup"
         );
-        if pool.preparation.is_some() {
+        let capacity_wait = capacity_wait_proof(&result)?;
+        if !capacity_wait && pool.preparation.is_some() {
             let actual = &result["assignment"];
             ensure!(
                 actual["verified"] == true
@@ -439,9 +451,24 @@ impl GitHub {
         );
         // Do not publish arbitrary worker stdout (could include JIT or workflow secrets).
         Ok(
-            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued", "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64()}),
+            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued", "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64(),"capacity_wait":capacity_wait}),
         )
     }
+}
+fn capacity_wait_proof(result: &Value) -> Result<bool> {
+    if result["status"] != "waiting_capacity" {
+        return Ok(false);
+    }
+    ensure!(
+        result["cleaned"] == true
+            && result["allocation_started"] == false
+            && result["allocation_id"].is_null()
+            && result["instance_uuid"].is_null()
+            && result["checkout"].is_null()
+            && result["assignment"].is_null(),
+        "Capacity wait must prove no allocation or assignment was attempted"
+    );
+    Ok(true)
 }
 fn finish_capacity(job: &mut Value, result: Value) {
     // A newer webhook wins over the earlier API observation.
@@ -452,6 +479,11 @@ fn finish_capacity(job: &mut Value, result: Value) {
             "finished"
         }
     );
+    if job["status"] == "queued" && result["capacity_wait"] == true {
+        job["capacity_retry_at"] = json!(api::now() + 60);
+    } else {
+        job.as_object_mut().unwrap().remove("capacity_retry_at");
+    }
     job["result"] = result;
 }
 fn job_persistence_failure(data: &mut crate::Data, key: &str) {
@@ -461,6 +493,25 @@ fn job_persistence_failure(data: &mut crate::Data, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_wait_never_accepts_an_ambiguous_or_started_allocation() {
+        let clean = json!({"status":"waiting_capacity","allocation_started":false,"cleaned":true});
+        assert!(capacity_wait_proof(&clean).unwrap());
+        for key in ["allocation_id", "instance_uuid", "checkout", "assignment"] {
+            let mut value = clean.clone();
+            value[key] = json!("present");
+            assert!(capacity_wait_proof(&value).is_err());
+        }
+        for key in ["allocation_started", "cleaned"] {
+            let mut value = clean.clone();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(capacity_wait_proof(&value).is_err());
+        }
+        let mut started = clean;
+        started["allocation_started"] = json!(true);
+        assert!(capacity_wait_proof(&started).is_err());
+        assert!(!capacity_wait_proof(&json!({"status":"finished"})).unwrap());
+    }
     #[test]
     fn shared_session_does_not_bypass_org_approval_or_suspension() {
         for installation in [
@@ -501,12 +552,20 @@ mod tests {
     #[test]
     fn jit_worker_cleanup_is_owned_and_worker_output_is_filtered() {
         for shared in [false, true] {
-            jit_fixture(false, shared);
-            jit_fixture(true, shared);
+            jit_fixture(false, shared, false);
+            jit_fixture(true, shared, false);
         }
     }
     #[cfg(unix)]
-    fn jit_fixture(prepared: bool, shared: bool) {
+    #[test]
+    fn capacity_wait_removes_unused_registration_and_defers_the_pool() {
+        for shared in [false, true] {
+            jit_fixture(false, shared, true);
+            jit_fixture(true, shared, true);
+        }
+    }
+    #[cfg(unix)]
+    fn jit_fixture(prepared: bool, shared: bool, capacity_wait: bool) {
         use crate::tests::{account, api_fixture, service, shared_service};
         use std::{
             fs,
@@ -531,15 +590,16 @@ mod tests {
         let worker = root.path().join("fixture-worker");
         fs::write(&worker,r#"#!/usr/bin/env python3
 import json,sys
+waiting=CAPACITY_WAIT
 r=json.load(sys.stdin)
 assert r['jitconfig']=='fixture-jit-config'
 assert set(r)=={'schema','name','job_id','repository','jitconfig','timeout_seconds'} | ({'preparation'} if 'preparation' in r else set())
-a={}
+a=None
 if 'preparation' in r:
  assert r['preparation']['verification_token']=='fixture-verification-token'
- a={'verified':True,'job_id':1000,'run_id':55,'run_attempt':2,'runner_id':501,'repository_id':101}
-print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':True,'runner_version':'2.337.0','duration_seconds':1,'private_extra':'must-not-expose','assignment':a}))
-"#).unwrap();
+ if not waiting: a={'verified':True,'job_id':1000,'run_id':55,'run_attempt':2,'runner_id':501,'repository_id':101}
+print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':True,'runner_version':'2.337.0','duration_seconds':1,'private_extra':'must-not-expose','assignment':a,'status':'waiting_capacity' if waiting else 'finished','allocation_started':not waiting}))
+"#.replace("CAPACITY_WAIT", if capacity_wait { "True" } else { "False" })).unwrap();
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
         g.config.as_mut().unwrap().pools[0].worker = vec![worker.to_str().unwrap().into()];
         {
@@ -618,15 +678,29 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         assert_eq!(result["runner_id"], 501);
         assert_eq!(result["demand_pending"], true);
         assert_eq!(result["prepared"], prepared);
-        if prepared {
+        assert_eq!(result["capacity_wait"], capacity_wait);
+        if prepared && !capacity_wait {
             assert_eq!(result["actual_job_id"], 1000);
         }
         let mut demand = json!({"status":"running","github_status":"queued"});
         finish_capacity(&mut demand, result.clone());
         assert_eq!(demand["status"], "queued");
+        if capacity_wait {
+            assert!(demand["capacity_retry_at"].as_u64().unwrap() > api::now());
+            demand["pool"] = json!(g.config.as_ref().unwrap().pools[0].id);
+            g.data
+                .lock()
+                .unwrap()
+                .jobs
+                .insert("2-99".into(), demand.clone());
+            g.tick().unwrap();
+            assert_eq!(g.pending(), 0);
+            assert_eq!(g.data.lock().unwrap().jobs["2-99"]["status"], "queued");
+        }
         demand["github_status"] = json!("completed");
         finish_capacity(&mut demand, result.clone());
         assert_eq!(demand["status"], "finished");
+        assert!(demand["capacity_retry_at"].is_null());
         for secret in [
             "fixture-jit-config",
             "fixture-installation-token",
