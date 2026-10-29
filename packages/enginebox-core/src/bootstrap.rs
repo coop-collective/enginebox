@@ -188,7 +188,9 @@ pub fn normalize(raw: Value) -> Result<Value> {
                 "max_instances",
                 "contribution_cpu",
                 "contribution_memory_gib",
-                "cpu_overcommit"
+                "cpu_overcommit",
+                "disk_overcommit",
+                "disk_accounting"
             ]
             .contains(&k.as_str())),
             "Unknown admission field"
@@ -198,7 +200,14 @@ pub fn normalize(raw: Value) -> Result<Value> {
             "Contribution limits must be paired"
         );
         for (k, v) in keys {
-            if k == "cpu_overcommit" {
+            if k == "disk_accounting" {
+                ensure!(
+                    ["copy_on_write", "allocated"].contains(&v.as_str().unwrap_or("")),
+                    "Invalid admission {k}"
+                );
+                continue;
+            }
+            if k == "cpu_overcommit" || k == "disk_overcommit" {
                 ensure!(
                     v.as_f64()
                         .is_some_and(|r| r.is_finite() && (1.0..=64.0).contains(&r)),
@@ -638,6 +647,8 @@ pub fn admission_errors(c: &Value, o: &Value) -> Result<Vec<Value>> {
         contribution_cpu: p["contribution_cpu"].as_u64(),
         contribution_memory_gib: p["contribution_memory_gib"].as_u64(),
         cpu_overcommit: p["cpu_overcommit"].as_f64(),
+        disk_overcommit: p["disk_overcommit"].as_f64(),
+        disk_accounting: serde_json::from_value(p["disk_accounting"].clone()).ok(),
         ..Default::default()
     };
     let room = crate::capacity::capacity(&h, facts)?;
@@ -1022,6 +1033,12 @@ pub fn install_template(h: &Host, manifest: &Value) -> Result<Value> {
     }
     if let Some(ratio) = h.cpu_overcommit {
         admission["cpu_overcommit"] = json!(ratio);
+    }
+    if let Some(ratio) = h.disk_overcommit {
+        admission["disk_overcommit"] = json!(ratio);
+    }
+    if let Some(mode) = h.disk_accounting {
+        admission["disk_accounting"] = json!(mode.as_str());
     }
     let c = normalize(
         json!({"host":{"transport":if h.target=="local"{"local"}else{"ssh"},"target":h.target,"install_packages":false,"disk_reserve":format!("{}GiB",h.reserve_disk_gib.max(1)),"memory_reserve":format!("{}GiB",h.reserve_memory_gib.max(1)),"admission":admission},"incus":{"project":h.project,"profile":base},"storage":{"mode":"existing","pool":h.pool},"network":{"mode":"existing","name":network},"workspace":{"name":base,"image":manifest["source_image"],"cpu":r.cpu,"memory":format!("{}GiB",r.memory_gib),"disk":format!("{}GiB",manifest["minimum"]["disk_gib"].as_u64().unwrap()),"state_disk":format!("{}GiB",r.memory_gib+2),"user":h.guest.user,"uid":h.guest.uid,"gid":h.guest.gid,"home":h.guest.home,"path":h.guest.workspace},"agents":{"install":manifest["native_clients"]},"modules":manifest["config"]}),

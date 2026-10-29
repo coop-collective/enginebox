@@ -140,12 +140,22 @@ pub fn capacity(host: &Host, facts: &Value) -> Result<Value> {
         cpu_room = cpu_room.min(c.saturating_sub(contributed_cpu));
         memory_room = memory_room.min((m * GIB).saturating_sub(contributed_mem));
     }
-    let pool_free =
-        number(&facts["pool_total_bytes"]).saturating_sub(number(&facts["pool_used_bytes"]));
-    let disk_room = number(&facts["disk_free_bytes"])
+    let pool_total = number(&facts["pool_total_bytes"]);
+    let pool_free = pool_total.saturating_sub(number(&facts["pool_used_bytes"]));
+    let reserve_disk = host.reserve_disk_gib * GIB;
+    let driver = facts["pool_driver"].as_str();
+    let disk_mode = host.disk_accounting(driver);
+    let disk_overcommit = host.disk_overcommit(disk_mode);
+    // Actual usage: what the pool and its backing filesystem really have free.
+    let disk_usage_room = number(&facts["disk_free_bytes"])
         .min(pool_free)
-        .min(number(&facts["pool_total_bytes"]).saturating_sub(committed))
-        .saturating_sub(host.reserve_disk_gib * GIB);
+        .saturating_sub(reserve_disk);
+    // Allocation guard: configured root plus saved-memory sizes of every VM
+    // in the pool, stopped included, may reach (total - reserve) * overcommit.
+    // With overcommit 1.0 this is the strict full-commitment model.
+    let disk_allocation_budget = scale(pool_total.saturating_sub(reserve_disk), disk_overcommit);
+    let disk_allocation_room = disk_allocation_budget.saturating_sub(committed);
+    let disk_room = disk_usage_room.min(disk_allocation_room);
     let count = items
         .iter()
         .filter(|v| v["managed"] == true && v["project"] == host.project)
@@ -164,8 +174,18 @@ pub fn capacity(host: &Host, facts: &Value) -> Result<Value> {
         );
     }
     Ok(
-        json!({"cpu_total":facts["cpu_total"],"memory_total_bytes":facts["memory_total_bytes"],"memory_available_bytes":facts["memory_available_bytes"],"disk_free_bytes":facts["disk_free_bytes"],"pool_total_bytes":facts["pool_total_bytes"],"pool_free_bytes":pool_free,"reserve_cpu":host.reserve_cpu,"cpu_overcommit":overcommit,"cpu_budget":cpu_budget,"reserve_memory_bytes":host.reserve_memory_gib*GIB,"contribution_cpu":host.contribution_cpu,"contribution_memory_bytes":host.contribution_memory_gib.map(|m|m*GIB),"contribution_allocated_cpu":contributed_cpu,"contribution_allocated_memory_bytes":contributed_mem,"allocated_cpu":allocated_cpu,"allocated_memory_bytes":allocated_memory,"disk_committed_bytes":committed,"max_additional":additional,"cpu_available":cpu_room,"memory_budget_available_bytes":memory_room,"disk_budget_available_bytes":disk_room,"instance_slots_available":slots}),
+        json!({"cpu_total":facts["cpu_total"],"memory_total_bytes":facts["memory_total_bytes"],"memory_available_bytes":facts["memory_available_bytes"],"disk_free_bytes":facts["disk_free_bytes"],"pool_total_bytes":facts["pool_total_bytes"],"pool_free_bytes":pool_free,"reserve_cpu":host.reserve_cpu,"cpu_overcommit":overcommit,"cpu_budget":cpu_budget,"reserve_memory_bytes":host.reserve_memory_gib*GIB,"contribution_cpu":host.contribution_cpu,"contribution_memory_bytes":host.contribution_memory_gib.map(|m|m*GIB),"contribution_allocated_cpu":contributed_cpu,"contribution_allocated_memory_bytes":contributed_mem,"allocated_cpu":allocated_cpu,"allocated_memory_bytes":allocated_memory,"disk_committed_bytes":committed,"max_additional":additional,"cpu_available":cpu_room,"memory_budget_available_bytes":memory_room,"disk_budget_available_bytes":disk_room,"pool_driver":driver,"disk_accounting":disk_mode.as_str(),"disk_overcommit":disk_overcommit,"reserve_disk_bytes":reserve_disk,"disk_usage_available_bytes":disk_usage_room,"disk_allocation_budget_bytes":disk_allocation_budget,"disk_allocation_available_bytes":disk_allocation_room,"instance_slots_available":slots}),
     )
+}
+/// `bytes * ratio`, floored, for a ratio clamped to 1.0-64.0.
+pub fn scale(bytes: u64, ratio: f64) -> u64 {
+    let ratio = if ratio.is_finite() {
+        ratio.clamp(1.0, 64.0)
+    } else {
+        1.0
+    };
+    let milli = (ratio * 1000.0).round() as u128;
+    u64::try_from(bytes as u128 * milli / 1000).unwrap_or(u64::MAX)
 }
 /// Running vCPUs admitted on `physical` cores at `ratio` overcommit.
 pub fn cpu_budget(physical: u64, ratio: f64) -> u64 {
@@ -203,14 +223,37 @@ pub fn shortage(host: &Host, facts: &Value, r: Resources) -> Result<Option<Strin
         ))
     } else if number(&c["disk_budget_available_bytes"]) < (r.disk_gib + r.memory_gib + 2) * GIB {
         Some(format!(
-            "disk: {} GiB requested, {} GiB free after the {} GiB reserve",
+            "disk: {} GiB requested; {} GiB actually free in the pool after the {} GiB reserve, {} of {} GiB allocation budget left ({} accounting, disk_overcommit {})",
             r.disk_gib + r.memory_gib + 2,
-            gib(number(&c["disk_budget_available_bytes"])),
-            host.reserve_disk_gib
+            gib(number(&c["disk_usage_available_bytes"])),
+            host.reserve_disk_gib,
+            gib(number(&c["disk_allocation_available_bytes"])),
+            gib(number(&c["disk_allocation_budget_bytes"])),
+            c["disk_accounting"].as_str().unwrap_or("allocated"),
+            c["disk_overcommit"]
         ))
     } else {
         None
     })
+}
+/// Stopped instances in the host project that no template references:
+/// `ebox-template-*` bases not named as any template's `source`, and a
+/// stopped `ebox-base`. Read-only; operators decide what to delete.
+pub fn stale_instances(host: &Host, facts: &Value, sources: &[&str]) -> Vec<Value> {
+    facts["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["project"] == host.project && v["status"] == "Stopped")
+        .filter(|v| {
+            v["name"].as_str().is_some_and(|n| {
+                (n == "ebox-base" || n.starts_with("ebox-template-")) && !sources.contains(&n)
+            })
+        })
+        .map(|v| {
+            json!({"name":v["name"],"pool":v["pool"],"disk_bytes":number(&v["disk_bytes"]),"state_disk_bytes":number(&v["state_disk_bytes"])})
+        })
+        .collect()
 }
 pub fn resource_fits(host: &Host, facts: &Value, r: Resources) -> Result<bool> {
     Ok(shortage(host, facts, r)?.is_none())
@@ -355,7 +398,11 @@ pub fn local_inventory(pool: &str, _project: &str) -> Result<Value> {
         items.push(item);
     }
     let space = incus_query(&format!("/1.0/storage-pools/{pool}/resources"))?["space"].clone();
+    // Optional: admission treats an unknown driver as strict allocation.
+    let driver = incus_query(&format!("/1.0/storage-pools/{pool}"))
+        .map(|p| p["driver"].clone())
+        .unwrap_or(Value::Null);
     Ok(
-        json!({"cpu_total":cpus,"memory_total_bytes":total,"memory_available_bytes":available,"disk_free_bytes":fs2::available_space("/var/lib/incus")?,"pool_total_bytes":space["total"],"pool_used_bytes":space["used"],"instances":items}),
+        json!({"cpu_total":cpus,"memory_total_bytes":total,"memory_available_bytes":available,"disk_free_bytes":fs2::available_space("/var/lib/incus")?,"pool_total_bytes":space["total"],"pool_used_bytes":space["used"],"pool_driver":driver,"instances":items}),
     )
 }

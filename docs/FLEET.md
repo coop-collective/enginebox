@@ -23,6 +23,14 @@ max_instances = 16
 # Optional: running vCPUs admitted per physical core left after reserve_cpu
 # (1.0-64.0, default 4.0). Older controller releases reject this key.
 cpu_overcommit = 4.0
+# Optional: disk accounting, "copy_on_write" or "allocated". Unset detects
+# copy-on-write from the Incus pool driver (btrfs, zfs); any other or unknown
+# driver is "allocated". Older controller releases reject this key.
+# disk_accounting = "copy_on_write"
+# Optional: sum of allocated disks admitted per byte of pool left after
+# reserve_disk_gib (1.0-64.0; default 4.0 for copy-on-write, 1.0 otherwise).
+# Older controller releases reject this key.
+# disk_overcommit = 4.0
 # Optional: concurrent native agent runs on this host (1–256, default 8).
 # Older controller releases reject this key; set it only after upgrading.
 max_agent_runs = 8
@@ -160,12 +168,28 @@ Admission is recalculated immediately before each creation or stopped-VM resume.
 - A CPU budget of `(cpu_total - reserve_cpu) * cpu_overcommit` running vCPUs. An instance's `limits.cpu` is a ceiling, not a reservation, and agent workloads mostly wait on inference, so `cpu_overcommit` defaults to `4.0` (range 1.0–64.0; set `1.0` for strict one-vCPU-per-core accounting). A frozen VM's vCPUs count again once it runs.
 - Memory with no overcommit: the configured memory of every instance that holds RAM plus `reserve_memory_gib` must fit in total memory, and new instances must also fit in the actual available host memory after the reserve.
 - An optional `contribution_cpu` / `contribution_memory_gib` ceiling on a contributed machine is an owner's promise and is never overcommitted.
-- Actual pool/backing-filesystem free space and full root-disk plus saved-memory commitments for every VM in the admission pool, including stopped VMs.
+- Disk, with two guards that must both admit the new VM's full root disk plus saved-memory size (RAM + 2 GiB):
+  - **Actual usage:** the smaller of the pool's free space (`pool_total - pool_used`) and the backing filesystem's free space, minus `reserve_disk_gib` (`disk_usage_available_bytes`).
+  - **Allocation:** the configured root plus saved-memory disks of every VM in the admission pool, stopped VMs included, may reach `(pool_total - reserve_disk_gib) * disk_overcommit` (`disk_allocation_budget_bytes`; what is left is `disk_allocation_available_bytes`).
+  - `disk_budget_available_bytes` is the smaller of the two.
 - The configured limit on fleet-created instances in the project.
 
-The model is deliberately conservative about copy-on-write storage: inexpensive initial clones still reserve their full configured disk capacity. Ordinary host processes and CI jobs are not Incus allocations; reserve enough headroom for them. These checks do not guarantee latency or prevent unrelated administrator workloads from consuming resources afterward.
+Disk accounting follows the admission pool's Incus driver, which the host inventory reports as `pool_driver`:
 
-A refused creation names the first limiting resource, for example `Insufficient CPU, memory, disk or instance slots; preserve reserves (memory: 4 GiB requested, 2 GiB free after the 40 GiB reserve)`. `GET /v1/fleet` reports `cpu_overcommit`, `cpu_budget`, `allocated_cpu` (running vCPUs) and `allocated_memory_bytes` (running and frozen) per host.
+| `disk_accounting` | Selected when | Default `disk_overcommit` | Effect |
+| --- | --- | --- | --- |
+| `copy_on_write` | driver `btrfs` or `zfs` | `4.0` | Clones share blocks with their template, so admission follows real usage; allocations may total four times the pool after the reserve. |
+| `allocated` | any other driver, or an inventory from an older host agent without `pool_driver` | `1.0` | Strict: every allocated byte is reserved, as before this setting existed. |
+
+Set `disk_accounting` on the host to override detection (for example while the host still runs an older `enginebox-host` that does not report the driver), and `disk_overcommit` (1.0–64.0) to tighten or loosen the allocation guard; `disk_overcommit = 1.0` restores strict accounting on a copy-on-write pool. Fleet files without either key behave as the table says. Thin LVM is treated as `allocated`: running a thin pool out of space fails hard, so opt in explicitly. Overcommitted guests can still fill the pool if they all write their full disks; watch `pool_free_bytes` and keep `reserve_disk_gib` large enough for growth between admissions.
+
+Ordinary host processes and CI jobs are not Incus allocations; reserve enough headroom for them. These checks do not guarantee latency or prevent unrelated administrator workloads from consuming resources afterward.
+
+A refused creation names the first limiting resource, for example `Insufficient CPU, memory, disk or instance slots; preserve reserves (memory: 4 GiB requested, 2 GiB free after the 40 GiB reserve)`. A disk refusal shows both disk guards: `disk: 36 GiB requested; 410 GiB actually free in the pool after the 32 GiB reserve, 20 of 1790 GiB allocation budget left (copy_on_write accounting, disk_overcommit 4.0)`. `GET /v1/fleet` reports `cpu_overcommit`, `cpu_budget`, `allocated_cpu` (running vCPUs) and `allocated_memory_bytes` (running and frozen) per host, and for disk `pool_driver`, `disk_accounting`, `disk_overcommit`, `reserve_disk_bytes`, `disk_committed_bytes` (allocated), `disk_usage_available_bytes`, `disk_allocation_budget_bytes`, `disk_allocation_available_bytes` and `disk_budget_available_bytes`.
+
+Disk example: a 515 GB btrfs pool with 485 GB free, `reserve_disk_gib = 32` and 13 VMs whose disks total 481 GB allocated. Under strict accounting it admits nothing (515 GB − 34.4 GB − 481 GB < 0). Under copy-on-write it has 450.6 GB (419 GiB) of actual room, so 11 standard VMs (30 GiB root + 6 GiB saved memory) fit at once, and an allocation budget of (515 − 34.4) × 4 = 1922.6 GB with 1441.6 GB left, so about 37 more standard VMs can be created as long as clones keep writing little.
+
+Each host in `GET /v1/fleet` also lists `stale_instances`: stopped `ebox-template-*` instances in the host project that no template on that host names as its `source`, and a stopped `ebox-base` that no template uses. Entries show their allocated `disk_bytes` and `state_disk_bytes`. The list is read-only; Engine Box never deletes them. Review and remove them with `incus delete` once nothing depends on them. It is `null` when the template registry cannot be read.
 
 Example: a 48-core, 125 GiB host with `reserve_cpu = 12`, `reserve_memory_gib = 40` and 13 VMs of 4 vCPU / 4 GiB, of which 5 are stopped, 4 frozen and 4 running, has a CPU budget of 144 vCPU with 16 used, and 125 − 40 − 32 = 53 GiB of memory budget, so it admits 13 more standard VMs.
 

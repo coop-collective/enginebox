@@ -6,6 +6,8 @@
 
 - **Project repositories.** Hosted Git repositories per project backed by Cloudflare Artifacts (beta) through a new Artifacts gateway Worker (`packages/artifacts-gateway`) that holds the Artifacts bindings and accepts only HMAC-signed, replay-protected controller requests (no Cloudflare API token is stored); an owner-only, write-only backend configuration; create (idempotent), list, read and short-lived token routes; per-project `repositories` grants for service tokens and OAuth consent; and runs that name a repository receive a write token at admission as a git header scoped to that remote, revoked when the run ends. A backend interface leaves room for a GitHub App backend ([repositories](docs/REPOSITORIES.md)).
 
+- **Copy-on-write disk admission.** Hosts whose admission pool uses btrfs or zfs (reported as `pool_driver` by the host inventory) now admit against actual pool usage after `reserve_disk_gib`, with allocated sizes capped at `(pool_total - reserve) * disk_overcommit` (default 4.0; 1.0 and strict for other drivers). New optional host keys `disk_accounting` and `disk_overcommit`; disk refusals show both guards; `GET /v1/fleet` reports the driver, mode and budgets plus a read-only `stale_instances` list ([fleet](docs/FLEET.md)).
+
 ## 0.3.0 — development preview
 
 Notable changes since 0.2.0, grouped from the commit history. Everything below remains a single-owner development preview; see the linked guides for what is qualified versus planned.
