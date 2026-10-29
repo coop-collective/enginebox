@@ -4,7 +4,7 @@ use crate::{
     Fleet,
     fleet::{CopyMode, required},
     node_protocol, state,
-    transport::{host_run, operation_lock},
+    transport::{host_run, operation_lock_wait},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -34,7 +34,7 @@ pub fn prepare(
     fleet.validate_operation(host_id, "create", params)?;
     let host = fleet.host(host_id)?;
     let _controller = fleet.controller_lock(host_id)?;
-    let _lease = operation_lock(&host)?;
+    let _lease = operation_lock_wait(&host, Duration::from_secs(30))?;
     fleet.assert_admission(host_id)?;
     // Use the same executable resolution as actual inventory/host operations.
     let protocol: Value = serde_json::from_slice(&host_run(

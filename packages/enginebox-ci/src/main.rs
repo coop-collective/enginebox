@@ -2,7 +2,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use enginebox_core::{
-    Fleet, Resources, capacity, capacity::inventory, operation_lock, state, transport::shell_quote,
+    Fleet, Resources, capacity,
+    capacity::inventory,
+    state,
+    transport::{operation_lock_wait, shell_quote},
 };
 use enginebox_storage_layerfs::{
     Runtime as LayerRuntime, config::Config as LayerConfig, incus::Target,
@@ -145,8 +148,14 @@ fn run(config: Config, request: Request) -> Result<Value> {
             &fleet,
             &host.id,
             "ci",
-            &json!({"name":request.name,"template":config.template,"resources":config.resources,"size":"custom"}),
-        )?;
+            &allocation_request(&request.name, &config.template, config.resources),
+        )
+        .inspect_err(|error| {
+            // Allocation has not received JIT or workflow credentials. Keep its
+            // diagnostic private; stdout and the controller expose no error text.
+            receipt["allocation_error"] =
+                json!(format!("{error:#}").chars().take(2048).collect::<String>());
+        })?;
         let uuid = bx.instance(&request.name)?["config"]["volatile.uuid"]
             .as_str()
             .context("Missing clone identity")?
@@ -214,7 +223,7 @@ fn run(config: Config, request: Request) -> Result<Value> {
             None
         };
         {
-            let _host_lock = operation_lock(&host)?;
+            let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
             owned(&bx.instance(&request.name)?, &receipt)?;
             let room = capacity(&host, &inventory(&host)?)?;
             ensure!(
@@ -345,7 +354,7 @@ exit 0
             runtime.operate(&checkout, "close", &[], 120, "")?;
             receipt["private_checkout_retained"] = json!(true);
         }
-        let _host_lock = operation_lock(&host)?;
+        let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
         let vm = bx.instance(&request.name)?;
         owned(&vm, &receipt)?;
         ensure!(
@@ -371,6 +380,9 @@ exit 0
     state::write_json(&receipt_path, &receipt)?;
     outcome?;
     Ok(receipt)
+}
+fn allocation_request(name: &str, template: &str, resources: Resources) -> Value {
+    json!({"name":name,"template":template,"resources":resources})
 }
 fn owned(vm: &Value, receipt: &Value) -> Result<()> {
     ensure!(
@@ -415,6 +427,56 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_allocation_is_accepted_by_fleet_admission() {
+        use enginebox_core::model::{Host, StaticTemplate};
+        let temp = tempfile::tempdir().unwrap();
+        let resources = Resources {
+            cpu: 4,
+            memory_gib: 4,
+            disk_gib: 20,
+        };
+        let state_root = temp.path().join("state");
+        let fleet = Fleet::from_hosts(
+            vec![Host {
+                id: "ci-local".into(),
+                target: "local".into(),
+                project: "enginebox-ci-test".into(),
+                templates: vec![StaticTemplate {
+                    id: "ci-linux".into(),
+                    label: "CI fixture".into(),
+                    source: "ebox-fixture-base".into(),
+                    snapshot: "prepared-fixture".into(),
+                    minimum: Some(resources),
+                    recommended: Some(resources),
+                }],
+                ..Host::default()
+            }],
+            &state_root,
+        )
+        .unwrap();
+        let request = allocation_request(
+            "ebox-ci-0123456789abcdef0123456789abcdef",
+            "ci-linux",
+            resources,
+        );
+        fleet
+            .validate_operation("ci-local", "create", &request)
+            .unwrap();
+        let too_small = allocation_request(
+            "ebox-ci-0123456789abcdef0123456789abcdef",
+            "ci-linux",
+            Resources {
+                cpu: 1,
+                ..resources
+            },
+        );
+        assert!(
+            fleet
+                .validate_operation("ci-local", "create", &too_small)
+                .is_err()
+        );
+    }
     #[test]
     fn cleanup_is_bound_to_allocation_and_instance_identity() {
         let receipt = json!({"instance_uuid":"fixture-uuid","allocation_id":"fixture-allocation"});

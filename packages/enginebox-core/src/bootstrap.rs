@@ -760,6 +760,8 @@ fn prepare_workspace(c: &Value, binary_dir: &Path) -> Result<()> {
             source.to_str().context("Invalid binary path")?,
             &format!("{name}/usr/local/bin/{binary}"),
             "--mode=0755",
+            "--uid=0",
+            "--gid=0",
         ])?;
     }
     let command = vec![

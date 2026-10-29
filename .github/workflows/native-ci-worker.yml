@@ -1,0 +1,45 @@
+name: Build native CI worker
+on:
+  pull_request:
+    paths:
+      - 'packages/enginebox-ci/**'
+      - 'packages/enginebox-core/**'
+      - 'packages/enginebox-storage-layerfs/**'
+      - 'Cargo.lock'
+      - '.github/workflows/native-ci-worker.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-worker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@12.15.0
+      - run: pnpm install --frozen-lockfile
+      - name: Verify and build worker
+        run: |
+          pnpm exec cargo fmt --all --check
+          pnpm exec cargo test --locked -p enginebox-ci
+          pnpm exec cargo test --locked -p enginebox-core --test transport_contract
+          pnpm exec cargo clippy --locked -p enginebox-ci --all-targets -- -D warnings
+          pnpm exec cargo build --locked --release -p enginebox-ci --bin enginebox-ci-worker
+      - name: Record worker source and checksum
+        run: |
+          mkdir -p .state/ci-worker
+          cp target/release/enginebox-ci-worker .state/ci-worker/
+          git rev-parse HEAD > .state/ci-worker/source-commit.txt
+          cd .state/ci-worker
+          sha256sum enginebox-ci-worker > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: enginebox-ci-worker-${{ github.event.pull_request.head.sha || github.sha }}
+          path: .state/ci-worker/
+          if-no-files-found: error
