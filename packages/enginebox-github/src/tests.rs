@@ -65,7 +65,7 @@ pub(crate) fn api_fixture(
             }
             let mut input = vec![0; length];
             reader.read_exact(&mut input).unwrap();
-            if let Some(expected) = response.as_object_mut().unwrap().remove("__request") {
+            if let Some(expected) = response.as_object_mut().and_then(|o| o.remove("__request")) {
                 if let Some(token) = expected["authorization"].as_str() {
                     assert_eq!(authorization, token);
                 }
@@ -119,6 +119,22 @@ pub(crate) fn api_fixture(
         }
     });
     (api::Api::fixture(format!("http://{address}")), thread)
+}
+/// Give the repository App a freshly generated RSA key so it can sign JWTs.
+pub(crate) fn with_app_key(g: &mut GitHub) {
+    let output = std::process::Command::new("openssl")
+        .args(["genrsa", "2048"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let config = g.config.as_mut().unwrap();
+    config
+        .app
+        .as_mut()
+        .or(config.repos.as_mut())
+        .unwrap()
+        .private_key = String::from_utf8(output.stdout).unwrap();
 }
 fn token() -> Value {
     json!({"access_token":"fixture-user-access","refresh_token":"fixture-user-refresh","expires_in":28800})
@@ -208,19 +224,7 @@ fn transfer_credentials_are_scoped_to_the_selected_repository() {
             g.transfer_credential("fixture/other", Some("main"), false)
                 .is_err()
         );
-        let output = std::process::Command::new("openssl")
-            .args(["genrsa", "2048"])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let config = g.config.as_mut().unwrap();
-        config
-            .app
-            .as_mut()
-            .or(config.repos.as_mut())
-            .unwrap()
-            .private_key = String::from_utf8(output.stdout).unwrap();
+        with_app_key(&mut g);
         let (api, server) = api_fixture(vec![
             (
                 "page=1",

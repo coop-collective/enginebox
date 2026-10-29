@@ -3,6 +3,7 @@ pub mod actions_secrets;
 pub mod api;
 pub mod ci;
 mod config;
+pub mod pulls;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use enginebox_core::state;
