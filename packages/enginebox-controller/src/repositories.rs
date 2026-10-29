@@ -1107,9 +1107,21 @@ impl Repositories {
     }
     /// A run's write token (`<project>/<name>`), minted at admission.
     pub fn run_credential(&self, reference: &str, ttl: u64) -> Result<repository::Credential> {
+        self.credential(reference, Access::Write, ttl)
+    }
+    /// A read token for the controller's own reads (the repository config).
+    pub fn read_credential(&self, reference: &str, ttl: u64) -> Result<repository::Credential> {
+        self.credential(reference, Access::Read, ttl)
+    }
+    fn credential(
+        &self,
+        reference: &str,
+        access: Access,
+        ttl: u64,
+    ) -> Result<repository::Credential> {
         let (project, name) = repository::parse_ref(reference)?;
         let record = self.record(&project, &name)?;
-        let (minted, auth) = self.mint_for(&record, Access::Write, ttl)?;
+        let (minted, auth) = self.mint_for(&record, access, ttl)?;
         Ok(repository::Credential {
             remote: record.remote,
             default_branch: record.default_branch,
