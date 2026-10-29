@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -676,4 +679,172 @@ fn a_run_interrupted_by_a_restart_owes_its_callback_once() {
     assert!(counting_hook(&third).lock().unwrap().is_empty());
     first.close();
     gate.open();
+}
+
+/// What the stand-in guest lease probe answers.
+#[derive(Clone, Copy, PartialEq)]
+enum LeaseAnswer {
+    Inactive,
+    Active,
+    Unreachable,
+}
+fn lease_probe(service: &AgentService, answer: Arc<Mutex<LeaseAnswer>>) -> Arc<AtomicUsize> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    service.set_lease_probe(Arc::new(move |host, name, provider| {
+        assert_eq!(
+            (host.id.as_str(), name, provider),
+            ("h1", "ebox-p1", "claude")
+        );
+        counter.fetch_add(1, Ordering::SeqCst);
+        match *answer.lock().unwrap() {
+            LeaseAnswer::Inactive => Ok(false),
+            LeaseAnswer::Active => Ok(true),
+            LeaseAnswer::Unreachable => Err(anyhow::anyhow!("ssh: connection refused")),
+        }
+    }));
+    calls
+}
+/// A pool of one workspace whose first run fails after the guest may have
+/// started (`guest_launch_failed`), leaving its execution uncertain.
+fn uncertain_pool(limits: QueueLimits) -> (tempfile::TempDir, AgentService, String) {
+    let (t, root) = root();
+    let service = service(&root, limits);
+    measure(&service, Some(roomy()));
+    pool(
+        &service,
+        json!({"name":"workers","workspaces":[{"host_id":"h1","name":"ebox-p1"}]}),
+    );
+    let first = Arc::new(AtomicBool::new(true));
+    service.set_run_executor(Arc::new(move |run: &AdmittedRun| {
+        if first.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("guest helper exited before reporting");
+        }
+        let session = run.request.resume_id.clone().unwrap_or(SESSION.into());
+        Ok(
+            json!({"exit_code":0,"output":json!({"type":"result","session_id":session}).to_string(),
+            "timed_out":false,"output_truncated":false}),
+        )
+    }));
+    let (run, _) = service
+        .launch_pool("workers", body("first"), TOKEN_A, LaunchOptions::default())
+        .unwrap();
+    let id = run["id"].as_str().unwrap().to_owned();
+    wait_for("first run failed", || {
+        service.get_pool_run("workers", &id).unwrap()["status"] == "failed"
+    });
+    let failed = service.get_pool_run("workers", &id).unwrap();
+    assert_eq!(failed["execution_uncertain"], true);
+    (t, service, id)
+}
+fn launch_second(service: &AgentService) -> String {
+    service
+        .launch_pool("workers", body("second"), TOKEN_A, LaunchOptions::default())
+        .unwrap()
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+fn waiting_reason(service: &AgentService, id: &str) -> String {
+    service.get_pool_run("workers", id).unwrap()["waiting_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned()
+}
+
+#[test]
+fn a_pool_run_behind_an_uncertain_but_idle_workspace_is_placed() {
+    let (_t, service, first) = uncertain_pool(QueueLimits::default());
+    let answer = Arc::new(Mutex::new(LeaseAnswer::Inactive));
+    let calls = lease_probe(&service, answer);
+    let second = launch_second(&service);
+    wait_for("second run succeeded", || {
+        service.get_pool_run("workers", &second).unwrap()["status"] == "succeeded"
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service.get_pool_run("workers", &first).unwrap()["execution_uncertain"],
+        false
+    );
+    let events = service.launch_events(&Default::default());
+    let probe = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "uncertain_lease_probe")
+        .expect("probe event")
+        .clone();
+    assert_eq!(probe["outcome"], "succeeded");
+    assert_eq!(probe["reason"], "lease_inactive");
+    assert_eq!(probe["pool"], "workers");
+    assert_eq!(probe["run_id"], first.as_str());
+}
+
+#[test]
+fn an_active_lease_keeps_the_fence_and_probing_is_rate_limited() {
+    let (_t, service, _) = uncertain_pool(QueueLimits::default());
+    let answer = Arc::new(Mutex::new(LeaseAnswer::Active));
+    let calls = lease_probe(&service, answer.clone());
+    let second = launch_second(&service);
+    wait_for("lease reason", || {
+        waiting_reason(&service, &second).contains("native session lease is still active")
+    });
+    let reason = waiting_reason(&service, &second);
+    assert!(
+        reason.starts_with(
+            "waiting for a free workspace in pool workers (ebox-p1: execution uncertain"
+        ),
+        "{reason}"
+    );
+    // The scheduler passes every 2 seconds, yet probes at most once a minute.
+    std::thread::sleep(Duration::from_millis(4500));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service.get_pool_run("workers", &second).unwrap()["status"],
+        "queued"
+    );
+    // An inactive lease seen on a later probe releases the workspace.
+    *answer.lock().unwrap() = LeaseAnswer::Inactive;
+    service.set_limits(QueueLimits {
+        uncertain_probe_seconds: 1,
+        ..Default::default()
+    });
+    wait_for("second run succeeded", || {
+        service.get_pool_run("workers", &second).unwrap()["status"] == "succeeded"
+    });
+}
+
+#[test]
+fn a_failed_lease_probe_keeps_the_fence() {
+    let limits = QueueLimits {
+        uncertain_probe_seconds: 1,
+        ..Default::default()
+    };
+    let (_t, service, first) = uncertain_pool(limits);
+    let answer = Arc::new(Mutex::new(LeaseAnswer::Unreachable));
+    let calls = lease_probe(&service, answer);
+    let second = launch_second(&service);
+    wait_for("probe failure reason", || {
+        waiting_reason(&service, &second).contains("lease probe failed: ssh: connection refused")
+    });
+    // Repeated failures keep probing (each interval) and never clear the fence.
+    wait_for("a second probe", || calls.load(Ordering::SeqCst) >= 2);
+    assert_eq!(
+        service.get_pool_run("workers", &second).unwrap()["status"],
+        "queued"
+    );
+    assert_eq!(
+        service.get_pool_run("workers", &first).unwrap()["execution_uncertain"],
+        true
+    );
+    // One event per change, not one per probe.
+    let events = service.launch_events(&Default::default());
+    let probes = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "uncertain_lease_probe")
+        .count();
+    assert_eq!(probes, 1);
 }

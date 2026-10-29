@@ -59,28 +59,158 @@ fn released_bootstrap_recipe_is_identical() {
     assert_eq!(bootstrap::fingerprint(&c), f["bootstrap_fingerprint"]);
 }
 #[test]
-fn unknown_and_frozen_states_keep_cpu_and_ram() {
-    for status in ["Frozen", "Migrating", "Starting", "Stopping", "Error"] {
+fn unknown_and_running_states_keep_cpu_and_ram() {
+    for status in [
+        "Running",
+        "Migrating",
+        "Starting",
+        "Stopping",
+        "Error",
+        "Unknown",
+    ] {
         let mut f = facts();
         f["instances"][0]["status"] = json!(status);
         let c = capacity(&host(), &f).unwrap();
-        assert_eq!(c["allocated_cpu"], 4);
-        assert_eq!(c["allocated_memory_bytes"], 4 * GIB);
+        assert_eq!(c["allocated_cpu"], 4, "{status}");
+        assert_eq!(c["allocated_memory_bytes"], 4 * GIB, "{status}");
     }
 }
 #[test]
-fn stopped_releases_cpu_but_keeps_disk() {
+fn frozen_keeps_ram_but_releases_cpu() {
+    let mut f = facts();
+    f["instances"][0]["status"] = json!("Frozen");
+    let c = capacity(&host(), &f).unwrap();
+    assert_eq!(c["allocated_cpu"], 0);
+    assert_eq!(c["allocated_memory_bytes"], 4 * GIB);
+    assert_eq!(c["disk_committed_bytes"], 38 * GIB);
+}
+#[test]
+fn stopped_releases_cpu_and_ram_but_keeps_disk() {
     let c = capacity(&host(), &facts()).unwrap();
     assert_eq!(c["allocated_cpu"], 0);
+    assert_eq!(c["allocated_memory_bytes"], 0);
     assert_eq!(c["disk_committed_bytes"], 38 * GIB);
+}
+#[test]
+fn cpu_overcommit_defaults_to_four_and_is_configurable() {
+    // 24 cores - 4 reserved = 20 physical cores for instances.
+    let c = capacity(&host(), &facts()).unwrap();
+    assert_eq!(c["cpu_overcommit"], 4.0);
+    assert_eq!(c["cpu_budget"], 80);
+    assert_eq!(c["cpu_available"], 80);
+    let mut h = host();
+    h.cpu_overcommit = Some(1.0);
+    assert_eq!(capacity(&h, &facts()).unwrap()["cpu_available"], 20);
+    h.cpu_overcommit = Some(1.5);
+    assert_eq!(capacity(&h, &facts()).unwrap()["cpu_budget"], 30);
+    for bad in [0.5, 65.0, f64::NAN, f64::INFINITY] {
+        h.cpu_overcommit = Some(bad);
+        assert!(h.validate().is_err(), "{bad}");
+    }
+    // Fleet files written before the field existed still load and serialize
+    // without it, so older releases keep reading generated configuration.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet.toml");
+    std::fs::write(
+        &path,
+        "schema_version = 1\n[[hosts]]\nid = \"primary\"\nlabel = \"P\"\ntarget = \"local\"\n",
+    )
+    .unwrap();
+    let hosts = load_hosts(&path).unwrap();
+    assert_eq!(hosts[0].cpu_overcommit, None);
+    assert_eq!(hosts[0].cpu_overcommit(), 4.0);
+    assert!(
+        serde_json::to_value(&hosts[0])
+            .unwrap()
+            .get("cpu_overcommit")
+            .is_none()
+    );
+    std::fs::write(
+        &path,
+        "schema_version = 1\n[[hosts]]\nid = \"primary\"\nlabel = \"P\"\ntarget = \"local\"\ncpu_overcommit = 2.0\n",
+    )
+    .unwrap();
+    assert_eq!(load_hosts(&path).unwrap()[0].cpu_overcommit(), 2.0);
+}
+#[test]
+fn idle_production_host_admits_new_workspaces() {
+    // The reported host: 48 cores, 125 GiB RAM with 95 GiB available,
+    // 13 VMs at 4 vCPU / 4 GiB (stopped templates, frozen spares and a few
+    // running workspaces) and reserves 12 CPU / 40 GiB / 32 GiB disk.
+    let h = Host {
+        reserve_cpu: 12,
+        reserve_memory_gib: 40,
+        reserve_disk_gib: 32,
+        max_instances: 64,
+        ..host()
+    };
+    let mut instances = Vec::new();
+    for (i, status) in ["Stopped"; 5]
+        .into_iter()
+        .chain(["Frozen"; 4])
+        .chain(["Running"; 4])
+        .enumerate()
+    {
+        instances.push(json!({"name":format!("vm{i}"),"project":"enginebox","status":status,"cpu":4,"memory_bytes":4*GIB,"disk_bytes":30*GIB,"state_disk_bytes":6*GIB,"pool":"pool","managed":true}));
+    }
+    let f = json!({"cpu_total":48,"memory_total_bytes":125*GIB,"memory_available_bytes":95*GIB,"disk_free_bytes":1500*GIB,"pool_total_bytes":1800*GIB,"pool_used_bytes":200*GIB,"instances":instances});
+    let c = capacity(&h, &f).unwrap();
+    assert_eq!(c["allocated_cpu"], 16);
+    assert_eq!(c["allocated_memory_bytes"], 32 * GIB);
+    assert_eq!(c["cpu_available"], 144 - 16);
+    // 125 - 40 reserve - 32 held = 53 GiB, below 95 - 40 = 55 GiB measured.
+    assert_eq!(c["memory_budget_available_bytes"], 53 * GIB);
+    assert_eq!(c["max_additional"]["standard"], 13);
+    let standard = Resources {
+        cpu: 4,
+        memory_gib: 4,
+        disk_gib: 30,
+    };
+    assert!(resource_fits(&h, &f, standard).unwrap());
+    // The same host without overcommit and with frozen CPU counted would
+    // have refused: 36 cores - 32 vCPU leaves room for exactly one.
+    let mut strict = h.clone();
+    strict.cpu_overcommit = Some(1.0);
+    assert_eq!(capacity(&strict, &f).unwrap()["cpu_available"], 20);
+}
+#[test]
+fn shortage_names_the_limiting_resource() {
+    let mut h = host();
+    h.cpu_overcommit = Some(1.0);
+    let mut f = facts();
+    f["instances"][0]["status"] = json!("Running");
+    f["instances"][0]["cpu"] = json!(18);
+    let r = Resources {
+        cpu: 4,
+        memory_gib: 4,
+        disk_gib: 30,
+    };
+    let reason = enginebox_core::capacity::shortage(&h, &f, r)
+        .unwrap()
+        .unwrap();
+    assert!(reason.starts_with("CPU:"), "{reason}");
+    f["instances"][0]["cpu"] = json!(4);
+    f["memory_available_bytes"] = json!(9 * GIB);
+    let reason = enginebox_core::capacity::shortage(&h, &f, r)
+        .unwrap()
+        .unwrap();
+    assert!(reason.starts_with("memory:"), "{reason}");
+    f["memory_available_bytes"] = json!(50 * GIB);
+    assert!(
+        enginebox_core::capacity::shortage(&h, &f, r)
+            .unwrap()
+            .is_none()
+    );
 }
 #[test]
 fn allocations_across_projects_reduce_admission() {
     let mut f = facts();
-    f["instances"].as_array_mut().unwrap().push(json!({"name":"other","project":"other","status":"Frozen","cpu":16,"memory_bytes":40*GIB,"disk_bytes":30*GIB,"state_disk_bytes":42*GIB,"pool":"pool","managed":false}));
+    f["instances"].as_array_mut().unwrap().push(json!({"name":"other","project":"other","status":"Running","cpu":16,"memory_bytes":40*GIB,"disk_bytes":30*GIB,"state_disk_bytes":42*GIB,"pool":"pool","managed":false}));
     let c = capacity(&host(), &f).unwrap();
     assert_eq!(c["allocated_cpu"], 16);
-    assert_eq!(c["max_additional"]["standard"], 1);
+    assert_eq!(c["allocated_memory_bytes"], 40 * GIB);
+    // 64 - 8 reserve - 40 held leaves 16 GiB: four standard VMs by RAM.
+    assert_eq!(c["max_additional"]["standard"], 4);
 }
 #[test]
 fn sparse_disk_commitments_prevent_overcommit() {
@@ -103,10 +233,11 @@ fn contribution_caps_include_owned_templates_across_projects() {
     h.contribution_cpu = Some(6);
     h.contribution_memory_gib = Some(8);
     let mut f = facts();
-    f["instances"][0]["status"] = json!("Frozen");
+    f["instances"][0]["status"] = json!("Running");
     f["instances"][0]["project"] = json!("other");
     f["instances"][0]["enginebox_owned"] = json!(true);
     let c = capacity(&h, &f).unwrap();
+    // Contribution limits are an owner's promise and are never overcommitted.
     assert_eq!(c["cpu_available"], 2);
     assert_eq!(c["memory_budget_available_bytes"], 4 * GIB);
     assert!(
@@ -121,12 +252,18 @@ fn contribution_caps_include_owned_templates_across_projects() {
         )
         .unwrap()
     );
+    // A frozen contributed instance keeps its RAM share but not its CPU.
+    f["instances"][0]["status"] = json!("Frozen");
+    let c = capacity(&h, &f).unwrap();
+    assert_eq!(c["cpu_available"], 6);
+    assert_eq!(c["memory_budget_available_bytes"], 4 * GIB);
 }
 #[test]
 fn contribution_limits_cannot_relax_physical_reserves() {
     let mut h = host();
     h.contribution_cpu = Some(100);
     h.contribution_memory_gib = Some(100);
+    h.cpu_overcommit = Some(1.0);
     let c = capacity(&h, &facts()).unwrap();
     assert_eq!(c["cpu_available"], 20);
     assert_eq!(c["memory_budget_available_bytes"], 42 * GIB);
@@ -456,7 +593,7 @@ fn bootstrap_admission_counts_prepared_templates_in_contribution() {
     c["host"]["admission"] = json!({"reserve_cpu":2,"reserve_memory_gib":4,"reserve_disk_gib":10,"max_instances":16,"contribution_cpu":4,"contribution_memory_gib":8});
     let mut o = observed(&c);
     let mut f = facts();
-    f["instances"][0]["status"] = json!("Frozen");
+    f["instances"][0]["status"] = json!("Running");
     f["instances"][0]["enginebox_owned"] = json!(true);
     o["fleet_facts"] = f;
     assert!(!bootstrap::admission_errors(&c, &o).unwrap().is_empty());

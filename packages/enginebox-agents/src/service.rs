@@ -25,6 +25,9 @@ const QUEUE_ENTRY_LIMIT: usize = 128 * 1024;
 const RETAINED_FINISHED: usize = 100;
 /// Wait after a failed pool workspace creation before trying again.
 const CREATE_BACKOFF: Duration = Duration::from_secs(60);
+/// How long a workspace's guest helper, once seen at this release, is
+/// trusted before placement checks it again.
+const GUEST_CHECK_TTL: Duration = Duration::from_secs(600);
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<Inner>,
@@ -58,6 +61,12 @@ struct Inner {
     admitting: AtomicBool,
     dispatcher: AtomicBool,
     measures: Mutex<BTreeMap<String, Measure>>,
+    /// Lease probes of workspaces fenced by an uncertain run, per
+    /// (host, workspace). A leaf lock: nothing else is taken while held.
+    probes: Mutex<BTreeMap<(String, String), Probe>>,
+    /// The last guest helper check per workspace: when, and why it is
+    /// outdated (`None`: it is this release's). A leaf lock.
+    guests: Mutex<BTreeMap<(String, String), GuestCheck>>,
     hooks: Hooks,
     /// Runs interrupted by a restart whose callback is still owed.
     owed_callbacks: Mutex<Vec<String>>,
@@ -89,6 +98,16 @@ struct Measure {
     at: Instant,
     load: Option<HostLoad>,
 }
+/// When a workspace's guest helper was checked, and why it is outdated.
+type GuestCheck = (Instant, Option<String>);
+/// The last lease probe of a fenced workspace.
+struct Probe {
+    /// When the last probe finished; `None` before the first.
+    last: Option<Instant>,
+    in_flight: bool,
+    /// Why the workspace stays fenced, for waiting reasons.
+    reason: String,
+}
 
 /// Measures one host's free resources (default: the fleet inventory).
 pub type MeasureHook = Arc<dyn Fn(&Host) -> Result<HostLoad> + Send + Sync>;
@@ -103,8 +122,13 @@ pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
 pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential> + Send + Sync>;
 /// Revokes a run's repository token when the run ends (best effort).
 pub type RepositoryRevoke = Arc<dyn Fn(&str, &repository::Credential) + Send + Sync>;
+/// Probes a workspace's native session lease for a provider: `Ok(true)` when
+/// active, `Ok(false)` only on a definite `{"active":false}` (default: the
+/// guest helper's `enginebox-guest lease <provider>`).
+pub type LeaseProbe = Arc<dyn Fn(&Host, &str, &str) -> Result<bool> + Send + Sync>;
 #[derive(Default)]
 struct Hooks {
+    lease_probe: Mutex<Option<LeaseProbe>>,
     measure: Mutex<Option<MeasureHook>>,
     create: Mutex<Option<CreateHook>>,
     resolver: Mutex<Option<ProfileResolver>>,
@@ -426,6 +450,8 @@ impl AgentService {
                 admitting: AtomicBool::new(true),
                 dispatcher: AtomicBool::new(false),
                 measures: Mutex::new(BTreeMap::new()),
+                probes: Mutex::new(BTreeMap::new()),
+                guests: Mutex::new(BTreeMap::new()),
                 hooks: Hooks::default(),
                 owed_callbacks: Mutex::new(owed),
                 launch_events,
@@ -1169,33 +1195,199 @@ impl AgentService {
             .cloned()
             .collect::<Vec<_>>();
         for value in uncertain {
-            let result = (|| -> Result<bool> {
-                let host = self.inner.fleet.host(host_id)?;
-                let p = value["provider"].as_str().unwrap_or("");
-                let command = guest_command(&host, name, &["lease".into(), p.into()])?;
-                let output = process::checked(&command, None, None, b"", 15, 1024)?;
-                let v: Value = serde_json::from_str(&output)?;
-                v["active"]
-                    .as_bool()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid lease probe."))
-            })();
+            let result = self.probe_lease(host_id, name, value["provider"].as_str().unwrap_or(""));
             if result.unwrap_or(true) {
                 return true;
             }
-            if let Some(v) = self
-                .inner
-                .records
-                .lock()
-                .unwrap()
-                .get_mut(value["id"].as_str().unwrap_or(""))
-            {
-                v["execution_uncertain"] = json!(false);
-                if self.save_record(v).is_err() {
-                    return true;
-                }
+            if !self.clear_uncertain(value["id"].as_str().unwrap_or("")) {
+                return true;
             }
         }
+        self.inner
+            .probes
+            .lock()
+            .unwrap()
+            .remove(&(host_id.to_owned(), name.to_owned()));
         false
+    }
+    /// One bounded guest lease probe. Only a definite `{"active":false}`
+    /// yields `Ok(false)`; anything else is active or an error.
+    fn probe_lease(&self, host_id: &str, name: &str, provider: &str) -> Result<bool> {
+        let host = self.inner.fleet.host(host_id)?;
+        let hook = self.inner.hooks.lease_probe.lock().unwrap().clone();
+        if let Some(probe) = hook {
+            return probe(&host, name, provider);
+        }
+        let command = guest_command(&host, name, &["lease".into(), provider.into()])?;
+        let output = process::checked(&command, None, None, b"", 15, 1024)?;
+        let v: Value = serde_json::from_str(&output)?;
+        v["active"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("Invalid lease probe."))
+    }
+    /// Clear one record's `execution_uncertain` after a definite inactive
+    /// lease. False when the record could not be saved (the fence stays).
+    fn clear_uncertain(&self, id: &str) -> bool {
+        let mut records = self.inner.records.lock().unwrap();
+        let Some(v) = records.get_mut(id) else {
+            return true;
+        };
+        if v["execution_uncertain"] != true {
+            return true;
+        }
+        v["execution_uncertain"] = json!(false);
+        if self.save_record(v).is_err() {
+            v["execution_uncertain"] = json!(true);
+            return false;
+        }
+        true
+    }
+    /// Probe, in the background and at most once per
+    /// `uncertain_probe_seconds` per workspace, each workspace that an
+    /// uncertain run fences, and clear the fence on a definite inactive
+    /// lease. Probe failures and active leases keep the fence. Returns why
+    /// each fenced workspace still waits.
+    fn probe_uncertain(&self) -> BTreeMap<(String, String), String> {
+        let mut fenced: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+        for v in self.inner.records.lock().unwrap().values() {
+            if v["execution_uncertain"] == true {
+                fenced
+                    .entry((
+                        v["host_id"].as_str().unwrap_or("").to_owned(),
+                        v["name"].as_str().unwrap_or("").to_owned(),
+                    ))
+                    .or_default()
+                    .push((
+                        v["id"].as_str().unwrap_or("").to_owned(),
+                        v["provider"].as_str().unwrap_or("").to_owned(),
+                    ));
+            }
+        }
+        let held: BTreeSet<(String, String)> = self
+            .inner
+            .leases
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, n, _)| (h.clone(), n.clone()))
+            .collect();
+        let interval = Duration::from_secs(self.limits().uncertain_probe_seconds);
+        let mut reasons = BTreeMap::new();
+        let mut due = Vec::new();
+        {
+            let mut probes = self.inner.probes.lock().unwrap();
+            probes.retain(|k, _| fenced.contains_key(k));
+            for (key, runs) in fenced {
+                let probe = probes.entry(key.clone()).or_insert(Probe {
+                    last: None,
+                    in_flight: false,
+                    reason: "execution uncertain; checking its native session lease".into(),
+                });
+                // A workspace running a new run is busy anyway; probe later.
+                if !probe.in_flight
+                    && !held.contains(&key)
+                    && probe.last.is_none_or(|at| at.elapsed() >= interval)
+                {
+                    probe.in_flight = true;
+                    due.push((key.clone(), runs, probe.reason.clone()));
+                }
+                reasons.insert(key, probe.reason.clone());
+            }
+        }
+        for ((host_id, name), runs, previous) in due {
+            let this = self.clone();
+            thread::spawn(move || {
+                let key = (host_id.clone(), name.clone());
+                let mut reason = None;
+                for (id, provider) in runs {
+                    let started = Instant::now();
+                    let result = this.probe_lease(&host_id, &name, &provider);
+                    let (outcome, why) = match &result {
+                        Ok(false) if this.clear_uncertain(&id) => ("cleared", None),
+                        Ok(false) => (
+                            "failed",
+                            Some("execution uncertain; its record could not be saved".to_owned()),
+                        ),
+                        Ok(true) => (
+                            "blocked",
+                            Some(
+                                "execution uncertain; the native session lease is still active"
+                                    .to_owned(),
+                            ),
+                        ),
+                        Err(e) => (
+                            "failed",
+                            Some(format!(
+                                "execution uncertain; lease probe failed: {}",
+                                launch_events::clip_message(&format!("{e:#}"), &BTreeMap::new())
+                            )),
+                        ),
+                    };
+                    // One event per change, not one per probe interval.
+                    if why.as_ref() == Some(&previous) {
+                        reason = why;
+                        break;
+                    }
+                    this.record_launch(LaunchEvent {
+                        kind: "uncertain_lease_probe".into(),
+                        outcome: if outcome == "cleared" {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
+                        run_id: Some(id.clone()),
+                        pool: this
+                            .inner
+                            .pools
+                            .all()
+                            .into_iter()
+                            .find(|p| {
+                                p.members()
+                                    .iter()
+                                    .any(|m| m.host_id == host_id && m.name == name)
+                            })
+                            .map(|p| p.name),
+                        host_id: Some(host_id.clone()),
+                        workspace: Some(name.clone()),
+                        provider: Some(provider.clone()),
+                        stage: Stage::Place.as_str().into(),
+                        reason: match outcome {
+                            "cleared" => "lease_inactive",
+                            "blocked" => "lease_active",
+                            _ => "lease_probe_failed",
+                        }
+                        .into(),
+                        message: why.clone().unwrap_or_else(|| {
+                            "Native session lease is inactive; the workspace is released.".into()
+                        }),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    });
+                    if why.is_some() {
+                        reason = why;
+                        break;
+                    }
+                }
+                {
+                    let mut probes = this.inner.probes.lock().unwrap();
+                    match reason {
+                        Some(reason) => {
+                            if let Some(p) = probes.get_mut(&key) {
+                                p.in_flight = false;
+                                p.last = Some(Instant::now());
+                                p.reason = reason;
+                            }
+                        }
+                        None => {
+                            probes.remove(&key);
+                        }
+                    }
+                }
+                this.kick();
+            });
+        }
+        reasons
     }
     pub fn get_run(&self, host_id: &str, name: &str, id: &str) -> Result<Value> {
         ensure!(
@@ -1512,6 +1704,12 @@ impl AgentService {
     pub fn set_measure_hook(&self, hook: MeasureHook) {
         *self.inner.hooks.measure.lock().unwrap() = Some(hook);
         self.inner.measures.lock().unwrap().clear();
+        self.kick();
+    }
+    /// Replace the guest lease probe (tests).
+    pub fn set_lease_probe(&self, hook: LeaseProbe) {
+        *self.inner.hooks.lease_probe.lock().unwrap() = Some(hook);
+        self.inner.probes.lock().unwrap().clear();
         self.kick();
     }
     pub fn set_create_hook(&self, hook: CreateHook) {
@@ -1923,6 +2121,7 @@ impl AgentService {
             hosts
         };
         self.refresh_measurements(&needed);
+        let uncertain = self.probe_uncertain();
         let mut sched = self.inner.sched.lock().unwrap();
         let leases = self.inner.leases.lock().unwrap().clone();
         let mut busy: BTreeSet<(String, String)> = leases
@@ -1992,6 +2191,11 @@ impl AgentService {
                         .backoff
                         .get(&def.name)
                         .is_some_and(|(until, _)| *until > now),
+                    backoff_reason: sched
+                        .backoff
+                        .get(&def.name)
+                        .filter(|(until, _)| *until > now)
+                        .map(|(_, why)| why.clone()),
                 },
             );
         }
@@ -2013,6 +2217,7 @@ impl AgentService {
             hosts,
             leases,
             busy_workspaces: busy,
+            uncertain,
             pools: pool_states,
             headroom_bytes: self.limits().run_memory_headroom_bytes,
             admitting: self.inner.admitting.load(Ordering::SeqCst)
@@ -2322,22 +2527,32 @@ impl AgentService {
             }
             return;
         }
-        let prepared = self.prepare(run, template.as_deref()).and_then(|host| {
-            if run.repository_access.is_some() {
-                self.check_guest_supports_repository(&host, &run.name)?;
-            }
-            Ok(host)
-        });
+        let prepared = self
+            .prepare(run, template.as_deref(), resolved.as_ref())
+            .and_then(|(host, guest_current)| {
+                if run.repository_access.is_some() {
+                    self.check_guest_supports_repository(&host, &run.name)?;
+                }
+                Ok((host, guest_current))
+            });
         match prepared {
-            Ok(host) => {
+            Ok((host, guest_current)) => {
                 let request = run.request.clone();
+                // Checkouts need a guest helper from this release; an older
+                // one keeps the previous in-workspace behavior.
+                let checkout = run
+                    .repository
+                    .as_deref()
+                    .filter(|_| run.repository_access.is_some() && guest_current)
+                    .and_then(|r| repository::parse_ref(r).ok())
+                    .map(|(_, name)| name);
                 if let Err(failure) = self.run_worker_with(
                     host,
                     &run.name,
                     request,
                     &run.id,
                     resolved.clone(),
-                    run.repository_access.clone(),
+                    run.repository_access.clone().map(|a| (a, checkout)),
                 ) {
                     self.launch_failed(
                         run,
@@ -2355,6 +2570,116 @@ impl AgentService {
                 &failure,
                 started,
             ),
+        }
+    }
+    /// Make sure the workspace's guest helper is this release's, refreshing
+    /// it through the host helper when it is not. Returns whether it is
+    /// current. A repository run with an outdated helper fails here, before
+    /// anything starts; other runs proceed on the old helper. Each refresh is
+    /// a `guest_refresh` launch event. The caller holds the host lock.
+    fn ensure_guest(
+        &self,
+        host: &Host,
+        run: &AdmittedRun,
+        template: Option<&str>,
+        resolved: Option<&ResolvedProfile>,
+    ) -> std::result::Result<bool, LaunchFailure> {
+        let key = (host.id.clone(), run.name.clone());
+        let outdated = |why: String| -> std::result::Result<bool, LaunchFailure> {
+            if run.repository_access.is_some() {
+                Err(LaunchFailure::new(Stage::Bootstrap, "guest_outdated", why))
+            } else {
+                Ok(false)
+            }
+        };
+        // Checked recently: no new probe or refresh attempt (and no event).
+        let cached = self
+            .inner
+            .guests
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < GUEST_CHECK_TTL)
+            .map(|(_, why)| why.clone());
+        match cached {
+            Some(None) => return Ok(true),
+            Some(Some(why)) => return outdated(why),
+            None => {}
+        }
+        let started = Instant::now();
+        let bx = host.engine_box();
+        let name = run.name.as_str();
+        let outcome = refresh_guest(
+            &expected_guest_version(),
+            || {
+                let bytes = bx.execute(
+                    name,
+                    &["enginebox-guest".into(), "--version".into()],
+                    Duration::from_secs(15),
+                )?;
+                Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+            },
+            || {
+                let dir = release_bin_dir(host);
+                enginebox_core::guest::ensure_remote_guest_tools_from(
+                    &bx,
+                    name,
+                    true,
+                    dir.as_deref(),
+                )
+                .or_else(|error| match dir {
+                    // The host helper may refuse this release's directory
+                    // (ownership); its own release is the fallback.
+                    Some(_) => {
+                        enginebox_core::guest::ensure_remote_guest_tools_from(&bx, name, true, None)
+                    }
+                    None => Err(error),
+                })
+                .map(|_| ())
+            },
+        );
+        let why = (!outcome.current).then(|| outcome.event().unwrap_or_default());
+        self.inner
+            .guests
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), why.clone()));
+        if let Some(event) = outcome.event() {
+            self.record_launch(LaunchEvent {
+                kind: "guest_refresh".into(),
+                outcome: if outcome.current {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+                .into(),
+                run_id: Some(run.id.clone()),
+                pool: run.pool.clone(),
+                host_id: Some(host.id.clone()),
+                workspace: Some(run.name.clone()),
+                template: template.map(str::to_owned),
+                template_revision: template.and_then(|t| self.template_revision(&host.id, t)),
+                profile: resolved
+                    .map(|p| p.name.clone())
+                    .or_else(|| run.profile.clone()),
+                profile_revision: resolved.map(|p| p.revision),
+                provider: Some(run.request.provider.clone()),
+                stage: Stage::Bootstrap.as_str().into(),
+                reason: if outcome.current {
+                    "ok"
+                } else {
+                    "guest_outdated"
+                }
+                .into(),
+                message: launch_events::clip_message(&event, &BTreeMap::new()),
+                duration_ms: started.elapsed().as_millis() as u64,
+                queue_wait_ms: Some(run.queue_wait_ms),
+                ..Default::default()
+            });
+        }
+        match why {
+            None => Ok(true),
+            Some(why) => outdated(why),
         }
     }
     /// Older guest helpers do not know `run-repository`; refuse the run with
@@ -2382,7 +2707,8 @@ impl AgentService {
         &self,
         run: &AdmittedRun,
         template: Option<&str>,
-    ) -> std::result::Result<Host, LaunchFailure> {
+        resolved: Option<&ResolvedProfile>,
+    ) -> std::result::Result<(Host, bool), LaunchFailure> {
         let (host_id, name) = (run.host_id.as_str(), run.name.as_str());
         let host = self
             .inner
@@ -2420,6 +2746,7 @@ impl AgentService {
                 "Previous native run must release its guest lease.",
             ));
         }
+        let guest_current = self.ensure_guest(&host, run, template, resolved)?;
         let attached = self
             .attach_locked(
                 host_id,
@@ -2441,7 +2768,7 @@ impl AgentService {
                 "The provider could not be delegated to this workspace.",
             ));
         }
-        Ok(host)
+        Ok((host, guest_current))
     }
     /// Record a launch failure: a structured log line and event, the run's
     /// `failure` (stage and reason code), and its terminal state. A failure
@@ -2737,7 +3064,8 @@ impl AgentService {
         request: native::RunRequest,
         id: &str,
         resolved: Option<ResolvedProfile>,
-        repository: Option<repository::Access>,
+        // The repository access and the checkout name, for repository runs.
+        repository: Option<(repository::Access, Option<String>)>,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
             self.inner
@@ -2749,7 +3077,7 @@ impl AgentService {
             // Runs without a profile keep the original guest command and
             // payload, so older guest helpers still serve them.
             let (mode, input) = match (&resolved, repository) {
-                (p, Some(access)) => (
+                (p, Some((access, checkout))) => (
                     repository::GUEST_MODE,
                     serde_json::to_vec(&repository::Envelope {
                         request: request.clone(),
@@ -2759,6 +3087,7 @@ impl AgentService {
                             files: p.files.clone(),
                         }),
                         repository: access,
+                        checkout,
                     })?,
                 ),
                 (None, None) => ("run", serde_json::to_vec(&request)?),
@@ -3032,6 +3361,94 @@ pub fn new_run_entries(
     let detail = json!({"schema":1,"task":run_details::task_preview(&request.prompt),"started_at":null,"cancel_requested":false,"cancelled":false,"started_by":started_by,"env_keys":request.env_keys()});
     (record, detail)
 }
+/// What `enginebox-guest --version` prints for this release.
+pub fn expected_guest_version() -> String {
+    format!("enginebox-guest {}", env!("CARGO_PKG_VERSION"))
+}
+/// This controller release's `bin` directory, when the host is this machine
+/// and the release ships the guest helpers there. The host helper copies
+/// from it (it accepts only root-owned, non-writable sources), so a host
+/// helper linked to an older release still installs this release's guest.
+fn release_bin_dir(host: &Host) -> Option<std::path::PathBuf> {
+    if host.target != "local" {
+        return None;
+    }
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    ["enginebox-host", "enginebox-guest", "enginebox-mcp"]
+        .iter()
+        .all(|b| dir.join(b).is_file())
+        .then_some(dir)
+}
+/// What placement found and did about a workspace's guest helper.
+#[derive(Debug, PartialEq)]
+pub struct GuestRefresh {
+    pub expected: String,
+    /// `--version` before any refresh (`None`: it could not be read).
+    pub before: Option<String>,
+    /// The refresh error, when one was attempted and failed.
+    pub sync_error: Option<String>,
+    /// `--version` after a refresh, when one was attempted.
+    pub after: Option<String>,
+    pub current: bool,
+}
+impl GuestRefresh {
+    /// The launch event message, when a refresh was attempted.
+    pub fn event(&self) -> Option<String> {
+        if self.before.as_deref() == Some(self.expected.as_str()) {
+            return None;
+        }
+        let found = |v: &Option<String>| v.clone().unwrap_or_else(|| "unreadable".into());
+        Some(if self.current {
+            format!(
+                "Refreshed the workspace's guest helper from {} to {}.",
+                found(&self.before),
+                self.expected
+            )
+        } else {
+            let why = match &self.sync_error {
+                Some(error) => format!("the refresh failed: {error}"),
+                None => "the host helper supplied an older release; update the host's \
+                    enginebox-host (enginebox-install expose-host --apply)"
+                    .into(),
+            };
+            format!(
+                "Workspace guest helper is {} but this controller needs {}; {why}.",
+                found(if self.after.is_some() {
+                    &self.after
+                } else {
+                    &self.before
+                }),
+                self.expected
+            )
+        })
+    }
+}
+/// Compare the guest helper's version with `expected` and refresh it once
+/// when they differ.
+pub fn refresh_guest(
+    expected: &str,
+    probe: impl Fn() -> Result<String>,
+    sync: impl FnOnce() -> Result<()>,
+) -> GuestRefresh {
+    let before = probe().ok();
+    let mut outcome = GuestRefresh {
+        expected: expected.to_owned(),
+        current: before.as_deref() == Some(expected),
+        before,
+        sync_error: None,
+        after: None,
+    };
+    if outcome.current {
+        return outcome;
+    }
+    if let Err(error) = sync() {
+        outcome.sync_error = Some(format!("{error:#}"));
+        return outcome;
+    }
+    outcome.after = probe().ok();
+    outcome.current = outcome.after.as_deref() == Some(expected);
+    outcome
+}
 pub fn guest_command(host: &Host, name: &str, args: &[String]) -> Result<Vec<String>> {
     let mut argv = vec![
         "exec".into(),
@@ -3123,6 +3540,68 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
 #[cfg(test)]
 mod run_control_tests {
     use super::*;
+
+    #[test]
+    fn a_current_guest_helper_is_left_alone() {
+        let expected = expected_guest_version();
+        let out = refresh_guest(&expected, || Ok(expected.clone()), || panic!("no refresh"));
+        assert!(out.current);
+        assert_eq!(out.event(), None);
+    }
+
+    #[test]
+    fn a_stale_guest_helper_is_refreshed_once() {
+        let expected = "enginebox-guest 0.3.1-live.42";
+        let version = Mutex::new("enginebox-guest 0.3.1-live.40".to_owned());
+        let syncs = AtomicUsize::new(0);
+        let out = refresh_guest(
+            expected,
+            || Ok(version.lock().unwrap().clone()),
+            || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                *version.lock().unwrap() = expected.into();
+                Ok(())
+            },
+        );
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        assert!(out.current);
+        assert_eq!(
+            out.event().unwrap(),
+            "Refreshed the workspace's guest helper from enginebox-guest 0.3.1-live.40 to enginebox-guest 0.3.1-live.42."
+        );
+    }
+
+    #[test]
+    fn a_guest_helper_that_stays_stale_is_reported() {
+        let expected = "enginebox-guest 0.3.1-live.42";
+        // The host helper's own release is older: the copy changes nothing.
+        let out = refresh_guest(
+            expected,
+            || Ok("enginebox-guest 0.3.1-live.10".into()),
+            || Ok(()),
+        );
+        assert!(!out.current);
+        let event = out.event().unwrap();
+        assert!(
+            event.starts_with("Workspace guest helper is enginebox-guest 0.3.1-live.10 but this controller needs enginebox-guest 0.3.1-live.42; the host helper supplied an older release"),
+            "{event}"
+        );
+        // A failed refresh says so, and an unreadable helper is named as such.
+        let out = refresh_guest(
+            expected,
+            || anyhow::bail!("exec failed"),
+            || anyhow::bail!("sudo: a password is required"),
+        );
+        assert!(!out.current);
+        assert_eq!(out.before, None);
+        assert!(
+            out.event()
+                .unwrap()
+                .contains("is unreadable but this controller needs enginebox-guest 0.3.1-live.42; the refresh failed: sudo: a password is required"),
+            "{:?}",
+            out.event()
+        );
+    }
 
     #[test]
     fn managed_host_fences_delegation_and_last_moment_guest_execution() {

@@ -461,7 +461,7 @@ pub fn execute_scoped(
     workspace: &Path,
     run_id: Option<&str>,
 ) -> Result<process::Output> {
-    execute_inner(r, home, workspace, run_id, None, None)
+    execute_inner(r, home, workspace, run_id, None, None, None)
 }
 
 /// Run under a profile: the envelope is re-validated here, its files are
@@ -480,6 +480,7 @@ pub fn execute_profiled(
         workspace,
         Some(run_id),
         Some((&envelope.block, &files)),
+        None,
         None,
     )
 }
@@ -503,6 +504,7 @@ pub fn execute_with_repository(
         Some(run_id),
         profile.map(|(p, files)| (&p.block, files)),
         Some(&envelope.repository),
+        envelope.checkout.as_deref(),
     )
 }
 
@@ -518,28 +520,69 @@ fn execute_inner(
     run_id: Option<&str>,
     profile: Option<ProfileInput<'_>>,
     repository: Option<&crate::repository::Access>,
+    checkout: Option<&str>,
 ) -> Result<process::Output> {
     r.validate()?;
     ensure!(
         (profile.is_none() && repository.is_none()) || run_id.is_some(),
         "Profile and repository runs require a controller run ID."
     );
+    ensure!(
+        checkout.is_none() || repository.is_some(),
+        "Only repository runs get a checkout."
+    );
     if let Some(id) = run_id {
         validate_run_id(id)?;
     }
     let home = security::absolute_existing(home)?;
     let workspace = security::absolute_existing(workspace)?;
-    let cwd = workspace.join(&r.workdir).canonicalize()?;
-    ensure!(
-        cwd.is_dir() && cwd.starts_with(&workspace),
-        "workdir escapes its assigned workspace."
-    );
+    if checkout.is_none() {
+        let cwd = workspace.join(&r.workdir).canonicalize()?;
+        ensure!(
+            cwd.is_dir() && cwd.starts_with(&workspace),
+            "workdir escapes its assigned workspace."
+        );
+    }
     let _state = security::safe_path(&home, ".local/state/enginebox/agent-runs/placeholder", true)?;
     security::private_dir(&home.join(".local/state/enginebox/agent-runs"))?;
     let lease = security::Lease::acquire(
         &home,
         &format!(".local/state/enginebox/agent-runs/{}.lock", r.provider),
     )?;
+    // A repository run works in a freshly emptied checkout at a stable path
+    // per repository (harnesses key their sessions and memory by cwd).
+    let work = match (checkout, run_id) {
+        (Some(name), Some(id)) => Some(crate::repository::open_checkout(
+            &home, &workspace, name, id,
+        )?),
+        _ => None,
+    };
+    let cwd = match &work {
+        Some(work) => {
+            let cwd = work.path.join(&r.workdir);
+            let mut current = work.path.clone();
+            for part in Path::new(&r.workdir).components() {
+                if let std::path::Component::Normal(part) = part {
+                    current.push(part);
+                    security::check_components(&current)?;
+                    if !current.exists() {
+                        std::fs::create_dir(&current)?;
+                    }
+                }
+            }
+            let cwd = cwd.canonicalize()?;
+            ensure!(
+                cwd.is_dir() && cwd.starts_with(work.path.canonicalize()?),
+                "workdir escapes its checkout."
+            );
+            cwd
+        }
+        None => workspace.join(&r.workdir).canonicalize()?,
+    };
+    ensure!(
+        cwd.is_dir() && cwd.starts_with(&workspace),
+        "workdir escapes its assigned workspace."
+    );
     let env = environment(&home)?;
     let exe = find_binary(binary(&r.provider), &env)
         .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
@@ -611,6 +654,16 @@ fn execute_inner(
             }
         };
         run_env.extend(variables);
+        if let Some(work) = &work {
+            run_env.insert(
+                crate::repository::ENV_RUN_DIR.into(),
+                work.path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid checkout path."))?
+                    .into(),
+            );
+            run_env.insert(crate::repository::ENV_RUN_ID.into(), id.into());
+        }
         // The token is in a file the agent can read; never let it reach output.
         redacted.insert("ENGINEBOX_REPO_TOKEN".into(), access.token.clone());
         if let Some((secret, _)) = access.token.split_once("?expires=") {
@@ -647,6 +700,9 @@ fn execute_inner(
             let _ = crate::repository::remove_run_dir(&home, id);
         }
     }
+    // A per-run fallback checkout is removed here, under the writer lease;
+    // the stable checkout stays until the next run empties it.
+    drop(work);
     drop(lease);
     let result = result.map(|mut output| {
         if !redacted.is_empty() {

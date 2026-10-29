@@ -65,6 +65,7 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
             token: TOKEN.into(),
             auth: repository::Auth::Bearer,
         },
+        checkout: None,
     };
     let out = native::execute_with_repository(&envelope, &home, &workspace, RUN).unwrap();
     assert_eq!(out.exit_code, 0, "{}", out.output);
@@ -111,6 +112,107 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
     assert!(native::execute_with_repository(&envelope, &home, &workspace, "bad").is_err());
     // An older helper's `run` refuses the envelope instead of running without it.
     assert!(native::RunRequest::parse(serde_json::to_value(&envelope).unwrap()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn each_repository_run_gets_a_fresh_checkout_at_a_stable_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    security::safe_path(&home, ".local/bin/claude", true).unwrap();
+    let exe = home.join(".local/bin/claude");
+    // Like an agent that clones into ./repo: it fails if the directory exists.
+    let script = "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.310 (Claude Code)'; exit 0; fi\ncat >/dev/null\n\
+        echo \"cwd=$(pwd) dir=$ENGINEBOX_RUN_DIR id=$ENGINEBOX_RUN_ID\"\n\
+        mkdir repo || exit 3\n";
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let envelope = |checkout: Option<&str>| repository::Envelope {
+        request: native::RunRequest::parse(json!({"provider":"claude","prompt":"work"})).unwrap(),
+        profile: None,
+        repository: repository::Access {
+            remote: REMOTE.into(),
+            default_branch: "main".into(),
+            token: TOKEN.into(),
+            auth: repository::Auth::Bearer,
+        },
+        checkout: checkout.map(str::to_owned),
+    };
+    let id = |c: char| c.to_string().repeat(32);
+    let run = |c: char, e: repository::Envelope| {
+        native::execute_with_repository(&e, &home, &workspace, &id(c)).unwrap()
+    };
+    let stable = workspace.join("game");
+    // Two runs in a row use the same path (so harness state keyed by cwd
+    // persists), and the second clone does not trip over the first's files.
+    for c in ['a', 'b'] {
+        let out = run(c, envelope(Some("game")));
+        assert_eq!(out.exit_code, 0, "{}", out.output);
+        assert!(
+            out.output.contains(&format!(
+                "cwd={} dir={} id={}",
+                stable.display(),
+                stable.display(),
+                id(c)
+            )),
+            "{}",
+            out.output
+        );
+        assert!(stable.join("repo").is_dir());
+    }
+    // Anything else left in the checkout is gone at the next run's start.
+    std::fs::write(stable.join("leftover"), "x").unwrap();
+    let out = run('c', envelope(Some("game")));
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    assert!(!stable.join("leftover").exists());
+    // While another run (another provider) holds the stable checkout, a run
+    // of the same repository works in a per-run directory, removed after.
+    let held =
+        security::Lease::acquire(&home, &format!("{}/game.lock", repository::CHECKOUT_LEASES))
+            .unwrap();
+    std::fs::write(stable.join("theirs"), "x").unwrap();
+    let out = run('d', envelope(Some("game")));
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    let fallback = workspace.join(format!("game-{}", id('d')));
+    assert!(
+        out.output.contains(&format!("cwd={}", fallback.display())),
+        "{}",
+        out.output
+    );
+    assert!(!fallback.exists());
+    assert!(
+        stable.join("theirs").exists(),
+        "the other run's checkout is untouched"
+    );
+    drop(held);
+    // Without a checkout (older controllers) the run works in the workspace
+    // as before and gets no ENGINEBOX_RUN_DIR.
+    let out = run('e', envelope(None));
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    assert!(
+        out.output
+            .contains(&format!("cwd={} dir= id=\n", workspace.display())),
+        "{}",
+        out.output
+    );
+    // A caller cannot set ENGINEBOX_RUN_DIR, and a checkout name must be a
+    // repository name.
+    let mut injected = envelope(Some("game"));
+    injected.request.env = [("ENGINEBOX_RUN_DIR".to_owned(), "/".to_owned())].into();
+    assert!(native::execute_with_repository(&injected, &home, &workspace, &id('f')).is_err());
+    for bad in ["../etc", "Game", "a/b", ""] {
+        assert!(
+            native::execute_with_repository(&envelope(Some(bad)), &home, &workspace, &id('f'))
+                .is_err(),
+            "{bad}"
+        );
+    }
 }
 
 mod service {

@@ -30,6 +30,9 @@ pub struct QueueLimits {
     pub measure_ttl_seconds: u64,
     /// `Retry-After` on a 429.
     pub retry_after_seconds: u64,
+    /// Minimum seconds between lease probes of one workspace whose previous
+    /// run's execution is uncertain.
+    pub uncertain_probe_seconds: u64,
 }
 impl Default for QueueLimits {
     fn default() -> Self {
@@ -40,14 +43,16 @@ impl Default for QueueLimits {
             run_memory_headroom_bytes: GIB,
             measure_ttl_seconds: 15,
             retry_after_seconds: 30,
+            uncertain_probe_seconds: 60,
         }
     }
 }
 impl QueueLimits {
     /// Defaults overridden by `ENGINEBOX_RUN_QUEUE_MAX_TOTAL`,
     /// `ENGINEBOX_RUN_QUEUE_MAX_PER_PRINCIPAL`, `ENGINEBOX_HOST_MAX_AGENT_RUNS`,
-    /// `ENGINEBOX_AGENT_RUN_MEMORY_MIB`, `ENGINEBOX_HOST_MEASURE_TTL_SECONDS`
-    /// and `ENGINEBOX_RUN_QUEUE_RETRY_AFTER_SECONDS`. Invalid values are refused.
+    /// `ENGINEBOX_AGENT_RUN_MEMORY_MIB`, `ENGINEBOX_HOST_MEASURE_TTL_SECONDS`,
+    /// `ENGINEBOX_RUN_QUEUE_RETRY_AFTER_SECONDS` and
+    /// `ENGINEBOX_UNCERTAIN_PROBE_SECONDS`. Invalid values are refused.
     pub fn from_env() -> Result<Self> {
         let mut limits = Self::default();
         let read = |key: &str, min: u64, max: u64| -> Result<Option<u64>> {
@@ -80,6 +85,9 @@ impl QueueLimits {
         }
         if let Some(n) = read("ENGINEBOX_RUN_QUEUE_RETRY_AFTER_SECONDS", 1, 3600)? {
             limits.retry_after_seconds = n;
+        }
+        if let Some(n) = read("ENGINEBOX_UNCERTAIN_PROBE_SECONDS", 1, 3600)? {
+            limits.uncertain_probe_seconds = n;
         }
         Ok(limits)
     }
@@ -263,6 +271,8 @@ pub struct PoolState {
     pub max_workspaces: usize,
     /// True while a failed creation is backing off.
     pub backoff: bool,
+    /// The failed creation's message while backing off.
+    pub backoff_reason: Option<String>,
 }
 
 /// A queued run as the planner sees it.
@@ -296,6 +306,8 @@ pub struct PlanInput<'a> {
     /// Workspaces a pool must not place on: any active run, or an unresolved
     /// lease from an interrupted run.
     pub busy_workspaces: BTreeSet<(String, String)>,
+    /// Why a workspace is fenced by an unresolved lease, for waiting reasons.
+    pub uncertain: BTreeMap<(String, String), String>,
     pub pools: BTreeMap<String, PoolState>,
     pub headroom_bytes: u64,
     pub admitting: bool,
@@ -406,10 +418,14 @@ pub fn plan(mut input: PlanInput) -> Plan {
                     .busy_workspaces
                     .contains(&(p.host_id.clone(), p.name.clone()))
                 {
-                    Err(format!(
-                        "workspace {} busy (resume is pinned to it)",
-                        p.name
-                    ))
+                    Err(
+                        match input.uncertain.get(&(p.host_id.clone(), p.name.clone())) {
+                            Some(why) => {
+                                format!("workspace {} busy (resume is pinned to it; {why})", p.name)
+                            }
+                            None => format!("workspace {} busy (resume is pinned to it)", p.name),
+                        },
+                    )
                 } else {
                     host_room(
                         &p.host_id,
@@ -424,11 +440,13 @@ pub fn plan(mut input: PlanInput) -> Plan {
                 Some(state) => {
                     let mut best: Option<(&Placement, usize, usize)> = None;
                     let mut host_reason = None;
+                    let mut fenced = Vec::new();
                     for m in &state.members {
-                        if input
-                            .busy_workspaces
-                            .contains(&(m.host_id.clone(), m.name.clone()))
-                        {
+                        let key = (m.host_id.clone(), m.name.clone());
+                        if input.busy_workspaces.contains(&key) {
+                            if let Some(why) = input.uncertain.get(&key) {
+                                fenced.push(format!("{}: {why}", m.name));
+                            }
                             continue;
                         }
                         let h = input.hosts.get(&m.host_id);
@@ -447,9 +465,18 @@ pub fn plan(mut input: PlanInput) -> Plan {
                         Some((m, _, _)) => Ok(m.clone()),
                         None => {
                             *pool_demand.entry(pool.clone()).or_default() += 1;
-                            Err(host_reason.unwrap_or_else(|| {
+                            let mut reason = host_reason.unwrap_or_else(|| {
                                 format!("waiting for a free workspace in pool {pool}")
-                            }))
+                            });
+                            if !fenced.is_empty() {
+                                reason = format!("{reason} ({})", fenced.join("; "));
+                            }
+                            if state.backoff
+                                && let Some(why) = &state.backoff_reason
+                            {
+                                reason = format!("{reason}; last workspace creation failed: {why}");
+                            }
+                            Err(reason)
                         }
                     }
                 }
@@ -565,6 +592,7 @@ mod tests {
             hosts: hosts.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             leases: BTreeSet::new(),
             busy_workspaces: BTreeSet::new(),
+            uncertain: BTreeMap::new(),
             pools: BTreeMap::new(),
             headroom_bytes: GIB,
             admitting: true,
@@ -706,6 +734,7 @@ mod tests {
                 create_hosts: vec!["h2".into()],
                 max_workspaces: 4,
                 backoff: false,
+                backoff_reason: None,
             },
         );
         let p = plan(i);
@@ -742,5 +771,41 @@ mod tests {
         let mut i = input(&c, vec![("h1", host(8, 0, Some(roomy())))]);
         i.busy_workspaces.insert(("h1".into(), "ebox-w2".into()));
         assert_eq!(plan(i).admit[0].1, member("h1", "ebox-w1"));
+    }
+
+    #[test]
+    fn waiting_reasons_name_fenced_workspaces_and_failed_creations() {
+        let c = vec![
+            pool_run("p", 1, None),
+            pool_run("r", 2, Some(member("h1", "ebox-w1"))),
+        ];
+        let mut i = input(&c, vec![("h1", host(8, 0, Some(roomy())))]);
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![member("h1", "ebox-w1")],
+                max_workspaces: 2,
+                create_hosts: vec!["h1".into()],
+                backoff: true,
+                backoff_reason: Some("Insufficient CPU (memory: 4 GiB requested)".into()),
+                ..Default::default()
+            },
+        );
+        let key = ("h1".to_string(), "ebox-w1".to_string());
+        i.busy_workspaces.insert(key.clone());
+        i.uncertain
+            .insert(key, "execution uncertain; lease probe failed".into());
+        let p = plan(i);
+        assert!(p.admit.is_empty() && p.create.is_empty());
+        assert_eq!(
+            p.waiting["p"].1,
+            "waiting for a free workspace in pool workers (ebox-w1: execution uncertain; \
+             lease probe failed); last workspace creation failed: Insufficient CPU (memory: \
+             4 GiB requested)"
+        );
+        assert_eq!(
+            p.waiting["r"].1,
+            "workspace ebox-w1 busy (resume is pinned to it; execution uncertain; lease probe failed)"
+        );
     }
 }

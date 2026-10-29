@@ -20,6 +20,9 @@ reserve_memory_gib = 4
 reserve_disk_gib = 10
 disk_gib = 30
 max_instances = 16
+# Optional: running vCPUs admitted per physical core left after reserve_cpu
+# (1.0-64.0, default 4.0). Older controller releases reject this key.
+cpu_overcommit = 4.0
 # Optional: concurrent native agent runs on this host (1–256, default 8).
 # Older controller releases reject this key; set it only after upgrading.
 max_agent_runs = 8
@@ -122,7 +125,7 @@ Creation/lifecycle requests return HTTP 202 with a job. Poll that job before tre
 All four fields are optional; a request without them is handled exactly as before (same native argv, same guest helper command and payload).
 
 - **`profile`** — the name of an owner-managed [profile](PROFILES.md). The profile must configure the requested `provider`, and when it names a `template` the workspace must have been created from it. A service token may name only profiles it was granted (`profiles` at mint); any other profile answers 403, an unknown profile 404. The profile's default `env` is merged under the run's `env` (the run wins) and the merged set must stay within the [per-run environment](#per-run-environment) bounds. Profile runs need a guest helper that supports `run-profile`; runs without a profile work with older helpers.
-- **`repository`** — `"<project>/<name>"` of a [hosted repository](REPOSITORIES.md#runs-with-a-repository). A service token needs a `write` repository grant on that project (otherwise 403); a pool run needs the repository's project to equal the pool's (otherwise 403, for the owner too); an unknown repository answers 404 and a missing backend 409. At admission the controller mints a write token for `timeout_seconds` + 600 s, the guest writes it into the run's private home as a git `http.<remote>.extraHeader` scoped to that remote, and the CLI process gets `ENGINEBOX_REPO_REMOTE` and `ENGINEBOX_REPO_DEFAULT_BRANCH`. The run records only the name; the token never reaches records, logs, launch events or callbacks, and is revoked when the run ends. Repository runs need a guest helper that supports `run-repository`; an older one fails the run with `{"stage":"bootstrap","reason":"guest_outdated"}` before it starts.
+- **`repository`** — `"<project>/<name>"` of a [hosted repository](REPOSITORIES.md#runs-with-a-repository). A service token needs a `write` repository grant on that project (otherwise 403); a pool run needs the repository's project to equal the pool's (otherwise 403, for the owner too); an unknown repository answers 404 and a missing backend 409. At admission the controller mints a write token for `timeout_seconds` + 600 s, the guest writes it into the run's private home as a git `http.<remote>.extraHeader` scoped to that remote, and the CLI process gets `ENGINEBOX_REPO_REMOTE` and `ENGINEBOX_REPO_DEFAULT_BRANCH`. The run works in a checkout emptied at its start, at a stable path per repository, `<workspace>/<name>`, named by `ENGINEBOX_RUN_DIR` (stable so harness state keyed by cwd persists; see [checkouts](REPOSITORIES.md#checkouts)). The run records only the name; the token never reaches records, logs, launch events or callbacks, and is revoked when the run ends. Repository runs need a guest helper from the controller's release; placement [refreshes](REPOSITORIES.md#guest-helper-refresh) an older one, and one that cannot be refreshed fails the run with `{"stage":"bootstrap","reason":"guest_outdated"}` before it starts.
 - **`idempotency_key`** — 1–128 characters of `A-Z a-z 0-9 . _ : -`. The same key from the same principal (owner, or one service token) — and, for pool starts, the same pool — returns the existing run, whether it is still queued, running or finished, with HTTP 200 and `"replayed":true` instead of starting another. The key is bound to its first request (provider, prompt, resume ID, workdir, timeout, model, env names, profile, callback URL and repository; env values are never hashed) and workspace; reusing it with a different request is refused. Keys are remembered for as long as the run is retained (the newest 100 finished runs).
 - **`callback`** — `{"url":"https://…"}`. When the run reaches a terminal state the controller POSTs a JSON summary: `schema`, `event` (`agent_run.finished`), `run_id`, `host_id`, `name`, `provider`, `profile`, `status`, `exit_code`, `timed_out`, `execution_uncertain`, `created_at`, `started_at`, `finished_at`. It never contains output, prompts, env names or values, or errors. Headers: `X-EngineBox-Event`, `X-EngineBox-Delivery` (one ID across retries, for deduplication) and `X-EngineBox-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`. The key is never taken from the request: a service token's runs are signed with that token's `callback_secret`, owner runs with the named profile's `callback_secret`; without one the launch is refused. Delivery succeeds on 2xx; 408, 429, 5xx and network errors are retried after 2, 10, 60 and 300 seconds; any other status stops. The run records only the URL's origin and the delivery state. The URL must be HTTPS without credentials or fragment; `localhost` names and IP literals in private, loopback, link-local, CGNAT or other non-public ranges are refused at launch, and the host is resolved before every attempt with every answer required to be public, then pinned for that connection (no proxy, no redirects). The callback target and key are kept with the run's private queue entry (mode 0600) from acceptance until the run finishes, so a restart keeps delivery: a queued run's callback fires when it later ends, and a run a restart interrupted fires once with `"execution_uncertain":true`. The payload also carries `pool` (null for workspace runs), `repository` (the name, or null) and `failure`: `{"stage","reason"}` codes when the launch stopped before or while the guest started the run (see [launch events](QUEUE.md#launch-events)), otherwise null. It carries codes only, never the failure message. Delivery that was already in progress when the controller stopped is not retried.
 
@@ -146,12 +149,25 @@ Connection status does not prove remaining quota. The fleet does not schedule pr
 
 Admission is recalculated immediately before each creation or stopped-VM resume. It accounts for:
 
-- CPU and configured memory allocations across **all Incus projects** on the machine. Frozen and transitional/unknown states retain their allocations; only `Stopped` releases CPU/RAM commitments.
-- Actual available host memory, with configured host reserves retained.
+- CPU and configured memory allocations across **all Incus projects** on the machine, by instance state:
+
+  | State | CPU | Memory | Disk |
+  | --- | --- | --- | --- |
+  | `Running`, transitional (`Starting`, `Stopping`, `Migrating`) and unknown/`Error` | counted | counted | counted |
+  | `Frozen` (paused, e.g. a warm spare) | not counted | counted (it holds its RAM) | counted |
+  | `Stopped` (templates, parked workspaces) | not counted | not counted | counted |
+
+- A CPU budget of `(cpu_total - reserve_cpu) * cpu_overcommit` running vCPUs. An instance's `limits.cpu` is a ceiling, not a reservation, and agent workloads mostly wait on inference, so `cpu_overcommit` defaults to `4.0` (range 1.0–64.0; set `1.0` for strict one-vCPU-per-core accounting). A frozen VM's vCPUs count again once it runs.
+- Memory with no overcommit: the configured memory of every instance that holds RAM plus `reserve_memory_gib` must fit in total memory, and new instances must also fit in the actual available host memory after the reserve.
+- An optional `contribution_cpu` / `contribution_memory_gib` ceiling on a contributed machine is an owner's promise and is never overcommitted.
 - Actual pool/backing-filesystem free space and full root-disk plus saved-memory commitments for every VM in the admission pool, including stopped VMs.
 - The configured limit on fleet-created instances in the project.
 
 The model is deliberately conservative about copy-on-write storage: inexpensive initial clones still reserve their full configured disk capacity. Ordinary host processes and CI jobs are not Incus allocations; reserve enough headroom for them. These checks do not guarantee latency or prevent unrelated administrator workloads from consuming resources afterward.
+
+A refused creation names the first limiting resource, for example `Insufficient CPU, memory, disk or instance slots; preserve reserves (memory: 4 GiB requested, 2 GiB free after the 40 GiB reserve)`. `GET /v1/fleet` reports `cpu_overcommit`, `cpu_budget`, `allocated_cpu` (running vCPUs) and `allocated_memory_bytes` (running and frozen) per host.
+
+Example: a 48-core, 125 GiB host with `reserve_cpu = 12`, `reserve_memory_gib = 40` and 13 VMs of 4 vCPU / 4 GiB, of which 5 are stopped, 4 frozen and 4 running, has a CPU budget of 144 vCPU with 16 used, and 125 − 40 − 32 = 53 GiB of memory budget, so it admits 13 more standard VMs.
 
 `max_additional` is a point-in-time estimate for repeatedly creating one size, not three budgets that can all be consumed independently. Queued jobs have not reserved capacity yet. A job can be rejected when it reaches execution even if inventory previously showed room.
 

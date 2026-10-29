@@ -32,6 +32,14 @@ pub const GUEST_MODE: &str = "run-repository";
 /// prefix, so a caller can never set them).
 pub const ENV_REMOTE: &str = "ENGINEBOX_REPO_REMOTE";
 pub const ENV_DEFAULT_BRANCH: &str = "ENGINEBOX_REPO_DEFAULT_BRANCH";
+/// The run's checkout directory, which is also its cwd.
+pub const ENV_RUN_DIR: &str = "ENGINEBOX_RUN_DIR";
+/// The controller run ID, for anything that needs a per-run unique name.
+pub const ENV_RUN_ID: &str = "ENGINEBOX_RUN_ID";
+/// Per-checkout leases, relative to the native home. Writer leases are per
+/// provider, so runs of different providers on one workspace can overlap;
+/// this lease keeps them out of each other's checkout.
+pub const CHECKOUT_LEASES: &str = ".local/state/enginebox/agent-runs/checkouts";
 /// Largest repository envelope the guest accepts on stdin.
 pub const MAX_ENVELOPE_BYTES: usize = profile::MAX_ENVELOPE_BYTES + 8192;
 
@@ -216,6 +224,15 @@ pub struct Envelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfilePart>,
     pub repository: Access,
+    /// The checkout's directory name (the repository name): the run works in
+    /// a freshly emptied `<workspace>/<checkout>`. The path is stable per
+    /// repository because native harnesses key their state (Claude Code's
+    /// sessions and memory under `~/.claude/projects/<cwd key>`) by working
+    /// path. Absent for controllers before checkouts: the run then works in
+    /// the workspace as before. Omitted when absent so older guest helpers
+    /// still accept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<String>,
 }
 impl Envelope {
     /// The profile part as the profile module's own envelope, if any.
@@ -231,6 +248,9 @@ impl Envelope {
     pub fn validate(&self) -> Result<Option<BTreeMap<String, Vec<u8>>>> {
         self.request.validate()?;
         self.repository.validate()?;
+        if let Some(name) = &self.checkout {
+            ensure!(valid_name(name), "Invalid checkout name.");
+        }
         ensure!(
             !self.request.env.keys().any(|k| reserved_env_key(k)),
             "env cannot set git configuration variables in a repository run."
@@ -309,6 +329,93 @@ pub fn remove_run_dir(home: &Path, run_id: &str) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// A directory owned by this user that is not a link, created 0700 if missing.
+fn owned_dir(path: &Path) -> Result<()> {
+    security::check_components(path)?;
+    if !path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(path)?;
+    }
+    let m = std::fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_dir() && !m.file_type().is_symlink(),
+        "Checkout path must be a directory, not a link."
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            m.uid() == unsafe { libc::geteuid() },
+            "Checkout directory owner mismatch."
+        );
+    }
+    Ok(())
+}
+fn remove_tree(dir: &Path) -> Result<()> {
+    security::check_components(dir)?;
+    match std::fs::symlink_metadata(dir) {
+        // `remove_dir_all` removes links inside without following them.
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(dir)?,
+        Ok(_) => std::fs::remove_file(dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+/// A run's checkout directory, held under its lease for the run.
+pub struct Checkout {
+    pub path: PathBuf,
+    /// False for the per-run fallback used while another run holds the
+    /// stable checkout; that one is removed when the run ends.
+    pub stable: bool,
+    lease_path: String,
+    home: PathBuf,
+    _lease: security::Lease,
+}
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        if !self.stable {
+            let _ = remove_tree(&self.path);
+            let _ = security::remove(&self.home, &self.lease_path);
+        }
+    }
+}
+/// Open the run's checkout, emptied: `<workspace>/<name>`, or
+/// `<workspace>/<name>-<run_id>` while another run (another provider on this
+/// workspace) holds that one. Nothing a previous run left there remains.
+pub fn open_checkout(home: &Path, workspace: &Path, name: &str, run_id: &str) -> Result<Checkout> {
+    ensure!(valid_name(name), "Invalid checkout name.");
+    native::validate_run_id(run_id)?;
+    let attempt = |dir: String, stable: bool| -> Result<Option<Checkout>> {
+        let lease_path = format!("{CHECKOUT_LEASES}/{dir}.lock");
+        let lease = match security::Lease::acquire(home, &lease_path) {
+            Ok(lease) => lease,
+            Err(e) if e.to_string().contains("active operation") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let path = workspace.join(&dir);
+        remove_tree(&path)?;
+        owned_dir(&path)?;
+        Ok(Some(Checkout {
+            path,
+            stable,
+            lease_path,
+            home: home.to_path_buf(),
+            _lease: lease,
+        }))
+    };
+    match attempt(name.to_owned(), true)? {
+        Some(checkout) => Ok(checkout),
+        None => attempt(format!("{name}-{run_id}"), false)?
+            .ok_or_else(|| anyhow::anyhow!("The run's checkout is in use.")),
+    }
 }
 
 /// The variables a repository run adds to the CLI process: git includes the
@@ -446,6 +553,7 @@ mod tests {
             request,
             profile: None,
             repository: access(),
+            checkout: None,
         };
         assert!(envelope.validate().is_err());
         let mut ok = envelope.clone();

@@ -1,6 +1,6 @@
 use crate::{
     GIB,
-    capacity::{capacity, inventory, number, resource_bytes, resource_fits},
+    capacity::{capacity, inventory, number, resource_bytes},
     model::{Host, Resources, identifier, load_hosts, preset, sizes},
     state,
     templates::Registry,
@@ -409,10 +409,9 @@ impl Fleet {
         check_name(h, name, &facts)?;
         let t = self.template(h, id)?;
         let r = preset(h, &t, size, custom)?;
-        ensure!(
-            resource_fits(h, &facts, r)?,
-            "Insufficient CPU, memory, disk or instance slots; preserve reserves"
-        );
+        if let Some(reason) = crate::capacity::shortage(h, &facts, r)? {
+            bail!("Insufficient CPU, memory, disk or instance slots; preserve reserves ({reason})");
+        }
         let bx = h.engine_box();
         let snap = template_snapshot(h, &t)?;
         if matches!(mode, CopyMode::Reserved(_)) {

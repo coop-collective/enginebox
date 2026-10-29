@@ -187,7 +187,8 @@ pub fn normalize(raw: Value) -> Result<Value> {
                 "reserve_disk_gib",
                 "max_instances",
                 "contribution_cpu",
-                "contribution_memory_gib"
+                "contribution_memory_gib",
+                "cpu_overcommit"
             ]
             .contains(&k.as_str())),
             "Unknown admission field"
@@ -197,6 +198,14 @@ pub fn normalize(raw: Value) -> Result<Value> {
             "Contribution limits must be paired"
         );
         for (k, v) in keys {
+            if k == "cpu_overcommit" {
+                ensure!(
+                    v.as_f64()
+                        .is_some_and(|r| r.is_finite() && (1.0..=64.0).contains(&r)),
+                    "Invalid admission {k}"
+                );
+                continue;
+            }
             let (lo, hi) = match k.as_str() {
                 "max_instances" => (1, 256),
                 "contribution_cpu" => (1, 4096),
@@ -628,6 +637,7 @@ pub fn admission_errors(c: &Value, o: &Value) -> Result<Vec<Value>> {
         max_instances: number(&p["max_instances"]),
         contribution_cpu: p["contribution_cpu"].as_u64(),
         contribution_memory_gib: p["contribution_memory_gib"].as_u64(),
+        cpu_overcommit: p["cpu_overcommit"].as_f64(),
         ..Default::default()
     };
     let room = crate::capacity::capacity(&h, facts)?;
@@ -1009,6 +1019,9 @@ pub fn install_template(h: &Host, manifest: &Value) -> Result<Value> {
     if let (Some(cpu), Some(mem)) = (h.contribution_cpu, h.contribution_memory_gib) {
         admission["contribution_cpu"] = json!(cpu);
         admission["contribution_memory_gib"] = json!(mem);
+    }
+    if let Some(ratio) = h.cpu_overcommit {
+        admission["cpu_overcommit"] = json!(ratio);
     }
     let c = normalize(
         json!({"host":{"transport":if h.target=="local"{"local"}else{"ssh"},"target":h.target,"install_packages":false,"disk_reserve":format!("{}GiB",h.reserve_disk_gib.max(1)),"memory_reserve":format!("{}GiB",h.reserve_memory_gib.max(1)),"admission":admission},"incus":{"project":h.project,"profile":base},"storage":{"mode":"existing","pool":h.pool},"network":{"mode":"existing","name":network},"workspace":{"name":base,"image":manifest["source_image"],"cpu":r.cpu,"memory":format!("{}GiB",r.memory_gib),"disk":format!("{}GiB",manifest["minimum"]["disk_gib"].as_u64().unwrap()),"state_disk":format!("{}GiB",r.memory_gib+2),"user":h.guest.user,"uid":h.guest.uid,"gid":h.guest.gid,"home":h.guest.home,"path":h.guest.workspace},"agents":{"install":manifest["native_clients"]},"modules":manifest["config"]}),
