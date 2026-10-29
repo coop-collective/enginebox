@@ -2538,21 +2538,21 @@ impl AgentService {
         match prepared {
             Ok((host, guest_current)) => {
                 let request = run.request.clone();
-                // Run directories need a guest helper from this release;
-                // an older one keeps the previous in-workspace behavior.
-                let run_dir = (run.repository_access.is_some() && guest_current)
-                    .then(|| self.run_dir_for(run))
-                    .flatten();
-                if let Some(dir) = &run_dir {
-                    self.record_run_dir(&run.id, dir);
-                }
+                // Checkouts need a guest helper from this release; an older
+                // one keeps the previous in-workspace behavior.
+                let checkout = run
+                    .repository
+                    .as_deref()
+                    .filter(|_| run.repository_access.is_some() && guest_current)
+                    .and_then(|r| repository::parse_ref(r).ok())
+                    .map(|(_, name)| name);
                 if let Err(failure) = self.run_worker_with(
                     host,
                     &run.name,
                     request,
                     &run.id,
                     resolved.clone(),
-                    run.repository_access.clone().map(|a| (a, run_dir)),
+                    run.repository_access.clone().map(|a| (a, checkout)),
                 ) {
                     self.launch_failed(
                         run,
@@ -2570,49 +2570,6 @@ impl AgentService {
                 &failure,
                 started,
             ),
-        }
-    }
-    /// The run directory a repository run works in: its own run ID, or for a
-    /// resume the directory of the run on this workspace that started the
-    /// session. A session started without a run directory resumes in the
-    /// workspace as before (`None`), so the native CLI still finds it.
-    fn run_dir_for(&self, run: &AdmittedRun) -> Option<String> {
-        let Some(session) = &run.request.resume_id else {
-            return Some(run.id.clone());
-        };
-        let origin = {
-            let records = self.inner.records.lock().unwrap();
-            records
-                .values()
-                .filter(|v| {
-                    v["id"] != run.id.as_str()
-                        && v["host_id"] == run.host_id.as_str()
-                        && v["name"] == run.name.as_str()
-                        && v["native_session_id"] == session.as_str()
-                })
-                .max_by(|a, b| {
-                    a["created_at"]
-                        .as_str()
-                        .unwrap_or("")
-                        .cmp(b["created_at"].as_str().unwrap_or(""))
-                })
-                .and_then(|v| v["id"].as_str().map(str::to_owned))
-        };
-        match origin {
-            None => Some(run.id.clone()),
-            Some(origin) => self
-                .inner
-                .details
-                .lock()
-                .unwrap()
-                .get(&origin)
-                .and_then(|d| d["run_dir"].as_str().map(str::to_owned)),
-        }
-    }
-    fn record_run_dir(&self, id: &str, dir: &str) {
-        if let Some(detail) = self.inner.details.lock().unwrap().get_mut(id) {
-            detail["run_dir"] = json!(dir);
-            let _ = self.save_detail(id, detail);
         }
     }
     /// Make sure the workspace's guest helper is this release's, refreshing
@@ -3107,7 +3064,7 @@ impl AgentService {
         request: native::RunRequest,
         id: &str,
         resolved: Option<ResolvedProfile>,
-        // The repository access and the run directory, for repository runs.
+        // The repository access and the checkout name, for repository runs.
         repository: Option<(repository::Access, Option<String>)>,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
@@ -3120,7 +3077,7 @@ impl AgentService {
             // Runs without a profile keep the original guest command and
             // payload, so older guest helpers still serve them.
             let (mode, input) = match (&resolved, repository) {
-                (p, Some((access, run_dir))) => (
+                (p, Some((access, checkout))) => (
                     repository::GUEST_MODE,
                     serde_json::to_vec(&repository::Envelope {
                         request: request.clone(),
@@ -3130,7 +3087,7 @@ impl AgentService {
                             files: p.files.clone(),
                         }),
                         repository: access,
-                        run_dir,
+                        checkout,
                     })?,
                 ),
                 (None, None) => ("run", serde_json::to_vec(&request)?),
@@ -3643,88 +3600,6 @@ mod run_control_tests {
                 .contains("is unreadable but this controller needs enginebox-guest 0.3.1-live.42; the refresh failed: sudo: a password is required"),
             "{:?}",
             out.event()
-        );
-    }
-
-    #[test]
-    fn a_resume_reuses_the_run_directory_of_its_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let host = Host {
-            id: "h1".into(),
-            target: "offline.invalid".into(),
-            ..Default::default()
-        };
-        let fleet = Fleet::from_hosts(vec![host], &root).unwrap();
-        let service = AgentService::new(&root, fleet).unwrap();
-        let session = "0b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a";
-        let legacy_session = "1b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a";
-        let add = |id: &str, session: &str, run_dir: Option<&str>| {
-            let request =
-                native::RunRequest::parse(json!({"provider":"claude","prompt":"x"})).unwrap();
-            let (mut record, mut detail) = new_run_entries(id, "h1", "ebox-w", &request, "owner");
-            record["status"] = json!("succeeded");
-            record["native_session_id"] = json!(session);
-            if let Some(dir) = run_dir {
-                detail["run_dir"] = json!(dir);
-            }
-            service
-                .inner
-                .records
-                .lock()
-                .unwrap()
-                .insert(id.into(), record);
-            service
-                .inner
-                .details
-                .lock()
-                .unwrap()
-                .insert(id.into(), detail);
-        };
-        let first = "a".repeat(32);
-        add(&first, session, Some(&first));
-        add(&"b".repeat(32), legacy_session, None);
-        let run = |id: &str, resume: Option<&str>| AdmittedRun {
-            id: id.into(),
-            host_id: "h1".into(),
-            name: "ebox-w".into(),
-            pool: None,
-            request: native::RunRequest::parse(
-                json!({"provider":"claude","prompt":"x","resume_id":resume}),
-            )
-            .unwrap(),
-            profile: None,
-            queue_wait_ms: 0,
-            repository: Some("alpha/game".into()),
-            repository_access: None,
-        };
-        let fresh = "c".repeat(32);
-        // A fresh run gets its own directory.
-        assert_eq!(service.run_dir_for(&run(&fresh, None)), Some(fresh.clone()));
-        // A resume works where its session was started...
-        assert_eq!(
-            service.run_dir_for(&run(&fresh, Some(session))),
-            Some(first.clone())
-        );
-        // ...in the workspace itself for a session from before run directories...
-        assert_eq!(
-            service.run_dir_for(&run(&fresh, Some(legacy_session))),
-            None
-        );
-        // ...and in a fresh directory for a session this workspace never recorded.
-        assert_eq!(
-            service.run_dir_for(&run(&fresh, Some("2b9a5a6e-3c1f-4c7e-9a43-2f3e4d5c6b7a"))),
-            Some(fresh.clone())
-        );
-        service.record_run_dir(&first, &first);
-        assert_eq!(
-            service.inner.details.lock().unwrap()[&first]["run_dir"],
-            first.as_str()
         );
     }
 

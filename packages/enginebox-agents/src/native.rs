@@ -504,25 +504,8 @@ pub fn execute_with_repository(
         Some(run_id),
         profile.map(|(p, files)| (&p.block, files)),
         Some(&envelope.repository),
-        envelope.run_dir.as_deref(),
+        envelope.checkout.as_deref(),
     )
-}
-
-/// Removes a run's working directory when dropped, unless kept.
-struct WorkDir {
-    home: std::path::PathBuf,
-    workspace: std::path::PathBuf,
-    id: String,
-    path: std::path::PathBuf,
-    remove: bool,
-    _lease: security::Lease,
-}
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        if self.remove {
-            let _ = crate::repository::remove_work_dir(&self.home, &self.workspace, &self.id);
-        }
-    }
 }
 
 type ProfileInput<'a> = (
@@ -537,7 +520,7 @@ fn execute_inner(
     run_id: Option<&str>,
     profile: Option<ProfileInput<'_>>,
     repository: Option<&crate::repository::Access>,
-    run_dir: Option<&str>,
+    checkout: Option<&str>,
 ) -> Result<process::Output> {
     r.validate()?;
     ensure!(
@@ -545,18 +528,15 @@ fn execute_inner(
         "Profile and repository runs require a controller run ID."
     );
     ensure!(
-        run_dir.is_none() || repository.is_some(),
-        "Only repository runs get a run directory."
+        checkout.is_none() || repository.is_some(),
+        "Only repository runs get a checkout."
     );
     if let Some(id) = run_id {
         validate_run_id(id)?;
     }
-    if let Some(id) = run_dir {
-        validate_run_id(id)?;
-    }
     let home = security::absolute_existing(home)?;
     let workspace = security::absolute_existing(workspace)?;
-    if run_dir.is_none() {
+    if checkout.is_none() {
         let cwd = workspace.join(&r.workdir).canonicalize()?;
         ensure!(
             cwd.is_dir() && cwd.starts_with(&workspace),
@@ -569,30 +549,13 @@ fn execute_inner(
         &home,
         &format!(".local/state/enginebox/agent-runs/{}.lock", r.provider),
     )?;
-    // A repository run works in its own directory: empty for a fresh run,
-    // the session's directory for a resume. Retained directories of other
-    // runs are pruned first; directories in use are never touched.
-    let work = match run_dir {
-        Some(id) => {
-            let fresh = r.resume_id.is_none();
-            let _ = crate::repository::prune_work_dirs(
-                &home,
-                &workspace,
-                id,
-                std::time::SystemTime::now(),
-            );
-            let (path, lease) = crate::repository::open_work_dir(&home, &workspace, id, fresh)?;
-            Some(WorkDir {
-                home: home.clone(),
-                workspace: workspace.clone(),
-                id: id.to_owned(),
-                path,
-                // Until the run leaves a session, a fresh directory is removed.
-                remove: fresh,
-                _lease: lease,
-            })
-        }
-        None => None,
+    // A repository run works in a freshly emptied checkout at a stable path
+    // per repository (harnesses key their sessions and memory by cwd).
+    let work = match (checkout, run_id) {
+        (Some(name), Some(id)) => Some(crate::repository::open_checkout(
+            &home, &workspace, name, id,
+        )?),
+        _ => None,
     };
     let cwd = match &work {
         Some(work) => {
@@ -610,7 +573,7 @@ fn execute_inner(
             let cwd = cwd.canonicalize()?;
             ensure!(
                 cwd.is_dir() && cwd.starts_with(work.path.canonicalize()?),
-                "workdir escapes its run directory."
+                "workdir escapes its checkout."
             );
             cwd
         }
@@ -696,9 +659,10 @@ fn execute_inner(
                 crate::repository::ENV_RUN_DIR.into(),
                 work.path
                     .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid run directory path."))?
+                    .ok_or_else(|| anyhow::anyhow!("Invalid checkout path."))?
                     .into(),
             );
+            run_env.insert(crate::repository::ENV_RUN_ID.into(), id.into());
         }
         // The token is in a file the agent can read; never let it reach output.
         redacted.insert("ENGINEBOX_REPO_TOKEN".into(), access.token.clone());
@@ -736,17 +700,9 @@ fn execute_inner(
             let _ = crate::repository::remove_run_dir(&home, id);
         }
     }
-    // Keep the run directory only when its run left a session to resume.
-    if let Some(mut work) = work {
-        if work.remove
-            && result
-                .as_ref()
-                .is_ok_and(|output| session_id(&output.output).is_some())
-        {
-            work.remove = false;
-        }
-        drop(work);
-    }
+    // A per-run fallback checkout is removed here, under the writer lease;
+    // the stable checkout stays until the next run empties it.
+    drop(work);
     drop(lease);
     let result = result.map(|mut output| {
         if !redacted.is_empty() {
