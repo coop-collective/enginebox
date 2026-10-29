@@ -22,6 +22,8 @@ import { WorkspacesPanel } from "@/components/workspaces-panel";
 import { EmailSignIn } from "@/components/email-sign-in";
 import { OrgPanel } from "@/components/org-panel";
 import { CredentialsPanel } from "@/components/credentials-panel";
+import { ConnectionsPanel } from "@/components/connections-panel";
+import { ProfilesPanel } from "@/components/profiles-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -67,6 +69,8 @@ const sections = {
     description: "Project sources, environments, agent activity and measured preparation.",
     icon: "box",
   },
+  profiles: { title: "Profiles", description: "How agents run: template, tools, skills and the connections each kind of run gets.", icon: "box" },
+  connections: { title: "Connections", description: "MCP servers and secret sources your profiles share.", icon: "link" },
   mcp: { title: "MCP", description: "Connect a client, control workspaces and review app access.", icon: "terminal" },
   org: { title: "Organization", description: "Members, invites and the organization you are working in.", icon: "lock" },
   apps: {
@@ -93,6 +97,12 @@ function Icon({ name = "box", size = 20 }: { name?: string; size?: number }) {
       </>
     ),
     arrow: <path d="M5 12h14m-5-5 5 5-5 5" />,
+    link: (
+      <>
+        <path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" />
+        <path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" />
+      </>
+    ),
     plus: <path d="M12 5v14M5 12h14" />,
     refresh: (
       <>
@@ -989,7 +999,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "workspaces", "agents", "templates", "environments", "mcp", "org"] as const)
+          {(["fleet", "workspaces", "agents", "profiles", "connections", "templates", "environments", "mcp", "org"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1139,6 +1149,8 @@ export default function Dashboard() {
                 </>
               )}
               {section === "environments" && <EnvironmentsPanel />}
+              {section === "profiles" && <ProfilesPanel />}
+              {section === "connections" && <ConnectionsPanel />}
               {["mcp", "apps"].includes(section) && <ConnectedAppsPanel />}
               {section === "org" && <OrgPanel onSwitched={() => window.location.reload()} />}
               {section === "fleet" && (

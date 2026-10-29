@@ -1703,3 +1703,20 @@ input::placeholder {
 .contributor-panel .table th, .contributor-panel .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line, #d8dee3); }
 .contributor-panel .host-card form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .contributor-panel .host-card textarea { width: 100%; }
+/* Connections catalog and profile builder */
+.contributor-panel .host-card form.connection-form { flex-direction: column; align-items: stretch; }
+.connection-rows { display: grid; gap: 6px; }
+.connection-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.connection-row input, .connection-row select { min-width: 0; flex: 1 1 140px; }
+.status-ok { color: var(--teal); }
+.status-bad { color: #b42318; }
+.policy-table td { vertical-align: top; }
+.policy-table label { display: inline-flex; gap: 4px; margin-right: 10px; white-space: nowrap; }
+.profile-pick { display: flex; flex-wrap: wrap; gap: 6px; }
+.profile-pick .button.active { border-color: var(--teal); color: var(--teal); }
+.catalog-scroll { overflow-x: auto; max-width: 100%; }
+.contributor-panel .catalog-scroll .mono { overflow-wrap: anywhere; }
+.contributor-panel .host-card { min-width: 0; max-width: 100%; }
+.policy-table input[type="checkbox"] { width: auto; height: auto; margin: 0; }
+.policy-table label { align-items: center; }
+.contributor-panel .host-card form.connection-form > .button { align-self: flex-start; }

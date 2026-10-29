@@ -59,6 +59,7 @@ Owner token only. Service tokens, including OAuth access tokens, get 403 on ever
 | `POST /v1/connections/{name}/test` | `{}`; see below |
 | `POST /v1/profiles/{name}/connections/attach` | `{connection, run_kinds?}` |
 | `POST /v1/profiles/{name}/connections/detach` | `{connection}` |
+| `POST /v1/profiles/{name}/connections/policy` | `{connection_policy}`: replace the run-kind policy (env values and the callback key are kept) |
 | `POST /v1/catalog/apply` | `{document, dry_run?, prune?}`; see [profiles as code](#profiles-as-code) |
 | `GET /v1/audit` | the org's newest audit entries (at most 500) |
 
