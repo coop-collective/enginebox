@@ -141,6 +141,23 @@ function ensureSecret(file) {
   return value;
 }
 
+/** True when `wrangler email sending list` already shows the domain enabled (re-runs and pre-enabled zones). */
+export function sendingEnabled(o, spawn = spawnSync) {
+  const result = spawn("pnpm", ["--dir", resolve(repo, "packages/email-gateway"), "exec", "wrangler", "email", "sending", "list"], {
+    cwd: repo,
+    env: { ...process.env, ...(o.account ? { CLOUDFLARE_ACCOUNT_ID: o.account } : {}) },
+    encoding: "utf8",
+  });
+  if (result.status !== 0) return false;
+  const domain = o.domain.toLowerCase();
+  return String(result.stdout ?? "")
+    .split("\n")
+    .some((line) => {
+      const cells = line.split(/[│|]/).map((c) => c.trim().toLowerCase());
+      return cells.includes(domain) && cells.includes("yes");
+    });
+}
+
 export function writeEnvironment(file, o, secret) {
   writeFileSync(file, `${JSON.stringify(dashboardEnvironment(o, secret), null, 2)}\n`, { mode: 0o600, flag: "wx" });
   chmodSync(file, 0o600);
@@ -150,7 +167,7 @@ function execute(step, o, log, spawn = spawnSync) {
   const input = step.stdin === "secret" ? `${ensureSecret(o.secretFile)}\n` : undefined;
   const result = spawn(step.command[0], step.command.slice(1), {
     cwd: repo,
-    env: { ...process.env, ...(step.env ?? {}) },
+    env: { ...process.env, ...(o.account ? { CLOUDFLARE_ACCOUNT_ID: o.account } : {}), ...(step.env ?? {}) },
     input,
     stdio: [input === undefined ? "inherit" : "pipe", "inherit", "inherit"],
     encoding: "utf8",
@@ -169,7 +186,9 @@ export function run(o, { log = console.log, spawn = spawnSync } = {}) {
       continue;
     }
     if (!o.apply) continue;
-    if (step.id === "secret") {
+    if (step.id === "sending-enable" && sendingEnabled(o, spawn)) {
+      log(`  done: ${step.id} (Email Sending is already enabled on ${o.domain})`);
+    } else if (step.id === "secret") {
       ensureSecret(o.secretFile);
       log("  done: secret");
     } else if (step.id === "dashboard-env") {
