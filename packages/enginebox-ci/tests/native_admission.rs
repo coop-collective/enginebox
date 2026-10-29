@@ -50,6 +50,7 @@ project = "enginebox-ci-test"
 pool = "ci"
 network = "cibr0"
 reserve_cpu = 4
+cpu_overcommit = 1.0
 reserve_memory_gib = 8
 reserve_disk_gib = 20
 max_instances = 4
@@ -63,7 +64,7 @@ recommended = { cpu = 4, memory_gib = 4, disk_gib = 30 }
     )
     .unwrap();
     let config = root.path().join("worker.json");
-    fs::write(&config,json!({"schema":1,"fleet":fleet,"state_root":state,"host_id":"ci-local","template":"ci-linux","resources":{"cpu":4,"memory_gib":4,"disk_gib":30},"runner_version":"2.338.2","layerfs":null,"projects":{}}).to_string()).unwrap();
+    enginebox_core::state::write_json(&config, &json!({"schema":1,"fleet":fleet,"state_root":state,"host_id":"ci-local","template":"ci-linux","resources":{"cpu":4,"memory_gib":4,"disk_gib":30},"runner_version":"2.338.2","layerfs":null,"projects":{}})).unwrap();
     let name = "ebox-ci-11111111111141118111111111111111";
     let request = json!({"schema":1,"name":name,"job_id":99,"repository":"fixture/repo","jitconfig":"never-deliver-this-token","timeout_seconds":60});
     let invoke = || {
