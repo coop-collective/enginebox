@@ -221,6 +221,183 @@ fn sparse_disk_commitments_prevent_overcommit() {
         0
     );
 }
+/// The reported `dedicated` host: a 515 GB btrfs pool with 485 GB free and
+/// 13 VMs whose allocated root plus saved-memory disks sum to 481 GB.
+fn production_disk(driver: Value) -> (Host, Value) {
+    const GB: u64 = 1_000_000_000;
+    let h = Host {
+        reserve_cpu: 12,
+        reserve_memory_gib: 40,
+        reserve_disk_gib: 32,
+        max_instances: 64,
+        ..host()
+    };
+    let mut instances = Vec::new();
+    for (i, status) in ["Stopped"; 5]
+        .into_iter()
+        .chain(["Frozen"; 4])
+        .chain(["Running"; 4])
+        .enumerate()
+    {
+        instances.push(json!({"name":format!("vm{i}"),"project":"enginebox","status":status,"cpu":4,"memory_bytes":4*GIB,"disk_bytes":33*GB,"state_disk_bytes":4*GB,"pool":"pool","managed":true}));
+    }
+    let f = json!({"cpu_total":48,"memory_total_bytes":125*GIB,"memory_available_bytes":95*GIB,"disk_free_bytes":485*GB,"pool_total_bytes":515*GB,"pool_used_bytes":30*GB,"pool_driver":driver,"instances":instances});
+    (h, f)
+}
+const STANDARD: Resources = Resources {
+    cpu: 4,
+    memory_gib: 4,
+    disk_gib: 30,
+};
+#[test]
+fn copy_on_write_pool_admits_against_actual_usage() {
+    let (h, f) = production_disk(json!("btrfs"));
+    let c = capacity(&h, &f).unwrap();
+    assert_eq!(c["pool_driver"], "btrfs");
+    assert_eq!(c["disk_accounting"], "copy_on_write");
+    assert_eq!(c["disk_overcommit"], 4.0);
+    assert_eq!(c["disk_committed_bytes"], 481_000_000_000_u64);
+    // 485 GB free - 32 GiB reserve.
+    assert_eq!(c["disk_usage_available_bytes"], 450_640_261_632_u64);
+    // (515 GB - 32 GiB) * 4 = 1922.6 GB, of which 481 GB is allocated.
+    assert_eq!(c["disk_allocation_budget_bytes"], 1_922_561_046_528_u64);
+    assert_eq!(c["disk_allocation_available_bytes"], 1_441_561_046_528_u64);
+    assert_eq!(c["disk_budget_available_bytes"], 450_640_261_632_u64);
+    // Each new VM must fit at full size in actual free space: 419 GiB /
+    // 36 GiB = 11 at once (was 0). Clones write little, so the room barely
+    // shrinks as they are created; see the allocation-cap test.
+    assert_eq!(c["max_additional"]["standard"], 11);
+    assert!(resource_fits(&h, &f, STANDARD).unwrap());
+}
+#[test]
+fn copy_on_write_allocation_cap_is_the_second_guard() {
+    // Keep adding stopped standard clones (36 GiB allocated, 2 GB written
+    // each) until disk refuses; only disk can refuse here.
+    let (mut h, mut f) = production_disk(json!("zfs"));
+    h.max_instances = 256;
+    let mut added = 0;
+    while enginebox_core::capacity::shortage(&h, &f, STANDARD)
+        .unwrap()
+        .is_none()
+    {
+        f["instances"].as_array_mut().unwrap().push(json!({"name":format!("clone{added}"),"project":"enginebox","status":"Stopped","cpu":4,"memory_bytes":4*GIB,"disk_bytes":30*GIB,"state_disk_bytes":6*GIB,"pool":"pool","managed":true}));
+        f["pool_used_bytes"] = json!(f["pool_used_bytes"].as_u64().unwrap() + 2_000_000_000);
+        f["disk_free_bytes"] = json!(f["disk_free_bytes"].as_u64().unwrap() - 2_000_000_000);
+        added += 1;
+        assert!(added < 1000);
+    }
+    // 1441.6 GB of allocation budget / 36 GiB = 37 more workspaces.
+    assert_eq!(added, 37);
+    let reason = enginebox_core::capacity::shortage(&h, &f, STANDARD)
+        .unwrap()
+        .unwrap();
+    assert!(reason.starts_with("disk: 36 GiB requested;"), "{reason}");
+    assert!(
+        reason.contains("GiB actually free in the pool after the 32 GiB reserve"),
+        "{reason}"
+    );
+    assert!(
+        reason
+            .contains("GiB allocation budget left (copy_on_write accounting, disk_overcommit 4.0)"),
+        "{reason}"
+    );
+}
+#[test]
+fn non_copy_on_write_pool_stays_strict() {
+    for driver in [json!("dir"), json!("lvm"), Value::Null] {
+        let (h, f) = production_disk(driver.clone());
+        let c = capacity(&h, &f).unwrap();
+        assert_eq!(c["disk_accounting"], "allocated", "{driver}");
+        assert_eq!(c["disk_overcommit"], 1.0);
+        // 515 GB - 32 GiB - 481 GB committed is below zero.
+        assert_eq!(c["disk_budget_available_bytes"], 0);
+        for size in ["small", "standard", "large"] {
+            assert_eq!(c["max_additional"][size], 0);
+        }
+        let reason = enginebox_core::capacity::shortage(&h, &f, STANDARD)
+            .unwrap()
+            .unwrap();
+        assert!(reason.starts_with("disk:"), "{reason}");
+        assert!(
+            reason.contains(
+                "0 of 447 GiB allocation budget left (allocated accounting, disk_overcommit 1.0)"
+            ),
+            "{reason}"
+        );
+    }
+}
+#[test]
+fn disk_accounting_overrides_and_compatibility() {
+    use enginebox_core::model::DiskAccounting;
+    // An inventory from an older host agent reports no driver; the host key
+    // declares copy-on-write.
+    let (mut h, f) = production_disk(Value::Null);
+    h.disk_accounting = Some(DiskAccounting::CopyOnWrite);
+    assert!(resource_fits(&h, &f, STANDARD).unwrap());
+    // An explicit overcommit of 1.0 restores strict allocation on btrfs.
+    let (mut h, f) = production_disk(json!("btrfs"));
+    h.disk_overcommit = Some(1.0);
+    assert!(!resource_fits(&h, &f, STANDARD).unwrap());
+    h.disk_overcommit = None;
+    h.disk_accounting = Some(DiskAccounting::Allocated);
+    assert!(!resource_fits(&h, &f, STANDARD).unwrap());
+    for bad in [0.5, 65.0, f64::NAN] {
+        h.disk_overcommit = Some(bad);
+        assert!(h.validate().is_err(), "{bad}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet.toml");
+    let base =
+        "schema_version = 1\n[[hosts]]\nid = \"primary\"\nlabel = \"P\"\ntarget = \"local\"\n";
+    std::fs::write(&path, base).unwrap();
+    let hosts = load_hosts(&path).unwrap();
+    assert_eq!(hosts[0].disk_accounting, None);
+    assert_eq!(hosts[0].disk_overcommit, None);
+    let v = serde_json::to_value(&hosts[0]).unwrap();
+    assert!(v.get("disk_accounting").is_none() && v.get("disk_overcommit").is_none());
+    std::fs::write(
+        &path,
+        format!("{base}disk_accounting = \"copy_on_write\"\ndisk_overcommit = 2.5\n"),
+    )
+    .unwrap();
+    let hosts = load_hosts(&path).unwrap();
+    assert_eq!(hosts[0].disk_accounting, Some(DiskAccounting::CopyOnWrite));
+    assert_eq!(hosts[0].disk_overcommit(DiskAccounting::CopyOnWrite), 2.5);
+    std::fs::write(&path, format!("{base}disk_accounting = \"thin\"\n")).unwrap();
+    assert!(load_hosts(&path).is_err());
+}
+#[test]
+fn bootstrap_admission_accepts_disk_accounting_keys() {
+    let mut c = fixture()["bootstrap"].clone();
+    c["host"]["admission"] = json!({"reserve_cpu":2,"reserve_memory_gib":4,"reserve_disk_gib":10,"max_instances":8,"disk_overcommit":4.0,"disk_accounting":"copy_on_write"});
+    assert!(bootstrap::normalize(c.clone()).is_ok());
+    c["host"]["admission"]["disk_accounting"] = json!("thin");
+    assert!(bootstrap::normalize(c.clone()).is_err());
+    c["host"]["admission"]["disk_accounting"] = json!("allocated");
+    c["host"]["admission"]["disk_overcommit"] = json!(0.5);
+    assert!(bootstrap::normalize(c).is_err());
+}
+#[test]
+fn stale_instances_lists_unreferenced_stopped_bases() {
+    let mut f = facts();
+    let list = f["instances"].as_array_mut().unwrap();
+    for (name, status, project) in [
+        ("ebox-template-aaaa", "Stopped", "enginebox"),
+        ("ebox-template-bbbb", "Stopped", "enginebox"),
+        ("ebox-template-cccc", "Running", "enginebox"),
+        ("ebox-template-dddd", "Stopped", "other"),
+        ("ebox-work", "Stopped", "enginebox"),
+    ] {
+        list.push(json!({"name":name,"project":project,"status":status,"disk_bytes":30*GIB,"state_disk_bytes":6*GIB,"pool":"pool"}));
+    }
+    let stale = enginebox_core::capacity::stale_instances(&host(), &f, &["ebox-template-aaaa"]);
+    let names = stale.iter().map(|v| v["name"].clone()).collect::<Vec<_>>();
+    assert_eq!(names, vec![json!("ebox-base"), json!("ebox-template-bbbb")]);
+    assert_eq!(stale[1]["disk_bytes"], 30 * GIB);
+    // A template whose source is ebox-base keeps it.
+    let stale = enginebox_core::capacity::stale_instances(&host(), &f, &["ebox-base"]);
+    assert_eq!(stale.len(), 2);
+}
 #[test]
 fn actual_free_ram_limits_budget() {
     let mut f = facts();

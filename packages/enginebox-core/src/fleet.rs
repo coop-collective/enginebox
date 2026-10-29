@@ -165,8 +165,23 @@ impl Fleet {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            // Any deployment on this host, current or superseded, keeps its
+            // source; an unreadable registry lists nothing rather than guess.
+            let stale = self
+                .registry
+                .deployments(Some(&h.id))
+                .map(|deployments| {
+                    let mut sources = h
+                        .templates
+                        .iter()
+                        .map(|t| t.source.as_str())
+                        .collect::<Vec<_>>();
+                    sources.extend(deployments.iter().filter_map(|d| d["source"].as_str()));
+                    json!(crate::capacity::stale_instances(h, &facts, &sources))
+                })
+                .unwrap_or(Value::Null);
             Ok(
-                json!({"id":h.id,"label":h.label,"online":true,"capacity":capacity(h,&facts)?,"warm_pools":crate::warm::summary(self,h,&facts),"instances":instances}),
+                json!({"id":h.id,"label":h.label,"online":true,"capacity":capacity(h,&facts)?,"warm_pools":crate::warm::summary(self,h,&facts),"instances":instances,"stale_instances":stale}),
             )
         })();
         status.unwrap_or_else(|_|json!({"id":h.id,"label":h.label,"online":false,"error":"Host inventory unavailable. Check SSH, Incus access and storage configuration.","instances":[]}))

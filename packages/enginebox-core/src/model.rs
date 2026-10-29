@@ -140,6 +140,29 @@ pub struct WarmPolicy {
 /// Default vCPU overcommit for agent workloads, which are mostly idle while a
 /// native client waits on inference.
 pub const DEFAULT_CPU_OVERCOMMIT: f64 = 4.0;
+/// Default disk allocation overcommit on copy-on-write pools (btrfs, zfs),
+/// where clones share blocks with their template until they diverge.
+pub const DEFAULT_COW_DISK_OVERCOMMIT: f64 = 4.0;
+/// Incus storage drivers whose clones share blocks (copy-on-write).
+pub const COPY_ON_WRITE_DRIVERS: [&str; 2] = ["btrfs", "zfs"];
+/// How the admission pool's disk is accounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskAccounting {
+    /// Clones share blocks: admit against actual pool usage, with the sum of
+    /// allocated sizes capped at `(total - reserve) * disk_overcommit`.
+    CopyOnWrite,
+    /// Every allocated byte is reserved (`disk_overcommit` defaults to 1.0).
+    Allocated,
+}
+impl DiskAccounting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CopyOnWrite => "copy_on_write",
+            Self::Allocated => "allocated",
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Host {
@@ -167,6 +190,18 @@ pub struct Host {
     /// overcommitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_overcommit: Option<f64>,
+    /// Disk accounting override. Unset detects copy-on-write from the
+    /// inventoried Incus pool driver (btrfs, zfs) and otherwise accounts
+    /// allocated sizes strictly. Omitted from serialization when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_accounting: Option<DiskAccounting>,
+    /// Disk allocation overcommit ratio (1.0-64.0): the sum of allocated
+    /// root and saved-memory disks may reach `(pool_total - reserve) *
+    /// disk_overcommit`. Unset uses [`DEFAULT_COW_DISK_OVERCOMMIT`] under
+    /// copy-on-write accounting and 1.0 otherwise. Omitted from
+    /// serialization when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_overcommit: Option<f64>,
     /// Concurrent native agent runs admitted on this host (1-256). Unset uses
     /// the controller default; omitted from serialization when unset so older
     /// releases still read generated configuration.
@@ -197,6 +232,8 @@ impl Default for Host {
             contribution_cpu: None,
             contribution_memory_gib: None,
             cpu_overcommit: None,
+            disk_accounting: None,
+            disk_overcommit: None,
             max_agent_runs: None,
             managed_registration: false,
         }
@@ -228,6 +265,9 @@ impl Host {
                 && self.max_agent_runs.is_none_or(|n| (1..=256).contains(&n))
                 && self
                     .cpu_overcommit
+                    .is_none_or(|r| r.is_finite() && (1.0..=64.0).contains(&r))
+                && self
+                    .disk_overcommit
                     .is_none_or(|r| r.is_finite() && (1.0..=64.0).contains(&r)),
             "Invalid host resource bounds"
         );
@@ -282,6 +322,21 @@ impl Host {
     /// Effective vCPU overcommit ratio for admission.
     pub fn cpu_overcommit(&self) -> f64 {
         self.cpu_overcommit.unwrap_or(DEFAULT_CPU_OVERCOMMIT)
+    }
+    /// Effective disk accounting for a pool reported with `driver`
+    /// (`None` when the host inventory predates driver reporting).
+    pub fn disk_accounting(&self, driver: Option<&str>) -> DiskAccounting {
+        self.disk_accounting.unwrap_or(match driver {
+            Some(d) if COPY_ON_WRITE_DRIVERS.contains(&d) => DiskAccounting::CopyOnWrite,
+            _ => DiskAccounting::Allocated,
+        })
+    }
+    /// Effective disk allocation overcommit for `mode`.
+    pub fn disk_overcommit(&self, mode: DiskAccounting) -> f64 {
+        self.disk_overcommit.unwrap_or(match mode {
+            DiskAccounting::CopyOnWrite => DEFAULT_COW_DISK_OVERCOMMIT,
+            DiskAccounting::Allocated => 1.0,
+        })
     }
     pub fn binding(&self) -> Value {
         json!({"target":self.target,"project":self.project,"pool":self.pool,"guest":self.guest,"network":self.network.as_deref().unwrap_or("")})
