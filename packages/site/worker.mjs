@@ -38,10 +38,41 @@ async function artifacts(request, url, env) {
   return artifactsReply(status, result?.body ?? { error: 'upstream' });
 }
 
+// Email sign-in (docs/ORGS.md): the dashboard's signed send requests to
+// /_email/send are forwarded over RPC to the email gateway Worker, which
+// verifies them and sends with its Email Sending binding. This Worker holds no
+// secret. Without the EMAIL_GATEWAY binding the route answers 503.
+const EMAIL_MAX_BODY = 4096;
+async function email(request, url, env) {
+  if (request.method !== 'POST') return artifactsReply(405, { error: 'method_not_allowed' });
+  if (url.pathname !== '/_email/send' || url.search) return artifactsReply(404, { error: 'not_found' });
+  if (request.headers.has('origin')) return artifactsReply(403, { error: 'forbidden' });
+  if (Number(request.headers.get('content-length') ?? 0) > EMAIL_MAX_BODY) return artifactsReply(413, { error: 'too_large' });
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength > EMAIL_MAX_BODY) return artifactsReply(413, { error: 'too_large' });
+  if (!env.EMAIL_GATEWAY) return artifactsReply(503, { error: 'unavailable' });
+  const header = (name) => request.headers.get(name) ?? '';
+  let result;
+  try {
+    result = await env.EMAIL_GATEWAY.send({
+      timestamp: header('x-enginebox-timestamp'),
+      nonce: header('x-enginebox-nonce'),
+      signature: header('x-enginebox-signature'),
+      body: new TextDecoder().decode(bytes),
+    });
+  } catch {
+    console.error(JSON.stringify({ event: 'email_gateway_unavailable' }));
+    return artifactsReply(503, { error: 'unavailable' });
+  }
+  const status = Number.isInteger(result?.status) && result.status >= 200 && result.status <= 599 ? result.status : 502;
+  return artifactsReply(status, result?.body ?? { error: 'upstream' });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/_artifacts' || url.pathname.startsWith('/_artifacts/')) return artifacts(request, url, env);
+    if (url.pathname === '/_email' || url.pathname.startsWith('/_email/')) return email(request, url, env);
     if (url.pathname === '/dashboard') {
       return new Response(null, {
         status: 307,

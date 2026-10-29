@@ -1691,3 +1691,15 @@ input::placeholder {
 .mcp-config { display: block; width: 100%; max-width: 100%; margin-block: 10px; font-family: var(--font-mono, monospace); font-size: 12px; overflow: auto; }
 .mcp-tool-list dt { font-weight: 600; margin-top: 12px; }
 .mcp-tool-list dd { margin: 6px 0 0; overflow-wrap: anywhere; }
+
+/* Email sign-in and the break-glass operator password (docs/ORGS.md). */
+.email-sign-in p { margin: 0 0 12px; }
+.email-sign-in form .button.small { margin-top: 8px; }
+.break-glass { margin-top: 16px; width: 100%; }
+.break-glass summary { cursor: pointer; color: var(--muted, #5b6670); font-size: 13px; }
+.break-glass form { margin-top: 12px; }
+.notice { border: 1px solid var(--line, #d8dee3); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.contributor-panel .table { width: 100%; border-collapse: collapse; }
+.contributor-panel .table th, .contributor-panel .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line, #d8dee3); }
+.contributor-panel .host-card form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.contributor-panel .host-card textarea { width: 100%; }

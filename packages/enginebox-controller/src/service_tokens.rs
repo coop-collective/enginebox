@@ -80,6 +80,10 @@ pub struct Token {
     /// releases still read the record.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub repositories: BTreeSet<RepositoryGrant>,
+    /// The org the token acts for (an OAuth grant's org). Omitted for the
+    /// platform org so older releases still read the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,6 +95,12 @@ impl std::fmt::Debug for Token {
     }
 }
 impl Token {
+    /// The org this token acts for (the platform org when unset).
+    pub fn org(&self) -> &str {
+        self.org_id
+            .as_deref()
+            .unwrap_or(enginebox_agents::pools::DEFAULT_ORG)
+    }
     pub fn principal(&self) -> String {
         format!("service-token:{}", self.id)
     }
@@ -157,6 +167,7 @@ impl Token {
             "pools":self.pools,
             "project":self.project,
             "repositories":self.repositories,
+            "org_id":self.org(),
             "has_callback_secret":self.callback_secret.is_some(),
             "active":self.revoked_at.is_none() && !self.expired(now),
         })
@@ -183,6 +194,9 @@ pub struct MintRequest {
     pub project: Option<String>,
     #[serde(default)]
     pub repositories: Vec<RepositoryGrant>,
+    /// The org the token acts for; omit for the platform org.
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 use enginebox_node_protocol::service_token::{secret_hash, valid_id};
@@ -291,6 +305,20 @@ impl ServiceTokens {
                 "Every granted pool must belong to the token's project"
             );
         }
+        if let Some(org) = &request.org_id {
+            ensure!(
+                enginebox_agents::pools::valid_org(org)
+                    && org != enginebox_agents::pools::DEFAULT_ORG,
+                "org_id must be an org ID other than the platform org (omit it for the platform org)"
+            );
+            // Repository grants are per project, and projects are shared across
+            // orgs; until repository grants are org-scoped only the platform org
+            // may hold them (docs/ORGS.md).
+            ensure!(
+                request.repositories.is_empty(),
+                "Repository grants are available to the platform org only in this release"
+            );
+        }
         for scope in &request.scopes {
             identifier(&scope.host_id, false)?;
             identifier(&scope.name, true)?;
@@ -353,6 +381,7 @@ impl ServiceTokens {
             pools: request.pools.into_iter().collect(),
             project: request.project,
             repositories: request.repositories.into_iter().collect(),
+            org_id: request.org_id,
         };
         self.save(&token)?;
         let public = token.public();
@@ -475,6 +504,7 @@ mod tests {
             pools: vec![],
             project: None,
             repositories: vec![],
+            org_id: None,
         }
     }
     #[test]
@@ -734,6 +764,7 @@ mod tests {
                     pools: BTreeSet::new(),
                     project: None,
                     repositories: BTreeSet::new(),
+                    org_id: None,
                 };
                 tokens.save(&token).unwrap();
                 map.insert(id, token);

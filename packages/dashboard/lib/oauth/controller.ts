@@ -33,6 +33,8 @@ export type TokenGrant = {
   repositories?: RepositoryGrant[];
   callback_secret?: string | null;
   project?: string | null;
+  /** The grant's org; sent only when it is not the platform org, so older controllers keep accepting default-org grants. */
+  org_id?: string | null;
 };
 
 /**
@@ -57,6 +59,7 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
       ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
       // Restricts the pool and repository grants to one project; the controller re-checks it on every request.
       ...(grant.project && (grant.pools.length || repositories.length) ? { project: grant.project } : {}),
+      ...(grant.org_id && grant.org_id !== "default" ? { org_id: grant.org_id } : {}),
     },
   });
   const body = (await response.json().catch(() => null)) as {
@@ -96,7 +99,7 @@ export async function grantableWorkspaces(): Promise<Workspace[]> {
   );
 }
 
-export type Pool = { name: string; project: string; description: string; profile: string | null; members: number };
+export type Pool = { name: string; project: string; description: string; profile: string | null; members: number; org_id: string };
 
 /** Pools listed by a controller without projects belong to this one. */
 export const DEFAULT_PROJECT = "default";
@@ -107,7 +110,7 @@ export const PROJECT = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
 export async function grantablePools(): Promise<Pool[]> {
   const response = await call("v1/pools", { method: "GET" });
   if (!response.ok) throw new HttpError(503, "The fleet service could not list pools.");
-  const body = (await response.json()) as { pools?: { name?: unknown; project?: unknown; description?: unknown; profile?: unknown; members?: unknown }[] };
+  const body = (await response.json()) as { pools?: { name?: unknown; project?: unknown; description?: unknown; profile?: unknown; members?: unknown; org_id?: unknown }[] };
   return (body.pools ?? [])
     .filter((p) => typeof p.name === "string")
     .map((p) => ({
@@ -116,6 +119,7 @@ export async function grantablePools(): Promise<Pool[]> {
       description: typeof p.description === "string" ? p.description : "",
       profile: typeof p.profile === "string" ? p.profile : null,
       members: Array.isArray(p.members) ? p.members.length : 0,
+      org_id: typeof p.org_id === "string" ? p.org_id : "default",
     }))
     .sort((a, b) => a.project.localeCompare(b.project) || a.name.localeCompare(b.name));
 }

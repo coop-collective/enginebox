@@ -1,4 +1,6 @@
-import { bodyJson, config, HttpError, json, requireOrigin, requireSession } from './server';
+import { bodyJson, config, HttpError, json, requireOrigin, requireRole, requireSession } from './server';
+import { DEFAULT_ORG } from './identity/store';
+import { forgetTenancy, hostOrg, tenancy } from './tenancy';
 
 const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result']);
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
@@ -38,7 +40,11 @@ async function forward(path: string, method: string, token: string, body?: unkno
   return value;
 }
 export async function contributors(request: Request, segments: string[]) {
-  requireSession(request);
+  // Enrolling, renewing and revoking machines is fleet administration. Each
+  // machine belongs to one org (docs/ORGS.md): an org sees and manages only its own.
+  const who = request.method === 'GET' ? requireSession(request) : requireRole(request, 'admin');
+  const view = await tenancy();
+  const mine = (id: unknown) => typeof id === 'string' && hostOrg(view, id) === who.org_id;
   if (request.method !== 'GET') requireOrigin(request);
   if (new URL(request.url).search) throw new HttpError(400, 'Query parameters are not supported.');
   const suffix = segments.join('/');
@@ -57,6 +63,8 @@ export async function contributors(request: Request, segments: string[]) {
       if (body.platform !== undefined && body.platform !== 'windows' && body.platform !== 'linux') throw new HttpError(400, 'Choose Windows or Linux.');
       platform = body.platform ?? 'windows';
       if (platform === 'linux') {
+        // Configured Linux servers are part of the install's own configuration.
+        if (who.org_id !== DEFAULT_ORG) throw new HttpError(403, 'Configured Linux servers belong to the platform organization. Enroll a Windows or WSL worker into this organization instead.');
         if (Object.keys(body).some(key => !['platform', 'host_id'].includes(key)) || typeof body.host_id !== 'string' || !/^[a-zA-Z0-9_-]{1,63}$/.test(body.host_id)) throw new HttpError(400, 'Select one configured Linux server.');
         expectedHost = body.host_id;
         path = `/v1/hosts/${expectedHost}/enrollment`;
@@ -72,7 +80,7 @@ export async function contributors(request: Request, segments: string[]) {
       const catalog = await forward('/v1/contributors', 'GET', config().apiToken);
       if (!Array.isArray(catalog.nodes)) throw new HttpError(502, 'Invalid registration inventory.');
       const node = catalog.nodes.find((node: Record<string, unknown>) => node.id === segments[0]);
-      if (!node) throw new HttpError(404, 'Registration unavailable.');
+      if (!node || !mine(node.id)) throw new HttpError(404, 'Registration unavailable.');
       if (node.enrolled || node.revoked) throw new HttpError(409, 'Only a pending registration can be renewed.');
       if (node.kind !== undefined && node.kind !== 'workspace' && node.kind !== 'incus') throw new HttpError(502, 'Unknown registration kind.');
       platform = node.kind === 'incus' ? 'linux' : 'windows';
@@ -85,13 +93,20 @@ export async function contributors(request: Request, segments: string[]) {
     const supervisor = await forward('/__enginebox/status', 'GET', config().apiToken);
     if (supervisor.node_protocol !== 1) throw new HttpError(503, 'The controller supervisor needs the node protocol update before registration.');
   }
+  if (request.method === 'POST' && !enrollment && !mine(segments[0])) throw new HttpError(404, 'Registration unavailable.');
   const result = await forward(path, request.method, config().apiToken, forwardedBody);
+  if (suffix === 'enrollments' && who.org_id !== DEFAULT_ORG && typeof result.id === 'string') {
+    // A machine enrolled from an org belongs to it.
+    await forward(`/v1/tenancy/hosts/${result.id}/org`, 'POST', config().apiToken, { org_id: who.org_id });
+    forgetTenancy();
+  }
   if (enrollment) {
     if ((platform === 'linux' && (result.kind !== 'incus' || result.host_id !== expectedHost)) || (platform === 'windows' && result.kind !== undefined && result.kind !== 'workspace')) throw new HttpError(502, 'The controller returned a different server registration.');
     const command = installCommand(String(result.code), Number(result.expires), platform);
     if (typeof result.id !== 'string' || !String(result.code).startsWith(`${result.id}.`)) throw new HttpError(502, 'Invalid registration identity.');
     return json({ id: result.id, expires: result.expires, code: result.code, command, platform, shell: platform === 'linux' ? 'Bash' : 'PowerShell', host_id: result.host_id ?? null });
   }
+  if (request.method === 'GET' && Array.isArray(result.nodes)) return json({ ...result, nodes: result.nodes.filter((n: { id?: unknown }) => mine(n.id)) });
   return json(result);
 }
 export async function nodeProxy(request: Request, action: string) {

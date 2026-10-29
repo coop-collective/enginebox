@@ -190,9 +190,21 @@ keep strict one-time refresh tokens.
 ## Security model
 
 - **Sign-in** goes through a `UserAuthenticator` interface
-  (`packages/dashboard/lib/oauth/identity.ts`). Today it is the operator password
-  and the existing eight-hour session cookie, sharing the login rate limit; grants
-  are keyed by user ID (`owner`), so per-tenant accounts can replace it.
+  (`packages/dashboard/lib/oauth/identity.ts`) and shares the dashboard's session
+  cookie. With [orgs](ORGS.md) enabled, members sign in with their email on the
+  dashboard in the same browser and choose **Continue**; the form on the consent
+  page is only the host operator's break-glass password. Without orgs it is the
+  operator password, as before.
+- **Who approves.** Approving needs the `admin` or `owner` role in the approver's
+  active org. The grant records the approver (`user_id`: their user ID, or `owner`
+  for the break-glass operator and every grant made before orgs) and the org
+  (`org_id`, absent for the platform org). The approver manages it under **MCP**;
+  so do that org's admins and owners. Consent offers only the org's own pools,
+  platform pools shared with it by a [capacity grant](ORGS.md#capacity-grants), and
+  workspaces on its own machines. Access tokens carry the grant's org; the
+  controller enforces it on every run. Repository grants are platform-org only in
+  this release (projects are shared across orgs). Grants made before orgs belong to
+  the platform org and keep working unchanged, Ideator's included.
 - The session cookie is `SameSite=Strict`, so it is absent on the app's cross-site
   redirect. The first authorize response is a same-origin meta-refresh hop that
   reveals an existing session before asking for a password.
@@ -245,9 +257,9 @@ URL for the owner to open.
 
 ## Not yet
 
-- **Per-tenant user accounts.** One owner today. With accounts, each tenant's
-  consent should offer only workspaces it owns, and scopes should name workspace
-  UUIDs (see [tenant design](TENANT-AGENT-STATE.md)).
+- **Org-scoped repository grants.** Repository projects are shared across orgs, so
+  only the platform org grants repository access in this release. Scopes should
+  also name workspace UUIDs (see [tenant design](TENANT-AGENT-STATE.md)).
 - **Profiles are granted per token, not per workspace.** The controller's
   service-token `profiles` grant applies to every workspace the token names, so a
   profile named on one workspace may be used on the others in the same connection.

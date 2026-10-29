@@ -130,3 +130,31 @@ test('paths that only look like /_artifacts stay static', async () => {
     assert.equal(await response.text(), 'static');
   }
 });
+
+test('signed email requests go to the email gateway over RPC; everything else under /_email is refused', async () => {
+  const calls = [];
+  const env = { EMAIL_GATEWAY: { async send(envelope) { calls.push(envelope); return { status: 200, body: { sent: true } }; } }, ASSETS: { fetch() { throw new Error('must not be static'); } } };
+  const body = JSON.stringify({ template: 'sign_in' });
+  const response = await worker.fetch(new Request('https://example.com/_email/send', { method: 'POST', headers: envelopeHeaders, body }), env);
+  assert.deepEqual([response.status, await response.json()], [200, { sent: true }]);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(calls, [{ timestamp: '1800000000', nonce: '0'.repeat(32), signature: 'v1=' + 'a'.repeat(64), body }]);
+  for (const [method, path, status] of [
+    ['GET', '/_email/send', 405],
+    ['POST', '/_email', 404],
+    ['POST', '/_email/other', 404],
+    ['POST', '/_email/send?x=1', 404],
+  ]) {
+    const r = await worker.fetch(new Request('https://example.com' + path, method === 'POST' ? { method, headers: envelopeHeaders, body: '{}' } : { method }), env);
+    assert.equal(r.status, status, `${method} ${path}`);
+  }
+  assert.equal(calls.length, 1);
+  const browser = await worker.fetch(new Request('https://example.com/_email/send', { method: 'POST', headers: { ...envelopeHeaders, origin: 'https://evil.example' }, body }), env);
+  assert.equal(browser.status, 403);
+  const big = await worker.fetch(new Request('https://example.com/_email/send', { method: 'POST', headers: envelopeHeaders, body: 'x'.repeat(4097) }), env);
+  assert.equal(big.status, 413);
+  const unbound = await worker.fetch(new Request('https://example.com/_email/send', { method: 'POST', headers: envelopeHeaders, body }), {});
+  assert.equal(unbound.status, 503);
+  const down = await worker.fetch(new Request('https://example.com/_email/send', { method: 'POST', headers: envelopeHeaders, body }), { EMAIL_GATEWAY: { send() { throw new Error('private'); } } });
+  assert.equal(down.status, 503);
+});

@@ -57,6 +57,8 @@ export type Code = {
   scope: string;
   resource: string;
   user_id: string;
+  /** The approver's org (absent: the platform org, `default`). */
+  org_id?: string;
   workspaces: WorkspaceGrant[];
   /** Absent in state written before pool grants existed. */
   pools?: PoolGrant[];
@@ -73,7 +75,10 @@ export type Code = {
 /** One client's consented access for one user: a refresh-token family. */
 export type Grant = {
   id: string;
+  /** The approver: a user ID, or "owner" (break-glass operator, and every grant made before orgs). */
   user_id: string;
+  /** The org the grant belongs to (absent: the platform org, `default`). Admins of that org manage it. */
+  org_id?: string;
   client_id: string;
   scope: string;
   resource: string;

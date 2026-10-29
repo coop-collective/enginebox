@@ -14,7 +14,9 @@ import {
   type Pool,
   type Workspace,
 } from "./controller";
-import { users } from "./identity";
+import { DEFAULT_ORG } from "../identity/store";
+import { granted, hostOrg, tenancy } from "../tenancy";
+import { users, type User } from "./identity";
 import { consentPage, errorPage, page, signInPage } from "./pages";
 import {
   randomId,
@@ -260,7 +262,7 @@ function render(
   extra: { error?: string; setCookie?: string; project?: string | null } = {},
 ) {
   return (async () => {
-    const listed = await grantable(extra.project);
+    const listed = await grantable(extra.project, users().current(request)?.org_id ?? DEFAULT_ORG);
     if (!listed) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
     const response = consentPage({
       request: pendingId,
@@ -282,16 +284,21 @@ function render(
  * What the owner can grant. Either list may fail on its own (a host whose
  * inventory cannot be read still leaves its pools grantable); null when both do.
  */
-async function grantable(project?: string | null): Promise<{ workspaces: Workspace[]; pools: Pool[]; projects: string[] } | null> {
-  const [workspaces, pools] = await Promise.allSettled([grantableWorkspaces(), grantablePools()]);
+async function grantable(project: string | null | undefined, org: string): Promise<{ workspaces: Workspace[]; pools: Pool[]; projects: string[] } | null> {
+  const [workspaces, pools, view] = await Promise.allSettled([grantableWorkspaces(), grantablePools(), tenancy()]);
   if (workspaces.status === "rejected" && pools.status === "rejected") return null;
-  const listed = pools.status === "fulfilled" ? pools.value : [];
+  const t = view.status === "fulfilled" ? view.value : { mode: "self_hosted", host_orgs: {}, grants: [] };
+  // An approver grants only their org's pools (and platform pools shared with it) and its own machines.
+  const listed = (pools.status === "fulfilled" ? pools.value : []).filter(
+    (p) => p.org_id === org || (p.org_id === DEFAULT_ORG && granted(t, org, p.name)),
+  );
   return {
-    workspaces: workspaces.status === "fulfilled" ? workspaces.value : [],
+    workspaces: workspaces.status === "fulfilled" ? workspaces.value.filter((w) => hostOrg(t, w.host) === org) : [],
     // An app that asked for one project's pools is offered only those.
     pools: project ? listed.filter((p) => p.project === project) : listed,
     // Repository access is granted per project; an app that asked for one project is offered only it.
-    projects: project ? [project] : await grantableRepositoryProjects(listed),
+    // Projects are shared across orgs, so only the platform org grants repositories in this release.
+    projects: org !== DEFAULT_ORG ? [] : project ? [project] : await grantableRepositoryProjects(listed),
   };
 }
 
@@ -400,6 +407,8 @@ export async function authorizePost(request: Request) {
   }
   const user = users().current(request);
   if (!user) return signInPage(users(), id, client.client_name, "Sign in again to continue.");
+  if (action === "approve" && !user.may_approve)
+    return errorPage("Connecting an app needs the admin or owner role in your organization. Ask an admin to approve it.", 403);
   const consume = () =>
     withState((state) => {
       const index = state.pending.findIndex((p) => p.id_hash === pending.id_hash);
@@ -428,7 +437,7 @@ export async function authorizePost(request: Request) {
     return render(request, id, client, pending.redirect_uri, { project, error: "Select at least one workspace or pool, or a project's repositories." });
   if (chosen.length > MAX_GRANT_WORKSPACES || chosen.length + chosenPools.length + chosenRepositories.length > MAX_GRANT_TARGETS)
     return render(request, id, client, pending.redirect_uri, { project, error: "Select fewer workspaces, pools and projects." });
-  const available = await grantable(project);
+  const available = await grantable(project, user.org_id);
   if (!available) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
   if (chosenRepositories.some((r) => !available.projects.includes(r.project)))
     return render(request, id, client, pending.redirect_uri, { project, error: "A selected project is not available." });
@@ -472,6 +481,7 @@ export async function authorizePost(request: Request) {
       scope: pending.scope,
       resource: pending.resource,
       user_id: user.id,
+      ...(user.org_id !== DEFAULT_ORG ? { org_id: user.org_id } : {}),
       workspaces,
       pools,
       repositories: chosenRepositories,
@@ -698,7 +708,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
   const callbackSecret = randomToken(32);
   let minted: Minted;
   try {
-    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project }, ACCESS_TOKEN_SECONDS);
+    minted = await mintAccessToken(grantId, { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project, org_id: record.org_id }, ACCESS_TOKEN_SECONDS);
   } catch (error) {
     if (error instanceof GrantRefused) throw new OAuthError("invalid_grant", error.message);
     throw error;
@@ -713,6 +723,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
     state.grants.push({
       id: grantId,
       user_id: record.user_id,
+      ...(record.org_id ? { org_id: record.org_id } : {}),
       client_id: client.client_id,
       scope: record.scope,
       resource: record.resource,
@@ -771,7 +782,7 @@ async function refresh(request: Request, form: URLSearchParams) {
   try {
     minted = await mintAccessToken(
       grant.id,
-      { workspaces: grant.workspaces, pools: grant.pools ?? [], repositories: grant.repositories ?? [], callback_secret: grant.callback_secret, project: grant.project },
+      { workspaces: grant.workspaces, pools: grant.pools ?? [], repositories: grant.repositories ?? [], callback_secret: grant.callback_secret, project: grant.project, org_id: grant.org_id },
       ACCESS_TOKEN_SECONDS,
     );
   } catch (error) {
@@ -957,6 +968,11 @@ export async function resourceProxy(request: Request, segments: string[]) {
 
 // ---------------------------------------------------------------- owner grant management
 
+/** A grant's approver manages it; so do the admins and owners of the org it belongs to. */
+function mayManageGrant(user: User, grant: Grant) {
+  return grant.user_id === user.id || (user.may_approve && (grant.org_id ?? DEFAULT_ORG) === user.org_id);
+}
+
 export function listGrants(request: Request) {
   requireSession(request);
   if (!stateDir()) return json({ enabled: false, grants: [] });
@@ -964,7 +980,7 @@ export function listGrants(request: Request) {
   const state = readState();
   const now = Date.now();
   const grants = state.grants
-    .filter((g) => g.revoked_at === null && g.refresh_expires_at > now && g.user_id === user?.id)
+    .filter((g) => g.revoked_at === null && g.refresh_expires_at > now && !!user && mayManageGrant(user, g))
     .map((g) => {
       const client = state.clients.find((c) => c.client_id === g.client_id);
       return {
@@ -993,7 +1009,7 @@ export async function revokeGrantByOwner(request: Request, id: string) {
   if (!/^[a-f0-9]{32}$/.test(id)) throw new HttpError(404, "Unknown connection.");
   const user = users().current(request);
   const found = withState((state, now) => {
-    const grant = state.grants.find((g) => g.id === id && g.user_id === user?.id && g.revoked_at === null);
+    const grant = state.grants.find((g) => g.id === id && !!user && mayManageGrant(user, g) && g.revoked_at === null);
     if (!grant) return false;
     revokeGrantIn(state, grant, "revoked by owner", now);
     return true;

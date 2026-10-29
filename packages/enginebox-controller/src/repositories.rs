@@ -522,8 +522,16 @@ pub struct Record {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_id: Option<String>,
+    /// The org that owns the repository. Omitted for the platform org so
+    /// older releases still read the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
 }
 impl Record {
+    /// The owning org (the platform org when unset).
+    pub fn org(&self) -> &str {
+        self.org_id.as_deref().unwrap_or(pools::DEFAULT_ORG)
+    }
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             pools::valid_project(&self.project)
@@ -535,7 +543,11 @@ impl Record {
                         && self.backend_id.as_deref().is_some_and(|f| {
                             self.remote == format!("https://github.com/{f}.git")
                         })))
-                && self.description.len() <= MAX_DESCRIPTION,
+                && self.description.len() <= MAX_DESCRIPTION
+                && self
+                    .org_id
+                    .as_deref()
+                    .is_none_or(|o| pools::valid_org(o) && o != pools::DEFAULT_ORG),
             "Invalid repository record"
         );
         Ok(())
@@ -544,6 +556,7 @@ impl Record {
         json!({
             "project":self.project,
             "name":self.name,
+            "org_id":self.org(),
             "backend":self.backend,
             "description":self.description,
             "remote":self.remote,
@@ -760,6 +773,10 @@ impl Repositories {
     pub fn exists(&self, project: &str, name: &str) -> bool {
         self.record(project, name).is_ok()
     }
+    /// The org that owns a repository, if it exists.
+    pub fn org_of(&self, project: &str, name: &str) -> Option<String> {
+        self.record(project, name).ok().map(|r| r.org().to_owned())
+    }
     /// `POST /v1/projects/:project/repositories`: create, or return the
     /// existing repository of that name (`false`).
     pub fn create(&self, project: &str, body: &Value) -> Result<(bool, Value)> {
@@ -769,10 +786,18 @@ impl Repositories {
             .ok_or_else(|| invalid("Expected an object."))?;
         if !object
             .keys()
-            .all(|k| ["name", "description"].contains(&k.as_str()))
+            .all(|k| ["name", "description", "org_id"].contains(&k.as_str()))
         {
-            return Err(invalid("Accepted fields: name, description."));
+            return Err(invalid("Accepted fields: name, description, org_id."));
         }
+        // The creating org (the dashboard names it for orgs other than the platform org).
+        let org_id = match body.get("org_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(o)) if pools::valid_org(o) => {
+                (o != pools::DEFAULT_ORG).then(|| o.clone())
+            }
+            Some(_) => return Err(invalid("org_id must be an org ID.")),
+        };
         let name = body["name"].as_str().unwrap_or("");
         if !repository::valid_name(name) {
             return Err(invalid(
@@ -792,6 +817,13 @@ impl Repositories {
         };
         let _creating = self.inner.creating.lock().unwrap();
         if let Ok(existing) = self.record(project, name) {
+            // Idempotent for its own org only; never reveal or return another org's repository.
+            if existing.org_id != org_id {
+                return Err(refuse(
+                    409,
+                    "A repository of that name already exists in this project.",
+                ));
+            }
             return Ok((false, json!({"repository":existing.public(None)})));
         }
         {
@@ -821,6 +853,7 @@ impl Repositories {
             default_branch: created.default_branch,
             created_at: chrono::Utc::now().to_rfc3339(),
             backend_id: created.id,
+            org_id,
         };
         record.validate()?;
         state::write_json(
@@ -913,6 +946,7 @@ impl Repositories {
             default_branch: branch,
             created_at: chrono::Utc::now().to_rfc3339(),
             backend_id: Some(full_name.to_owned()),
+            org_id: None,
         };
         record
             .validate()

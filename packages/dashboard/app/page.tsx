@@ -19,6 +19,8 @@ import { ComputePanel, type Contributor } from "@/components/compute-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
 import { WorkspacesPanel } from "@/components/workspaces-panel";
+import { EmailSignIn } from "@/components/email-sign-in";
+import { OrgPanel } from "@/components/org-panel";
 import { coldSlots, matchingPools, validResources } from "@/lib/resources";
 
 const GiB = 1024 ** 3;
@@ -65,6 +67,7 @@ const sections = {
     icon: "box",
   },
   mcp: { title: "MCP", description: "Connect a client, control workspaces and review app access.", icon: "terminal" },
+  org: { title: "Organization", description: "Members, invites and the organization you are working in.", icon: "lock" },
   apps: {
     title: "MCP",
     description: "Connect a client, control workspaces and review app access.",
@@ -701,6 +704,8 @@ export default function Dashboard() {
     "loading",
   );
   const [password, setPassword] = useState("");
+  // Email sign-in is offered when orgs are enabled; the password is then the host operator's break-glass.
+  const [emailSignIn, setEmailSignIn] = useState(false);
   const [fleet, setFleet] = useState<Fleet | null>(null);
   const [workers, setWorkers] = useState<Contributor[]>([]);
   const [workerNodes, setWorkerNodes] = useState<ComputeNode[]>([]);
@@ -719,8 +724,11 @@ export default function Dashboard() {
   useEffect(() => {
     const panel = new URLSearchParams(window.location.search).get("panel");
     if (panel && Object.hasOwn(sections, panel)) setSection(panel as DashboardSection);
-    api<{ authenticated: boolean }>("/api/session")
-      .then((data) => setSession(data.authenticated ? "ready" : "login"))
+    api<{ authenticated: boolean; email_sign_in?: boolean }>("/api/session")
+      .then((data) => {
+        setEmailSignIn(!!data.email_sign_in);
+        setSession(data.authenticated ? "ready" : "login");
+      })
       .catch((err) => {
         setError(err.message);
         setSession("login");
@@ -936,6 +944,36 @@ export default function Dashboard() {
     total > 0
       ? `${Math.min(100, Math.max(0, (used / total) * 100)).toFixed(1)}%`
       : "—";
+  const passwordForm = (
+    <form onSubmit={signIn}>
+      <label>
+        {emailSignIn ? "Operator password (break-glass)" : "Operator password"}
+        <input
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+          autoFocus={!emailSignIn}
+          placeholder="Enter your dashboard password"
+        />
+      </label>
+      <button
+        className="button primary"
+        disabled={submitting}
+        type="submit"
+      >
+        {submitting ? (
+          <span className="spinner" />
+        ) : (
+          <>
+            Open dashboard
+            <Icon name="arrow" size={17} />
+          </>
+        )}
+      </button>
+    </form>
+  );
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -950,7 +988,7 @@ export default function Dashboard() {
         </a>
         <div className="nav-label">CONTROL PLANE</div>
         <nav aria-label="Control plane">
-          {(["fleet", "workspaces", "agents", "templates", "environments", "mcp"] as const)
+          {(["fleet", "workspaces", "agents", "templates", "environments", "mcp", "org"] as const)
             .filter((item) => session === "ready" || item === "fleet")
             .map((item) => (
               <button
@@ -1026,34 +1064,17 @@ export default function Dashboard() {
                   Checking your session…
                 </div>
               ) : (
-                <form onSubmit={signIn}>
-                  <label>
-                    Operator password
-                    <input
-                      type="password"
-                      autoComplete="current-password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      required
-                      autoFocus
-                      placeholder="Enter your dashboard password"
-                    />
-                  </label>
-                  <button
-                    className="button primary"
-                    disabled={submitting}
-                    type="submit"
-                  >
-                    {submitting ? (
-                      <span className="spinner" />
-                    ) : (
-                      <>
-                        Open dashboard
-                        <Icon name="arrow" size={17} />
-                      </>
-                    )}
-                  </button>
-                </form>
+                emailSignIn ? (
+                  <>
+                    <EmailSignIn onSignedIn={() => setSession("ready")} />
+                    <details className="break-glass">
+                      <summary>Host operator? Sign in with the break-glass password</summary>
+                      {passwordForm}
+                    </details>
+                  </>
+                ) : (
+                  passwordForm
+                )
               )}
               <span className="login-foot">
                 Your session stays in this browser.
@@ -1115,6 +1136,7 @@ export default function Dashboard() {
               )}
               {section === "environments" && <EnvironmentsPanel />}
               {["mcp", "apps"].includes(section) && <ConnectedAppsPanel />}
+              {section === "org" && <OrgPanel onSwitched={() => window.location.reload()} />}
               {section === "fleet" && (
                 <>
                   <div className="stat-grid">

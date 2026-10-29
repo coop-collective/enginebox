@@ -145,6 +145,10 @@ pub struct Profile {
     pub name: String,
     #[serde(default = "owner")]
     pub owner: String,
+    /// The org that owns the profile. Absent (and never written) for the
+    /// platform org, so records stay readable by releases before orgs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// Template the workspace must have been created from (for example one
@@ -244,6 +248,12 @@ impl Profile {
             "Profile name must match ^[a-z][a-z0-9-]{{0,62}}$."
         );
         ensure!(self.owner == OWNER, "Profiles are owner-managed.");
+        if let Some(org) = &self.org_id {
+            ensure!(
+                crate::pools::valid_org(org) && org != crate::pools::DEFAULT_ORG,
+                "org_id must be an org ID other than the platform org (omit it for the platform org)."
+            );
+        }
         ensure!(
             self.description.len() <= 512 && !self.description.chars().any(char::is_control),
             "description must be at most 512 printable bytes."
@@ -287,6 +297,7 @@ impl Profile {
         json!({
             "name":self.name,
             "owner":self.owner,
+            "org_id":self.org_id.as_deref().unwrap_or(crate::pools::DEFAULT_ORG),
             "description":self.description,
             "template":self.template,
             "providers":providers,

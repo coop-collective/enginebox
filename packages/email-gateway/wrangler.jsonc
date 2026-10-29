@@ -1,0 +1,27 @@
+// Engine Box email gateway: the shape of its Worker configuration.
+// Deploys use the private file `pnpm configure` writes to
+// .state/email-gateway/wrangler.json (account, sender address and dashboard
+// origin). This committed file carries no account and serves local
+// development only. The gateway has no hostname: the site Worker calls it over
+// a service binding with entrypoint "EmailGateway".
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "enginebox-email-gateway",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-10-23",
+  // Not reachable over HTTP: no route, no workers.dev, no preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  // Cloudflare Email Sending, restricted to the one sender address.
+  "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["login@example.com"] }],
+  "vars": {
+    "FROM_ADDRESS": "login@example.com",
+    "FROM_NAME": "Engine Box",
+    "DASHBOARD_ORIGIN": "http://127.0.0.1:3000"
+  },
+  // Replay cache for request nonces (one instance).
+  "durable_objects": { "bindings": [{ "name": "REPLAY", "class_name": "ReplayGuard" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ReplayGuard"] }],
+  "observability": { "enabled": true }
+  // EMAIL_GATEWAY_SECRET is a Worker secret: `pnpm secret` (never a var).
+}

@@ -49,13 +49,15 @@ export function signInPage(users: UserAuthenticator, request: string, clientName
   const fields = users.signInFields
     .map((f) => `<label class="field">${escape(f.label)}<input type="${f.type}" name="${escape(f.name)}" required autocomplete="${f.type === "password" ? "current-password" : "username"}"></label>`)
     .join("");
+  const hint = users.signInHint?.() ?? null;
   return page(
     "Sign in to Engine Box",
     `<h1>Sign in to Engine Box</h1><p class="muted">“${escape(clientName)}” is asking to connect. Sign in to review what it can access.</p>` +
       (error ? `<p class="warn" role="alert">${escape(error)}</p>` : "") +
+      (hint ? `<p>${escape(hint)}</p>` : "") +
       `<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escape(request)}"><input type="hidden" name="action" value="sign_in">${fields}` +
       `<div class="actions"><button class="primary" type="submit">Sign in</button></div></form>` +
-      (continueUrl ? `<p class="muted">Already signed in on this browser? <a href="${escape(continueUrl)}">Continue</a>.</p>` : ""),
+      (continueUrl || hint ? `<p class="muted">Already signed in on this browser? <a href="${escape(continueUrl ?? `/oauth/authorize?request=${encodeURIComponent(request)}`)}">Continue</a>.</p>` : ""),
   );
 }
 
