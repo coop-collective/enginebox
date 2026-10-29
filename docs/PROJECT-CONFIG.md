@@ -189,6 +189,35 @@ registers does not affect security, because a config only declares. A run on
 another branch still uses the default branch's config: changes to what a
 repository asks for take effect when they are merged.
 
+### Generating a config
+
+A repository without its own `.enginebox/config.json` shows **No agent config**
+on the dashboard's Connections page. **Generate** (org owners and admins) calls
+`POST /v1/projects/{p}/repositories/{n}/agent-config/generate {pool?, provider?, force?}`
+(owner token only; audited as `repo.config_generate`). The controller starts one
+run in the repository's project pool (the first pool of the org in that project
+unless `pool` names one; provider `codex` unless named) with `run_kind: "config"`
+and a fixed prompt kept in the controller (`repo_generate.rs`), never taken from
+the request. The agent inspects the repository (package manager, lockfiles,
+scripts, Wrangler and test setup, CI), writes a schema version 2 file with one
+default profile (setup, test and dev argv, non-secret env, secret requirements by
+name and qualifier only), checks that it parses, and pushes it to the branch
+`enginebox/agent-config`. A repository that already has its own config is
+refused (409) unless `force` is true; one generation runs at a time (409).
+
+The generation's state is reported as `generation` on `GET …/requirements`:
+`running`, then `succeeded` or `failed` (with a short reason). When the run
+succeeds on a **GitHub** repository the controller opens a pull request from
+`enginebox/agent-config` into the selected branch through the repository GitHub
+App, or reuses the one already open (`pr_url`, `pr_number`; audited as
+`repo.config_generated`). The App needs the repository permission **Pull
+requests: read and write**; without it the generation records `pr_error` and the
+request is retried at most every five minutes when the generation is read. On a
+**hosted** repository the branch waits for review (`branch`). Nothing is merged
+automatically: the config takes effect only on the default branch, where the
+controller reads it before each run, and its requirements still need approved
+mappings.
+
 ### API and tools
 
 | Route | Who | Purpose |
@@ -198,6 +227,7 @@ repository asks for take effect when they are merged.
 | `POST …/requirements/propose` | owner; service tokens with a repository grant | `{repo_profile, kind?, requirement, connection?, source_name?}` |
 | `POST …/requirements/approve` | owner token only (dashboard: org owners and admins) | same body; replaces any earlier mapping for the requirement |
 | `POST …/requirements/revoke` | owner token only | `{repo_profile, kind?, requirement}` |
+| `POST …/agent-config/generate` | owner token only (dashboard: org owners and admins) | `{pool?, provider?, force?}`: start a run that proposes the config ([Generating a config](#generating-a-config)) |
 
 `kind` is `secret` (default), `mcp` or `mcp_server`. `source_name` names the value
 in the secret source when it differs from the requirement name. Every write is

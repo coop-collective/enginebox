@@ -4,7 +4,8 @@ import { api, errorMessage } from "@/lib/client";
 
 type Repo = { project: string; name: string };
 type Requirement = { kind: "secret" | "mcp" | "mcp_server"; name: string; qualifier: string; run_kinds: string[]; required: boolean; status: "met" | "unmet" | "proposed" | "needs_reapproval"; mapping: { connection?: string; source_name?: string; qualifier: string; proposed_by: string; approved_by?: string } | null };
-type Report = { configured: boolean; commit?: string | null; registered_at?: string; profiles: Record<string, { default: boolean; description?: string | null; requirements: Requirement[] }>; dev?: Requirement[]; can_manage: boolean };
+type Generation = { run_id: string; state: "running" | "succeeded" | "failed"; started_at: string; failure?: string; branch?: string; pr_url?: string; pr_number?: number; pr_error?: string };
+type Report = { configured: boolean; source?: "repository" | "registered"; generation?: Generation | null; commit?: string | null; registered_at?: string; profiles: Record<string, { default: boolean; description?: string | null; requirements: Requirement[] }>; dev?: Requirement[]; can_manage: boolean };
 
 const statusLabel = { met: "Met", unmet: "Unmet", proposed: "Proposed", needs_reapproval: "Needs re-approval" } as const;
 
@@ -37,6 +38,26 @@ export function RepoRequirementsPanel({ sources, mcps }: { sources: string[]; mc
     }
   }, [selected]);
   useEffect(() => { void load(); }, [load]);
+  // A running generation settles on the controller; check again until it does.
+  const running = report?.generation?.state === "running";
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => void load(), 10_000);
+    return () => clearInterval(timer);
+  }, [running, load]);
+
+  async function generate() {
+    setBusy("generate");
+    setError("");
+    try {
+      await api(`/api/catalog/repositories/${selected}/generate`, { method: "POST", body: JSON.stringify({}) });
+      await load();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  }
 
   async function approve(profile: string, r: Requirement) {
     const key = `${profile}:${r.kind}:${r.name}`;
@@ -63,7 +84,7 @@ export function RepoRequirementsPanel({ sources, mcps }: { sources: string[]; mc
       <select value={selected} onChange={(e) => setSelected(e.target.value)} aria-label="Repository">
         {repos.map((r) => <option key={`${r.project}/${r.name}`} value={`${r.project}/${r.name}`}>{r.project}/{r.name}</option>)}
       </select>
-      {report && !report.configured && <p>No agent configuration has been registered for this repository.</p>}
+      {report && report.source !== "repository" && <GenerateBanner report={report} busy={!!busy} onGenerate={generate} />}
       {report?.configured && (
         <div className="catalog-scroll">
           <table className="table">
@@ -99,6 +120,33 @@ export function RepoRequirementsPanel({ sources, mcps }: { sources: string[]; mc
             </tbody>
           </table>
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A repository without its own .enginebox/config.json: owners and admins can
+ * have an agent write one to a branch for review (a pull request on GitHub).
+ */
+function GenerateBanner({ report, busy, onGenerate }: { report: Report; busy: boolean; onGenerate: () => void }) {
+  const g = report.generation;
+  return (
+    <div className="alert" role="region" aria-label="Agent config">
+      <strong>No agent config</strong>
+      <p>
+        {report.configured
+          ? "This repository has no .enginebox/config.json of its own; runs use a config registered through the API."
+          : "This repository has no .enginebox/config.json, so runs get no setup, test or dev commands and no declared secrets."}{" "}
+        An agent can inspect the repository and propose one for review. Nothing applies until it is merged.
+      </p>
+      {g?.state === "running" && <p role="status">Generating… (run <span className="mono">{g.run_id.slice(0, 8)}</span>)</p>}
+      {g?.state === "succeeded" && g.pr_url && <p role="status">Ready for review: <a href={g.pr_url} target="_blank" rel="noreferrer">pull request #{g.pr_number}</a></p>}
+      {g?.state === "succeeded" && !g.pr_url && !g.pr_error && <p role="status">Ready for review on branch <span className="mono">{g.branch}</span>.</p>}
+      {g?.state === "succeeded" && g.pr_error && <p role="status">The config is on branch <span className="mono">{g.branch}</span>, but no pull request was opened: {g.pr_error}</p>}
+      {g?.state === "failed" && <p role="status">Generation failed: {g.failure}</p>}
+      {report.can_manage && g?.state !== "running" && (
+        <button className="button small" disabled={busy} onClick={onGenerate}>{g ? "Generate again" : "Generate"}</button>
       )}
     </div>
   );

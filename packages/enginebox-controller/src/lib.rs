@@ -14,6 +14,7 @@ pub mod kitbash;
 pub mod metering;
 pub mod profiles;
 pub mod repo_config;
+pub mod repo_generate;
 pub mod repo_source;
 pub mod repositories;
 pub mod service_tokens;
@@ -71,6 +72,7 @@ struct Runtime {
     profiles: profiles::Profiles,
     catalog: catalog::Catalog,
     repo_config: repo_config::RepoRequirements,
+    generations: repo_generate::Generations,
     repositories: repositories::Repositories,
     tenancy: tenancy::Tenancy,
     usage: Arc<dyn metering::UsageSink>,
@@ -207,6 +209,7 @@ impl Controller {
             profiles,
             catalog,
             repo_config: repo_config::RepoRequirements::open(&self.root)?,
+            generations: repo_generate::Generations::open(&self.root),
             tenancy: tenancy::Tenancy::open(&self.root)?,
             credentials: credentials::Credentials::open(
                 &self.root,
@@ -1067,9 +1070,10 @@ fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Resul
                     && runtime.repositories.exists(project, name),
                 "Unknown repository"
             );
-            runtime
-                .repo_config
-                .report(org, &repo_config::repository_ref(project, name))
+            let repository = repo_config::repository_ref(project, name);
+            let mut report = runtime.repo_config.report(org, &repository)?;
+            report["generation"] = json!(generation(&runtime, org, project, name));
+            Ok(report)
         }
         ["v1", "profiles"] => {
             let runtime = c.runtime()?;
@@ -1154,6 +1158,197 @@ fn acting_org(
                 .ok_or("X-EngineBox-Org must be an org ID."),
         },
     }
+}
+
+/// The repository's latest config generation, settled from its run and with
+/// its pull request opened once the run succeeded (repo_generate.rs).
+fn generation(
+    runtime: &Runtime,
+    org: &str,
+    project: &str,
+    name: &str,
+) -> Option<repo_generate::Generation> {
+    let repository = repo_config::repository_ref(project, name);
+    let mut g = runtime.generations.get(org, &repository)?;
+    let (pool, run_id) = (g.pool.clone(), g.run_id.clone());
+    let changed = repo_generate::reconcile(
+        &mut g,
+        || runtime.agents.get_pool_run(&pool, &run_id),
+        || {
+            runtime.repositories.open_pull_request(
+                project,
+                name,
+                repo_generate::BRANCH,
+                "Add Engine Box agent config",
+                &repo_generate::pr_body(&run_id),
+            )
+        },
+    );
+    if changed {
+        if let Err(error) = runtime.generations.put(&g) {
+            eprintln!(
+                "{}",
+                json!({"event":"enginebox.repo_config.generation_save_failed","repository":repository,"reason":error.to_string()})
+            );
+        }
+        if g.pr_url.is_some() || g.state == "failed" {
+            let detail = json!({"run_id": g.run_id, "state": g.state, "pr_url": g.pr_url, "failure": g.failure});
+            runtime.catalog.audit.record(
+                org,
+                "controller",
+                "repo.config_generated",
+                &repository,
+                g.state != "failed",
+                detail,
+            );
+        }
+    }
+    Some(g)
+}
+
+/// `POST …/repositories/{name}/agent-config/generate {pool?, provider?, force?}`:
+/// start an agent run that writes the repository's `.enginebox/config.json`
+/// and pushes it to a branch for review (docs/PROJECT-CONFIG.md, "Generating a
+/// config"). Owner token only (the dashboard limits it to org owners and
+/// admins); audited as `repo.config_generate`.
+#[allow(clippy::too_many_arguments)]
+async fn generate_config(
+    runtime: &Runtime,
+    org: &str,
+    actor: &str,
+    principal: &Principal,
+    project: &str,
+    name: &str,
+    body: Value,
+) -> Result<(StatusCode, Value)> {
+    let repository = repo_config::repository_ref(project, name);
+    let refuse = |status: StatusCode, message: &str| -> Result<(StatusCode, Value)> {
+        runtime.catalog.audit.record(
+            org,
+            actor,
+            "repo.config_generate",
+            &repository,
+            false,
+            json!({"reason": message}),
+        );
+        Ok((status, json!({"error": message})))
+    };
+    if !matches!(principal, Principal::Owner) {
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "Only an owner or admin generates a repository config.",
+        );
+    }
+    if keys(&body, &["pool", "provider", "force"], &[]).is_err()
+        || body.get("force").is_some_and(|f| !f.is_boolean())
+    {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The request accepts pool, provider and force.",
+        );
+    }
+    if !(runtime.repositories.exists(project, name)
+        && repo_config::same_org(org, runtime.repositories.org_of(project, name)))
+    {
+        return refuse(StatusCode::NOT_FOUND, "Unknown repository.");
+    }
+    let force = body["force"] == true;
+    if !force
+        && runtime
+            .repo_config
+            .snapshot(&repository)
+            .is_some_and(|s| s.org_id == org && s.registered_by == repo_config::SOURCE_ACTOR)
+    {
+        return refuse(
+            StatusCode::CONFLICT,
+            "The repository already has its own .enginebox/config.json; pass force to generate a new one.",
+        );
+    }
+    let previous = {
+        let (r, o, p, n) = (
+            runtime.clone(),
+            org.to_owned(),
+            project.to_owned(),
+            name.to_owned(),
+        );
+        blocking(move || Ok(generation(&r, &o, &p, &n))).await?
+    };
+    if previous.as_ref().is_some_and(|g| g.state == "running") {
+        return refuse(
+            StatusCode::CONFLICT,
+            "A config generation is already running for this repository.",
+        );
+    }
+    let pool = match body.get("pool").and_then(Value::as_str) {
+        Some(pool) => pool.to_owned(),
+        None => match runtime
+            .agents
+            .pools()
+            .in_project(project)
+            .into_iter()
+            .find(|p| p.org() == org)
+        {
+            Some(pool) => pool.name,
+            None => {
+                return refuse(
+                    StatusCode::CONFLICT,
+                    "The repository's project has no pool to run the generation in.",
+                );
+            }
+        },
+    };
+    let provider = body
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("codex")
+        .to_owned();
+    let started_at = chrono::Utc::now();
+    let request = json!({
+        "provider": provider,
+        "prompt": repo_generate::PROMPT,
+        "workdir": ".",
+        "timeout_seconds": repo_generate::TIMEOUT_SECONDS,
+        "repository": repository,
+        "run_kind": repo_generate::RUN_KIND,
+    });
+    let (status, value) = start_run(
+        runtime,
+        RunTarget::Pool(pool.clone()),
+        request,
+        principal,
+        org,
+    )
+    .await?;
+    let Some(run_id) = value["run"]["id"].as_str().filter(|_| status.is_success()) else {
+        let reason = value["error"].as_str().unwrap_or("The run did not start.");
+        return refuse(status, reason);
+    };
+    let g = repo_generate::Generation {
+        repository: repository.clone(),
+        org_id: org.to_owned(),
+        run_id: run_id.to_owned(),
+        pool: pool.clone(),
+        provider: provider.clone(),
+        started_by: actor.to_owned(),
+        started_at: started_at.to_rfc3339(),
+        state: "running".into(),
+        failure: None,
+        branch: None,
+        pr_url: None,
+        pr_number: None,
+        pr_error: None,
+        pr_attempted_at: None,
+    };
+    runtime.generations.put(&g)?;
+    runtime.catalog.audit.record(
+        org,
+        actor,
+        "repo.config_generate",
+        &repository,
+        true,
+        json!({"pool": pool, "provider": provider, "run_id": run_id, "force": force}),
+    );
+    Ok((StatusCode::ACCEPTED, json!({"generation": g})))
 }
 
 /// Repository config writes (docs/PROJECT-CONFIG.md): register the config a
@@ -1367,6 +1562,19 @@ async fn write(
         })
         .await?;
         return Ok((StatusCode::from_u16(status)?, value));
+    }
+    if let [
+        "v1",
+        "projects",
+        project,
+        "repositories",
+        name,
+        "agent-config",
+        "generate",
+    ] = routed.as_slice()
+    {
+        let runtime = c.runtime()?;
+        return generate_config(&runtime, &org, &actor, &principal, project, name, body).await;
     }
     if let ["v1", "projects", project, "repositories", name, rest @ ..] = routed.as_slice()
         && matches!(
@@ -4749,6 +4957,134 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    }
+
+    #[tokio::test]
+    async fn generating_a_config_starts_one_run_and_reports_its_outcome() {
+        const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+        let (_temp, c) = setup();
+        let api = repositories::mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]);
+        c.set_repository_transport(api.clone());
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let post = |path: &str, body: Value| request(Method::POST, path, &body.to_string(), true);
+        let config = json!({"url":repositories::mock::URL,"namespace_prefix":"eb","secret":repositories::mock::SECRET}).to_string();
+        call(
+            &app,
+            request(
+                Method::PUT,
+                "/v1/repository-backends/artifacts-worker",
+                &config,
+                true,
+            ),
+        )
+        .await;
+        call(&app, post("/v1/pools", json!({"name":"alpha-w","project":"alpha","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}))).await;
+        call(
+            &app,
+            post("/v1/projects/alpha/repositories", json!({"name":"site"})),
+        )
+        .await;
+        let base = "/v1/projects/alpha/repositories/site";
+        let generate = format!("{base}/agent-config/generate");
+        assert_eq!(
+            call(&app, post(&generate, json!({"prompt":"anything"})))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, started) = call(&app, post(&generate, json!({"provider":"claude"}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let g = &started["generation"];
+        assert_eq!(
+            (g["pool"].as_str(), g["state"].as_str()),
+            (Some("alpha-w"), Some("running"))
+        );
+        let run_id = g["run_id"].as_str().unwrap().to_owned();
+        let (_, run) = call(
+            &app,
+            request(
+                Method::GET,
+                &format!("/v1/pools/alpha-w/agent-runs/{run_id}"),
+                "",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(run["run"]["repository"], "alpha/site", "{run}");
+        assert!(
+            run["run"]["task"]
+                .as_str()
+                .unwrap()
+                .contains(repo_generate::BRANCH)
+        );
+        // One generation at a time.
+        assert_eq!(
+            call(&app, post(&generate, json!({"provider":"claude"})))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        // The run's outcome reaches the report.
+        call(
+            &app,
+            post(
+                &format!("/v1/pools/alpha-w/agent-runs/{run_id}/cancel"),
+                json!({}),
+            ),
+        )
+        .await;
+        let (_, report) = call(
+            &app,
+            request(Method::GET, &format!("{base}/requirements"), "", true),
+        )
+        .await;
+        assert_eq!(report["generation"]["state"], "failed", "{report}");
+        assert!(report["source"].is_null());
+        assert!(
+            report["generation"]["failure"]
+                .as_str()
+                .unwrap()
+                .starts_with("The run cancelled")
+        );
+        // A repository with its own config needs force.
+        c.runtime()
+            .unwrap()
+            .repo_config
+            .register(
+                enginebox_agents::pools::DEFAULT_ORG,
+                repo_config::SOURCE_ACTOR,
+                "alpha/site",
+                &json!({"commit":"0123abcd","config":repo_config::tests::workers_config()}),
+            )
+            .unwrap();
+        let (_, report) = call(
+            &app,
+            request(Method::GET, &format!("{base}/requirements"), "", true),
+        )
+        .await;
+        assert_eq!(report["source"], "repository");
+        assert_eq!(
+            call(&app, post(&generate, json!({"provider":"claude"})))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            call(
+                &app,
+                post(&generate, json!({"provider":"claude","force":true}))
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+        let (_, audit) = call(&app, request(Method::GET, "/v1/audit", "", true)).await;
+        let generated = audit.to_string();
+        assert!(
+            generated.contains("repo.config_generate")
+                && generated.contains("repo.config_generated")
+        );
     }
 
     #[tokio::test]

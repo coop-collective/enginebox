@@ -99,3 +99,32 @@ test("Profiles shows the profile, its connections, per-run-kind policy and recen
   await panel.getByRole("button", { name: "Detach" }).first().click();
   await expect.poll(() => fixture.posts.find((p) => p.url.endsWith("/connections/detach"))?.body).toEqual({ connection: "kitbash" });
 });
+
+test("A repository without its own agent config can generate one for review", async ({ page }) => {
+  let generation: Record<string, unknown> | null = null;
+  const posts: { url: string; body: unknown }[] = [];
+  await page.route("**/api/catalog/**", async (route) => {
+    const url = new URL(route.request().url()).pathname;
+    if (route.request().method() === "POST") {
+      posts.push({ url, body: route.request().postDataJSON() });
+      generation = { run_id: "0123456789abcdef0123456789abcdef", state: "running", started_at: "2026-10-29T02:00:00Z" };
+      return route.fulfill({ status: 202, json: { generation } });
+    }
+    if (url === "/api/catalog/connections") return route.fulfill({ json: { connections: [], can_manage: true, role: "owner" } });
+    if (url === "/api/catalog/repositories") return route.fulfill({ json: { repositories: [{ project: "alpha", name: "site" }], can_manage: true } });
+    if (url === "/api/catalog/repositories/alpha/site") return route.fulfill({ json: { configured: false, profiles: {}, generation, can_manage: true } });
+    return route.fulfill({ status: 404, json: { error: "Unknown" } });
+  });
+  await open(page, "/?panel=connections");
+  const banner = page.getByRole("region", { name: "Agent config" });
+  await expect(banner.getByText("No agent config", { exact: true })).toBeVisible();
+  await banner.getByRole("button", { name: "Generate" }).click();
+  await expect(banner.getByRole("status")).toContainText("Generating… (run 01234567)");
+  expect(posts).toEqual([{ url: "/api/catalog/repositories/alpha/site/generate", body: {} }]);
+  await expect(banner.getByRole("button", { name: /Generate/ })).toHaveCount(0);
+  // The run succeeded and the controller opened the pull request.
+  generation = { ...generation!, state: "succeeded", branch: "enginebox/agent-config", pr_url: "https://github.com/alpha/site/pull/4", pr_number: 4 };
+  await page.reload();
+  await expect(banner.getByRole("link", { name: "pull request #4" })).toHaveAttribute("href", "https://github.com/alpha/site/pull/4");
+  await expect(banner.getByRole("button", { name: "Generate again" })).toBeVisible();
+});

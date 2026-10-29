@@ -140,6 +140,14 @@ pub trait GithubLink: Send + Sync {
     fn selected_branch(&self, full_name: &str) -> Option<String>;
     /// A single-repository installation token (about an hour).
     fn token(&self, full_name: &str, write: bool) -> Result<String>;
+    /// Open (or find the open) pull request from `head`: `{number, url, reused}`.
+    fn open_pull_request(
+        &self,
+        full_name: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Value>;
 }
 impl GithubLink for enginebox_github::GitHub {
     fn selected_branch(&self, full_name: &str) -> Option<String> {
@@ -148,6 +156,15 @@ impl GithubLink for enginebox_github::GitHub {
     fn token(&self, full_name: &str, write: bool) -> Result<String> {
         let minted = self.transfer_credential(full_name, None, write)?;
         Ok(minted["token"].as_str().unwrap_or("").to_owned())
+    }
+    fn open_pull_request(
+        &self,
+        full_name: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Value> {
+        enginebox_github::GitHub::open_pull_request(self, full_name, head, title, body)
     }
 }
 /// GitHub installation tokens last an hour.
@@ -1109,6 +1126,25 @@ impl Repositories {
     pub fn run_credential(&self, reference: &str, ttl: u64) -> Result<repository::Credential> {
         self.credential(reference, Access::Write, ttl)
     }
+    /// Open a pull request from `head` on a GitHub-linked repository; None for
+    /// repositories on another backend, which have no pull requests.
+    pub fn open_pull_request(
+        &self,
+        project: &str,
+        name: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Option<Value>> {
+        let record = self.record(project, name)?;
+        if record.backend != GITHUB_KIND {
+            return Ok(None);
+        }
+        let full_name = record.backend_id.as_deref().unwrap_or("");
+        self.github()?
+            .open_pull_request(full_name, head, title, body)
+            .map(Some)
+    }
     /// A read token for the controller's own reads (the repository config).
     pub fn read_credential(&self, reference: &str, ttl: u64) -> Result<repository::Credential> {
         self.credential(reference, Access::Read, ttl)
@@ -1569,6 +1605,17 @@ mod tests {
                 .unwrap()
                 .push((full_name.to_owned(), write));
             Ok("ghs_fixture0123456789abcdefghijklmnop".to_owned())
+        }
+        fn open_pull_request(
+            &self,
+            full_name: &str,
+            head: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<Value> {
+            Ok(
+                json!({"number":1,"url":format!("https://github.com/{full_name}/pull/1"),"head":head,"reused":false}),
+            )
         }
     }
 
