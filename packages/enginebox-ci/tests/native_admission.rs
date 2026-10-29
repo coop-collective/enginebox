@@ -11,6 +11,7 @@ use std::{
 #[test]
 fn capacity_shortage_never_allocates_or_delivers_jit_and_cannot_replay() {
     let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let state = root.path().join("state");
     let bin = root.path().join("bin");
     fs::create_dir(&bin).unwrap();
