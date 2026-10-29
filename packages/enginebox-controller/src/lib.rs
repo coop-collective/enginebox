@@ -4,6 +4,7 @@ pub mod ci;
 mod ci_templates;
 mod compute;
 pub mod contributors;
+pub mod credentials;
 mod environment;
 pub mod jobs;
 pub mod metering;
@@ -65,6 +66,7 @@ struct Runtime {
     repositories: repositories::Repositories,
     tenancy: tenancy::Tenancy,
     usage: Arc<dyn metering::UsageSink>,
+    credentials: credentials::Credentials,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -186,6 +188,10 @@ impl Controller {
             service_tokens: service_tokens::ServiceTokens::open(&self.root)?,
             profiles: profiles::Profiles::open(&self.root)?,
             tenancy: tenancy::Tenancy::open(&self.root)?,
+            credentials: credentials::Credentials::open(
+                &self.root,
+                &std::collections::BTreeMap::new(),
+            )?,
             usage: self.usage_sink.lock().unwrap().clone(),
             repositories: match self.repository_transport.lock().unwrap().clone() {
                 Some(transport) => {
@@ -650,9 +656,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         };
         let operation = controller.clone();
         let reader = principal.clone();
+        let acting = org.clone();
         let result = blocking(move || {
             let _admission = admission;
-            read(&operation, &parts, &reader)
+            read(&operation, &parts, &reader, &acting)
         })
         .await;
         if let Ok(value) = &result
@@ -873,7 +880,7 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
     }
 }
 
-fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
+fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
         ["v1", "hosts", host, "admission"] => {
@@ -916,6 +923,10 @@ fn read(c: &Controller, p: &[String], principal: &Principal) -> Result<Value> {
         }
         ["v1", "agents"] => c.runtime()?.agents.status(),
         ["v1", "tenancy"] => Ok(c.runtime()?.tenancy.view()),
+        ["v1", "credentials"] => Ok(c.runtime()?.credentials.list(org)),
+        ["v1", "credentials", id, "sessions", session] => {
+            c.runtime()?.credentials.login_status(org, id, session)
+        }
         ["v1", "agent-runs"] => {
             let agents = c.runtime()?.agents;
             let project_of = |pool: &str| agents.pools().project_of(pool);
@@ -1385,6 +1396,27 @@ async fn write(
             runtime.tenancy.grant(&body, &|p| {
                 agents.pools().get(p).map(|pool| pool.org().to_owned())
             })?
+        }
+        ["v1", "credentials"] => {
+            code = StatusCode::CREATED;
+            runtime.credentials.create(&org, &body)?
+        }
+        ["v1", "credentials", id, "share"] => runtime.credentials.share(&org, id, &body)?,
+        ["v1", "credentials", id, "delete"] => {
+            empty(&body)?;
+            runtime.credentials.delete(&org, id)?
+        }
+        ["v1", "credentials", id, "login"] => {
+            empty(&body)?;
+            code = StatusCode::ACCEPTED;
+            json!({"session":runtime.credentials.start_login(&org, id)?})
+        }
+        ["v1", "credentials", id, "sessions", session, "input"] => {
+            json!({"session":runtime.credentials.login_input(&org, id, session, &body)?})
+        }
+        ["v1", "credentials", id, "sessions", session, "cancel"] => {
+            empty(&body)?;
+            json!({"session":runtime.credentials.login_cancel(&org, id, session)?})
         }
         ["v1", "tenancy", "grants", id, "revoke"] => {
             empty(&body)?;

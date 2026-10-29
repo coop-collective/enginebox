@@ -4,6 +4,30 @@ This is the checklist for turning on [organizations and email sign-in](ORGS.md) 
 
 Never paste secrets into the repository, an issue or a log. Generate them on the machine that stores them and pipe them straight into `wrangler secret put` and the private `environment.json`.
 
+## Guided setup
+
+`onboard-orgs` automates steps 2–6 below with wrangler. Run it from the repository root on a trusted machine (after `npx wrangler login`):
+
+```sh
+node packages/enginebox-deploy/src/onboard-orgs.mjs \
+  --domain example.com \
+  --origin https://enginebox.example.com \
+  --account <32-hex Cloudflare account id> \
+  --owner-email you@example.com \
+  --env-out ./orgs-environment.json \
+  --deploy-site            # plan first; add --apply to make the changes
+```
+
+Without `--apply` it only runs read-only checks (`wrangler whoami`, `wrangler email sending list`, `wrangler email sending dns get <domain>`) and prints every command it would run and the dashboard environment (secret as a placeholder). With `--apply` it:
+
+1. enables Email Sending on the domain (`wrangler email sending enable`), which adds the SPF and DKIM records;
+2. generates the shared secret into `~/.enginebox/email-gateway-secret` (0600; kept if it exists; `--secret-file` overrides);
+3. writes the gateway's private wrangler config, deploys the gateway, and sets `EMAIL_GATEWAY_SECRET` by piping the file to `wrangler secret put`;
+4. with `--deploy-site`, redeploys the site Worker with its `EMAIL_GATEWAY` binding;
+5. writes the dashboard environment fragment to `--env-out` (0600, never overwritten) for you to merge into the supervisor's `environment.json`.
+
+The sender defaults to `login@<domain>` (`--from` overrides). Domain registration is a Cloudflare dashboard step; the script reports whether the domain has Email Sending. Then do steps 6–8 of the checklist.
+
 ## Checklist
 
 - [ ] **1. Domain on Cloudflare.** Register a domain with Cloudflare Registrar (Dashboard → Domain Registration → Register Domains), or add an existing domain as a zone (Dashboard → Add a domain) and switch its nameservers. Email Sending needs the zone on Cloudflare DNS.
