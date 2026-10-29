@@ -93,6 +93,38 @@ jobs:
       - run: 'printf "Native Engine Box runner: %s\n" "$RUNNER_NAME"'
 ```
 
+### Linux CI guest privileges
+
+Prepare the dedicated CI base with passwordless `sudo` for its configured runner
+user before taking the clean snapshot. This matches the administrative access of
+[GitHub-hosted Linux VMs](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges),
+so existing steps such as `sudo apt-get install` work. Keep the runner process
+non-root; elevation applies inside that disposable VM. This does not change the
+host's sudo policy or the ordinary developer-workspace template.
+
+For the default `agent` user, run the following **as root inside the dedicated CI
+base**, with `sudo` already installed. Adapt the username if the worker uses a
+different guest account:
+
+```sh
+set -eu
+test "$(id -u agent)" -ne 0
+candidate=$(mktemp)
+trap 'rm -f "$candidate"' EXIT
+printf '%s\n' 'agent ALL=(ALL:ALL) NOPASSWD: ALL' > "$candidate"
+visudo -cf "$candidate"
+install -o root -g root -m 0440 "$candidate" /etc/sudoers.d/90-enginebox-ci-agent
+visudo -c
+test "$(su - agent -c 'sudo -n id -u')" = 0
+```
+
+Retain the previous snapshot for rollback. Run the ordinary clean-base checks,
+reset guest identity, stop the base, and create a new snapshot before changing
+the CI inventory's template reference. The native runner canary checks both that
+the job starts non-root and that `sudo -n` can elevate without a prompt. Qualify
+package installation in a real workflow as well; this privilege check alone
+does not establish package availability or network access.
+
 The worker command is administrator-owned configuration, not request input. On the same node, invoke the built `enginebox-ci-worker --config /private/path/ci-worker.json`. A remote controller can use an administrator-provisioned SSH wrapper with fixed host/config/command and strict host-key checking; stdin must be forwarded and only the worker JSON returned on stdout. Worker configuration and fleet resources never come from webhook payloads. No worker command is executed by the mere presence of a GitHub repository connection.
 
 Implemented controller API (owner bearer authentication except signed webhooks):
