@@ -358,3 +358,47 @@ mod service {
         assert!(events.contains("repository_unavailable"));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn codex_repository_runs_start_above_their_checkout_so_its_git_is_writable() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    security::safe_path(&home, ".local/bin/codex", true).unwrap();
+    let exe = home.join(".local/bin/codex");
+    // Codex's sandbox protects the `.git` at the top of its writable root, so
+    // the run must start one level above the checkout it works in.
+    let script = "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.163.0'; exit 0; fi\ncat >/dev/null\n\
+        echo \"cwd=$(pwd) dir=$ENGINEBOX_RUN_DIR\"\n";
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let envelope = repository::Envelope {
+        request: native::RunRequest::parse(json!({"provider":"codex","prompt":"work"})).unwrap(),
+        profile: None,
+        repository: repository::Access {
+            remote: REMOTE.into(),
+            default_branch: "main".into(),
+            token: TOKEN.into(),
+            auth: repository::Auth::Bearer,
+        },
+        checkout: Some("game".into()),
+    };
+    let out =
+        native::execute_with_repository(&envelope, &home, &workspace, &"f".repeat(32)).unwrap();
+    assert_eq!(out.exit_code, 0, "{}", out.output);
+    assert!(
+        out.output.contains(&format!(
+            "cwd={} dir={}",
+            workspace.display(),
+            workspace.join("game").display()
+        )),
+        "{}",
+        out.output
+    );
+}
