@@ -16,6 +16,7 @@ A [pool](QUEUE.md#pools) may name a profile: every run started on `POST /v1/pool
 - **Private per run.** Before the CLI starts, the guest writes the profile's files and configuration into `~/.local/state/enginebox/agent-runs/profiles/<run_id>/` (mode 0700, files 0600, `executable` files 0700) and nowhere else, points the CLI at it, and removes the directory before releasing the run's writer lease. Runs never share a profile directory, so nothing carries over between runs or between profiles.
 - **Repositories alongside profiles.** A run may also name a [hosted repository](REPOSITORIES.md#runs-with-a-repository). Its git config is written the same way, into `~/.local/state/enginebox/agent-runs/repositories/<run_id>/gitconfig` (0700/0600), and removed with the run; with a profile, the guest command is `run-repository` and the profile travels inside that envelope. Profile and repository env may not set `GIT_CONFIG*` or `GIT_ASKPASS` on a repository run.
 - **Secrets stay write-only.** `env` values and `callback_secret` are never returned; reads show `env_keys` and `has_callback_secret`.
+- **Shared connections.** `connections` names [catalog connections](CONNECTIONS.md) of the profile's org (MCP servers and secret sources) that are merged into each provider's config and the run's env at launch; `connection_policy` picks which apply per run kind. One connection can serve many profiles; editing it changes all of them. The inline `mcp_servers` and `env` fields remain and work alongside connections.
 
 ## Provider block
 
@@ -38,7 +39,24 @@ Codex profile runs get a generated `CODEX_HOME` inside the run directory: a `con
 
 Claude profiles that leave `user` out of `setting_sources` would lose the delegated access token, which lives in user settings; Engine Box passes it to that run itself as `CLAUDE_CODE_OAUTH_TOKEN`, and scrubs it from returned output like any other secret.
 
-Top-level fields: `name` (`^[a-z][a-z0-9-]{0,62}$`), `description` (at most 512 bytes), optional `template` (a registered template ID; the workspace must have been created from it), `providers`, optional `callback_secret` (32–256 printable ASCII characters; signs [callbacks](FLEET.md#agent-runs-v2) for owner runs with this profile).
+Top-level fields: `name` (`^[a-z][a-z0-9-]{0,62}$`), `description` (at most 512 bytes), optional `template` (a registered template ID; the workspace must have been created from it), `providers`, optional `callback_secret` (32–256 printable ASCII characters; signs [callbacks](FLEET.md#agent-runs-v2) for owner runs with this profile), optional `connections` (up to 32 distinct connection names that exist in the profile's org) and optional `connection_policy` (run kind or `*` → a subset of `connections`; see [policy per kind of run](CONNECTIONS.md#policy-per-kind-of-run)). Both are omitted from the stored record when empty.
+
+### Connections
+
+A profile that uses the org's `kitbash` MCP connection for every run, and staging secrets only for builders:
+
+```json
+{
+  "name": "builder",
+  "providers": {"claude": {"allowed_tools": ["Read", "Write", "Edit", "Bash", "mcp__kitbash__*"]}, "codex": {}},
+  "connections": ["kitbash", "staging-secrets"],
+  "connection_policy": {"planner": ["kitbash"], "builder": ["kitbash", "staging-secrets"]}
+}
+```
+
+A run states its kind with `"run_kind": "builder"` on the start request. Connection MCP servers are named after the connection, so tool patterns such as `mcp__kitbash__*` work as for inline servers. `POST /v1/profiles/{name}/connections/attach {connection, run_kinds?}` and `/detach {connection}` change these fields without resending the whole profile (and keep the callback key); see [CONNECTIONS.md](CONNECTIONS.md#api). Profiles can also be kept in a repository and applied declaratively ([profiles as code](CONNECTIONS.md#profiles-as-code)).
+
+Org scoping: a request acting for an org other than the platform org (`X-EngineBox-Org`) lists and reads only that org's profiles and cannot replace another org's profile of the same name. Platform-org requests see every profile, as before.
 
 ## Examples
 
@@ -118,7 +136,7 @@ The same token naming `coder` gets HTTP 403.
 ## Deliberately later
 
 - **Tenant ownership.** Profiles, files and grants are owner-managed; tenant-owned profiles (and per-tenant listing and quotas) follow tenant identities ([TENANT-AGENT-STATE.md](TENANT-AGENT-STATE.md)).
-- **A credential vault and secret references.** Secrets reach a run only through its `env` or a profile's default `env`; there are no `secret_refs`, file injection or rotation yet. Callback keys are stored with their token or profile record (owner-only files), not in a vault.
+- **Secret rotation and file injection.** Secrets reach a run through its `env`, a profile's default `env`, or a [connection](CONNECTIONS.md) (write-only stored values or a Kitbash delivery, referenced by name); they are never written as files into the workspace, and there is no rotation yet. Callback keys are stored with their token or profile record (owner-only files), not in a vault.
 - **Prepared snapshot images per profile.** A profile references a template; it does not build one. Bootstrap commands, package installs and warm pools per profile revision are not implemented, so an engine must already be in the template.
 - **Referencing files already in an image.** Files are uploaded to the controller; referencing a path baked into a template (with its digest checked in the guest) is not supported.
 - **Network egress rules, resources and budgets per profile**, Cursor MCP/skills, Codex turn limits, file garbage collection (uploaded files are kept after a profile is deleted), and callback events other than the terminal one (`started`, heartbeats).

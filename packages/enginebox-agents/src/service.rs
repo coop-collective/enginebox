@@ -117,7 +117,9 @@ pub type MeasureHook = Arc<dyn Fn(&Host) -> Result<HostLoad> + Send + Sync>;
 /// Creates one pool workspace: (host, name, template, size).
 pub type CreateHook = Arc<dyn Fn(&str, &str, &str, Option<&str>) -> Result<()> + Send + Sync>;
 /// Resolves a profile by name for a provider at admission.
-pub type ProfileResolver = Arc<dyn Fn(&str, &str) -> Result<ResolvedProfile> + Send + Sync>;
+/// Arguments: profile name, provider, the run's kind (when it states one).
+pub type ProfileResolver =
+    Arc<dyn Fn(&str, &str, Option<&str>) -> Result<ResolvedProfile> + Send + Sync>;
 /// Replaces workspace preparation and the guest helper (tests only).
 pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
 /// Mints a run's repository write token at admission: (`<project>/<name>`,
@@ -147,6 +149,8 @@ pub struct AdmittedRun {
     pub pool: Option<String>,
     pub request: native::RunRequest,
     pub profile: Option<String>,
+    /// The kind of run the start request stated (`planner`, `builder`...).
+    pub run_kind: Option<String>,
     /// Milliseconds between acceptance and admission.
     pub queue_wait_ms: u64,
     /// `<project>/<name>` of the run's hosted repository.
@@ -165,6 +169,11 @@ pub struct ResolvedProfile {
     pub template: Option<String>,
     pub block: profile::ProviderProfile,
     pub files: BTreeMap<String, String>,
+    /// The run kind the profile was resolved for.
+    pub run_kind: Option<String>,
+    /// The catalog connections merged into `block`: `{name, revision, kind}`
+    /// plus `skipped` when a provider cannot use one. Never values.
+    pub connections: Vec<Value>,
 }
 /// Where to POST a run's terminal summary, and the HMAC key that signs it.
 #[derive(Clone)]
@@ -188,6 +197,9 @@ pub struct LaunchOptions {
     /// `<project>/<name>` of a hosted repository. The controller checks the
     /// caller's grant; a write token is minted at admission.
     pub repository: Option<String>,
+    /// The kind of run (docs/CONNECTIONS.md): selects which of the profile's
+    /// connections apply.
+    pub run_kind: Option<String>,
 }
 /// Handed to the finish hook once a run with a callback reaches a terminal state.
 #[derive(Debug, Clone)]
@@ -226,7 +238,7 @@ fn scoped_key_digest(started_by: &str, target: &Target, key: &str) -> String {
 /// What a replay must match: the request with env values replaced by names
 /// (values are secrets and are never hashed to disk), plus the v2 choices.
 fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOptions) -> String {
-    security::digest(&json!({
+    let mut value = json!({
         "provider":request.provider,
         "prompt":request.prompt,
         "resume_id":request.resume_id,
@@ -237,7 +249,12 @@ fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOpti
         "profile":options.profile.as_ref().map(|p| &p.name),
         "callback":options.callback.as_ref().map(|c| &c.url),
         "repository":options.repository,
-    }))
+    });
+    // Added only when set, so digests stored before run kinds still match.
+    if let Some(kind) = &options.run_kind {
+        value["run_kind"] = json!(kind);
+    }
+    security::digest(&value)
 }
 struct Session {
     public: Value,
@@ -2043,6 +2060,7 @@ impl AgentService {
             finished_at: None,
             outcome: None,
             repository: options.repository.clone(),
+            run_kind: options.run_kind.clone(),
         };
         // Order: sidecar, record, queue entry. A crash before the entry leaves
         // a queued record that the next start marks failed, never a lost run.
@@ -2353,6 +2371,7 @@ impl AgentService {
             pool: queued.entry.pool().map(str::to_owned),
             request,
             profile: queued.entry.profile.clone(),
+            run_kind: queued.entry.run_kind.clone(),
             queue_wait_ms,
             repository: queued.entry.repository.clone(),
             repository_access: None,
@@ -2428,7 +2447,7 @@ impl AgentService {
             (Some(_), Some(r)) => Some(r),
             (Some(name), None) => {
                 let resolver = self.inner.hooks.resolver.lock().unwrap().clone();
-                match resolver.map(|r| r(name, &run.request.provider)) {
+                match resolver.map(|r| r(name, &run.request.provider, run.run_kind.as_deref())) {
                     Some(Ok(r)) => Some(r),
                     other => {
                         let message = match other {
@@ -2451,6 +2470,12 @@ impl AgentService {
                 .entry(run.id.clone())
                 .and_modify(|d| {
                     d["profile"] = json!({"name":r.name,"revision":r.revision});
+                    if let Some(kind) = &r.run_kind {
+                        d["profile"]["run_kind"] = json!(kind);
+                    }
+                    if !r.connections.is_empty() {
+                        d["profile"]["connections"] = json!(r.connections);
+                    }
                     let _ = security::write_json(
                         &self.inner.details_root,
                         &format!("{}.json", run.id),

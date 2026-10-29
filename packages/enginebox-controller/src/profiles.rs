@@ -100,7 +100,9 @@ impl Profiles {
                 "description",
                 "template",
                 "providers",
-                "callback_secret"
+                "callback_secret",
+                "connections",
+                "connection_policy"
             ]
             .contains(&k.as_str())),
             "Unsupported profile fields"
@@ -150,6 +152,76 @@ impl Profiles {
         profiles.remove(name);
         Ok(json!({"deleted":name}))
     }
+    /// Validate a candidate record against the stored files (dry runs).
+    pub fn check(&self, profile: &Profile) -> Result<()> {
+        profile.validate(&|sha| self.has_file(sha))
+    }
+    /// The stored record (internal use: env values and keys included).
+    pub fn record(&self, name: &str) -> Option<Profile> {
+        self.profiles.lock().unwrap().get(name).cloned()
+    }
+    /// The org that owns a profile.
+    pub fn org_of(&self, name: &str) -> Option<String> {
+        self.profiles.lock().unwrap().get(name).map(|p| {
+            p.org_id
+                .clone()
+                .unwrap_or_else(|| enginebox_agents::pools::DEFAULT_ORG.into())
+        })
+    }
+    /// Names of the profiles of `org`.
+    pub fn names(&self, org: &str) -> Vec<String> {
+        let profiles = self.profiles.lock().unwrap();
+        profiles
+            .values()
+            .filter(|p| {
+                p.org_id
+                    .as_deref()
+                    .unwrap_or(enginebox_agents::pools::DEFAULT_ORG)
+                    == org
+            })
+            .map(|p| p.name.clone())
+            .collect()
+    }
+    /// The profiles of `org` that reference connection `name`.
+    pub fn using(&self, org: &str, name: &str) -> Vec<String> {
+        let profiles = self.profiles.lock().unwrap();
+        profiles
+            .values()
+            .filter(|p| {
+                p.org_id
+                    .as_deref()
+                    .unwrap_or(enginebox_agents::pools::DEFAULT_ORG)
+                    == org
+                    && p.connections.iter().any(|c| c == name)
+            })
+            .map(|p| p.name.clone())
+            .collect()
+    }
+    /// Change one profile in place (attach/detach a connection): validated,
+    /// revision bumped and written like a replacement.
+    pub fn modify(
+        &self,
+        name: &str,
+        change: impl FnOnce(&mut Profile) -> Result<()>,
+    ) -> Result<Value> {
+        let mut profiles = self.profiles.lock().unwrap();
+        let mut profile = profiles.get(name).cloned().context("Unknown profile")?;
+        let before = profile.clone();
+        change(&mut profile)?;
+        if profile == before {
+            return Ok(json!({"profile":profile.public(),"changed":false}));
+        }
+        profile.revision += 1;
+        profile.updated_at = chrono::Utc::now().to_rfc3339();
+        profile.validate(&|sha| self.has_file(sha))?;
+        state::write_json(
+            &self.records.join(format!("{}.json", profile.name)),
+            &serde_json::to_value(&profile)?,
+        )?;
+        let public = profile.public();
+        profiles.insert(profile.name.clone(), profile);
+        Ok(json!({"profile":public,"changed":true}))
+    }
     pub fn exists(&self, name: &str) -> bool {
         self.profiles.lock().unwrap().contains_key(name)
     }
@@ -163,7 +235,15 @@ impl Profiles {
     }
     /// Resolve a profile for one launch: its block for `provider` and the
     /// bytes of every referenced file, each re-verified against its digest.
-    pub fn resolve(&self, name: &str, provider: &str) -> Result<ResolvedProfile> {
+    /// `run_kind` selects the connections that apply (the profile's
+    /// `connection_policy`); they are merged from `connections` into the block.
+    pub fn resolve(
+        &self,
+        name: &str,
+        provider: &str,
+        run_kind: Option<&str>,
+        connections: &crate::connections::Connections,
+    ) -> Result<ResolvedProfile> {
         let profile = self
             .profiles
             .lock()
@@ -171,11 +251,30 @@ impl Profiles {
             .get(name)
             .cloned()
             .context("Unknown profile")?;
-        let block = profile
+        let mut block = profile
             .providers
             .get(provider)
             .cloned()
             .context("The profile does not configure this provider")?;
+        let selected =
+            profile::connections_for(&profile.connections, &profile.connection_policy, run_kind);
+        let used = if selected.is_empty() {
+            Vec::new()
+        } else {
+            let org = profile
+                .org_id
+                .as_deref()
+                .unwrap_or(enginebox_agents::pools::DEFAULT_ORG);
+            connections
+                .apply(
+                    org,
+                    selected,
+                    provider,
+                    profile.template.as_deref(),
+                    &mut block,
+                )?
+                .used
+        };
         let mut files = BTreeMap::new();
         let mut total = 0;
         for sha in block.digests() {
@@ -196,6 +295,8 @@ impl Profiles {
             template: profile.template,
             block,
             files,
+            run_kind: run_kind.map(str::to_owned),
+            connections: used,
         })
     }
 }

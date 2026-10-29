@@ -12,6 +12,9 @@ pub struct FleetClient {
     client: Client,
     base: String,
     token: String,
+    /// `ENGINEBOX_ORG`: act for this org (sent as `X-EngineBox-Org`); unset
+    /// acts for the platform org, as before orgs.
+    org: Option<String>,
 }
 impl FleetClient {
     pub fn new(base: &str, token: String) -> Result<Self> {
@@ -48,6 +51,7 @@ impl FleetClient {
             client,
             base: base.trim_end_matches('/').to_owned(),
             token,
+            org: None,
         })
     }
     pub fn from_env() -> Result<Self> {
@@ -64,7 +68,21 @@ impl FleetClient {
             None => std::env::var("ENGINEBOX_API_TOKEN")
                 .context("Set ENGINEBOX_API_TOKEN_FILE or ENGINEBOX_API_TOKEN")?,
         };
-        Self::new(&base, token)
+        let mut client = Self::new(&base, token)?;
+        if let Ok(org) = std::env::var("ENGINEBOX_ORG")
+            && !org.is_empty()
+        {
+            ensure!(
+                org.len() == 28
+                    && org.starts_with("org_")
+                    && org[4..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "ENGINEBOX_ORG must be an org ID"
+            );
+            client.org = Some(org);
+        }
+        Ok(client)
     }
     pub fn request(&self, path: &str, body: Option<Value>) -> Result<Value> {
         ensure!(
@@ -78,6 +96,10 @@ impl FleetClient {
             self.client.post(url).json(&body)
         } else {
             self.client.get(url)
+        };
+        let req = match &self.org {
+            Some(org) => req.header("X-EngineBox-Org", org),
+            None => req,
         };
         let response = req
             .bearer_auth(&self.token)
@@ -390,7 +412,74 @@ pub fn tools() -> Vec<Value> {
             json!({"host_id":{"type":"string"},"name":{"type":"string"},"action":{"type":"string","enum":["deps","checkpoint","remount","close","recover"]},"message":{"type":"string","maxLength":4096}}),
             &["host_id", "name", "action"],
         ),
+        tool(
+            "connection_list",
+            "Owner/admin: list the org's catalog connections (MCP servers and secret sources) with the profiles that use each. Secret values are never returned; only their names.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "connection_create",
+            "Owner/admin: create a named connection profiles can share. kind mcp_http (url, headers), mcp_stdio (command under /usr/bin, /usr/local/bin or /opt, args, env, template) or secret_source (source {provider: stored|kitbash, integration, project, environment}, names). Header and env values are references: {env: VAR} (the run supplies it), {secret: NAME} (a value in this request's secrets) or {secret_source: <connection>, name: NAME}. secrets are write-only: stored once, never echoed. Prefer a Kitbash secret_source over pasting values. Audited.",
+            json!({"name":{"type":"string"},"kind":{"type":"string","enum":["mcp_http","mcp_stdio","secret_source"]},"description":{"type":"string","maxLength":512},"url":{"type":"string"},"headers":{"type":"object"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"env":{"type":"object"},"template":{"type":"string"},"source":{"type":"object"},"names":{"type":"array","items":{"type":"string"}},"secrets":{"type":"object","description":"NAME -> value; write-only"}}),
+            &["name", "kind"],
+        ),
+        tool(
+            "connection_update",
+            "Owner/admin: change a connection's fields or secrets. Every profile using it picks the change up on its next run. secrets sets values (write-only); remove_secrets drops names. Name and kind never change. Audited.",
+            json!({"name":{"type":"string"},"description":{"type":"string","maxLength":512},"url":{"type":"string"},"headers":{"type":"object"},"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"env":{"type":"object"},"template":{"type":"string"},"source":{"type":"object"},"names":{"type":"array","items":{"type":"string"}},"secrets":{"type":"object"},"remove_secrets":{"type":"array","items":{"type":"string"}}}),
+            &["name"],
+        ),
+        tool(
+            "connection_delete",
+            "Owner/admin: delete a connection and its stored secrets. Refused while a profile uses it (detach first). Audited.",
+            json!({"name":{"type":"string"}}),
+            &["name"],
+        ),
+        tool(
+            "connection_test",
+            "Owner/admin: check that a connection's values resolve and, for mcp_http, that the server answers and accepts the credentials. Reports names and statuses only. Audited.",
+            json!({"name":{"type":"string"}}),
+            &["name"],
+        ),
+        tool(
+            "profile_get",
+            "Owner/admin: read a profile: template, per-provider tools and skills, attached connections and the per-run-kind connection policy. Env values and callback keys are never returned.",
+            json!({"profile":{"type":"string"}}),
+            &["profile"],
+        ),
+        tool(
+            "profile_attach_connection",
+            "Owner/admin: attach a catalog connection to a profile. Without run_kinds it applies to every run kind the policy does not restrict; with run_kinds (e.g. [\"debug\"]) only to runs that state one of those kinds. Audited.",
+            json!({"profile":{"type":"string"},"connection":{"type":"string"},"run_kinds":{"type":"array","items":{"type":"string"}}}),
+            &["profile", "connection"],
+        ),
+        tool(
+            "profile_detach_connection",
+            "Owner/admin: remove a connection from a profile and from its run-kind policy. Audited.",
+            json!({"profile":{"type":"string"},"connection":{"type":"string"}}),
+            &["profile", "connection"],
+        ),
+        tool(
+            "catalog_apply",
+            "Owner/admin: make the org's connections and profiles match a declarative catalog document (schema enginebox.catalog/v1; secret references only, never values). Idempotent. dry_run returns the diff without writing; prune deletes records the document does not mention. Audited.",
+            json!({"document":{"type":"object"},"dry_run":{"type":"boolean"},"prune":{"type":"boolean"}}),
+            &["document"],
+        ),
     ]
+}
+/// A catalog record name (connection or profile).
+fn catalog_name(v: &Value, key: &str) -> Result<String> {
+    let value = field(v, key)?;
+    ensure!(
+        (1..=63).contains(&value.len())
+            && value.as_bytes()[0].is_ascii_lowercase()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "Invalid {key}"
+    );
+    Ok(value.to_owned())
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().context("Required string field missing")
@@ -452,6 +541,53 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
     }
     let result = match name {
         "workspace_catalog" => ("/v1/workspaces".into(), None),
+        "connection_list" => ("/v1/connections".into(), None),
+        "connection_create" => ("/v1/connections".into(), Some(args.clone())),
+        "connection_update" => {
+            let mut body = args.clone();
+            body.as_object_mut().unwrap().remove("name");
+            (
+                format!("/v1/connections/{}", catalog_name(args, "name")?),
+                Some(body),
+            )
+        }
+        "connection_delete" | "connection_test" => (
+            format!(
+                "/v1/connections/{}/{}",
+                catalog_name(args, "name")?,
+                if name == "connection_delete" {
+                    "delete"
+                } else {
+                    "test"
+                }
+            ),
+            Some(json!({})),
+        ),
+        "profile_get" => (
+            format!("/v1/profiles/{}", catalog_name(args, "profile")?),
+            None,
+        ),
+        "profile_attach_connection" | "profile_detach_connection" => {
+            let mut body = json!({"connection": catalog_name(args, "connection")?});
+            if name == "profile_attach_connection"
+                && let Some(kinds) = args.get("run_kinds")
+            {
+                body["run_kinds"] = kinds.clone();
+            }
+            (
+                format!(
+                    "/v1/profiles/{}/connections/{}",
+                    catalog_name(args, "profile")?,
+                    if name == "profile_attach_connection" {
+                        "attach"
+                    } else {
+                        "detach"
+                    }
+                ),
+                Some(body),
+            )
+        }
+        "catalog_apply" => ("/v1/catalog/apply".into(), Some(args.clone())),
         "repository_list" | "repository_create" | "repository_link_github" => {
             let project = storage_id(args, "project")?;
             let mut path = format!("/v1/projects/{project}/repositories");
@@ -937,6 +1073,44 @@ pub fn rpc(request: Value, client: &FleetClient) -> Option<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn catalog_tools_map_to_owner_only_controller_routes() {
+        let (path, body) = tool_request("connection_list", &json!({})).unwrap();
+        assert_eq!((path.as_str(), body), ("/v1/connections", None));
+        let (path, body) = tool_request(
+            "connection_update",
+            &json!({"name":"kitbash","secrets":{"KITBASH_TOKEN":"v-123456789"}}),
+        )
+        .unwrap();
+        assert_eq!(path, "/v1/connections/kitbash");
+        assert!(body.unwrap().get("name").is_none());
+        let (path, _) = tool_request("connection_test", &json!({"name":"kitbash"})).unwrap();
+        assert_eq!(path, "/v1/connections/kitbash/test");
+        let (path, body) = tool_request(
+            "profile_attach_connection",
+            &json!({"profile":"coder","connection":"kitbash","run_kinds":["debug"]}),
+        )
+        .unwrap();
+        assert_eq!(path, "/v1/profiles/coder/connections/attach");
+        assert_eq!(body.unwrap()["run_kinds"], json!(["debug"]));
+        let (path, body) = tool_request(
+            "catalog_apply",
+            &json!({"document":{"schema":"enginebox.catalog/v1"},"dry_run":true}),
+        )
+        .unwrap();
+        assert_eq!(path, "/v1/catalog/apply");
+        assert_eq!(body.unwrap()["dry_run"], true);
+        // Names cannot traverse paths; unknown arguments are refused.
+        assert!(tool_request("connection_delete", &json!({"name":"../profiles"})).is_err());
+        assert!(tool_request("profile_get", &json!({"profile":"Coder"})).is_err());
+        assert!(
+            tool_request(
+                "profile_detach_connection",
+                &json!({"profile":"coder","connection":"kitbash","run_kinds":["x"]})
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn workspace_source_and_pool_tools_preserve_the_controller_boundaries() {
         assert_eq!(
             tool_request("workspace_catalog", &json!({})).unwrap(),
@@ -1068,7 +1242,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            45
+            54
         );
     }
     #[test]
