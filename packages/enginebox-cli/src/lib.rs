@@ -461,6 +461,12 @@ pub fn tools() -> Vec<Value> {
             &["profile", "connection"],
         ),
         tool(
+            "github_actions_secret_set",
+            "Owner only, platform org: create or update a GitHub Actions secret on a repository selected in the GitHub panel (or one of its environments) through the repository GitHub App, which needs the Secrets: read and write permission. The value comes from a secret_source connection (from: {connection, name}; preferred) or write-only value; it is encrypted to the repository's public key and never echoed. Audited.",
+            json!({"repository":{"type":"string","description":"owner/repo"},"environment":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"from":{"type":"object","properties":{"connection":{"type":"string"},"name":{"type":"string"}}}}),
+            &["repository", "name"],
+        ),
+        tool(
             "catalog_apply",
             "Owner/admin: make the org's connections and profiles match a declarative catalog document (schema enginebox.catalog/v1; secret references only, never values). Idempotent. dry_run returns the diff without writing; prune deletes records the document does not mention. Audited.",
             json!({"document":{"type":"object"},"dry_run":{"type":"boolean"},"prune":{"type":"boolean"}}),
@@ -588,6 +594,13 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
             )
         }
         "catalog_apply" => ("/v1/catalog/apply".into(), Some(args.clone())),
+        "github_actions_secret_set" => {
+            ensure!(
+                args.get("value").is_some() != args.get("from").is_some(),
+                "Send exactly one of value or from"
+            );
+            ("/v1/actions-secrets".into(), Some(args.clone()))
+        }
         "repository_list" | "repository_create" | "repository_link_github" => {
             let project = storage_id(args, "project")?;
             let mut path = format!("/v1/projects/{project}/repositories");
@@ -1242,7 +1255,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            54
+            55
         );
     }
     #[test]

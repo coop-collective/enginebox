@@ -20,6 +20,8 @@ App or create one. Use separate registrations for staging and production.
 - Repository permissions: **Metadata read**, **Contents read/write** for sync,
   **Actions read** for runners. **Workflows write** is optional for exporting
   edits to `.github/workflows`; also set `app.workflows_write: true` when enabling it.
+- Repository permission **Secrets read/write**, only if Engine Box should write Actions
+  secrets for selected repositories ([CONNECTIONS.md](CONNECTIONS.md#github-actions-secrets)).
 - Organization permissions: **Self-hosted runners read/write** for organization runners.
 - Install on the organization and include the intended repositories. When adding
   permissions to an existing App, accept the new permissions on that installation.
@@ -70,6 +72,10 @@ configuration. Use `pools: []` until the dedicated CI worker and runner group ar
 The helper does not activate Enginebox configuration or restart a developer workspace.
 
 ## 3. Optional Infisical adapter
+
+> **Retired.** Secrets now live in Cloudflare Secrets Store managed through Kitbash, plus GitHub
+> Actions secrets. This adapter remains for existing deployments only. For new projects, use Kitbash
+> controller deliveries and [connections](CONNECTIONS.md#kitbash).
 
 Use [github-secrets.kitbash.json](../examples/github-secrets.kitbash.json) for the
 operator helper's `.kitbash/secrets.json`. Fill the real project UUID/domain and

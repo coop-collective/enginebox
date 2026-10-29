@@ -10,6 +10,7 @@ pub mod contributors;
 pub mod credentials;
 mod environment;
 pub mod jobs;
+pub mod kitbash;
 pub mod metering;
 pub mod profiles;
 pub mod repositories;
@@ -180,8 +181,12 @@ impl Controller {
         // A standby process must never recover another process's active jobs.
         let github = enginebox_github::GitHub::open(&self.root)?;
         let profiles = profiles::Profiles::open(&self.root)?;
+        let mut connections = connections::Connections::open(&self.root)?;
+        if let Some(reader) = kitbash::KitbashReader::from_env()? {
+            connections = connections.with_reader(Arc::new(reader));
+        }
         let catalog = catalog::Catalog::new(
-            connections::Connections::open(&self.root)?,
+            connections,
             profiles.clone(),
             audit::Audit::open(&self.root)?,
         );
@@ -751,6 +756,7 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         256 * 1024
     } else if path == "/v1/ci/templates"
         || path == "/v1/pools"
+        || path == "/v1/actions-secrets"
         || path.starts_with("/v1/connections")
     {
         65536
@@ -1110,6 +1116,79 @@ fn acting_org(
     }
 }
 
+/// `POST /v1/actions-secrets`: write one GitHub Actions secret on a selected
+/// repository (or one of its environments) through the repository GitHub App.
+/// Platform org, owner token only. The value comes from the write-only request
+/// body (`value`) or a `secret_source` connection (`from: {connection, name}`),
+/// is encrypted to the repository's public key, never echoed, and audited by
+/// name.
+fn actions_secret(runtime: &Runtime, org: &str, actor: &str, body: &Value) -> (StatusCode, Value) {
+    let target = format!(
+        "{}{}/{}",
+        body["repository"].as_str().unwrap_or(""),
+        body["environment"]
+            .as_str()
+            .map(|e| format!(":{e}"))
+            .unwrap_or_default(),
+        body["name"].as_str().unwrap_or("")
+    );
+    let source = body["from"]["connection"]
+        .as_str()
+        .map(|c| format!("connection:{c}"))
+        .unwrap_or_else(|| "request".into());
+    let result = (|| -> Result<Value> {
+        ensure!(
+            org == enginebox_agents::pools::DEFAULT_ORG,
+            "GitHub Actions secrets are written for the platform org's GitHub connection only."
+        );
+        keys(
+            body,
+            &["repository", "environment", "name", "value", "from"],
+            &["repository", "name"],
+        )?;
+        let value = match (body.get("value"), body.get("from")) {
+            (Some(value), None) => value
+                .as_str()
+                .context("value must be a string.")?
+                .to_owned(),
+            (None, Some(from)) => {
+                keys(from, &["connection", "name"], &["connection", "name"])?;
+                runtime.catalog.connections.source_value(
+                    org,
+                    string(from, "connection")?,
+                    string(from, "name")?,
+                )?
+            }
+            _ => anyhow::bail!("Send exactly one of value or from."),
+        };
+        runtime.github.set_actions_secret(
+            string(body, "repository")?,
+            body.get("environment").and_then(Value::as_str),
+            string(body, "name")?,
+            &value,
+        )
+    })();
+    let detail = match &result {
+        Ok(_) => json!({"source": source}),
+        Err(error) => json!({"source": source, "reason": catalog::message(error)}),
+    };
+    runtime.catalog.audit.record(
+        org,
+        actor,
+        "github.actions_secret_set",
+        &target,
+        result.is_ok(),
+        detail,
+    );
+    match result {
+        Ok(value) => (StatusCode::OK, value),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            json!({"error": catalog::message(&error)}),
+        ),
+    }
+}
+
 /// Who performed an operation, for the audit log and `created_by`: the member
 /// the dashboard names in `X-EngineBox-Actor` (owner token only), else `owner`;
 /// a service token is its own principal.
@@ -1165,6 +1244,10 @@ async fn write(
         })
         .await?;
         return Ok((StatusCode::from_u16(status)?, value));
+    }
+    if routed.as_slice() == ["v1", "actions-secrets"] {
+        let runtime = c.runtime()?;
+        return blocking(move || Ok(actions_secret(&runtime, &org, &actor, &body))).await;
     }
     if routed.as_slice() == ["v1", "profiles"] {
         stamp_org(&mut body, &org);
@@ -4340,5 +4423,63 @@ mod tests {
         assert!(resolved.connections.is_empty());
         assert_eq!(resolved.block.mcp_servers.len(), 1);
         assert_eq!(resolved.block.env["MODE"], "x");
+    }
+
+    #[tokio::test]
+    async fn actions_secret_writes_are_owner_gated_platform_only_and_never_echoed() {
+        let (temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let value = "deploy-token-value-0003";
+        let body =
+            json!({"repository":"owner/repo","name":"DEPLOY_TOKEN","value":value}).to_string();
+        // GitHub is not configured here: refused with a reason, value not echoed.
+        let (status, refused) = call(
+            &app,
+            request(Method::POST, "/v1/actions-secrets", &body, true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!refused.to_string().contains(value));
+        // Another org cannot write through the platform's GitHub App.
+        let mut org_request = request(Method::POST, "/v1/actions-secrets", &body, true);
+        org_request.headers_mut().insert(
+            tenancy::ORG_HEADER,
+            "org_aaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+        );
+        let (status, refused) = call(&app, org_request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(refused["error"].as_str().unwrap().contains("platform org"));
+        // Exactly one of value or from.
+        let both = json!({"repository":"owner/repo","name":"X","value":"v-12345678","from":{"connection":"a","name":"B"}}).to_string();
+        let (status, _) = call(
+            &app,
+            request(Method::POST, "/v1/actions-secrets", &both, true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Service tokens are refused before the handler.
+        let (_, token) = mint(&app, json!({"label":"runner","scopes":[{"host_id":"worker","name":"ebox-a"}],"operations":["agent_runs.start"]})).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/actions-secrets")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // Audited by name and source, never the value.
+        let (_, audit) = call(&app, request(Method::GET, "/v1/audit", "", true)).await;
+        let entry = &audit["events"][0];
+        assert_eq!(entry["action"], "github.actions_secret_set");
+        assert_eq!(entry["target"], "owner/repo/X");
+        assert!(!audit.to_string().contains(value));
+        assert!(files_contain(&temp.path().join("state"), value).is_empty());
     }
 }

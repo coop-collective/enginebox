@@ -829,6 +829,22 @@ impl Connections {
             }
         }
     }
+    /// One value a `secret_source` connection yields, for controller-side
+    /// consumers such as GitHub Actions secret writes. Never returned to a caller.
+    pub fn source_value(&self, org: &str, connection: &str, name: &str) -> Result<String> {
+        let record = self
+            .get(org, connection)
+            .filter(|c| c.kind == Kind::SecretSource)
+            .with_context(|| format!("Unknown secret source {connection}."))?;
+        let stored = self.secret_names(&record.id);
+        ensure!(
+            record.yields(&stored).iter().any(|n| n == name),
+            "Secret source {connection} does not yield {name}."
+        );
+        self.source_values(&record)?
+            .remove(name)
+            .with_context(|| format!("Secret source {connection} is missing {name}."))
+    }
     /// Resolve one reference to a value. `Ok(None)` for `env` references (the
     /// run supplies them).
     fn resolve_ref(

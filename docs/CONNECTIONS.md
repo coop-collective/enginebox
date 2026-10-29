@@ -170,7 +170,70 @@ Ideator's `packages/plugin/enginebox/ideator-agent.profile.json` maps onto this 
 
 ## Kitbash
 
-Kitbash is the first real connection pair: its MCP server, and the values it delivers to the controller. The Kitbash `secret_source` reader and the Kitbash MCP connection are described in the Kitbash section added with that change; until a controller is configured with a Kitbash delivery root, `kitbash` sources fail resolution with "No Kitbash delivery root is configured on this controller."
+Kitbash is the first real connection pair: its MCP server, and the values it delivers to the controller. Secrets live in Cloudflare Secrets Store, managed through Kitbash, and in GitHub Actions secrets. Infisical is retired.
+
+### The Kitbash MCP connection
+
+Kitbash's broker serves a remote MCP endpoint at `https://<broker hostname>/mcp` with a bearer key (Kitbash [BROKER-SETUP.md](https://github.com/coop-collective/kitbash/blob/main/docs/BROKER-SETUP.md#mcp-connection-and-repeat-setup); Coop Collective's broker is `https://kitbash.coopcollective.dev/mcp`). It has no OAuth server, so the connection carries the key as a header:
+
+```json
+{"name": "kitbash", "kind": "mcp_http", "url": "https://kitbash.coopcollective.dev/mcp",
+ "headers": {"Authorization": {"secret": "KITBASH_MCP_TOKEN", "prefix": "Bearer "}}}
+```
+
+Set the key once with `connection_update {"name": "kitbash", "secrets": {"KITBASH_MCP_TOKEN": "…"}}` from the operator's private `.kitbash/mcp.json`, or deliver it with Kitbash (below) and reference it with `{"secret_source": "kitbash-ops", "name": "KITBASH_MCP_TOKEN", "prefix": "Bearer "}`. Kitbash rotates the key on each setup run; update the connection when that happens. Profiles then attach `kitbash` and allow `mcp__kitbash__*`.
+
+### Kitbash secret sources
+
+A `secret_source` with `"provider": "kitbash"` reads what Kitbash's controller receiver staged on the controller host. The operator sets the delivery root once: `ENGINEBOX_KITBASH_ROOT=/opt/enginebox-control/kitbash` (absolute; in the supervisor's `environment.json`). A connection names an **integration** inside that root, never a path:
+
+```json
+{"name": "canvalytics-staging", "kind": "secret_source",
+ "source": {"provider": "kitbash", "integration": "canvalytics-staging", "project": "canvalytics", "environment": "staging"},
+ "names": ["CLOUDFLARE_API_TOKEN", "DATABASE_URL"]}
+```
+
+The receiver's layout (Kitbash `packages/secrets-broker/scripts/controller-receiver.mjs`), generalised:
+
+```text
+<root>/<integration>/config.json     {integration, project, target, kind, names, outputDirectory, enginebox_org?}
+<root>/<integration>/receipt.json    {deliveryId, integration, status: "staged", directory, names}
+<root>/<integration>/credentials/<deliveryId>/<file>    one 0600 file per value
+```
+
+When a run resolves the connection, the controller:
+
+1. checks that `config.json` names this integration, that `project` and `target` match the connection's `project` and `environment` (when set), and that the delivery belongs to the connection's org (`enginebox_org`; absent means the platform org);
+2. requires `receipt.json` to be `staged` and its `directory` to be exactly `<root>/<integration>/credentials/<deliveryId>`, whatever else it says;
+3. reads each listed name from a regular, non-symlink, owner-only file of at most 16 KiB. For the GitHub App kinds (`runners`, `repos`) the files are `<kind>-client-secret`, `<kind>-private-key` and `<kind>-webhook-secret`, mapped to names by `config.names`. For the generic `env` kind each file is named after its value (`CLOUDFLARE_API_TOKEN`).
+
+Values are read at resolution and never copied into controller state. A missing delivery, file or value refuses the run with the integration's name. `connection_test` reports which names are present.
+
+### What Kitbash needs to deliver per project
+
+For each project and environment whose secrets runs should get (for example `canvalytics` / `staging`):
+
+1. Register the values in Kitbash for that project and target (`kitbash_register_secrets`), stored in Cloudflare Secrets Store. Use `generate: true` for application keys Kitbash can generate, and `generate: false` for provider-issued ones such as a Cloudflare API token.
+2. *(Proposed Kitbash change; the flags below do not exist yet.)* Enroll an **`env`-kind** controller delivery named `<project>-<environment>` on the controller host (`pnpm run setup:controller --kind env --integration canvalytics-staging --project canvalytics --target staging --directory /opt/enginebox-control/kitbash`, plus `--enginebox-org org_…` for a tenant org). The generic `env` kind is the generalisation this design needs from Kitbash: the existing receiver supports only the GitHub App kinds. It writes one file per registered name, with no GitHub webhook step, and `config.json` lists the delivered names.
+3. Upload or deliver the values (`kitbash_upload_secrets` with `delivery: "<integration>"`). The receiver timer stages them under `credentials/<deliveryId>/`.
+4. Create the `secret_source` connection (or put it in the catalog file) and attach it to profiles, limited by run kind (`debug` gets read-only tokens, `deploy` gets the deploy token).
+
+Rotation is a new delivery: the receiver refuses a different delivery ID without an explicit migration, so rotating means re-enrolling and then pointing the connection's `integration` at the new directory.
+
+## GitHub Actions secrets
+
+`POST /v1/actions-secrets` (MCP `github_actions_secret_set`) creates or updates an Actions secret on a repository selected in the dashboard's GitHub panel, or on one of its deployment environments:
+
+```json
+{"repository": "coop-collective/canvalytics", "environment": "production", "name": "CLOUDFLARE_API_TOKEN",
+ "from": {"connection": "canvalytics-production", "name": "CLOUDFLARE_API_TOKEN"}}
+```
+
+- **Gated.** Owner token and platform org only (the GitHub App is the platform org's). Service and OAuth tokens get 403. The dashboard limits it to platform-org owners.
+- **Values** come from a `secret_source` connection (`from`, preferred: the value never passes through the caller) or from a write-only `value` in the body. They are never echoed or logged.
+- **Encryption.** The controller mints an installation token limited to that repository and `secrets: write`, fetches the repository's (or environment's) Actions public key, encrypts the value as a libsodium sealed box (X25519 + XSalsa20-Poly1305, the `crypto_box` crate), and PUTs `{encrypted_value, key_id}`.
+- **Audit.** `github.actions_secret_set` with target `owner/repo[:environment]/NAME` and the source (`request` or `connection:<name>`).
+- **App permission.** The repository GitHub App needs **Secrets: read and write** (repository permission). Add it in the App settings and approve it on the installation ([GITHUB-SECRETS.md](GITHUB-SECRETS.md#1-configure-one-app-and-installation)). Without it the token request fails and the call reports that the permission is missing.
 
 ## Migration and rollback
 
@@ -185,3 +248,4 @@ Kitbash is the first real connection pair: its MCP server, and the values it del
 - `agent_account` connections (the credential-pool work).
 - A per-template manifest allowlist of stdio MCP binaries (today: fixed path prefixes plus the optional `template` binding).
 - Secret rotation and versioned values; per-connection quotas.
+- Reading Kitbash values through the broker's API instead of a staged delivery.
