@@ -16,5 +16,5 @@ pub mod warm;
 pub use capacity::{capacity, resource_fits};
 pub use fleet::Fleet;
 pub use model::{GuestConfig, Host, Resources, identifier, load_hosts};
-pub use transport::{EngineBox, HostOperationLock, host_run, operation_lock};
+pub use transport::{EngineBox, HostOperationLock, host_run, operation_lock, operation_lock_wait};
 pub const GIB: u64 = 1024 * 1024 * 1024;
