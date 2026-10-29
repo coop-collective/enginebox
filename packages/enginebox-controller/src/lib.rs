@@ -4489,16 +4489,37 @@ mod tests {
         let app = router(c.clone());
         c.activate().unwrap();
         let post = |path: &str, body: Value| request(Method::POST, path, &body.to_string(), true);
-        call(&app, post("/v1/connections", json!({"name":"docs","kind":"mcp_http","url":"https://docs.example.com/mcp"}))).await;
+        call(
+            &app,
+            post(
+                "/v1/connections",
+                json!({"name":"docs","kind":"mcp_http","url":"https://docs.example.com/mcp"}),
+            ),
+        )
+        .await;
         let (status, _) = call(&app, post("/v1/profiles", json!({"name":"coder","providers":{"claude":{"env":{"KEEP":"kept-value-123"}}},"connections":["docs"],"callback_secret":"k".repeat(40)}))).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, saved) = call(&app, post("/v1/profiles/coder/connections/policy", json!({"connection_policy":{"planner":[]}}))).await;
+        let (status, saved) = call(
+            &app,
+            post(
+                "/v1/profiles/coder/connections/policy",
+                json!({"connection_policy":{"planner":[]}}),
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{saved}");
         assert_eq!(saved["profile"]["connection_policy"], json!({"planner":[]}));
         assert_eq!(saved["profile"]["has_callback_secret"], true);
         let record = c.runtime().unwrap().profiles.record("coder").unwrap();
         assert_eq!(record.providers["claude"].env["KEEP"], "kept-value-123");
-        let (status, refused) = call(&app, post("/v1/profiles/coder/connections/policy", json!({"connection_policy":{"debug":["unknown"]}}))).await;
+        let (status, refused) = call(
+            &app,
+            post(
+                "/v1/profiles/coder/connections/policy",
+                json!({"connection_policy":{"debug":["unknown"]}}),
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     }
 }
