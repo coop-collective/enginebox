@@ -583,6 +583,20 @@ fn execute_inner(
         cwd.is_dir() && cwd.starts_with(&workspace),
         "workdir escapes its assigned workspace."
     );
+    // Codex's workspace-write sandbox keeps the `.git` at the top of its
+    // writable root read-only (it even mounts an empty one there), so a Codex
+    // repository run starts in the workspace root, one level above its
+    // checkout: the checkout's own `.git` is then writable and the agent can
+    // clone, commit and push. `ENGINEBOX_RUN_DIR` still names the checkout.
+    let launch_cwd = match &work {
+        Some(work) if r.provider == "codex" && r.workdir == "." => work
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone()),
+        _ => cwd.clone(),
+    };
+    let cwd = launch_cwd;
     let env = environment(&home)?;
     let exe = find_binary(binary(&r.provider), &env)
         .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
