@@ -185,6 +185,20 @@ fn a_start_is_queued_then_runs_then_succeeds() {
 }
 
 #[test]
+fn a_run_with_a_truncated_transcript_that_exits_zero_succeeds() {
+    let (_t, root) = root();
+    let service = service(&root, QueueLimits::default());
+    service.set_run_executor(Arc::new(|_: &AdmittedRun| {
+        Ok(json!({"exit_code":0,"output":"head [truncated] tail","timed_out":false,"output_truncated":true}))
+    }));
+    measure(&service, Some(roomy()));
+    let run = start(&service, "ebox-a", "owner", "chatty");
+    wait_for("success", || {
+        status(&service, "ebox-a", &run["id"]) == "succeeded"
+    });
+}
+
+#[test]
 fn queued_runs_survive_a_restart_and_are_admitted_in_order() {
     let (_t, root) = root();
     let first = service(&root, QueueLimits::default());
