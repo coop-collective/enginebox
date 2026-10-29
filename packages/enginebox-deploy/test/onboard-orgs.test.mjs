@@ -53,8 +53,10 @@ test("plan mode runs only read-only checks; apply writes the secret and env frag
     run({ ...options, apply: true }, { log: (l) => lines.push(l), spawn });
     const secret = readFileSync(join(dir, "secret"), "utf8").trim();
     assert.equal(secret.length, 64);
-    assert.equal(statSync(join(dir, "secret")).mode & 0o777, 0o600);
-    assert.equal(statSync(join(dir, "env.json")).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(join(dir, "secret")).mode & 0o777, 0o600);
+      assert.equal(statSync(join(dir, "env.json")).mode & 0o777, 0o600);
+    }
     assert.equal(JSON.parse(readFileSync(join(dir, "env.json"), "utf8")).ENGINEBOX_EMAIL_SECRET, secret);
     const piped = calls.find((c) => c.args.includes("EMAIL_GATEWAY_SECRET"));
     assert.equal(piped.input, `${secret}\n`);
