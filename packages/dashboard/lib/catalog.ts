@@ -109,6 +109,8 @@ export async function catalog(request: Request, segments: string[]) {
   else if (kind === "profiles" && name && sub === "connections" && ["attach", "detach", "policy"].includes(action ?? "")) path = `v1/profiles/${name}/connections/${action}`;
   else if (kind === "repositories" && name && sub && PROJECT.test(name) && REPO.test(sub) && ["approve", "revoke"].includes(action ?? ""))
     path = `v1/projects/${name}/repositories/${sub}/requirements/${action}`;
+  else if (kind === "repositories" && name && sub && PROJECT.test(name) && REPO.test(sub) && action === "generate")
+    path = `v1/projects/${name}/repositories/${sub}/agent-config/generate`;
   if (!path) throw new HttpError(404, "Unknown catalog operation.");
   const { status, value } = await controller(path, who, "POST", body);
   return json(value, status);

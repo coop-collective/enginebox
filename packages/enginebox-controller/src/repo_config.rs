@@ -409,7 +409,7 @@ pub struct Granted {
     pub record: Value,
 }
 
-fn file_key(repository: &str) -> String {
+pub(crate) fn file_key(repository: &str) -> String {
     repository.replace('/', "__")
 }
 
@@ -647,6 +647,8 @@ impl RepoRequirements {
             "schema_version": config.schema_version,
             "commit": snapshot.commit,
             "registered_at": snapshot.registered_at,
+            // `repository`: read from the repository's own file; else registered through the API.
+            "source": if snapshot.registered_by == SOURCE_ACTOR { "repository" } else { "registered" },
             "profiles": profiles,
             "dev": dev,
         }))
