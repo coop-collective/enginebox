@@ -115,6 +115,33 @@ test('managed admission adopts legacy state and fences hot updates and interrupt
   } finally { await authority.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test('schema v2 keeps v1 behaviour, adds agents and dev secret requirements by name only', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ebox-project-v2-'));
+  try {
+    const v2 = files();
+    v2['.enginebox/config.json'] = JSON.stringify({ schema_version: 2, dev: { template: './templates/web.json', secrets: [{ name: 'DATABASE_URL', qualifier: 'staging', required: true }] }, agents: { profiles: { default: { default: true } } } });
+    const resolved = await resolveProject(await snapshot(root, v2));
+    assert.equal(resolved.template.id, 'web');
+    assert.deepEqual(resolved.secretRequirements, [{ name: 'DATABASE_URL', qualifier: 'staging', run_kinds: [], required: true }]);
+    // v1 files resolve exactly as before, with no requirements.
+    assert.deepEqual((await resolveProject(await snapshot(root, files()))).secretRequirements, []);
+    // An agents-only v2 repo has no dev environment.
+    const agentsOnly = files(); agentsOnly['.enginebox/config.json'] = JSON.stringify({ schema_version: 2, agents: { profiles: {} } });
+    assert.equal(await resolveProject(await snapshot(root, agentsOnly)), null);
+    for (const config of [
+      { schema_version: 1, dev: { template: './templates/web.json' }, agents: {} },
+      { schema_version: 1, dev: { template: './templates/web.json', secrets: [] } },
+      { schema_version: 2, dev: { template: './templates/web.json', secrets: [{ name: 'DATABASE_URL', qualifier: 'staging', value: 'leak' }] } },
+      { schema_version: 2, dev: { template: './templates/web.json', secrets: [{ name: 'database_url', qualifier: 'staging' }] } },
+      { schema_version: 2, dev: { template: './templates/web.json', secrets: [{ name: 'DATABASE_URL' }] } },
+      { schema_version: 3, dev: { template: './templates/web.json' } },
+    ]) {
+      const bad = files(); bad['.enginebox/config.json'] = JSON.stringify(config);
+      await assert.rejects(resolveProject(await snapshot(root, bad)));
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('project declarations resolve local or registered templates and bind install inputs, never host paths', async () => {
   const root = await mkdtemp(join(tmpdir(), 'ebox-project-schema-'));
   try {

@@ -34,6 +34,25 @@ export async function verifiedJson(source, path) {
   return JSON.parse(bytes.toString('utf8'));
 }
 
+const secretName = value => typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(value);
+const qualifier = value => typeof value === 'string' && /^[a-z][a-z0-9_.:-]{0,63}$/.test(value);
+const runKind = value => typeof value === 'string' && /^[a-z][a-z0-9_-]{0,31}$/.test(value);
+/** Secret requirements by name (v2): `{name, qualifier, run_kinds?, required?, description?}`. */
+export function requirements(list) {
+  if (list === undefined) return [];
+  check(Array.isArray(list) && list.length <= 64, 'invalid-secret-requirements');
+  const names = new Set();
+  for (const r of list) {
+    fields(r, ['name', 'qualifier', 'run_kinds', 'required', 'description']);
+    check(secretName(r.name) && !names.has(r.name) && qualifier(r.qualifier), 'invalid-secret-requirement');
+    check(r.run_kinds === undefined || (Array.isArray(r.run_kinds) && r.run_kinds.length <= 32 && r.run_kinds.every(runKind)), 'invalid-secret-requirement');
+    check(r.required === undefined || typeof r.required === 'boolean', 'invalid-secret-requirement');
+    check(r.description === undefined || (typeof r.description === 'string' && r.description.length <= 512), 'invalid-secret-requirement');
+    names.add(r.name);
+  }
+  return list.map(r => ({ name: r.name, qualifier: r.qualifier, run_kinds: r.run_kinds ?? [], required: r.required ?? false }));
+}
+
 export function validateTemplate(value) {
   fields(value, ['schema_version', 'kind', 'id', 'revision', 'image', 'prepare', 'command', 'cwd', 'ports', 'health', 'cpu', 'memoryMiB', 'timeoutSeconds', 'writableDirs', 'env', 'installInputs']);
   check(value.schema_version === 1 && value.kind === 'dev' && id(value.id) && Number.isSafeInteger(value.revision) && value.revision > 0, 'invalid-dev-template');
@@ -58,9 +77,16 @@ export function templateEnvironment(t, name, source, ports) {
 export async function resolveProject(source, catalog = []) {
   if (!source.manifest.entries.some(e => e.path === configPath)) return null;
   const config = await verifiedJson(source, configPath);
-  fields(config, ['schema_version', 'dev']);
-  check(config.schema_version === 1, 'invalid-project-config-version');
-  fields(config.dev, ['template']);
+  check(config.schema_version === 1 || config.schema_version === 2, 'invalid-project-config-version');
+  // v2 (docs/PROJECT-CONFIG.md) adds `agents` (read by the controller, not
+  // here) and secret *requirements* for the dev section. v1 files are unchanged.
+  fields(config, config.schema_version === 1 ? ['schema_version', 'dev'] : ['schema_version', 'dev', 'agents']);
+  if (config.schema_version === 2) {
+    check(config.agents === undefined || (config.agents && typeof config.agents === 'object' && !Array.isArray(config.agents)), 'invalid-agents-section');
+    if (config.dev === undefined) return null;
+  }
+  fields(config.dev, config.schema_version === 1 ? ['template'] : ['template', 'secrets']);
+  const secretRequirements = requirements(config.dev.secrets);
   const ref = config.dev.template;
   check(typeof ref === 'string', 'dev-template-required');
   let template; const paths = [configPath];
@@ -81,5 +107,7 @@ export async function resolveProject(source, catalog = []) {
     inputs[path] = entries[0].sha256;
   }
   const templateDigest = digest(template);
-  return { template, templateDigest, inputs, fingerprint: digest({ templateDigest, inputs }) };
+  // Requirements are names only; the repo never supplies or grants a value.
+  // Satisfying them needs an approved mapping in the controller's catalog.
+  return { template, templateDigest, inputs, fingerprint: digest({ templateDigest, inputs }), secretRequirements };
 }

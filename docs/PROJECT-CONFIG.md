@@ -62,8 +62,10 @@ The dev command must listen on `0.0.0.0`. Engine Box supplies
 No framework-specific reload code is injected.
 
 `env` contains ordinary nonsecret values. Secrets and provider credentials must
-not appear in tracked files. Secret references are not implemented by this
-version. Source remains read-only at runtime; `writableDirs` grants bounded
+not appear in tracked files. Schema version 2 adds secret *requirements* by name
+(see [Agent profiles and secret requirements](#agent-profiles-and-secret-requirements-schema-version-2));
+the environment service validates and reports them but does not yet inject
+values into dev containers. Source remains read-only at runtime; `writableDirs` grants bounded
 ephemeral caches. Persistent simulated bindings and application data belong in
 `ENGINEBOX_DATA_DIR` (`/data`). Cache paths cannot overlap tracked source files.
 
@@ -71,6 +73,178 @@ Dev templates, native-agent VM templates and CI toolchain templates have differe
 validated schemas and execution lifetimes. A CI automation continues selecting
 its own `job.template`; a native or CI template cannot be used as a dev runtime.
 Existing CI/CD automation formats are unchanged. Main promotion runs no CD job.
+
+## Agent profiles and secret requirements (schema version 2)
+
+`"schema_version": 2` keeps everything above and adds two things: named **agent
+profiles** for runs on this repository, and **secret requirements** for both the
+agent profiles and the `dev` section. Version 1 files keep working unchanged in
+the environment service and the controller. In version 2 the `dev` section is
+optional, so a repository may declare only agent profiles.
+
+### Security model
+
+Repository content is untrusted: any pull request or agent can edit it. So:
+
+- A repository only **declares** what it wants: secret names with a qualifier and
+  run kinds, catalog connections by name, its own MCP server URLs. It never
+  contains a value and can never grant itself a connection or a secret.
+- The org's [connections catalog](CONNECTIONS.md) **satisfies** a requirement only
+  through an explicit **approved mapping**: repository + repository profile +
+  requirement → a connection (a `secret_source` for a secret, an MCP connection
+  for an MCP name). Only an org owner or admin approves one, and it is audited.
+  Agents and service tokens with access to the repository may *propose* one.
+- An approval records the qualifier it was granted for. If the repository changes
+  a requirement's qualifier (`staging` → `production`, `read-only` → `write`) or a
+  repository MCP server's URL, the mapping shows **needs re-approval** and no
+  longer applies.
+- A requirement without an approved mapping is **unmet**: the run starts without
+  it and the run's details list it under `repo_profile.unmet`. If the requirement
+  is marked `"required": true`, the start is refused (HTTP 409) instead.
+- Repository-declared MCP servers carry a URL only, never headers, so they cannot
+  pull a run's secrets into a request. They need approval like everything else.
+
+### Format
+
+```json
+{
+  "schema_version": 2,
+  "dev": {"template": "./templates/web-dev.json",
+          "secrets": [{"name": "DATABASE_URL", "qualifier": "staging"}]},
+  "agents": {"profiles": {
+    "<name>": {
+      "default": true,
+      "description": "…",
+      "template": "native-dev", "size": "recommended",
+      "setup": ["pnpm", "install", "--frozen-lockfile"],
+      "dev": "dev",
+      "test": ["pnpm", "test"],
+      "env": {"NODE_ENV": "development"},
+      "mcp": ["kitbash", {"name": "docs", "url": "https://docs.example.com/mcp"}],
+      "secrets": [{"name": "DATABASE_URL", "qualifier": "staging", "run_kinds": ["builder"], "required": false}],
+      "ci": [{"name": "unit", "command": ["pnpm", "test"]}]
+    }
+  }}
+}
+```
+
+- **Profiles**: names match `^[a-z][a-z0-9-]{0,31}$`; at most 16; exactly one has
+  `"default": true`.
+- **Commands**: `setup`, `dev` and `test` are argv lists (1–32 arguments).
+  `"dev": "dev"` reuses the `dev` section's command, so the dev command is defined
+  once.
+- **`env`**: non-secret variables under the [per-run environment](FLEET.md#per-run-environment)
+  rules and denylist. They may not share a name with a secret requirement.
+- **`mcp`**: catalog connection names, or `{name, url}` for a server the repository
+  declares (HTTPS, no credentials).
+- **`secrets`**: up to 64 requirements: `name` (a variable a run may set),
+  `qualifier` (`^[a-z][a-z0-9_.:-]{0,63}$`, for example `staging`, `read-only`,
+  `deploy`), optional `run_kinds` (which kinds of run need it; empty means every
+  run), `required` and `description`.
+- **`ci`**: optional named jobs (`name`, `command`, optional `template`). These are
+  declared for tools that read them; Engine Box CI does not run them yet.
+- `dev.secrets` uses the same requirement shape. Its mappings use the repository
+  profile name `:dev`.
+
+### Choosing a profile and what a run gets
+
+A run on a hosted repository (`"repository": "<project>/<name>"`) uses the
+repository's default agent profile unless the start request names another with
+`"repo_profile": "debug"`. Ideator passes one per kind of work, together with
+`run_kind`. For that profile and run kind the controller:
+
+1. adds the profile's non-secret `env` and each met secret requirement's value
+   (from the mapped secret source) to the run's env, which reaches the native CLI
+   on stdin and is scrubbed from output like any run env value. Variables the
+   start request sets itself win. Like any run env, these values sit in the run's
+   private queue entry (0600) until admission;
+2. with an Engine Box profile on the run, adds met MCP connections and approved
+   repository servers to that provider's generated MCP config. Without one, MCP
+   requirements are recorded as unmet (`needs_profile`);
+3. skips requirements whose `run_kinds` exclude the run's kind (a run without a
+   kind gets only requirements with no `run_kinds`);
+4. records `repo_profile: {name, commit, met, unmet}` in the run's details, with
+   names and reasons only.
+
+`template`, `size`, `setup`, `dev`, `test` and `ci` are declarations for the
+caller and for the dashboard. The controller records the profile but does not yet
+choose a workspace template, run setup commands or start CI from them.
+
+### Where the controller reads the config
+
+The controller uses the config last **registered** for the repository:
+`POST /v1/projects/{project}/repositories/{name}/agent-config {commit, config}`,
+or the `repo_config_register` MCP tool. Callers with access to the repository may
+register, typically the checkout that is about to run, or CI on the default
+branch. Who registers does not affect security, because a config only declares.
+Reading `.enginebox/config.json` automatically at the exact commit a run checks
+out (from the guest checkout or the repository backend) is not implemented yet.
+
+### API and tools
+
+| Route | Who | Purpose |
+|---|---|---|
+| `GET /v1/projects/{p}/repositories/{n}/requirements` | owner; service tokens with a repository grant | each profile's requirements with `status` (`met`, `unmet`, `proposed`, `needs_reapproval`) and mapping |
+| `POST …/agent-config` | owner; service tokens with a repository grant | register the config (and commit) |
+| `POST …/requirements/propose` | owner; service tokens with a repository grant | `{repo_profile, kind?, requirement, connection?, source_name?}` |
+| `POST …/requirements/approve` | owner token only (dashboard: org owners and admins) | same body; replaces any earlier mapping for the requirement |
+| `POST …/requirements/revoke` | owner token only | `{repo_profile, kind?, requirement}` |
+
+`kind` is `secret` (default), `mcp` or `mcp_server`. `source_name` names the value
+in the secret source when it differs from the requirement name. Every write is
+audited (`repo.config_register`, `repo.requirement_propose`,
+`repo.requirement_approve`, `repo.requirement_revoke`). The fleet MCP server
+exposes `repo_requirements_get`, `repo_config_register` and
+`repo_requirement_propose_mapping`, with no approve tool. The dashboard's
+**Connections** page shows each repository's requirements with an **Approve**
+action for owners and admins.
+
+### Example: a Cloudflare Workers repository
+
+```json
+{
+  "schema_version": 2,
+  "dev": {
+    "template": "./templates/workers-dev.json",
+    "secrets": [{"name": "CLOUDFLARE_API_TOKEN", "qualifier": "read-only"}]
+  },
+  "agents": {"profiles": {
+    "default": {
+      "default": true,
+      "description": "Build features against staging.",
+      "template": "native-dev", "size": "recommended",
+      "setup": ["pnpm", "install", "--frozen-lockfile"],
+      "dev": "dev",
+      "test": ["pnpm", "test"],
+      "env": {"NODE_ENV": "development"},
+      "mcp": ["kitbash"],
+      "secrets": [{"name": "DATABASE_URL", "qualifier": "staging", "run_kinds": ["builder"]}]
+    },
+    "debug": {
+      "description": "Read-only Cloudflare and database access for investigating production.",
+      "template": "native-dev",
+      "mcp": ["cf-readonly", {"name": "docs", "url": "https://developers.cloudflare.com/mcp"}],
+      "secrets": [
+        {"name": "CLOUDFLARE_API_TOKEN", "qualifier": "read-only"},
+        {"name": "DATABASE_URL", "qualifier": "production-read-only"}
+      ]
+    },
+    "deploy": {
+      "description": "Run the tests, then deploy the Worker.",
+      "template": "native-dev",
+      "test": ["pnpm", "test"],
+      "secrets": [{"name": "CLOUDFLARE_API_TOKEN", "qualifier": "deploy", "run_kinds": ["deploy"], "required": true}],
+      "ci": [{"name": "deploy", "command": ["pnpm", "wrangler", "deploy"]}]
+    }
+  }}
+}
+```
+
+An admin then approves, for example, `default` / `DATABASE_URL` → the
+`canvalytics-staging` Kitbash source, `debug` / `CLOUDFLARE_API_TOKEN` → a
+read-only token source, and `deploy` / `CLOUDFLARE_API_TOKEN` → the deploy token
+source. A pull request that changes `debug`'s qualifier to `write`, or adds a new
+requirement, gets nothing until someone approves it.
 
 ## Import and startup
 

@@ -1,6 +1,7 @@
 "use client";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api, errorMessage } from "@/lib/client";
+import { RepoRequirementsPanel } from "@/components/repo-requirements-panel";
 
 type ValueRef = { env?: string; secret?: string; secret_source?: string; name?: string; prefix?: string };
 type Connection = {
@@ -227,6 +228,8 @@ export function ConnectionsPanel() {
           </tbody>
         </table></div>
       </div>
+
+      <RepoRequirementsPanel sources={sources} mcps={listing.connections.filter((c) => c.kind === "mcp_http" || c.kind === "mcp_stdio").map((c) => c.name)} />
 
       {manage && secretFor && (
         <div className="host-card">
