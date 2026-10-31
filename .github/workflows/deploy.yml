@@ -2,6 +2,14 @@ name: Deploy private controller
 on:
   push:
     branches: [main]
+    # Docs, examples and other workflows never change the controller: no deploy.
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!examples/**'
+      - '!**/*.md'
+      - '!.github/workflows/**'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
     inputs:
       operation:
@@ -32,7 +40,20 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+      # Settle window: pushes landing close together deploy once. A newer commit on main
+      # means a newer run (queued behind this one in the concurrency group) deploys it.
+      - id: settle
+        if: github.event_name == 'push'
+        env:
+          SETTLE_SECONDS: ${{ vars.ENGINEBOX_DEPLOY_SETTLE_SECONDS || '300' }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep "$SETTLE_SECONDS"
+          head=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.sha" "https://api.github.com/repos/$REPO/commits/main")
+          if [ "$head" != "$GITHUB_SHA" ]; then echo "superseded=true" >> "$GITHUB_OUTPUT"; echo "main moved to $head; the newer run deploys"; fi
       - id: plan
+        if: steps.settle.outputs.superseded != 'true'
         env:
           ENGINEBOX_DEPLOY_OPERATION: ${{ inputs.operation || 'update' }}
           ENGINEBOX_DEPLOY_VERSION: ${{ inputs.version }}
@@ -64,7 +85,7 @@ jobs:
           if-no-files-found: error
   deploy:
     needs: [plan, build]
-    if: always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.plan.outputs.operation != 'update')
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.operation != '' && (needs.build.result == 'success' || needs.plan.outputs.operation != 'update')
     runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 180
     environment: ${{ vars.ENGINEBOX_DEPLOY_ENVIRONMENT || 'production' }}
