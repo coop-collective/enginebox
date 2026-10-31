@@ -295,6 +295,45 @@ pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
     }
     args
 }
+/// Package-manager caches in the guest user's home. Codex's workspace-write
+/// sandbox makes the home read-only, so corepack, pnpm, npm, bun and cargo
+/// fail before a project's tests run; these directories alone are writable,
+/// and they persist between runs on the workspace like any cache.
+pub const PACKAGE_CACHE_DIRS: &[&str] = &[
+    ".cache",
+    ".npm",
+    ".local/share/pnpm",
+    ".bun/install/cache",
+    ".cargo/registry",
+    ".cargo/git",
+];
+/// The package caches under `home` that are real directories (never symlinks).
+pub fn package_cache_roots(home: &Path) -> Vec<String> {
+    PACKAGE_CACHE_DIRS
+        .iter()
+        .map(|d| home.join(d))
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect()
+}
+/// Create the package caches a Codex run may write (best effort: one that
+/// cannot be created is simply not offered to the sandbox).
+pub fn ensure_package_caches(home: &Path) {
+    for dir in PACKAGE_CACHE_DIRS {
+        let _ = std::fs::create_dir_all(home.join(dir));
+    }
+}
+/// A TOML array of path strings (JSON string escaping is valid TOML).
+pub fn toml_paths(paths: &[String]) -> String {
+    format!(
+        "[{}]",
+        paths
+            .iter()
+            .map(|p| serde_json::to_string(p).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
 pub fn native_command_with_config(
     r: &RunRequest,
     exe: &str,
@@ -302,6 +341,21 @@ pub fn native_command_with_config(
     cwd: &Path,
 ) -> Vec<String> {
     let mut args = native_command(r, exe);
+    if r.provider == "codex" {
+        let roots = package_cache_roots(home);
+        if !roots.is_empty() {
+            args.splice(
+                args.len() - 1..args.len() - 1,
+                [
+                    "-c".into(),
+                    format!(
+                        "sandbox_workspace_write.writable_roots={}",
+                        toml_paths(&roots)
+                    ),
+                ],
+            );
+        }
+    }
     if r.provider == "codex" && codex_browser_needs_default(home, cwd) {
         // A leaf override preserves per-tool policies and disabled_tools. Never
         // create a transport for browser-free homes or override an explicit
@@ -598,6 +652,9 @@ fn execute_inner(
     };
     let cwd = launch_cwd;
     let env = environment(&home)?;
+    if r.provider == "codex" {
+        ensure_package_caches(&home);
+    }
     let exe = find_binary(binary(&r.provider), &env)
         .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
     verify_client(&exe, &r.provider, &env, &cwd)?;

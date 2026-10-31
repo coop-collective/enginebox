@@ -746,7 +746,7 @@ fn materialize_inner(
             let browser = !block.strict_mcp && codex_home_has_browser(home);
             write(
                 "codex-home/config.toml",
-                codex_config(block, browser).as_bytes(),
+                codex_config(block, browser, &native::package_cache_roots(home)).as_bytes(),
                 false,
             )?;
             if let Some(auth) =
@@ -834,7 +834,7 @@ fn toml_array(values: &[String]) -> String {
 /// The generated CODEX_HOME config: sandbox from the permission profile, no
 /// approvals, risky features and bundled skills off, and only the profile's
 /// MCP servers (plus the workspace browser server unless `strict_mcp`).
-pub fn codex_config(block: &ProviderProfile, browser: bool) -> String {
+pub fn codex_config(block: &ProviderProfile, browser: bool, cache_roots: &[String]) -> String {
     let sandbox = match block.permission_profile {
         PermissionProfile::Edit => "workspace-write",
         PermissionProfile::ReadOnly => "read-only",
@@ -857,12 +857,19 @@ pub fn codex_config(block: &ProviderProfile, browser: bool) -> String {
         "[skills.bundled]".into(),
         "enabled = false".into(),
     ]);
-    if block.network_access && block.permission_profile == PermissionProfile::Edit {
-        lines.extend([
-            String::new(),
-            "[sandbox_workspace_write]".into(),
-            "network_access = true".into(),
-        ]);
+    if block.permission_profile == PermissionProfile::Edit
+        && (block.network_access || !cache_roots.is_empty())
+    {
+        lines.extend([String::new(), "[sandbox_workspace_write]".into()]);
+        if block.network_access {
+            lines.push("network_access = true".into());
+        }
+        if !cache_roots.is_empty() {
+            lines.push(format!(
+                "writable_roots = {}",
+                native::toml_paths(cache_roots)
+            ));
+        }
     }
     if browser {
         lines.extend([

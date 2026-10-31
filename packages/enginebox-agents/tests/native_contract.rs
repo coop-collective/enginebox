@@ -101,7 +101,20 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
 fn codex_browser_default_requires_owned_enabled_entry_and_preserves_policy() {
     let (_t, home) = temp();
     let request = native::RunRequest::parse(json!({"provider":"codex","prompt":"hello"})).unwrap();
-    let base = native::native_command(&request, "codex");
+    let mut base = native::native_command(&request, "codex");
+    // Every Codex run may write the package caches in its home.
+    native::ensure_package_caches(&home);
+    base.splice(
+        base.len() - 1..base.len() - 1,
+        [
+            "-c".into(),
+            format!(
+                "sandbox_workspace_write.writable_roots={}",
+                native::toml_paths(&native::package_cache_roots(&home))
+            ),
+        ],
+    );
+    assert!(base.iter().any(|a| a.contains(".local/share/pnpm")));
     let project = home.join("project");
     let cwd = project.join("nested");
     std::fs::create_dir_all(&cwd).unwrap();
