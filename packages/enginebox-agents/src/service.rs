@@ -4144,6 +4144,10 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
         "native_session_id",
         "error",
         "execution_uncertain",
+        // Written by note_start once a run's workspace is up; a controller that rejected them could not
+        // activate over the state of one that wrote them.
+        "start_path",
+        "start_latency_ms",
     ];
     ensure!(
         v.as_object()
@@ -4161,6 +4165,13 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
             && ["queued", "running", "failed", "succeeded"]
                 .contains(&v["status"].as_str().unwrap_or("")),
         "Invalid native run record."
+    );
+    ensure!(
+        v.get("start_path")
+            .is_none_or(|p| ["hot", "frozen", "stopped", "warm", "created"]
+                .contains(&p.as_str().unwrap_or("")))
+            && v.get("start_latency_ms").is_none_or(Value::is_u64),
+        "Invalid native run record start."
     );
     enginebox_core::identifier(v["host_id"].as_str().unwrap_or(""), false)?;
     enginebox_core::identifier(v["name"].as_str().unwrap_or(""), true)?;
@@ -4361,6 +4372,13 @@ mod run_control_tests {
             .unwrap();
         // A retained controller release can still read and safely classify the record.
         validate_record(&raw, id).unwrap();
+        // Records that note how their workspace started still load on activation.
+        let mut started = raw.clone();
+        started["start_path"] = json!("frozen");
+        started["start_latency_ms"] = json!(1234);
+        validate_record(&started, id).unwrap();
+        started["start_path"] = json!("teleported");
+        assert!(validate_record(&started, id).is_err());
         assert_eq!(raw["status"], "failed");
         let restarted = AgentService::new(&root, fleet).unwrap();
         assert_eq!(
