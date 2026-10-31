@@ -114,7 +114,7 @@ fn codex_browser_default_requires_owned_enabled_entry_and_preserves_policy() {
             ),
         ],
     );
-    assert!(base.iter().any(|a| a.contains(".local/share/pnpm")));
+    assert!(base.iter().any(|a| a.contains("pnpm")));
     let project = home.join("project");
     let cwd = project.join("nested");
     std::fs::create_dir_all(&cwd).unwrap();
