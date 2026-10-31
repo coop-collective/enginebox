@@ -8,6 +8,7 @@ mod compute;
 pub mod connections;
 pub mod contributors;
 pub mod credentials;
+pub mod engine_sessions;
 mod environment;
 pub mod jobs;
 pub mod kitbash;
@@ -80,6 +81,7 @@ struct Runtime {
     tenancy: tenancy::Tenancy,
     usage: Arc<dyn metering::UsageSink>,
     credentials: credentials::Credentials,
+    engine_sessions: engine_sessions::EngineSessions,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -230,6 +232,7 @@ impl Controller {
                 }),
             },
             tenancy: tenancy::Tenancy::open(&self.root)?,
+            engine_sessions: engine_sessions::EngineSessions::open(&self.root)?,
             credentials: {
                 let store =
                     credentials::Credentials::open(&self.root, &std::collections::BTreeMap::new())?;
@@ -752,9 +755,10 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         let operation = controller.clone();
         let reader = principal.clone();
         let acting = org.clone();
+        let acting_member = actor.clone();
         let result = blocking(move || {
             let _admission = admission;
-            read(&operation, &parts, &reader, &acting)
+            read(&operation, &parts, &reader, &acting, &acting_member)
         })
         .await;
         if let Ok(value) = &result
@@ -907,7 +911,16 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
         .to_owned();
     if request.method() != Method::POST
         || request.uri().query().is_some()
-        || !["enroll", "hello", "heartbeat", "poll", "result"].contains(&action.as_str())
+        || ![
+            "enroll",
+            "hello",
+            "heartbeat",
+            "poll",
+            "result",
+            "engine-poll",
+            "engine-report",
+        ]
+        .contains(&action.as_str())
     {
         return error(StatusCode::NOT_FOUND, "Unknown node operation.");
     }
@@ -924,7 +937,7 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
     let admission = {
         let mut gate = controller.gate.lock().unwrap();
         // Already admitted work must keep its lease and finish during a drain.
-        let finishing = ["heartbeat", "result"].contains(&action.as_str());
+        let finishing = ["heartbeat", "result", "engine-report"].contains(&action.as_str());
         if gate.mode != Mode::Active && !(finishing && gate.mode == Mode::Draining) {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -972,6 +985,16 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
                         .contributors
                         .enroll(&token, serde_json::from_value(body)?),
                 }
+            } else if let Some(engine) = action.strip_prefix("engine-") {
+                // Engine sessions use their own channel, never the job slot.
+                let (node, epoch) = runtime.contributors.engine_channel(&token, &body)?;
+                let platform = RuntimePlatform(&runtime);
+                match engine {
+                    "poll" => runtime.engine_sessions.poll(&node, epoch, &platform),
+                    _ => runtime
+                        .engine_sessions
+                        .report(&node, epoch, &body, &platform),
+                }
             } else {
                 runtime.contributors.node_call(&token, &action, body)
             }
@@ -988,7 +1011,13 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
     }
 }
 
-fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Result<Value> {
+fn read(
+    c: &Controller,
+    p: &[String],
+    principal: &Principal,
+    org: &str,
+    actor: &str,
+) -> Result<Value> {
     let s: Vec<_> = p.iter().map(String::as_str).collect();
     match s.as_slice() {
         ["v1", "hosts", host, "admission"] => {
@@ -1147,6 +1176,28 @@ fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Resul
             runtime
                 .previews
                 .get(&repo_config::repository_ref(project, name), id)
+        }
+        ["v1", "projects", project, "engine-sessions"] => {
+            let runtime = c.runtime()?;
+            Ok(runtime
+                .engine_sessions
+                .list(org, Some(project), actor, &RuntimePlatform(&runtime)))
+        }
+        ["v1", "projects", project, "engine-sessions", id] => {
+            let runtime = c.runtime()?;
+            runtime
+                .engine_sessions
+                .get(org, project, actor, id, &RuntimePlatform(&runtime))
+        }
+        ["v1", "engine-sessions"] => {
+            ensure!(
+                matches!(principal, Principal::Owner) && actor == "owner",
+                "Owner only"
+            );
+            let runtime = c.runtime()?;
+            Ok(runtime
+                .engine_sessions
+                .list(org, None, actor, &RuntimePlatform(&runtime)))
         }
         ["v1", "profiles"] => {
             let runtime = c.runtime()?;
@@ -1617,6 +1668,161 @@ fn unity_write(
     }
 }
 
+/// Engine sessions see the controller through this (engine_sessions.rs).
+struct RuntimePlatform<'a>(&'a Runtime);
+impl RuntimePlatform<'_> {
+    fn engine_repository(&self, org: &str, repository: &str, name: &str) -> Result<String> {
+        self.0.catalog.connections.source_value(
+            org,
+            &format!(
+                "{}{repository}",
+                engine_sessions::REPOSITORY_CONNECTION_PREFIX
+            ),
+            name,
+        )
+    }
+}
+impl engine_sessions::Platform for RuntimePlatform<'_> {
+    fn nodes(&self) -> Vec<engine_sessions::NodeView> {
+        self.0
+            .contributors
+            .engine_nodes()
+            .into_iter()
+            .map(|n| engine_sessions::NodeView {
+                org: self.0.tenancy.host_org(&n.id),
+                unity_versions: n.tools["unity"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .take(32)
+                    .collect(),
+                id: n.id,
+                engine_owner: n.engine_owner,
+                engine: n.windows,
+                online: n.online,
+                revoked: n.revoked,
+                epoch: n.epoch,
+            })
+            .collect()
+    }
+    fn repository_known(&self, org: &str, project: &str, repository: &str) -> bool {
+        (self.0.repositories.exists(project, repository)
+            && repo_config::same_org(org, self.0.repositories.org_of(project, repository)))
+            || self
+                .engine_repository(org, repository, engine_sessions::REPOSITORY_REMOTE)
+                .is_ok()
+    }
+    fn repository_access(
+        &self,
+        org: &str,
+        project: &str,
+        repository: &str,
+    ) -> Result<engine_sessions::RepositoryAccess> {
+        if self.0.repositories.exists(project, repository)
+            && repo_config::same_org(org, self.0.repositories.org_of(project, repository))
+        {
+            let credential = self.0.repositories.read_credential(
+                &repo_config::repository_ref(project, repository),
+                engine_sessions::REPOSITORY_TOKEN_TTL,
+            )?;
+            return Ok(engine_sessions::RepositoryAccess {
+                remote: credential.remote,
+                token: credential.token,
+                auth: match credential.auth {
+                    enginebox_agents::repository::Auth::Bearer => "bearer",
+                    enginebox_agents::repository::Auth::GithubToken => "github_token",
+                }
+                .into(),
+                expires_at: credential.expires_at,
+            });
+        }
+        // v1: an owner-configured read token for a repository Engine Box does
+        // not host or link (docs/ENGINE-SESSIONS.md).
+        let remote = self.engine_repository(org, repository, engine_sessions::REPOSITORY_REMOTE)?;
+        engine_sessions::check_remote(&remote)?;
+        Ok(engine_sessions::RepositoryAccess {
+            remote,
+            token: self.engine_repository(org, repository, engine_sessions::REPOSITORY_TOKEN)?,
+            auth: "github_token".into(),
+            expires_at: String::new(),
+        })
+    }
+    fn has_unity_account(&self, org: &str, member: &str) -> bool {
+        self.0.credentials.unity_for(org, member).is_some()
+    }
+    fn unity_access_token(&self, org: &str, member: &str) -> Result<String> {
+        self.0.credentials.unity_access_token(org, member)
+    }
+    fn relay(&self) -> Result<engine_sessions::Relay> {
+        let value = |name| {
+            self.0.catalog.connections.source_value(
+                enginebox_agents::pools::DEFAULT_ORG,
+                engine_sessions::MOQ_CONNECTION,
+                name,
+            )
+        };
+        match (
+            value(engine_sessions::MOQ_PUBLISH),
+            value(engine_sessions::MOQ_SUBSCRIBE),
+        ) {
+            (Ok(publish_token), Ok(subscribe_token)) => Ok(engine_sessions::Relay {
+                url: engine_sessions::DEFAULT_RELAY.into(),
+                publish_token,
+                subscribe_token,
+                control_token: value(engine_sessions::MOQ_CONTROL).ok(),
+            }),
+            _ => Err(engine_sessions::relay_missing()),
+        }
+    }
+    fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value) {
+        self.0
+            .catalog
+            .audit
+            .record(org, actor, action, target, ok, detail);
+    }
+}
+
+/// `POST /v1/projects/{p}/engine-sessions` (start), `…/{id}/renew`,
+/// `…/{id}/end`, and the owner's `POST /v1/engine-sessions/{id}/end`.
+/// Owner token (the dashboard names the member); service tokens are refused
+/// by `service_allows` until the OAuth grant exists.
+fn engine_session_write(
+    runtime: &Runtime,
+    org: &str,
+    actor: &str,
+    project: Option<&str>,
+    rest: &[String],
+    body: &Value,
+    owner: bool,
+) -> (StatusCode, Value) {
+    let platform = RuntimePlatform(runtime);
+    let sessions = &runtime.engine_sessions;
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let result = match (project, rest.as_slice()) {
+        (Some(project), []) => sessions.create(org, project, actor, body, &platform),
+        (Some(project), [id, "renew"]) => sessions.renew(org, project, actor, id, body, &platform),
+        (Some(project), [id, "end"]) => {
+            sessions.end(Some(org), Some(project), actor, id, body, &platform)
+        }
+        (None, [id, "end"]) if owner => sessions.end(None, None, actor, id, body, &platform),
+        _ => Ok((404, json!({"error": "Unknown engine session operation."}))),
+    };
+    match result {
+        Ok((status, value)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            value,
+        ),
+        Err(error) => {
+            let (status, message) = engine_sessions::status_of(&error);
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                json!({"error": message}),
+            )
+        }
+    }
+}
+
 fn actions_secret(runtime: &Runtime, org: &str, actor: &str, body: &Value) -> (StatusCode, Value) {
     let target = format!(
         "{}{}/{}",
@@ -1814,6 +2020,29 @@ async fn write(
         return blocking(move || Ok(unity_write(&runtime, &org, &actor, id.as_deref(), &body)))
             .await;
     }
+    if let Some((project, rest)) = match routed.as_slice() {
+        ["v1", "projects", project, "engine-sessions", rest @ ..] => {
+            Some((Some(project.to_string()), rest))
+        }
+        ["v1", "engine-sessions", rest @ ..] if matches!(rest, [_, "end"]) => Some((None, rest)),
+        _ => None,
+    } {
+        let runtime = c.runtime()?;
+        let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        let owner = matches!(principal, Principal::Owner) && actor == "owner";
+        return blocking(move || {
+            Ok(engine_session_write(
+                &runtime,
+                &org,
+                &actor,
+                project.as_deref(),
+                &rest,
+                &body,
+                owner,
+            ))
+        })
+        .await;
+    }
     if routed.as_slice() == ["v1", "actions-secrets"] {
         let runtime = c.runtime()?;
         return blocking(move || Ok(actions_secret(&runtime, &org, &actor, &body))).await;
@@ -1967,6 +2196,18 @@ async fn write(
         ["v1", "contributors", node, "renew-enrollment"] => {
             empty(&body)?;
             runtime.contributors.renew_enrollment(node)?
+        }
+        ["v1", "contributors", node, "engine-owner"] => {
+            let result = runtime.contributors.set_engine_owner(node, &body);
+            runtime.catalog.audit.record(
+                &org,
+                &actor,
+                "engine.machine_owner",
+                node,
+                result.is_ok(),
+                json!({"member": body.get("member")}),
+            );
+            result?
         }
         ["v1", "contributors", node, "revoke"] => {
             empty(&body)?;
@@ -5959,6 +6200,228 @@ mod tests {
                 })
                 .collect();
             assert!(leaks.is_empty(), "{leaks:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_sessions_run_on_the_members_own_machine_over_the_engine_channel() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        const BOB: &str = "usr_bbbbbbbbbbbbbbbbbbbbbbbb";
+        let (_temp, c) = setup();
+        let (url, _) = unity::fake::serve();
+        c.set_unity_login_url(&url);
+        c.activate().unwrap();
+        let app = router(c.clone());
+        let as_member = |method: Method, path: &str, body: Value, actor: &str| {
+            let mut r = request(method, path, &body.to_string(), true);
+            r.headers_mut()
+                .insert(catalog::ACTOR_HEADER, actor.parse().unwrap());
+            r
+        };
+        let node_post = |action: &str, token: &str, body: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/node/{action}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let publish = "eyJhbGciOiJFUzI1NiJ9.publish-claims.publish-signature";
+        let subscribe = "eyJhbGciOiJFUzI1NiJ9.subscribe-claims.subscribe-signature";
+        let repo_token = "github_pat_engine_repo_read_value";
+        for body in [
+            json!({"name":"cloudflare-moq","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"MOQ_PUBLISH_TOKEN":publish,"MOQ_SUBSCRIBE_TOKEN":subscribe}}),
+            json!({"name":"engine-repo-queen-of-hearts","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"GIT_REMOTE_URL":"https://github.com/coop-collective/queen-of-hearts.git","GIT_READ_TOKEN":repo_token}}),
+        ] {
+            let (status, created) = call(
+                &app,
+                request(Method::POST, "/v1/connections", &body.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+        }
+        // An engine machine, enrolled and claimed by Alice.
+        let runtime = c.runtime().unwrap();
+        let issued = runtime
+            .contributors
+            .issue(enginebox_node_protocol::Invitation {
+                label: "RTX 4080".into(),
+                budget: enginebox_node_protocol::installer_ceiling(),
+                workloads: enginebox_node_protocol::Workloads {
+                    ci: false,
+                    agents: false,
+                    engine: true,
+                },
+            })
+            .unwrap();
+        let node = issued["id"].as_str().unwrap().to_owned();
+        let token = format!("{node}.{}", "e".repeat(64));
+        runtime
+            .contributors
+            .enroll(
+                issued["code"].as_str().unwrap(),
+                enginebox_node_protocol::Enrollment {
+                    secret_hash: enginebox_core::state::digest(&json!(token)),
+                    budget: enginebox_node_protocol::Budget {
+                        cpu: 8,
+                        memory_gib: 32,
+                        disk_gib: 200,
+                    },
+                    os: "windows".into(),
+                    architecture: "x86_64".into(),
+                },
+            )
+            .unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let (status, hello) =
+            call(&app, node_post("hello", &token, json!({"session":session}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let epoch = hello["epoch"].clone();
+        let tools = json!({"worker_running":false,"engine":{"ready":true,"unity":["6000.6.5f1"],"running":0}});
+        let beat = json!({"session":session,"epoch":epoch,"tools":tools});
+        assert_eq!(
+            call(&app, node_post("heartbeat", &token, beat.clone()))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let start = json!({"request_id":"qoh-1","repository":"queen-of-hearts","ref":"main","project_path":"unity-project","engine":{"kind":"unity","version":"6000.6.5f1"},"scene":"Assets/_Project/Scenes/Prototype.unity"});
+        let path = "/v1/projects/qoh/engine-sessions";
+        // No Unity account yet: refused with the clear reason.
+        let (status, refused) =
+            call(&app, as_member(Method::POST, path, start.clone(), ALICE)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["error"], engine_sessions::NO_UNITY_ACCOUNT);
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                json!({"provider":"unity","kind":"personal","owner_user_id":ALICE,"username":"a@example.com","password":"right-password"}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // The machine has no owner member yet: nobody's session goes there.
+        let (status, refused) =
+            call(&app, as_member(Method::POST, path, start.clone(), ALICE)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["error"], engine_sessions::NO_ENGINE_MACHINE);
+        let (status, claimed) = call(
+            &app,
+            request(
+                Method::POST,
+                &format!("/v1/contributors/{node}/engine-owner"),
+                &json!({"member":ALICE}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{claimed}");
+        let (status, created) =
+            call(&app, as_member(Method::POST, path, start.clone(), ALICE)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        assert_eq!(created["state"], "placed");
+        let id = created["id"].as_str().unwrap().to_owned();
+        // Service tokens are not granted engine sessions yet.
+        let (_, secret) = mint(
+            &app,
+            json!({"label":"repo","scopes":[],"operations":[],"repositories":[{"project":"qoh","access":"write"}]}),
+        )
+        .await;
+        let mut as_service = request(Method::GET, path, "", false);
+        as_service.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {secret}").parse().unwrap(),
+        );
+        assert_eq!(call(&app, as_service).await.0, StatusCode::FORBIDDEN);
+        // The engine channel: a stale epoch is refused; the current one gets secrets.
+        let mut stale = json!({"session":session,"epoch":0});
+        assert_eq!(
+            call(&app, node_post("engine-poll", &token, stale.clone()))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        stale["epoch"] = epoch.clone();
+        let (status, polled) = call(&app, node_post("engine-poll", &token, stale.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{polled}");
+        let row = &polled["sessions"][0];
+        assert_eq!(row["id"], id.as_str());
+        assert_eq!(row["spec"]["namespace"], format!("eb-{id}"));
+        assert_eq!(row["secrets"]["unity"]["access_token"], unity::fake::TOKEN);
+        assert_eq!(row["secrets"]["repository"]["token"], repo_token);
+        assert_eq!(row["secrets"]["moq"]["publish_token"], publish);
+        assert!(!polled.to_string().contains(subscribe));
+        // The job slot is untouched.
+        let (_, job) = call(&app, node_post("poll", &token, stale.clone())).await;
+        assert!(job["job"].is_null());
+        assert!(runtime.contributors.catalog()["nodes"][0]["active_job"].is_null());
+        let generation = row["generation"].clone();
+        for state in ["preparing", "starting", "ready"] {
+            let mut report = stale.clone();
+            report["id"] = json!(id);
+            report["generation"] = generation.clone();
+            report["state"] = json!(state);
+            let (status, reply) = call(&app, node_post("engine-report", &token, report)).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+        }
+        let one = format!("{path}/{id}");
+        let (status, read) = call(&app, as_member(Method::GET, &one, json!({}), ALICE)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["state"], "ready");
+        assert_eq!(read["stream"]["audience"]["token"], subscribe);
+        let text = read.to_string();
+        for secret in [publish, repo_token, unity::fake::TOKEN, "right-password"] {
+            assert!(!text.contains(secret));
+        }
+        // Bob sees nothing; the owner sees the session without its stream.
+        assert_eq!(
+            call(&app, as_member(Method::GET, &one, json!({}), BOB))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, owner) = call(&app, request(Method::GET, &one, "", true)).await;
+        assert_eq!(owner["state"], "ready");
+        assert!(owner.get("stream").is_none());
+        let (_, all) = call(&app, request(Method::GET, "/v1/engine-sessions", "", true)).await;
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 1);
+        // Renew with the lease, then end; the node is told to stop.
+        let lease = created["lease"].as_str().unwrap();
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                &format!("{one}/renew"),
+                json!({"lease":lease,"ttl_seconds":1800}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, ended) = call(
+            &app,
+            as_member(Method::POST, &format!("{one}/end"), json!({}), ALICE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ended["state"], "ending");
+        let (_, polled) = call(&app, node_post("engine-poll", &token, stale.clone())).await;
+        assert_eq!(polled["sessions"][0]["desired"], "stop");
+        assert!(polled["sessions"][0].get("secrets").is_none());
+        // Audit has the start and the machine claim, never a value.
+        let (_, audit) = call(&app, request(Method::GET, "/v1/audit", "", true)).await;
+        let audit = audit.to_string();
+        assert!(audit.contains("engine.session_start") && audit.contains("engine.machine_owner"));
+        assert!(!audit.contains(publish) && !audit.contains(repo_token));
+        // Records on disk never hold minted secrets.
+        let disk =
+            std::fs::read_to_string(c.root.join(format!("engine-sessions/{id}.json"))).unwrap();
+        for secret in [publish, subscribe, repo_token, unity::fake::TOKEN] {
+            assert!(!disk.contains(secret));
         }
     }
 }

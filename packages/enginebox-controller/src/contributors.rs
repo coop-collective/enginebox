@@ -47,11 +47,26 @@ struct Node {
     active: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_binding: Option<ManagedHostBinding>,
+    /// The member whose personal engine machine this is (engine_sessions.rs).
+    /// Only that member's sessions are placed on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine_owner: Option<String>,
 }
 fn invitation_response(n: &Node, code: &str) -> Value {
     json!({"id":n.id,"code":code,"expires":n.expires,"one_time":true,
         "kind":if n.host_binding.is_some() {"incus"} else {"workspace"},
         "host_id":n.host_binding.as_ref().map(|b| &b.host_id),"budget":n.budget})
+}
+/// An engine machine as engine session placement sees it.
+pub struct EngineNode {
+    pub id: String,
+    pub engine_owner: Option<String>,
+    pub revoked: bool,
+    pub online: bool,
+    pub windows: bool,
+    pub epoch: u64,
+    /// The node's `tools.engine` report (`{ready, unity:[versions], running}`).
+    pub tools: Value,
 }
 #[derive(Clone)]
 pub struct Contributors {
@@ -185,6 +200,7 @@ impl Contributors {
             tools: json!({}),
             active: None,
             host_binding,
+            engine_owner: None,
         };
         self.save(&node)?;
         let response = invitation_response(&node, &code);
@@ -426,12 +442,73 @@ impl Contributors {
     }
     pub fn catalog(&self) -> Value {
         let rows=self.nodes.lock().unwrap().values().map(|n|json!({"id":n.id,"label":n.invitation.label,
-            "budget":n.budget,"workloads":n.invitation.workloads,"os":n.os,"architecture":n.architecture,
+            "budget":n.budget,"workloads":n.invitation.workloads,"engine_owner":n.engine_owner,"os":n.os,"architecture":n.architecture,
             "enrolled":n.secret_hash.is_some(),"revoked":n.revoked,"blocked":n.blocked,"active_job":n.active,
             "online":!n.revoked && n.last_seen+LEASE_SECONDS>now(),"last_seen":n.last_seen,"tools":n.tools,
             "kind":if n.host_binding.is_some() {"incus"} else {"workspace"},"host_id":n.host_binding.as_ref().map(|b| &b.host_id),"binding_digest":n.host_binding.as_ref().map(|b| &b.binding_digest),
             "disk_enforcement":if n.host_binding.is_some() { "Incus admission and configured host reserves" } else if n.os == "linux" { "WSL virtual disk maximum" } else { "workspace usage watchdog" },"cpu_memory_enforcement":if n.host_binding.is_some() { "Incus VM limits and configured host reserves" } else if n.os == "linux" { "WSL runtime cgroup" } else { "Windows Job Object (legacy)" }})).collect::<Vec<_>>();
         json!({"nodes":rows})
+    }
+    /// Record which member's personal machine an engine node is
+    /// (`POST /v1/contributors/{id}/engine-owner {member}`; owner token, the
+    /// dashboard sends the claiming admin). Engine sessions of other members
+    /// are never placed on it.
+    pub fn set_engine_owner(&self, key: &str, body: &Value) -> Result<Value> {
+        crate::keys(body, &["member"], &["member"])?;
+        let member = body["member"]
+            .as_str()
+            .context("member must be a user ID")?;
+        ensure!(
+            crate::audit::valid_actor(member) && member != "owner",
+            "member must be a user ID"
+        );
+        let mut nodes = self.nodes.lock().unwrap();
+        let n = nodes.get_mut(key).context("Unknown node")?;
+        ensure!(
+            !n.revoked && n.invitation.workloads.engine && n.host_binding.is_none(),
+            "Only an engine machine has an engine owner"
+        );
+        n.engine_owner = Some(member.to_owned());
+        self.save(n)?;
+        Ok(json!({"id": n.id, "engine_owner": n.engine_owner}))
+    }
+    /// Engine machines as session placement sees them.
+    pub fn engine_nodes(&self) -> Vec<EngineNode> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.invitation.workloads.engine && n.host_binding.is_none())
+            .map(|n| EngineNode {
+                id: n.id.clone(),
+                engine_owner: n.engine_owner.clone(),
+                revoked: n.revoked,
+                online: n.secret_hash.is_some() && n.last_seen + LEASE_SECONDS > now(),
+                windows: n.os == "windows",
+                epoch: n.epoch,
+                tools: n.tools["engine"].clone(),
+            })
+            .collect()
+    }
+    /// Authenticate and fence an `engine-poll` / `engine-report`: the node's
+    /// current session and epoch, an engine machine, with a fresh heartbeat.
+    /// Returns (node id, epoch). Never reads or changes the job slot.
+    pub fn engine_channel(&self, token: &str, body: &Value) -> Result<(String, u64)> {
+        ensure!(self.authenticated(token), "Invalid node credential");
+        let key = token.split('.').next().unwrap();
+        let nodes = self.nodes.lock().unwrap();
+        let n = nodes.get(key).context("Unknown node")?;
+        let session = body["session"].as_str().context("Session required")?;
+        ensure!(
+            !n.revoked
+                && n.host_binding.is_none()
+                && n.invitation.workloads.engine
+                && n.session == session
+                && body["epoch"].as_u64() == Some(n.epoch),
+            "Stale node session"
+        );
+        ensure!(n.last_seen + LEASE_SECONDS > now(), "Heartbeat required");
+        Ok((n.id.clone(), n.epoch))
     }
     pub fn revoke(&self, key: &str) -> Result<Value> {
         let mut nodes = self.nodes.lock().unwrap();

@@ -148,6 +148,10 @@ fn executable(name: &str) -> Option<PathBuf> {
         .map(|p| p.join(&file))
         .find(|p| p.is_absolute() && p.is_file())
 }
+/// An executable the worker would find (engine.rs uses it for git).
+pub fn find_executable(name: &str) -> Option<PathBuf> {
+    executable(name)
+}
 fn bytes_used(path: &Path, remaining: &mut usize) -> Result<u64> {
     ensure!(*remaining > 0, "Workspace file inventory limit reached");
     *remaining -= 1;
@@ -166,7 +170,20 @@ fn bytes_used(path: &Path, remaining: &mut usize) -> Result<u64> {
     Ok(bytes)
 }
 fn check_disk(root: &Path, budget: &Budget) -> Result<()> {
-    let used = bytes_used(root, &mut 250_000)?;
+    // Engine checkouts (a Unity project and its Library cache) are far larger
+    // than the workspace inventory walk allows; they are the owner's own
+    // machine's projects and are left to the free-space check below.
+    let mut remaining = 250_000;
+    let mut used = 0u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == "engine" {
+            continue;
+        }
+        used = used
+            .checked_add(bytes_used(&entry.path(), &mut remaining)?)
+            .context("Workspace size overflow")?;
+    }
     ensure!(
         used <= u64::from(budget.disk_gib) * 1024 * 1024 * 1024,
         "Workspace disk allowance exceeded"
@@ -330,11 +347,54 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
         "Controller returned a different machine budget or identity"
     );
     let epoch = hello["epoch"].as_u64().context("Missing epoch")?;
+    // Engine sessions: a parallel channel, never the job slot (engine.rs).
+    let engine_config = private
+        .parent()
+        .context("Missing installation root")?
+        .join(crate::engine::CONFIG_FILE);
+    let mut engine = if c.workloads.engine {
+        let swept = crate::engine::sweep(&root, private)?;
+        atomic_json(&private.join("engine-sweep.json"), &swept)?;
+        Some(crate::engine::Executor::new(
+            engine_config.clone(),
+            root.clone(),
+            private.to_owned(),
+        ))
+    } else {
+        None
+    };
+    let mut pending: Vec<(crate::engine::Report, u32)> = Vec::new();
+    let mut engine_polled = std::time::Instant::now();
     let result: Result<()>=async {
         loop {
-            let inventory=tools(&root,&c,false).await;
+            let mut inventory=tools(&root,&c,false).await;
+            if let Some(ex) = &engine {
+                inventory["engine"] = crate::engine::inventory(&engine_config, ex.running());
+            }
             let heartbeat=post(&c,"heartbeat",json!({"session":session,"epoch":epoch,"tools":inventory}),test).await?;
             atomic_json(&private.join("status.json"),&json!({"online":true,"id":c.id,"controller":c.controller,"budget":c.budget,"tools":inventory,"blocked":heartbeat["blocked"]}))?;
+            if let Some(ex) = engine.as_mut() {
+                match post(&c, "engine-poll", json!({"session":session,"epoch":epoch}), test).await {
+                    Ok(polled) => {
+                        engine_polled = std::time::Instant::now();
+                        pending.extend(ex.apply(&polled).into_iter().map(|r| (r, 0)));
+                    }
+                    // Without the controller's word for a minute, nothing keeps running.
+                    Err(_) if engine_polled.elapsed() > Duration::from_secs(60) => {
+                        ex.stop_all();
+                    }
+                    Err(_) => {}
+                }
+                pending.extend(ex.drain().into_iter().map(|r| (r, 0)));
+                // In order; a report the controller refuses is retried a few times, then dropped.
+                while let Some((report, attempts)) = pending.first_mut() {
+                    match post(&c, "engine-report", crate::engine::report_body(&session, epoch, report), test).await {
+                        Ok(_) => { pending.remove(0); }
+                        Err(_) if *attempts < 5 => { *attempts += 1; break; }
+                        Err(_) => { pending.remove(0); }
+                    }
+                }
+            }
             if heartbeat["blocked"]!=true {
                 check_disk(&root,&c.budget)?;
                 let poll=post(&c,"poll",json!({"session":session,"epoch":epoch}),test).await?;
@@ -380,6 +440,10 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
         }
     }.await;
+    if let Some(ex) = engine.as_mut() {
+        // The session Job Objects close with this process; ask tasks to stop first.
+        ex.stop_all();
+    }
     if cfg!(target_os = "linux") {
         crate::wsl::stop_runtime()?;
     }
