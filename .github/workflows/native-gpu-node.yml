@@ -61,6 +61,10 @@ jobs:
     runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON((github.ref == 'refs/heads/main' && vars.ENGINEBOX_LINUX_RUNNER) || '"ubuntu-24.04"') || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # GitHub's image ships git-lfs; Engine Box CI VMs may not (the LayerFS tests need it)
+      - name: Ensure git-lfs
+        if: runner.os == 'Linux'
+        run: command -v git-lfs >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git-lfs; }
       - name: Verify and build native node
         shell: bash
         run: |
@@ -114,6 +118,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # GitHub's image ships git-lfs; Engine Box CI VMs may not (the LayerFS tests need it)
+      - name: Ensure git-lfs
+        if: runner.os == 'Linux'
+        run: command -v git-lfs >/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git-lfs; }
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '24'
