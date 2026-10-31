@@ -67,7 +67,8 @@ INSTALLER=$PROD_PREFIX/releases/$VERSION/bin/enginebox-install
 
 # ---- directories (owner-only)
 run sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0700 "$STAGING"
-run install -d -m 0700 "$PREFIX" "$PREFIX/etc" "$STATE"
+# The installer refuses a prefix it does not own: let `stage` create it, then add etc/.
+run install -d -m 0700 "$STATE"
 
 # ---- release: stage the exact artifact into the staging prefix and activate it as the first release
 if [ -d "$PREFIX/releases/$VERSION" ]; then echo "keep release $VERSION"; else
@@ -77,6 +78,7 @@ fi
 if [ -f "$PREFIX/current.json" ]; then echo "keep active release ($(grep -o '"current": *"[^"]*"' "$PREFIX/current.json"))"; else
   run "$PREFIX/releases/$VERSION/bin/enginebox-install" --prefix "$PREFIX" activate --version "$VERSION"
 fi
+run install -d -m 0700 "$PREFIX/etc"
 
 # ---- private configuration: fresh secrets, never copied from production
 write_new "$PREFIX/etc/api-token" 0600 < <(openssl rand -hex 32)
