@@ -75,6 +75,8 @@ export function validateConfig(config) {
     const dirs = env.writableDirs ?? [];
     check(Array.isArray(dirs) && dirs.length <= 16 && dirs.every(p => sourcePath(p) && /^[A-Za-z0-9_./-]+$/.test(p)), 'invalid-writable-directories');
     check(dirs.length === 0 || env.updateMode === 'files', 'writable-directories-require-files-mode');
+    // A writable tmpfs over node_modules hides the dependencies prepare installed.
+    check(!dirs.some(p => p.split('/').at(-1) === 'node_modules'), 'writable-directory-hides-dependencies');
     for (let i = 0; i < dirs.length; i++) check(!dirs.slice(0, i).some(p => p === dirs[i] || p.startsWith(`${dirs[i]}/`) || dirs[i].startsWith(`${p}/`)), 'overlapping-writable-directories');
     if (env.source.kind === 'git') {
       fields(env.source, ['kind', 'url', 'branch']);

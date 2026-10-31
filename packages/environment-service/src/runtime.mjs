@@ -28,6 +28,14 @@ export function command(program, args, options = {}) {
   });
 }
 
+// The package manager a checkout's lockfile names, in the working directory
+// or else at the source root (a workspace keeps one lockfile there).
+async function packageManager(...dirs) {
+  const locks = [['pnpm-lock.yaml', 'pnpm'], ['package-lock.json', 'npm'], ['npm-shrinkwrap.json', 'npm'], ['yarn.lock', 'yarn'], ['bun.lock', 'bun'], ['bun.lockb', 'bun']];
+  for (const dir of dirs) for (const [file, name] of locks) if (await stat(join(dir, file)).then(() => true, () => false)) return name;
+  return null;
+}
+
 export class Environments {
   constructor(config, run = command) {
     this.config = config; this.run = run; this.states = {}; this.routes = []; this.busy = false;
@@ -144,7 +152,7 @@ export class Environments {
       this.observe(env, 'preparation_reuse', { revision: source.revision, status: 'reused', elapsed_ms: performance.now() - started });
       return release;
     }
-    const receipt = { revision: source.revision, source_copy_ms: null, source_bytes: null, prepare_ms: null };
+    const receipt = { revision: source.revision, source_copy_ms: null, source_bytes: null, prepare_ms: null, package_manager: null };
     try {
       // Each failed attempt gets an independent checkout; never clean a live tree.
       const checkout = join(source.root, `checkout-${source.revision}-${randomUUID()}`);
@@ -161,10 +169,13 @@ export class Environments {
         for (const part of env.cwd.split('/')) { path = join(path, part); check((await lstat(path)).isDirectory(), 'working-directory-invalid'); }
       }
       if (env.prepare?.length) {
+        receipt.package_manager = await packageManager(...(env.cwd && env.cwd !== '.' ? [join(checkout, env.cwd)] : []), checkout);
+        const state = this.states[env.id] ??= { healthy: false, status: 'pending' };
+        state.warnings = ['npm', 'yarn', 'bun'].includes(receipt.package_manager) ? [`package-manager-${receipt.package_manager}: environments are tuned for pnpm, whose store is shared across the project; ${receipt.package_manager} installs use a per-repository cache and are slower`] : [];
         await this.remove(env, '-prepare');
         const prepareStarted = performance.now();
         try {
-          await this.docker([...this.base(env, source.revision, '-prepare'), '--mount', `type=bind,src=${checkout},dst=/app`, env.image, ...env.prepare], { timeout: env.timeoutSeconds * 1000 });
+          await this.docker([...this.base(env, source.revision, '-prepare', await this.packageCache(env)), '--mount', `type=bind,src=${checkout},dst=/app`, env.image, ...env.prepare], { timeout: env.timeoutSeconds * 1000 });
         } finally { receipt.prepare_ms = performance.now() - prepareStarted; await this.remove(env, '-prepare'); }
       }
       await atomic(join(checkout, '.enginebox-prepared'), { revision: source.revision });
@@ -188,8 +199,30 @@ export class Environments {
     }
   }
 
-  base(env, revision, suffix = '') {
-    return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, ...(env.publicHost ? ['--env', `ENGINEBOX_PUBLIC_HOST=${env.publicHost}`, '--env', `ENGINEBOX_PUBLIC_URL=${env.publicScheme}://${env.publicHost}${env.publicPort ? `:${env.publicPort}` : ''}`] : []), ...Object.entries(env.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--workdir', env.cwd && env.cwd !== '.' ? `/app/${env.cwd}` : '/app'];
+  // Package managers cache under HOME, a 16 MiB tmpfs: npx, corepack and pnpm
+  // fill it (ENOSPC) before a monorepo installs. Each repository (or
+  // environment) gets one persistent cache directory for npm, yarn, bun and
+  // corepack. pnpm, which environments are tuned for, shares one
+  // content-addressed store across the project's repositories instead: a
+  // package downloads once, and pnpm checks each file's integrity when it
+  // imports it. The template's own env still wins.
+  async packageCache(env) {
+    const dir = async (kind, key) => {
+      const path = join(this.config.stateDir, kind, createHash('sha256').update(String(key)).digest('hex').slice(0, 32));
+      await mkdir(path, { recursive: true, mode: 0o700 });
+      return path;
+    };
+    const project = env.source?.repository?.split('/')[0] ?? env.source?.project ?? env.dataId ?? env.id;
+    return { cache: await dir('package-cache', env.source?.repository ?? env.dataId ?? env.id), store: await dir('pnpm-store', project) };
+  }
+  cacheArgs(caches) {
+    if (!caches) return [];
+    return ['--mount', `type=bind,src=${caches.cache},dst=/cache`, '--mount', `type=bind,src=${caches.store},dst=/pnpm-store`,
+      ...Object.entries({ npm_config_cache: '/cache/npm', npm_config_store_dir: '/pnpm-store', COREPACK_HOME: '/cache/corepack', XDG_CACHE_HOME: '/cache/xdg-cache', XDG_DATA_HOME: '/cache/xdg-data', BUN_INSTALL_CACHE_DIR: '/cache/bun', YARN_CACHE_FOLDER: '/cache/yarn' })
+        .flatMap(([key, value]) => ['--env', `${key}=${value}`])];
+  }
+  base(env, revision, suffix = '', cache = null) {
+    return ['run', '--name', this.container(env, suffix), '--label', `enginebox.environment.owner=${this.owner}`, '--label', `enginebox.environment.id=${env.id}`, '--label', `enginebox.environment.revision=${revision}`, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--pids-limit=256', '--cpus', String(env.cpu), '--memory', `${env.memoryMiB}m`, '--memory-swap', `${env.memoryMiB}m`, '--log-driver=local', '--log-opt=max-size=10m', '--log-opt=max-file=2', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', '--tmpfs', `/home/app:rw,nosuid,nodev,size=16m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`, '--user', `${process.getuid()}:${process.getgid()}`, '--env', 'HOME=/home/app', '--env', 'ENGINEBOX_DATA_DIR=/data', '--env', `ENGINEBOX_REVISION=${revision}`, ...this.cacheArgs(cache), ...(env.publicHost ? ['--env', `ENGINEBOX_PUBLIC_HOST=${env.publicHost}`, '--env', `ENGINEBOX_PUBLIC_URL=${env.publicScheme}://${env.publicHost}${env.publicPort ? `:${env.publicPort}` : ''}`] : []), ...Object.entries(env.env ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--workdir', env.cwd && env.cwd !== '.' ? `/app/${env.cwd}` : '/app'];
   }
   async start(env, revision) {
     await this.assertAdmission();
@@ -198,7 +231,7 @@ export class Environments {
     await mkdir(data, { recursive: true, mode: 0o700 });
     await this.remove(env);
     const files = env.updateMode === 'files';
-    const args = [...this.base(env, revision), '--detach', '--restart=unless-stopped', '--mount', `type=bind,src=${join(root, files ? 'workspace' : revision)},dst=/app,readonly`, '--mount', `type=bind,src=${data},dst=/data`];
+    const args = [...this.base(env, revision, '', await this.packageCache(env)), '--detach', '--restart=unless-stopped', '--mount', `type=bind,src=${join(root, files ? 'workspace' : revision)},dst=/app,readonly`, '--mount', `type=bind,src=${data},dst=/data`];
     if (files) {
       args.push('--label', `enginebox.environment.recipe=${createHash('sha256').update(JSON.stringify(env)).digest('hex')}`);
       for (const path of env.writableDirs ?? []) args.push('--tmpfs', `/app/${path}:rw,nosuid,nodev,size=256m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`);

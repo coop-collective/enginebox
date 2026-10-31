@@ -51,6 +51,10 @@ test('file watching requires verified storage and isolated nonoverlapping writab
   for (const dirs of [['../escape'], ['.git'], ['cache', 'cache/nested'], ['cache', 'cache'], ['cache:rw'], ['cache,nodev'], ['/absolute']]) {
     env.writableDirs = dirs; assert.throws(() => validateConfig(config));
   }
+  // A tmpfs over node_modules would hide what prepare installed.
+  for (const dirs of [['node_modules'], ['packages/api/node_modules']]) {
+    env.writableDirs = dirs; assert.throws(() => validateConfig(config), /writable-directory-hides-dependencies/);
+  }
   env.writableDirs = ['.wrangler', 'node_modules/.vite']; validateConfig(config);
   env.updateMode = 'restart'; assert.throws(() => validateConfig(config), /require-files-mode/);
   env.updateMode = 'unknown'; assert.throws(() => validateConfig(config), /invalid-update-mode/);
@@ -68,6 +72,14 @@ test('dev processes get a stable read-only source, bounded writable caches and a
     for (const path of env.writableDirs) assert(argv.includes(`/app/${path}:rw,nosuid,nodev,size=256m,mode=700,uid=${process.getuid()},gid=${process.getgid()}`));
     assert(argv.includes('127.0.0.1:18081:3000/tcp'));
     assert(argv.some(value => value.startsWith('enginebox.environment.recipe=')));
+    // Package managers write a persistent per-environment cache, not the 16 MiB
+    // home, and pnpm a store shared across the project.
+    const cache = argv.find(value => value.startsWith(`type=bind,src=${join(root, 'package-cache')}/`));
+    assert(cache && cache.endsWith(',dst=/cache'));
+    const store = argv.find(value => value.startsWith(`type=bind,src=${join(root, 'pnpm-store')}/`));
+    assert(store && store.endsWith(',dst=/pnpm-store'));
+    for (const variable of ['npm_config_cache=/cache/npm', 'npm_config_store_dir=/pnpm-store', 'COREPACK_HOME=/cache/corepack', 'XDG_DATA_HOME=/cache/xdg-data']) assert(argv.includes(variable));
+    assert(argv.indexOf('npm_config_cache=/cache/npm') < argv.indexOf(env.image), 'cache variables precede the template env and image');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 test('source follows only main, checks out exact commits, and preserves prior code and data', { skip: process.platform === 'win32' }, async () => {
