@@ -136,6 +136,7 @@ impl Contributors {
                 workloads: Workloads {
                     agents: true,
                     ci: false,
+                    engine: false,
                 },
             },
             Some(binding),
@@ -713,6 +714,7 @@ mod tests {
             workloads: Workloads {
                 ci: true,
                 agents: true,
+                engine: false,
             },
         }
     }

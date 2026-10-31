@@ -95,6 +95,15 @@ The receipt records the choice; later installs keep it, and `-Mode Uninstall`
 
 ### Dedicated engine account (personal GPU machines)
 
+**Add machine → Windows → Use: GPU engine machine** is the default Windows
+choice. It registers the `engine` workload only (never CI or agents) and the
+copied command runs the native node bootstrap with `-Workload engine`, which asks
+once for administrator approval and runs `install-worker-node.ps1 -EngineAccount`,
+sizing the allowance from the machine (all CPUs but two, 75% of memory, 200 GiB
+of disk) unless `-Cpu`, `-MemoryGiB` or `-DiskGiB` are given. The `engine`
+workload is serialized only when set, so CI and agent machines keep working with
+node releases that predate it; engine machines need a release that includes it.
+
 On an owner's own Windows PC, engine sessions run natively for full graphics
 (DirectX 12, Vulkan, Unreal) but never in the owner's account. `-EngineAccount`
 (elevated, implies `-AutoLogon`) creates a standard local user `enginebox`
@@ -145,6 +154,10 @@ The deployed dashboard requires:
 - `ENGINEBOX_NODE_INSTALLER_URL`: an exact versioned Enginebox GitHub release
   `install.ps1` URL.
 - `ENGINEBOX_NODE_INSTALLER_SHA256`: the lowercase SHA-256 of that file.
+- `ENGINEBOX_ENGINE_NODE_INSTALLER_URL` and `ENGINEBOX_ENGINE_NODE_INSTALLER_SHA256`:
+  the native node release's `install.ps1` bootstrap and its SHA-256, used for
+  **GPU engine machines**. Without them, engine machine registration returns a
+  visible error; WSL registration is unaffected.
 - Optional `ENGINEBOX_NODE_PUBLIC_ORIGIN`: HTTPS origin used by installed nodes;
   defaults to the dashboard origin. Paths, queries and URL credentials are refused.
 

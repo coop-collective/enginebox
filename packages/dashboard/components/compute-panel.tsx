@@ -3,7 +3,7 @@ import { FormEvent, ReactNode, useEffect, useState } from 'react';
 import { api } from '@/lib/client';
 import type { ComputeNode, Host } from '@/lib/types';
 type Budget = { cpu: number; memory_gib: number; disk_gib: number };
-export type Contributor = { kind?: 'workspace' | 'incus'; host_id?: string | null; id: string; label: string; budget: Budget; workloads: { ci: boolean; agents: boolean }; online: boolean; enrolled: boolean; revoked: boolean; blocked: boolean; tools: { ci?: boolean; workspace?: boolean; backend?: string; worker_running?: boolean } };
+export type Contributor = { kind?: 'workspace' | 'incus'; host_id?: string | null; id: string; label: string; budget: Budget; workloads: { ci: boolean; agents: boolean; engine?: boolean }; online: boolean; enrolled: boolean; revoked: boolean; blocked: boolean; tools: { ci?: boolean; workspace?: boolean; backend?: string; worker_running?: boolean } };
 type Enrollment = { id: string; expires: number; code: string; command: string; platform: 'windows' | 'linux'; shell: 'PowerShell' | 'Bash'; host_id: string | null };
 
 export function ComputePanel({ hosts, hostsLoaded, nodes, machines: inventory, loaded, loadError, refresh, hostDetails }: {
@@ -13,6 +13,7 @@ export function ComputePanel({ hosts, hostsLoaded, nodes, machines: inventory, l
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false), [adding, setAdding] = useState(false);
   const [label, setLabel] = useState('Windows workstation'), [ci, setCi] = useState(true), [agents, setAgents] = useState(true);
+  const [role, setRole] = useState<'engine' | 'workspaces'>('engine');
   const [platform, setPlatform] = useState<'windows' | 'linux'>('windows'), [hostId, setHostId] = useState('');
   const eligibleHosts = inventory.filter(n => n.backend === 'incus' && n.management.enroll);
   const selectedHost = eligibleHosts.find(n => n.source_id === hostId)?.source_id ?? eligibleHosts[0]?.source_id ?? '';
@@ -25,7 +26,7 @@ export function ComputePanel({ hosts, hostsLoaded, nodes, machines: inventory, l
   }, [invitation, nodes]);
   async function issue(event: FormEvent) {
     event.preventDefault();
-    await issueRegistration(platform === 'linux' ? { platform, host_id: selectedHost } : { platform, label, workloads: { ci, agents } });
+    await issueRegistration(platform === 'linux' ? { platform, host_id: selectedHost } : { platform, label, workloads: role === 'engine' ? { ci: false, agents: false, engine: true } : { ci, agents } });
   }
   async function issueRegistration(body: object) {
     setBusy(true); setError(''); setCopied(undefined); setInvitation(undefined);
@@ -66,8 +67,13 @@ export function ComputePanel({ hosts, hostsLoaded, nodes, machines: inventory, l
       <label>Operating system<select value={platform} onChange={e => setPlatform(e.target.value as 'windows' | 'linux')}><option value="windows">Windows</option><option value="linux">Linux server</option></select></label>
       {platform === 'windows' ? <>
         <label>Machine name<input required maxLength={80} value={label} onChange={e => setLabel(e.target.value)} /></label>
-        <p>Choose CPU, memory and disk limits in the installer.</p>
-        <div className="worker-actions"><label className="contributor-choice"><input type="checkbox" checked={ci} onChange={e => setCi(e.target.checked)} /> CI builds and checks</label><label className="contributor-choice"><input type="checkbox" checked={agents} onChange={e => setAgents(e.target.checked)} /> Agents in templates</label></div>
+        <label>Use<select value={role} onChange={e => setRole(e.target.value as 'engine' | 'workspaces')}><option value="engine">GPU engine machine: runs my engine sessions</option><option value="workspaces">Agents and CI (WSL)</option></select></label>
+        {role === 'engine'
+          ? <p>Engine sessions run natively with full graphics under a separate engine account that signs in by itself, never in your own account. The installer asks once for administrator approval; restart Windows afterwards.</p>
+          : <>
+            <p>Choose CPU, memory and disk limits in the installer.</p>
+            <div className="worker-actions"><label className="contributor-choice"><input type="checkbox" checked={ci} onChange={e => setCi(e.target.checked)} /> CI builds and checks</label><label className="contributor-choice"><input type="checkbox" checked={agents} onChange={e => setAgents(e.target.checked)} /> Agents in templates</label></div>
+          </>}
       </> : <>
         <label>Linux server<select required value={selectedHost} onChange={e => setHostId(e.target.value)}><option value="" disabled>Select a server</option>{eligibleHosts.map(host => <option key={host.id} value={host.source_id}>{host.label}</option>)}</select></label>
         <p>{eligibleHosts.length ? 'The installer adopts this configured server and preserves its existing workspaces and resource allowance.' : 'No configured servers need registration. Renew unfinished installations under Pending registrations. A new Linux server must first be configured for managed enrollment.'}</p>

@@ -31,6 +31,10 @@ impl Budget {
 pub struct Workloads {
     pub ci: bool,
     pub agents: bool,
+    /// Engine sessions on the owner's own GPU machine. Omitted when false so CI and agent machines
+    /// keep working with node releases that predate it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub engine: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -59,8 +63,8 @@ impl Invitation {
             "Invalid node label"
         );
         ensure!(
-            self.workloads.ci || self.workloads.agents,
-            "Select CI or agents"
+            self.workloads.ci || self.workloads.agents || self.workloads.engine,
+            "Select CI, agents or engine sessions"
         );
         Ok(())
     }
@@ -214,4 +218,52 @@ pub fn machine_id_hash(value: &str) -> Result<String> {
         "{:x}",
         Sha256::digest(value.to_ascii_lowercase().as_bytes())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invitation(workloads: Workloads) -> Invitation {
+        Invitation {
+            label: "Engine machine".into(),
+            budget: installer_ceiling(),
+            workloads,
+        }
+    }
+
+    #[test]
+    fn engine_workload_is_omitted_unless_set() {
+        let old: Workloads = serde_json::from_str(r#"{"ci":true,"agents":false}"#).unwrap();
+        assert!(!old.engine);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"ci":true,"agents":false}"#
+        );
+        let engine = Workloads {
+            ci: false,
+            agents: false,
+            engine: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&engine).unwrap(),
+            r#"{"ci":false,"agents":false,"engine":true}"#
+        );
+    }
+
+    #[test]
+    fn engine_only_invitations_validate() {
+        let engine = Workloads {
+            ci: false,
+            agents: false,
+            engine: true,
+        };
+        invitation(engine).validate().unwrap();
+        let none = Workloads {
+            ci: false,
+            agents: false,
+            engine: false,
+        };
+        assert!(invitation(none).validate().is_err());
+    }
 }
