@@ -46,7 +46,8 @@ MANIFEST=$ARTIFACTS/enginebox-$VERSION-$TARGET.json
 ARCHIVE=$ARTIFACTS/enginebox-$VERSION-$TARGET.tar.gz
 [ -f "$MANIFEST" ] && [ -f "$ARCHIVE" ] || { echo "missing $MANIFEST or $ARCHIVE" >&2; exit 2; }
 
-run() { if [ "$APPLY" = 1 ]; then "$@"; else printf 'would run:'; printf ' %q' "$@"; printf '\n'; fi; }
+# Commands never read stdin: `incus project create/set` read YAML from a non-terminal stdin (and would eat a loop's input).
+run() { if [ "$APPLY" = 1 ]; then "$@" </dev/null; else printf 'would run:'; printf ' %q' "$@"; printf '\n'; fi; }
 write_new() { # write_new FILE MODE: content from stdin, only when FILE does not exist yet
   local file=$1 mode=$2 content; content=$(cat)
   if [ -e "$file" ]; then echo "keep $file"; return; fi
@@ -67,7 +68,8 @@ INSTALLER=$PROD_PREFIX/releases/$VERSION/bin/enginebox-install
 
 # ---- directories (owner-only)
 run sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0700 "$STAGING"
-run install -d -m 0700 "$PREFIX" "$PREFIX/etc" "$STATE"
+# The installer refuses a prefix it does not own: let `stage` create it, then add etc/.
+run install -d -m 0700 "$STATE"
 
 # ---- release: stage the exact artifact into the staging prefix and activate it as the first release
 if [ -d "$PREFIX/releases/$VERSION" ]; then echo "keep release $VERSION"; else
@@ -77,6 +79,7 @@ fi
 if [ -f "$PREFIX/current.json" ]; then echo "keep active release ($(grep -o '"current": *"[^"]*"' "$PREFIX/current.json"))"; else
   run "$PREFIX/releases/$VERSION/bin/enginebox-install" --prefix "$PREFIX" activate --version "$VERSION"
 fi
+run install -d -m 0700 "$PREFIX/etc"
 
 # ---- private configuration: fresh secrets, never copied from production
 write_new "$PREFIX/etc/api-token" 0600 < <(openssl rand -hex 32)
