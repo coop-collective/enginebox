@@ -78,7 +78,7 @@ test('dev processes get a stable read-only source, bounded writable caches and a
     assert(cache && cache.endsWith(',dst=/cache'));
     const store = argv.find(value => value.startsWith(`type=bind,src=${join(root, 'pnpm-store')}/`));
     assert(store && store.endsWith(',dst=/pnpm-store'));
-    for (const variable of ['npm_config_cache=/cache/npm', 'npm_config_store_dir=/pnpm-store', 'COREPACK_HOME=/cache/corepack', 'XDG_DATA_HOME=/cache/xdg-data']) assert(argv.includes(variable));
+    for (const variable of ['npm_config_cache=/cache/npm', 'npm_config_store_dir=/pnpm-store', 'pnpm_config_store_dir=/pnpm-store', 'COREPACK_HOME=/cache/corepack', 'XDG_DATA_HOME=/cache/xdg-data']) assert(argv.includes(variable));
     assert(argv.indexOf('npm_config_cache=/cache/npm') < argv.indexOf(env.image), 'cache variables precede the template env and image');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

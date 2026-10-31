@@ -218,7 +218,7 @@ export class Environments {
   cacheArgs(caches) {
     if (!caches) return [];
     return ['--mount', `type=bind,src=${caches.cache},dst=/cache`, '--mount', `type=bind,src=${caches.store},dst=/pnpm-store`,
-      ...Object.entries({ npm_config_cache: '/cache/npm', npm_config_store_dir: '/pnpm-store', COREPACK_HOME: '/cache/corepack', XDG_CACHE_HOME: '/cache/xdg-cache', XDG_DATA_HOME: '/cache/xdg-data', BUN_INSTALL_CACHE_DIR: '/cache/bun', YARN_CACHE_FOLDER: '/cache/yarn' })
+      ...Object.entries({ npm_config_cache: '/cache/npm', npm_config_store_dir: '/pnpm-store', pnpm_config_store_dir: '/pnpm-store', COREPACK_HOME: '/cache/corepack', XDG_CACHE_HOME: '/cache/xdg-cache', XDG_DATA_HOME: '/cache/xdg-data', BUN_INSTALL_CACHE_DIR: '/cache/bun', YARN_CACHE_FOLDER: '/cache/yarn' })
         .flatMap(([key, value]) => ['--env', `${key}=${value}`])];
   }
   base(env, revision, suffix = '', cache = null) {

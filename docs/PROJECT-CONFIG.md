@@ -72,7 +72,7 @@ A writable directory cannot be a whole `node_modules` (it would hide what
 `prepare` installed); name the cache inside it, such as `node_modules/.cache`.
 
 Environments are tuned for pnpm. The project's repositories share one pnpm
-content-addressed store (`npm_config_store_dir=/pnpm-store`; pnpm checks each
+content-addressed store (`/pnpm-store`, through `pnpm_config_store_dir` and `npm_config_store_dir`; pnpm checks each
 file's integrity as it imports it), so a package downloads once per host. npm,
 yarn and bun work too, with a persistent cache per repository; a preview of a
 repository whose lockfile is not pnpm's carries a `package-manager-<name>` warning.
