@@ -274,20 +274,22 @@ impl Pools {
     /// the name counter are kept across replacement.
     pub fn put(&self, body: Value, known_host: &dyn Fn(&str) -> bool) -> Result<Value> {
         let object = body.as_object().context("Expected object")?;
-        ensure!(
-            object.keys().all(|k| [
-                "name",
-                "project",
-                "org_id",
-                "description",
-                "profile",
-                "template",
-                "workspaces",
-                "autoscale"
-            ]
-            .contains(&k.as_str())),
-            "Unsupported pool fields"
-        );
+        crate::require(
+            object.keys().all(|k| {
+                [
+                    "name",
+                    "project",
+                    "org_id",
+                    "description",
+                    "profile",
+                    "template",
+                    "workspaces",
+                    "autoscale",
+                ]
+                .contains(&k.as_str())
+            }),
+            "Unsupported pool fields",
+        )?;
         let named_project = object.contains_key("project");
         let named_org = object.contains_key("org_id");
         let mut pool: Pool = serde_json::from_value(body)?;
@@ -309,13 +311,13 @@ impl Pools {
                 pool.created_at = existing.created_at.clone();
             }
             None => {
-                ensure!(pools.len() < MAX_POOLS, "Pool limit reached");
+                crate::require(pools.len() < MAX_POOLS, "Pool limit reached")?;
                 pool.revision = 1;
                 pool.created_at = now.clone();
             }
         }
         pool.updated_at = now;
-        pool.validate(known_host)?;
+        pool.validate(known_host).map_err(crate::rule)?;
         self.save(&pool)?;
         let public = pool.public();
         pools.insert(pool.name.clone(), pool);
