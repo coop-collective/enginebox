@@ -28,6 +28,11 @@ mod preparation;
 struct Args {
     #[arg(long)]
     config: PathBuf,
+    /// Remove the disposable VM of an earlier request whose controller lost track of it
+    /// (`ebox-ci-<uuid>`). Only a VM matching that request's receipt (instance UUID and
+    /// allocation) is touched; a cleaned or never-allocated request is reported as is.
+    #[arg(long)]
+    reclaim: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -404,6 +409,48 @@ exit 0
     outcome?;
     Ok(receipt)
 }
+/// Reclaim one earlier request's VM: the controller found its GitHub job finished and its
+/// runner gone, but no worker reported cleanup (a restart interrupted the report).
+fn reclaim(config: Config, name: &str) -> Result<Value> {
+    enginebox_core::identifier(name, true)?;
+    ensure!(
+        name.starts_with("ebox-ci-") && uuid::Uuid::parse_str(&name[8..]).is_ok(),
+        "Not a disposable CI name"
+    );
+    let receipts = config.state_root.join("ci-receipts");
+    let receipt_path = receipts.join(format!("{name}.json"));
+    ensure!(receipt_path.try_exists()?, "No receipt for this request");
+    // A worker still running this request holds the lease: refused, not raced.
+    let _lease = state::lock(&receipts.join(format!("{name}.lock")), false)?;
+    let mut receipt = state::read_json(&receipt_path)?;
+    if receipt["cleaned"] == true {
+        return Ok(json!({"schema":1,"name":name,"reclaimed":false,"cleaned":true}));
+    }
+    let fleet = Fleet::load(&config.fleet, &config.state_root)?;
+    let host = fleet.host(&config.host_id)?;
+    ensure!(
+        host.project.starts_with("enginebox-ci-") && host.target == "local",
+        "CI worker requires a dedicated enginebox-ci-* project on the local Linux node"
+    );
+    let bx = host.engine_box();
+    let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
+    let existing = bx.instance(name).ok();
+    let reclaimed = if let Some(vm) = existing {
+        owned(&vm, &receipt)?;
+        if vm["status"] != "Stopped" {
+            bx.call(&["stop", name, "--force"])?;
+        }
+        bx.call(&["delete", name])?;
+        true
+    } else {
+        // Never allocated, or already gone.
+        false
+    };
+    receipt["cleaned"] = json!(true);
+    receipt["status"] = json!("reclaimed");
+    state::write_json(&receipt_path, &receipt)?;
+    Ok(json!({"schema":1,"name":name,"reclaimed":reclaimed,"cleaned":true}))
+}
 fn allocation_request(name: &str, template: &str, resources: Resources) -> Value {
     json!({"name":name,"template":template,"resources":resources})
 }
@@ -430,6 +477,9 @@ fn main() {
             "CI worker requires a local Linux Incus node"
         );
         let config: Config = serde_json::from_value(state::read_json(&args.config)?)?;
+        if let Some(name) = &args.reclaim {
+            return reclaim(config, name);
+        }
         let mut input = vec![];
         std::io::stdin()
             .take(128 * 1024 + 1)

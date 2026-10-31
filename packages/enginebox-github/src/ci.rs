@@ -7,8 +7,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
-    path::Path,
-    sync::atomic::Ordering,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -252,7 +256,15 @@ impl GitHub {
                 let pool = pool.clone();
                 std::thread::spawn(move || {
                     let started = Instant::now();
-                    let outcome = this.run_job(&key, &pool);
+                    let released = Arc::new(AtomicBool::new(false));
+                    let outcome = this.run_job(&key, &pool, &released);
+                    if !released.swap(true, Ordering::SeqCst) {
+                        this.pending.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    if this.handed_off.load(Ordering::SeqCst) {
+                        // The next owner adopted the worker.
+                        return;
+                    }
                     let mut data = this.data.lock().unwrap();
                     let job = data.jobs.get_mut(&key).unwrap();
                     match outcome {
@@ -270,13 +282,164 @@ impl GitHub {
                     if this.save(&data).is_err() {
                         job_persistence_failure(&mut data, &key);
                     }
-                    this.pending.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         }
+        drop(data);
+        self.reconcile_uncertain(config);
         Ok(())
     }
-    fn run_job(&self, key: &str, pool: &Pool) -> Result<Value> {
+    /// This owner hands state to the next controller: worker threads stop
+    /// writing, and live workers are left for the next owner to adopt.
+    pub fn hand_off(&self) {
+        let _data = self.data.lock().unwrap();
+        self.handed_off.store(true, Ordering::SeqCst);
+    }
+    /// Follow workers a previous owner left running to their end, once each.
+    pub fn adopt_workers(&self) {
+        let Some(config) = &self.config else {
+            return;
+        };
+        for key in std::mem::take(&mut *self.adoptable.lock().unwrap()) {
+            let job = self.data.lock().unwrap().jobs.get(&key).cloned();
+            let Some(pool) = job
+                .as_ref()
+                .and_then(|j| config.pools.iter().find(|p| j["pool"] == p.id))
+                .cloned()
+            else {
+                continue;
+            };
+            let this = self.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                while job.as_ref().is_some_and(worker_alive) {
+                    if this.handed_off.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                let outcome = job
+                    .as_ref()
+                    .context("Adopted job vanished")
+                    .and_then(read_worker_output)
+                    .and_then(|output| this.complete_job(&key, &pool, &output));
+                if this.handed_off.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut data = this.data.lock().unwrap();
+                let Some(job) = data.jobs.get_mut(&key) else {
+                    return;
+                };
+                match outcome {
+                    Ok(result) => finish_capacity(job, result),
+                    Err(_) => {
+                        job["status"] = json!("uncertain");
+                        job["error"] = json!(
+                            "Adopted runner did not report cleanup. Inspect GitHub and the private worker receipt; no automatic replay."
+                        );
+                    }
+                }
+                job["adopted_seconds"] = json!(started.elapsed().as_secs_f64());
+                if this.save(&data).is_err() {
+                    job_persistence_failure(&mut data, &key);
+                }
+            });
+        }
+    }
+    /// Uncertain jobs (a restart lost the worker's report): when GitHub shows
+    /// the job finished and its runner gone, have the worker remove that
+    /// request's VM (only the VM its receipt names) and mark the job finished.
+    /// Anything else waits and is retried later; nothing is replayed.
+    fn reconcile_uncertain(&self, config: &crate::Config) {
+        let now = api::now();
+        let candidates: Vec<(String, Value)> = {
+            let data = self.data.lock().unwrap();
+            data.jobs
+                .iter()
+                .filter(|(_, j)| {
+                    j["status"] == "uncertain"
+                        && j["runner_name"].is_string()
+                        && j["runner_id"].is_u64()
+                        && j["reconcile_after"].as_u64().unwrap_or(0) <= now
+                })
+                .map(|(k, j)| (k.clone(), j.clone()))
+                .collect()
+        };
+        for (key, job) in candidates {
+            let Some(pool) = config.pools.iter().find(|p| job["pool"] == p.id) else {
+                continue;
+            };
+            let outcome = self.reclaim(pool, &job);
+            if self.handed_off.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut data = self.data.lock().unwrap();
+            let Some(job) = data.jobs.get_mut(&key) else {
+                continue;
+            };
+            match outcome {
+                Ok(Some(result)) => {
+                    job["status"] = json!("finished");
+                    job["reclaimed"] = result["reclaimed"].clone();
+                    job.as_object_mut().unwrap().remove("error");
+                    job.as_object_mut().unwrap().remove("reconcile_after");
+                }
+                // Not yet provably over, or the check failed: look again later.
+                Ok(None) | Err(_) => job["reconcile_after"] = json!(now + RECONCILE_INTERVAL),
+            }
+            if self.save(&data).is_err() {
+                job_persistence_failure(&mut data, &key);
+            }
+        }
+    }
+    /// `Some(worker result)` when the job was provably over and its VM reclaimed.
+    fn reclaim(&self, pool: &Pool, job: &Value) -> Result<Option<Value>> {
+        let token = self.api.call(
+            "POST",
+            &format!("/app/installations/{}/access_tokens", pool.installation_id),
+            &api::jwt(self.app("runners")?)?,
+            Some(json!({"permissions":{"organization_self_hosted_runners":"write","actions":"read"}})),
+        )?;
+        let token = text(&token, "token")?;
+        let repo = text(job, "repository")?;
+        full_name(repo)?;
+        let current = self.api.call(
+            "GET",
+            &format!("/repos/{repo}/actions/jobs/{}", number(job, "id")?),
+            token,
+            None,
+        )?;
+        if current["status"] != "completed" {
+            return Ok(None);
+        }
+        let runner_name = text(job, "runner_name")?;
+        // Gone already, or idle and ours: removed. Busy or renamed: refused.
+        self.api.cleanup_runner(
+            &format!(
+                "/orgs/{}/actions/runners/{}",
+                pool.organization,
+                number(job, "runner_id")?
+            ),
+            token,
+            runner_name,
+        )?;
+        let mut command = std::process::Command::new(&pool.worker[0]);
+        command
+            .args(&pool.worker[1..])
+            .args(["--reclaim", runner_name])
+            .env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        let output = run_command(command, None, Duration::from_secs(180))?;
+        let result: Value = serde_json::from_slice(&output)?;
+        ensure!(
+            result["schema"] == 1 && result["cleaned"] == true && result["name"] == runner_name,
+            "Worker did not prove reclamation"
+        );
+        Ok(Some(result))
+    }
+    fn run_job(&self, key: &str, pool: &Pool, released: &AtomicBool) -> Result<Value> {
         let (job, token) = {
             let mut data = self.data.lock().unwrap();
             let installations = self.installations("runners", &mut data)?;
@@ -384,20 +547,57 @@ impl GitHub {
                 command.env(key, value);
             }
         }
-        let output = run_command(
-            command,
-            Some(&serde_json::to_vec(&request)?),
-            // Cold generation resolution has its own 20-minute bound before VM execution.
-            Duration::from_secs(
-                pool.timeout_seconds
-                    + if pool.preparation.is_some() {
-                        1800
-                    } else {
-                        600
-                    },
-            ),
-        )?;
-        let result: Value = serde_json::from_slice(&output)?;
+        // Cold generation resolution has its own 20-minute bound before VM execution.
+        let timeout = Duration::from_secs(
+            pool.timeout_seconds
+                + if pool.preparation.is_some() {
+                    1800
+                } else {
+                    600
+                },
+        );
+        // The worker runs detached (its own process group, output to a private
+        // file): a controller handoff neither waits for nor interrupts it.
+        let out = self.root.join("workers").join(format!("{key}.out"));
+        let mut child = spawn_worker(command, &serde_json::to_vec(&request)?, &out)?;
+        {
+            let mut data = self.data.lock().unwrap();
+            let job = data.jobs.get_mut(key).unwrap();
+            job["worker_pid"] = json!(child.id());
+            job["worker_program"] = json!(pool.worker[0]);
+            job["worker_output"] = json!(out.display().to_string());
+            self.save(&data)?;
+        }
+        if !released.swap(true, Ordering::SeqCst) {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.handed_off.load(Ordering::SeqCst) {
+                anyhow::bail!("Handed to the next controller");
+            }
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if Instant::now() > deadline {
+                kill_group(&mut child);
+                anyhow::bail!("Worker exceeded its bound");
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let job = self.data.lock().unwrap().jobs[key].clone();
+        let output = read_worker_output(&job)?;
+        self.complete_job(key, pool, &output)
+    }
+    /// Check a finished worker's report, remove its runner registration and
+    /// confirm the job's identity (also used for an adopted worker).
+    fn complete_job(&self, key: &str, pool: &Pool, output: &[u8]) -> Result<Value> {
+        let job = self.data.lock().unwrap().jobs[key].clone();
+        let repo = text(&job, "repository")?;
+        let runner_id = number(&job, "runner_id")?;
+        let runner_name = text(&job, "runner_name")?.to_owned();
+        let selected_id = number(&job, "repository_id")?;
+        let result: Value = serde_json::from_slice(output)?;
         ensure!(
             result["schema"] == 1
                 && result["cleaned"] == true
@@ -418,7 +618,7 @@ impl GitHub {
             let actual = &result["assignment"];
             ensure!(
                 actual["verified"] == true
-                    && actual["repository_id"] == selected.id
+                    && actual["repository_id"] == selected_id
                     && actual["runner_id"] == runner_id
                     && actual["job_id"].as_u64().is_some_and(|id| id > 0)
                     && actual["run_id"].as_u64().is_some_and(|id| id > 0)
@@ -453,6 +653,86 @@ impl GitHub {
         Ok(
             json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued", "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64(),"capacity_wait":capacity_wait}),
         )
+    }
+}
+/// How long an uncertain job waits between reconciliation attempts.
+const RECONCILE_INTERVAL: u64 = 600;
+const MAX_WORKER_OUTPUT: u64 = 1024 * 1024;
+/// Start a worker in its own process group with stdin from a private file
+/// and stdout to `out`, so it outlives this controller process.
+fn spawn_worker(
+    mut command: std::process::Command,
+    input: &[u8],
+    out: &Path,
+) -> Result<std::process::Child> {
+    enginebox_core::state::private_dir(out.parent().context("Invalid worker output path")?)?;
+    let mut stdin = tempfile::tempfile()?;
+    stdin.write_all(input)?;
+    stdin.seek(SeekFrom::Start(0))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let stdout = options.open(out)?;
+    command
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn().context("Cannot start CI worker")
+}
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+/// A finished worker's report, then its output file is removed.
+fn read_worker_output(job: &Value) -> Result<Vec<u8>> {
+    let path = PathBuf::from(text(job, "worker_output")?);
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take(MAX_WORKER_OUTPUT + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_WORKER_OUTPUT,
+        "Oversized worker report"
+    );
+    let _ = std::fs::remove_file(&path);
+    Ok(bytes)
+}
+/// Whether the job's recorded worker process is still that worker (not a reused pid).
+pub(crate) fn worker_alive(job: &Value) -> bool {
+    let (Some(pid), Some(program)) = (job["worker_pid"].as_u64(), job["worker_program"].as_str())
+    else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| {
+            raw.split(|b| *b == 0)
+                .next()
+                .is_some_and(|first| first == program.as_bytes())
+        })
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = program;
+        i32::try_from(pid).is_ok_and(|pid| unsafe { libc::kill(pid, 0) == 0 })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, program);
+        false
     }
 }
 fn capacity_wait_proof(result: &Value) -> Result<bool> {
@@ -526,10 +806,14 @@ mod tests {
             )]);
             g.api = api;
             assert!(
-                g.run_job("2-99", &g.config.as_ref().unwrap().pools[0])
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Approve organization")
+                g.run_job(
+                    "2-99",
+                    &g.config.as_ref().unwrap().pools[0],
+                    &AtomicBool::new(true)
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Approve organization")
             );
             server.join().unwrap();
             assert!(g.status()["jobs"].as_array().unwrap().is_empty());
@@ -565,6 +849,101 @@ mod tests {
         }
     }
     #[cfg(unix)]
+    #[test]
+    fn a_live_worker_is_adopted_after_a_restart_and_a_dead_one_is_uncertain() {
+        let (root, g) = crate::tests::shared_service();
+        {
+            let mut data = g.data.lock().unwrap();
+            // This test process stands in for a worker that outlived its controller.
+            data.jobs.insert("2-1".into(), json!({"id":1,"status":"running","pool":"linux","worker_pid":std::process::id(),"worker_program":std::env::args().next().unwrap()}));
+            data.jobs.insert("2-2".into(), json!({"id":2,"status":"running","pool":"linux","worker_pid":999_999_999u64,"worker_program":"/nonexistent"}));
+            g.save(&data).unwrap();
+        }
+        let reopened = GitHub::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.adoptable.lock().unwrap().as_slice(),
+            ["2-1".to_owned()]
+        );
+        let data = reopened.data.lock().unwrap();
+        assert_eq!(data.jobs["2-1"]["status"], "running");
+        assert_eq!(data.jobs["2-2"]["status"], "uncertain");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn an_uncertain_job_is_reclaimed_once_github_shows_it_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, mut g) = crate::tests::shared_service();
+        crate::tests::with_app_key(&mut g);
+        let worker = root.path().join("reclaim-worker");
+        std::fs::write(
+            &worker,
+            "#!/bin/sh\n[ \"$1\" = --reclaim ] || exit 2\nprintf '{\"schema\":1,\"name\":\"%s\",\"reclaimed\":true,\"cleaned\":true}\\n' \"$2\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        g.config.as_mut().unwrap().pools[0].worker = vec![worker.display().to_string()];
+        let name = "ebox-ci-0123456789abcdef0123456789abcdef";
+        let job = |status: &str| json!({"id":99,"run_id":44,"status":status,"pool":"linux","repository":"fixture/private","repository_id":101,"runner_id":501,"runner_name":name,"error":"Controller restarted; inspect runner and worker receipts before recovery. No job replayed."});
+        // Still running on GitHub: left alone and retried later.
+        g.data
+            .lock()
+            .unwrap()
+            .jobs
+            .insert("2-99".into(), job("uncertain"));
+        let (api, server) = crate::tests::api_fixture(vec![
+            (
+                "/app/installations/2/access_tokens",
+                json!({"token":"fixture-installation-token"}),
+            ),
+            (
+                "/repos/fixture/private/actions/jobs/99",
+                json!({"id":99,"status":"in_progress"}),
+            ),
+        ]);
+        g.api = api;
+        let config = g.config.clone().unwrap();
+        g.reconcile_uncertain(&config);
+        server.join().unwrap();
+        {
+            let data = g.data.lock().unwrap();
+            assert_eq!(data.jobs["2-99"]["status"], "uncertain");
+            assert!(data.jobs["2-99"]["reconcile_after"].as_u64().unwrap() > api::now());
+        }
+        // Over, runner idle: the runner and the VM are removed, the job finished.
+        g.data
+            .lock()
+            .unwrap()
+            .jobs
+            .insert("2-99".into(), job("uncertain"));
+        let (api, server) = crate::tests::api_fixture(vec![
+            (
+                "/app/installations/2/access_tokens",
+                json!({"token":"fixture-installation-token"}),
+            ),
+            (
+                "/repos/fixture/private/actions/jobs/99",
+                json!({"id":99,"status":"completed"}),
+            ),
+            (
+                "GET /orgs/fixture/actions/runners/501",
+                json!({"name":name,"busy":false}),
+            ),
+            ("DELETE /orgs/fixture/actions/runners/501", json!({})),
+        ]);
+        g.api = api;
+        g.reconcile_uncertain(&config);
+        server.join().unwrap();
+        let data = g.data.lock().unwrap();
+        assert_eq!(data.jobs["2-99"]["status"], "finished");
+        assert_eq!(data.jobs["2-99"]["reclaimed"], true);
+        assert!(data.jobs["2-99"]["error"].is_null());
+    }
+    #[test]
+    fn a_handed_off_service_stops_writing() {
+        let (_root, g) = crate::tests::shared_service();
+        g.hand_off();
+        assert!(g.handed_off.load(Ordering::SeqCst));
+    }
     fn jit_fixture(prepared: bool, shared: bool, capacity_wait: bool) {
         use crate::tests::{account, api_fixture, service, shared_service};
         use std::{
@@ -671,7 +1050,11 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         let (api, server) = api_fixture(responses);
         g.api = api;
         let result = g
-            .run_job("2-99", &g.config.as_ref().unwrap().pools[0])
+            .run_job(
+                "2-99",
+                &g.config.as_ref().unwrap().pools[0],
+                &AtomicBool::new(true),
+            )
             .unwrap();
         server.join().unwrap();
         assert_eq!(result["cleaned"], true);

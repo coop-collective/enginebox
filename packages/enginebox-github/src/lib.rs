@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -93,6 +93,11 @@ pub struct GitHub {
     pub(crate) data: Arc<Mutex<Data>>,
     pub(crate) api: api::Api,
     pub(crate) pending: Arc<AtomicUsize>,
+    /// Set when this owner hands state to the next: its worker threads stop
+    /// writing and leave live workers to the next owner.
+    pub(crate) handed_off: Arc<AtomicBool>,
+    /// Jobs whose worker outlived the previous owner, adopted on activation.
+    pub(crate) adoptable: Arc<Mutex<Vec<String>>>,
 }
 pub fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().context("Missing text field")
@@ -208,8 +213,14 @@ impl GitHub {
                 );
             }
         }
-        for job in data.jobs.values_mut() {
+        let mut adoptable = Vec::new();
+        for (key, job) in data.jobs.iter_mut() {
             if job["status"] == "running" {
+                // A worker started detached may still be running: adopt it.
+                if ci::worker_alive(job) {
+                    adoptable.push(key.clone());
+                    continue;
+                }
                 job["status"] = json!("uncertain");
                 job["error"] = json!(
                     "Controller restarted; inspect runner and worker receipts before recovery. No job replayed."
@@ -222,6 +233,8 @@ impl GitHub {
             data: Arc::new(Mutex::new(data)),
             api: api::Api::new()?,
             pending: Arc::new(AtomicUsize::new(0)),
+            handed_off: Arc::new(AtomicBool::new(false)),
+            adoptable: Arc::new(Mutex::new(adoptable)),
         };
         if service.config.is_some() {
             service.save(&service.data.lock().unwrap())?;
