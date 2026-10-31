@@ -44,7 +44,7 @@ function protocol(report) {
 export async function execute(request, directory) {
   fields(request, ['operation', 'version', 'config', 'templates', 'manifest_sha256']);
   check(request.operation === 'update' ? /^[a-f0-9]{64}$/.test(request.manifest_sha256) : request.manifest_sha256 === null, 'request-manifest-pin');
-  check(['update', 'rollback', 'status', 'smoke', 'watch'].includes(request.operation), 'invalid-deployment-operation');
+  check(['update', 'rollback', 'status', 'smoke', 'reads', 'watch'].includes(request.operation), 'invalid-deployment-operation');
   const deployment = config(request.config); const pin = request.operation === 'status' ? null : version(request.version); const c = deployment.controller;
   check(Array.isArray(request.templates) && request.templates.length <= 32, 'template-list');
   request.templates.forEach(v => template(v, deployment));
@@ -66,6 +66,7 @@ export async function execute(request, directory) {
     return { ok: true, operation: 'status', version: previous.current, ready: true, private_state_preserved: true };
   }
   if (request.operation === 'smoke') return smoke(deployment, c.url, token, pin, previous);
+  if (request.operation === 'reads') return { ok: true, operation: 'reads', version: pin, ...(await reads(c.url, token, pin, previous)) };
   if (request.operation === 'watch') return watch(deployment, c.url, token, pin, previous);
   const release = join(c.prefix, 'releases', pin);
   if (request.operation === 'update') {
@@ -87,7 +88,14 @@ export async function execute(request, directory) {
   protocol(report);
   const builtVersion = (await run(join(release, 'bin/enginebox-controller'), ['--version'])).trim();
   check(builtVersion === `enginebox-controller ${pin}`, 'candidate-binary-version-mismatch');
-  if (previous.current !== pin) await run(c.installer, installerArgs(deployment, request.operation, pin), { timeout: 1200000 });
+  if (previous.current !== pin) {
+    try {
+      await run(c.installer, installerArgs(deployment, request.operation, pin), { timeout: 1200000 });
+    } catch {
+      // A refused activation must never look like a retryable blip: name what state the controller was left in.
+      throw new Error(await cutoverFailure(c.url, token, pin, previous.current));
+    }
+  }
   const ready = await api(c.url, token, '/readyz');
   check(ready.version === pin && ready.mode === 'active', 'deployed-controller-not-ready');
   const expected = [];
@@ -130,14 +138,60 @@ const listRuns = async (base, token) => {
   return value.runs;
 };
 
-/** The staging gate: the exact version is active and serving reads; with a pool and provider, a trivial run succeeds. */
-async function smoke(deployment, base, token, pin, status) {
-  check(status.current === pin, 'smoke-version-not-active');
+/**
+ * After a failed installer switch: which state the controller is in. The supervisor restores the old controller on a
+ * refused activation; when that restore fails too, the controller is left drained (serving nothing) until the next
+ * activation, which is the incident this classification exists for.
+ */
+export async function cutoverFailure(base, token, pin, before, probe = api) {
+  let status;
+  try { status = await probe(base, token, '/__enginebox/status'); } catch { return 'cutover-failed-controller-unreachable'; }
+  let ready = null;
+  try { ready = await probe(base, token, '/readyz'); } catch { ready = null; }
+  if (!ready || ready.mode !== 'active') return 'cutover-failed-controller-drained';
+  if (status.current === before && ready.version === before) return 'cutover-refused-previous-version-restored';
+  if (status.current === pin && ready.version === pin) return 'cutover-failed-after-switch';
+  return 'cutover-failed-version-mismatch';
+}
+
+/** The exact version is active and serving the main reads. */
+async function reads(base, token, pin, status) {
+  check(status.current === pin, 'version-not-active');
   const ready = await api(base, token, '/readyz');
-  check(ready.version === pin && ready.mode === 'active', 'smoke-controller-not-ready');
+  check(ready.version === pin && ready.mode === 'active', 'controller-not-ready');
   for (const endpoint of ['/v1/pools', '/v1/agent-runs', '/v1/templates']) await api(base, token, endpoint);
+  return { reads: 'ok' };
+}
+
+/**
+ * Durable state written by this release, so the rollback round trip makes the previous release read it: a pool record
+ * and an agent-run record (queued on the empty smoke pool, then cancelled). Agent-run record fields are exactly what
+ * broke a previous release's activation validator once.
+ */
+const SEED_POOL = 'smoke-state';
+async function seed(base, token) {
+  await api(base, token, '/v1/pools', { name: SEED_POOL, description: 'Deploy smoke state (staging only)', workspaces: [] });
+  let run = 'refused';
+  try {
+    const started = await api(base, token, `/v1/pools/${SEED_POOL}/agent-runs`, { provider: 'codex', prompt: 'Deploy smoke state record; never placed.', timeout_seconds: 60 });
+    const id = started.run?.id ?? started.id;
+    if (typeof id === 'string' && /^[a-f0-9]{32}$/.test(id)) {
+      await api(base, token, `/v1/pools/${SEED_POOL}/agent-runs/${id}/cancel`, {});
+      run = 'queued-and-cancelled';
+    }
+  } catch { run = 'refused'; }
+  return { pool: SEED_POOL, run };
+}
+
+/**
+ * The staging gate: the exact version is active and serving reads, it writes durable state for the rollback round
+ * trip, and with a pool and provider a trivial run succeeds.
+ */
+async function smoke(deployment, base, token, pin, status) {
+  await reads(base, token, pin, status);
+  const seeded = await seed(base, token);
   const s = deployment.smoke ?? {};
-  if (!s.pool) return { ok: true, operation: 'smoke', version: pin, run: 'skipped' };
+  if (!s.pool) return { ok: true, operation: 'smoke', version: pin, seeded, run: 'skipped' };
   const started = await api(base, token, `/v1/pools/${s.pool}/agent-runs`, { provider: s.provider, prompt: s.prompt ?? 'Reply with exactly: OK', timeout_seconds: s.timeout_seconds ?? 300 });
   const id = started.run?.id ?? started.id;
   check(typeof id === 'string' && /^[a-f0-9]{32}$/.test(id), 'smoke-run-not-started');
@@ -149,7 +203,7 @@ async function smoke(deployment, base, token, pin, status) {
       check(run.status === 'succeeded', 'smoke-run-failed');
       const output = String(run.result?.output ?? '');
       check(output.includes(s.expect ?? 'OK'), 'smoke-run-unexpected-output');
-      return { ok: true, operation: 'smoke', version: pin, run: { status: run.status, start_path: run.start_path ?? null, start_latency_ms: run.start_latency_ms ?? null } };
+      return { ok: true, operation: 'smoke', version: pin, seeded, run: { status: run.status, start_path: run.start_path ?? null, start_latency_ms: run.start_latency_ms ?? null } };
     }
     check(Date.now() < deadline, 'smoke-run-timeout');
     await sleep(5000);

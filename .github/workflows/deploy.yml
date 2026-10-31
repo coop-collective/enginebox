@@ -115,13 +115,18 @@ jobs:
       - name: Create owned temporary credential directory
         run: node packages/enginebox-deploy/src/temporary.mjs create
       - name: Deploy to staging
+        id: deploy
         env:
           ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
           ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
           ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
           ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
-        run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact
-      - name: Smoke gate
+        run: |
+          out=$(node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact)
+          printf '%s\n' "$out"
+          previous=$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).previous_version;process.stdout.write(/^[0-9A-Za-z.+-]{1,99}$/.test(v??"")?v:"")})')
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+      - name: Smoke gate (writes durable state with the new release)
         if: needs.plan.outputs.operation == 'update'
         env:
           ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
@@ -129,6 +134,30 @@ jobs:
           ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
           ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
         run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation smoke --version "$VERSION"
+      # Rollback round trip: the previous release must activate over state the new release wrote, and the new release
+      # must activate again over that. A refused activation here (for example a stricter old validator rejecting new
+      # record fields) fails the gate, so production never gets a release it cannot roll back from.
+      - name: Round trip — roll staging back to the previous release
+        if: needs.plan.outputs.operation == 'update' && steps.deploy.outputs.previous != '' && steps.deploy.outputs.previous != needs.plan.outputs.version
+        env:
+          PREVIOUS: ${{ steps.deploy.outputs.previous }}
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation rollback --version "$PREVIOUS" || { echo "::error title=Rollback gate failed::$PREVIOUS could not activate over state written by $VERSION. $VERSION is not rollback-safe; production promotion stopped."; exit 1; }
+          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation reads --version "$PREVIOUS" || { echo "::error title=Rollback gate failed::$PREVIOUS activated but does not serve reads over $VERSION state."; exit 1; }
+      - name: Round trip — update staging forward to the new release again
+        if: needs.plan.outputs.operation == 'update' && steps.deploy.outputs.previous != '' && steps.deploy.outputs.previous != needs.plan.outputs.version
+        env:
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation update --version "$VERSION" --artifacts .state/deploy-artifact || { echo "::error title=Forward gate failed::$VERSION could not re-activate after a rollback; production promotion stopped."; exit 1; }
+          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation reads --version "$VERSION"
       - name: Production held
         if: needs.plan.outputs.held == 'true'
         run: echo "::notice::ENGINEBOX_PROD_HOLD is true; $VERSION stays in staging."
@@ -174,8 +203,24 @@ jobs:
           ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
           ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
         run: |
-          out=$(node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact)
+          set +e
+          out=$(node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact 2> deploy-error.txt)
+          code=$?
+          set -e
           printf '%s\n' "$out"
+          if [ "$code" -ne 0 ]; then
+            reason=$(tr -cd 'a-z0-9-\n' < deploy-error.txt | tail -1)
+            # A refused cutover is not retried: it needs a person. Drained means production serves nothing until the
+            # next successful activation.
+            case "$reason" in
+              cutover-failed-controller-drained) echo "::error title=PRODUCTION DRAINED::The cutover to $VERSION was refused and the previous controller was NOT restored. Production serves no API until the next activation. Inspect controller logs now; do not re-run blindly." ;;
+              cutover-failed-controller-unreachable) echo "::error title=PRODUCTION UNREACHABLE::The cutover to $VERSION failed and the supervisor does not answer. Inspect the host now." ;;
+              cutover-refused-previous-version-restored) echo "::error title=Cutover refused::$VERSION failed to activate; the previous version was restored and is serving. Production is up; $VERSION needs a fix." ;;
+              cutover-*) echo "::error title=Cutover failed::$reason during the switch to $VERSION. Check production status before any retry." ;;
+              *) echo "::error title=Production deploy failed::$reason" ;;
+            esac
+            exit 1
+          fi
           previous=$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).previous_version;process.stdout.write(/^[0-9A-Za-z.+-]{1,99}$/.test(v??"")?v:"")})')
           echo "previous=$previous" >> "$GITHUB_OUTPUT"
       - name: Watch the new version
@@ -197,7 +242,10 @@ jobs:
           ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
         run: |
           echo "::error::$VERSION regressed after promotion; rolling back to $PREVIOUS"
-          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation rollback --version "$PREVIOUS"
+          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation rollback --version "$PREVIOUS" 2> rollback-error.txt || {
+            echo "::error title=AUTOMATIC ROLLBACK FAILED::Rolling production back to $PREVIOUS failed ($(tr -cd 'a-z0-9-\n' < rollback-error.txt | tail -1)). Production may be drained. Inspect the host now."
+            exit 1
+          }
       - name: Remove temporary deployment credentials
         if: always()
         run: node packages/enginebox-deploy/src/temporary.mjs cleanup

@@ -29,7 +29,7 @@ export function sshArgs(settings, temporary, remoteCommand) {
 export async function main(args = process.argv.slice(2)) {
   requireUnixClient();
   const options = cli(args, ['config', 'version', 'operation', 'artifacts']);
-  check(options.config && ['update', 'rollback', 'status', 'smoke', 'watch'].includes(options.operation), 'deployment-arguments');
+  check(options.config && ['update', 'rollback', 'status', 'smoke', 'reads', 'watch'].includes(options.operation), 'deployment-arguments');
   const pin = options.operation === 'status' ? null : version(options.version);
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const request = { operation: options.operation, version: pin, ...await loadConfig(options.config, root, options.operation === 'update') };

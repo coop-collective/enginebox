@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { config, smokeConfig, watchConfig, watchVerdict, startFailure, nodeInstallerArgs, WATCH_DEFAULTS } from '../src/lib.mjs';
 import { plan } from '../src/ci-plan.mjs';
+import { cutoverFailure } from '../src/remote.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const environment = async name => JSON.parse(await readFile(`${root}/environments/${name}.json`, 'utf8'));
@@ -66,6 +67,21 @@ test('a start failure is a failed run whose agent never exited; an agent exiting
   assert.equal(startFailure({ status: 'failed', result: { exit_code: 1 } }), false);
   assert.equal(startFailure({ status: 'succeeded' }), false);
   assert.equal(startFailure(null), false);
+});
+
+test('a failed cutover names the state it left: drained, old version restored, or switched but failing', async () => {
+  const probe = answers => async (_base, _token, endpoint) => {
+    const value = answers[endpoint];
+    if (value instanceof Error) throw value;
+    return value;
+  };
+  const down = new Error('controller-request-rejected-503');
+  // Activation refused and the old controller could not be restored: nothing serves until the next activation.
+  assert.equal(await cutoverFailure('u', 't', 'new', 'old', probe({ '/__enginebox/status': { current: 'old' }, '/readyz': down })), 'cutover-failed-controller-drained');
+  assert.equal(await cutoverFailure('u', 't', 'new', 'old', probe({ '/__enginebox/status': { current: 'old' }, '/readyz': { version: 'old', mode: 'draining' } })), 'cutover-failed-controller-drained');
+  assert.equal(await cutoverFailure('u', 't', 'new', 'old', probe({ '/__enginebox/status': down, '/readyz': down })), 'cutover-failed-controller-unreachable');
+  assert.equal(await cutoverFailure('u', 't', 'new', 'old', probe({ '/__enginebox/status': { current: 'old' }, '/readyz': { version: 'old', mode: 'active' } })), 'cutover-refused-previous-version-restored');
+  assert.equal(await cutoverFailure('u', 't', 'new', 'old', probe({ '/__enginebox/status': { current: 'new' }, '/readyz': { version: 'new', mode: 'active' } })), 'cutover-failed-after-switch');
 });
 
 test('the node helper rollout stages, activates and republishes with the release\'s own installer', () => {

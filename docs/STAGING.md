@@ -7,11 +7,22 @@ The deploy workflow (`.github/workflows/deploy.yml`) ships every push to `main`:
 2. **staging** — that exact artifact is deployed to the staging controller, then the **smoke gate** runs: the version is
    active and ready, `/v1/pools`, `/v1/agent-runs` and `/v1/templates` answer, and (once a provider account is
    connected, see below) a trivial pool run succeeds and reports its start path.
+   The smoke gate also **writes durable state with the new release** (a `smoke-state` pool record and an agent-run
+   record queued on that empty pool, then cancelled). Then the **rollback round trip** runs: staging rolls back to the
+   previous release, which must activate over that state and serve reads, then updates forward to the new release,
+   which must activate again. A refused activation either way fails the gate and nothing is promoted. This catches a
+   release whose new record fields a previous release's activation validator rejects — the failure mode that once left
+   production drained after every later handoff, rollback or restart.
 3. **production** — the same artifact is promoted unless `ENGINEBOX_PROD_HOLD` is `true`. The production deploy also
    rolls out the host node helper (stage, activate, republish), so controller and guest helper never drift.
 4. **watch** — for `watch.seconds` (600) the workflow checks readiness and the start failures of runs created after the
    cutover. Losing readiness for 3 checks in a row, or at least 3 start failures that are also at least half of the new
    runs, rolls production back to the previous version automatically and fails the run.
+
+A failed production cutover is never retried automatically. The deploy client classifies what the controller was left
+in and the job fails with a titled annotation: **PRODUCTION DRAINED** (activation refused and the old controller not
+restored: no API until the next activation), **PRODUCTION UNREACHABLE**, **Cutover refused** (old version restored and
+serving), or a generic cutover failure. A failed automatic rollback raises **AUTOMATIC ROLLBACK FAILED**.
 
 Nothing waits on a timer: a passing push reaches production in build + deploy time. Pending staging and production
 jobs are replaced by newer runs (one deployment per environment at a time); a production cutover or its watch is
