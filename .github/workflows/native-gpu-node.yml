@@ -28,7 +28,7 @@ jobs:
           if ($LASTEXITCODE) { throw 'Windows bootstrap regression failed' }
   linux-image:
     if: github.event_name != 'workflow_dispatch' || !inputs.controller_preview
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_LINUX_DOCKER_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -58,7 +58,7 @@ jobs:
             profile: linux-nvidia
           - os: macos-15
             profile: macos-videotoolbox
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(vars.ENGINEBOX_LINUX_RUNNER || '"ubuntu-24.04"') || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Verify and build native node
@@ -110,7 +110,7 @@ jobs:
 
   controller-preview:
     if: github.event_name == 'workflow_dispatch' && inputs.controller_preview
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_LINUX_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

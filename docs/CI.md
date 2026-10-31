@@ -345,3 +345,17 @@ and [official listener command/environment handling](https://github.com/actions/
 ## Organization runner pools
 
 The optional [GitHub account and Actions service](GITHUB-ACTIONS.md) adds separate organization runner approval, signed workflow-job webhooks and bounded disposable Incus JIT runners. It complements the explicit dispatch/runner interfaces above. Configure provider credentials through the [Kitbash secret setup](GITHUB-SECRETS.md); existing organization runners require an explicit routing/drain migration.
+
+## This repository's own CI on Engine Box
+
+The Linux jobs in `verify.yml`, `native-gpu-node.yml` (package and controller
+preview), `release.yml` (x86_64 package) and the Docker jobs (`linux-image`,
+`linux-node`) take their runner from repository variables and fall back to
+GitHub-hosted `ubuntu-24.04` when unset:
+
+- `ENGINEBOX_LINUX_RUNNER`: for example `{"group":"enginebox-ci","labels":"enginebox-linux"}`
+- `ENGINEBOX_LINUX_DOCKER_RUNNER`: the same, once the CI template provides Docker
+
+Clearing a variable moves those jobs back to GitHub. Publish and deploy jobs stay
+GitHub-hosted. Windows and macOS jobs stay on GitHub because Engine Box has no
+Windows or macOS CI hosts.
