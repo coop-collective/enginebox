@@ -201,7 +201,10 @@ and a fixed prompt kept in the controller (`repo_generate.rs`), never taken from
 the request. The agent inspects the repository (package manager, lockfiles,
 scripts, Wrangler and test setup, CI), writes a schema version 2 file with one
 default profile (setup, test and dev argv, non-secret env, secret requirements by
-name and qualifier only), checks that it parses, and pushes it to the branch
+name and qualifier only), and, when the repository has a dev server that runs
+without real secrets, a `dev` section with a digest-pinned template in
+`.enginebox/templates/dev.json` (used for [branch previews](ENVIRONMENT-SERVICES.md#repository-branch-previews)).
+It checks that the file parses and pushes it to the branch
 `enginebox/agent-config`. A repository that already has its own config is
 refused (409) unless `force` is true; one generation runs at a time (409).
 

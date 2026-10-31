@@ -22,7 +22,7 @@ pub const TIMEOUT_SECONDS: u64 = 1800;
 const PR_RETRY_SECONDS: i64 = 300;
 
 /// The fixed task; never taken from the request.
-pub const PROMPT: &str = r#"Write this repository's Engine Box agent config, .enginebox/config.json (schema_version 2), and push it to the branch enginebox/agent-config. Change nothing else.
+pub const PROMPT: &str = r#"Write this repository's Engine Box agent config, .enginebox/config.json (schema_version 2), plus .enginebox/templates/dev.json when step 3b applies, and push it to the branch enginebox/agent-config. Change nothing else.
 
 1. git clone "$ENGINEBOX_REPO_REMOTE" "$ENGINEBOX_RUN_DIR" (the directory is empty), cd into it, and git checkout -B enginebox/agent-config. If .enginebox/config.json exists, keep its dev section and profiles and only fix or complete them.
 2. Inspect the repository: package manager and lockfile (pnpm-lock.yaml, package-lock.json, yarn.lock, bun.lockb, Cargo.lock, uv.lock...), workspace layout, package.json scripts, wrangler.toml/wrangler.jsonc, test runner config, README and CI workflows. Prefer the commands CI already runs.
@@ -33,8 +33,12 @@ pub const PROMPT: &str = r#"Write this repository's Engine Box agent config, .en
 - secrets declares requirements by NAME only: {"name": "DATABASE_URL", "qualifier": "staging", "run_kinds": ["builder"], "description": "why it is needed"}. Use qualifiers like staging, read-only, production-read-only or deploy. List only variables the code or its config actually reads (.dev.vars.example, .env.example, wrangler bindings, process.env / env.X uses). Do not mark any requirement required.
 - mcp lists catalog connection names only (for example "kitbash") and only when the repository clearly uses that service; usually leave it out.
 - Keep it short: one default profile; add a "debug" profile with read-only secrets only if the repository is a deployed service.
+3b. If the repository has a dev server that runs without real secrets (a vinext/Vite app, wrangler dev --local, a Node server), also add a branch preview template: "dev": {"template": "./templates/dev.json"} at the top level of config.json, and write .enginebox/templates/dev.json:
+{"schema_version": 1, "kind": "dev", "id": "dev", "revision": 1, "image": "node@sha256:<digest>", "prepare": ["pnpm", "install", "--frozen-lockfile"], "command": ["pnpm", "dev", "--host", "0.0.0.0"], "installInputs": ["package.json", "pnpm-lock.yaml"], "ports": [{"name": "web", "protocol": "http", "port": 5173, "expose": true}], "health": {"port": "web", "path": "/"}, "writableDirs": ["node_modules/.vite"], "memoryMiB": 2048}
+- The image must be pinned by digest: get one with TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/node:pull" | node -pe 'JSON.parse(require("fs").readFileSync(0)).token') then curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json" https://registry-1.docker.io/v2/library/node/manifests/24-bookworm-slim and copy the docker-content-digest header. If you cannot get a digest, leave the dev section out.
+- installInputs lists every file dependency installation reads (each package.json of a workspace and the lockfile). The dev command must listen on 0.0.0.0 at the declared port; application data goes under $ENGINEBOX_DATA_DIR (for wrangler: --local --persist-to /data/wrangler). If the dev server needs real secrets, leave the dev section out.
 4. Check it parses: node -e 'JSON.parse(require("fs").readFileSync(".enginebox/config.json","utf8"))' (or python3 -m json.tool .enginebox/config.json). Fix any error.
-5. git add .enginebox/config.json, git commit -m "Add Engine Box agent config", git push --force-with-lease origin enginebox/agent-config. Push to no other branch.
+5. git add .enginebox, git commit -m "Add Engine Box agent config", git push --force-with-lease origin enginebox/agent-config. Push to no other branch.
 6. Finish with a short summary: the commands you chose and why, and each secret requirement with where the code reads it."#;
 
 /// One generation of a repository's config.
@@ -221,7 +225,7 @@ mod tests {
 
     #[test]
     fn the_prompt_is_fixed_and_short() {
-        assert!(PROMPT.len() < 3500, "{}", PROMPT.len());
+        assert!(PROMPT.len() < 5000, "{}", PROMPT.len());
         assert!(PROMPT.contains(BRANCH) && PROMPT.contains("schema_version"));
     }
 

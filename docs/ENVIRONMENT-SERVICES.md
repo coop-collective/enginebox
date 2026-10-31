@@ -438,3 +438,54 @@ older supervisor, revoke all draft leases first and remove unsupported
 `workspaceCommand`/`urlPort` configuration; otherwise its older route/config
 validator cannot load the new draft registrations. Do not restore old provider
 credentials or stop native workspaces as part of this update.
+
+## Repository branch previews
+
+A leased draft can also come from **one branch of a hosted or linked repository**,
+for example the branch an agent pushed for review. The lifecycle is the leased
+preview above (renew, retry, revoke, expiry withdraws routes first); only the
+source differs. Register it with
+`POST /v1/environments/previews {host, repository: "<project>/<name>", branch, task, ttlSeconds}`.
+One live draft exists per host, repository and branch: asking again returns the
+same draft and lease. The draft's template is the branch's own
+`.enginebox/config.json` `dev` section; without one the draft reports
+`not-configured` and runs nothing.
+
+The host needs an operator-owned `repositoryCommand`, which receives exactly
+`REPOSITORY BRANCH`:
+
+```json
+{"id":"node", "command":["/opt/enginebox/export-main"],
+ "repositoryCommand":["/home/ubuntu/enginebox-environments/bin/node",
+   "/home/ubuntu/enginebox-environments/current/packages/environment-service/src/repository-export.mjs",
+   "--controller","http://127.0.0.1:8765",
+   "--token-file","/home/ubuntu/enginebox-environments/repository-read-token",
+   "--cache","/home/ubuntu/enginebox-environments/repository-cache"]}
+```
+
+`repository-export.mjs` mints a five-minute **read** token from the controller
+with the credential in `--token-file` (a service token with a `repositories`
+read grant on the projects to preview; 0600, readable only by the service
+user), fetches the branch head (`--depth=1`) with the token as a URL-scoped git
+header from its own environment, never argv, extracts that commit's tree into an
+immutable export keyed by commit, and prints `{revision, sourceRoot, manifest}`
+(`authority: "repository-branch"`, with `repository`, `branch` and `commit`).
+The service verifies that provenance and copies only inventoried bytes, as for
+any export. The token never reaches the container, and the container gets no
+Git metadata. Exports of the last three commits per repository are kept.
+Commands print at most 2 MiB, which bounds a manifest at a few thousand files
+per branch.
+
+The controller is the authenticated front door for callers such as Ideator:
+`POST /v1/projects/{p}/repositories/{n}/previews {branch, ttl_seconds?, task?}`
+(30–3600 s, default 3600) starts one, `GET …/previews/{id}` reads it, and
+`POST …/previews/{id} {lease, expected_revision, ttl_seconds | revoke: true, retry?}`
+renews or revokes it. A service token needs a **write** grant on the project to
+start, renew or revoke (previews run the branch's code) and any grant to read.
+Starts and revocations are audited (`repo.preview_start`, `repo.preview_revoke`).
+The controller reads `ENGINEBOX_ENVIRONMENTS_URL` (https, or http to this
+machine), `ENGINEBOX_ENVIRONMENTS_TOKEN_FILE` (this service's API token) and
+`ENGINEBOX_PREVIEW_HOST` (the bootstrap host with a `repositoryCommand`);
+without them previews answer 409 and `GET …/requirements` reports
+`previews_configured: false`. Preview routes use the bootstrap `access` policy;
+use `authenticated` for anything not meant to be public.

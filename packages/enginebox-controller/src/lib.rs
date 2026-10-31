@@ -12,6 +12,7 @@ mod environment;
 pub mod jobs;
 pub mod kitbash;
 pub mod metering;
+pub mod previews;
 pub mod profiles;
 pub mod repo_config;
 pub mod repo_generate;
@@ -73,6 +74,7 @@ struct Runtime {
     catalog: catalog::Catalog,
     repo_config: repo_config::RepoRequirements,
     generations: repo_generate::Generations,
+    previews: previews::Previews,
     repositories: repositories::Repositories,
     tenancy: tenancy::Tenancy,
     usage: Arc<dyn metering::UsageSink>,
@@ -100,6 +102,8 @@ pub struct Controller {
     reconcile_error: Mutex<Option<(String, String)>>,
     /// Test harnesses stand in for the repository backend's API.
     repository_transport: Mutex<Option<Arc<dyn repositories::Transport>>>,
+    /// Test harnesses stand in for the environment service (previews.rs).
+    preview_api: Mutex<Option<(Arc<dyn previews::PreviewApi>, String)>>,
     /// Where usage events go (metering.rs); discarded unless a deployment sets one.
     usage_sink: Mutex<Arc<dyn metering::UsageSink>>,
 }
@@ -136,6 +140,7 @@ impl Controller {
             observations: Mutex::new(std::collections::BTreeMap::new()),
             reconcile_error: Mutex::new(None),
             repository_transport: Mutex::new(None),
+            preview_api: Mutex::new(None),
             usage_sink: Mutex::new(metering::noop()),
         }))
     }
@@ -210,6 +215,16 @@ impl Controller {
             catalog,
             repo_config: repo_config::RepoRequirements::open(&self.root)?,
             generations: repo_generate::Generations::open(&self.root),
+            previews: match self.preview_api.lock().unwrap().clone() {
+                Some((api, host)) => previews::Previews::with_api(api, &host),
+                None => previews::Previews::from_env().unwrap_or_else(|error| {
+                    eprintln!(
+                        "{}",
+                        json!({"event":"enginebox.previews.config_invalid","reason":error.to_string()})
+                    );
+                    previews::Previews::default()
+                }),
+            },
             tenancy: tenancy::Tenancy::open(&self.root)?,
             credentials: credentials::Credentials::open(
                 &self.root,
@@ -290,6 +305,10 @@ impl Controller {
     #[doc(hidden)]
     pub fn set_repository_transport(&self, transport: Arc<dyn repositories::Transport>) {
         *self.repository_transport.lock().unwrap() = Some(transport);
+    }
+    /// Stand in for the environment service. Takes effect at the next activation.
+    pub fn set_preview_api(&self, api: Arc<dyn previews::PreviewApi>, host: &str) {
+        *self.preview_api.lock().unwrap() = Some((api, host.to_owned()));
     }
     #[doc(hidden)]
     pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
@@ -530,6 +549,15 @@ fn service_allows(
         ) => token.repository_access(project).is_some(),
         (&Method::POST, ["v1", "projects", project, "repositories"]) => {
             token.repository_access(project) == Some(repositories::Access::Write)
+        }
+        // Branch previews run the repository's code: a write grant starts,
+        // renews and revokes one; any grant reads one.
+        (&Method::POST, ["v1", "projects", project, "repositories", _, "previews"])
+        | (&Method::POST, ["v1", "projects", project, "repositories", _, "previews", _]) => {
+            token.repository_access(project) == Some(repositories::Access::Write)
+        }
+        (&Method::GET, ["v1", "projects", project, "repositories", _, "previews", _]) => {
+            token.repository_access(project).is_some()
         }
         _ => false,
     }
@@ -1072,8 +1100,28 @@ fn read(c: &Controller, p: &[String], principal: &Principal, org: &str) -> Resul
             );
             let repository = repo_config::repository_ref(project, name);
             let mut report = runtime.repo_config.report(org, &repository)?;
+            report["previews_configured"] = json!(runtime.previews.configured());
             report["generation"] = json!(generation(&runtime, org, project, name));
             Ok(report)
+        }
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "previews",
+            id,
+        ] => {
+            let runtime = c.runtime()?;
+            ensure!(
+                repo_config::same_org(org, runtime.repositories.org_of(project, name))
+                    && runtime.repositories.exists(project, name),
+                "Unknown repository"
+            );
+            runtime
+                .previews
+                .get(&repo_config::repository_ref(project, name), id)
         }
         ["v1", "profiles"] => {
             let runtime = c.runtime()?;
@@ -1432,6 +1480,63 @@ fn repo_requirement_write(
 /// body (`value`) or a `secret_source` connection (`from: {connection, name}`),
 /// is encrypted to the repository's public key, never echoed, and audited by
 /// name.
+/// `POST …/repositories/{name}/previews {branch, ttl_seconds?, task?}` starts a
+/// branch preview; `POST …/previews/{id} {lease, expected_revision, …}` renews,
+/// retries or revokes one (previews.rs). Starts and revocations are audited.
+fn preview_write(
+    runtime: &Runtime,
+    org: &str,
+    actor: &str,
+    project: &str,
+    name: &str,
+    id: Option<&str>,
+    body: &Value,
+) -> (StatusCode, Value) {
+    if !(repo_config::same_org(org, runtime.repositories.org_of(project, name))
+        && runtime.repositories.exists(project, name))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            json!({"error":"Unknown repository."}),
+        );
+    }
+    let repository = repo_config::repository_ref(project, name);
+    let outcome = match id {
+        None => runtime.previews.create(&repository, body),
+        Some(id) => runtime.previews.change(&repository, id, body),
+    };
+    let (status, value) = match outcome {
+        Ok((status, value)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            value,
+        ),
+        Err(error) => (
+            if runtime.previews.configured() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::CONFLICT
+            },
+            json!({"error": error.to_string()}),
+        ),
+    };
+    let action = match (id, body.get("revoke")) {
+        (None, _) => Some("repo.preview_start"),
+        (Some(_), Some(Value::Bool(true))) => Some("repo.preview_revoke"),
+        _ => None,
+    };
+    if let Some(action) = action {
+        runtime.catalog.audit.record(
+            org,
+            actor,
+            action,
+            &repository,
+            status.is_success(),
+            json!({"branch": body["branch"], "preview": value["id"], "status": value["status"]}),
+        );
+    }
+    (status, value)
+}
+
 fn actions_secret(runtime: &Runtime, org: &str, actor: &str, body: &Value) -> (StatusCode, Value) {
     let target = format!(
         "{}{}/{}",
@@ -1575,6 +1680,33 @@ async fn write(
     {
         let runtime = c.runtime()?;
         return generate_config(&runtime, &org, &actor, &principal, project, name, body).await;
+    }
+    if let [
+        "v1",
+        "projects",
+        project,
+        "repositories",
+        name,
+        "previews",
+        rest @ ..,
+    ] = routed.as_slice()
+        && rest.len() <= 1
+    {
+        let runtime = c.runtime()?;
+        let (project, name) = (project.to_string(), name.to_string());
+        let id = rest.first().map(|s| s.to_string());
+        return blocking(move || {
+            Ok(preview_write(
+                &runtime,
+                &org,
+                &actor,
+                &project,
+                &name,
+                id.as_deref(),
+                &body,
+            ))
+        })
+        .await;
     }
     if let ["v1", "projects", project, "repositories", name, rest @ ..] = routed.as_slice()
         && matches!(
@@ -4052,6 +4184,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_previews_need_a_write_grant_and_stay_in_their_repository() {
+        const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+        let (_temp, c) = setup();
+        c.set_repository_transport(repositories::mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]));
+        let service = Arc::new(previews::tests::FakeService::default());
+        c.set_preview_api(service.clone(), "node");
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let config = json!({"url":repositories::mock::URL,"namespace_prefix":"eb","secret":repositories::mock::SECRET}).to_string();
+        let backend = "/v1/repository-backends/artifacts-worker";
+        assert_eq!(
+            call(&app, request(Method::PUT, backend, &config, true))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/projects/alpha/repositories",
+                r#"{"name":"site"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, read) = mint(&app, json!({"label":"read","scopes":[],"operations":[],"repositories":[{"project":"alpha","access":"read"}]})).await;
+        let (_, write) = mint(&app, json!({"label":"write","scopes":[],"operations":[],"repositories":[{"project":"alpha","access":"write"}]})).await;
+        let base = "/v1/projects/alpha/repositories/site/previews";
+        let start = r#"{"branch":"autopilot/feat-v2","task":"feat"}"#;
+        assert_eq!(
+            call(&app, bearer(Method::POST, base, start, &read)).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, started) = call(&app, bearer(Method::POST, base, start, &write)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        let id = started["id"].as_str().unwrap().to_owned();
+        let sent = service.calls.lock().unwrap()[0].2.clone().unwrap();
+        assert_eq!(sent["repository"], "alpha/site");
+        assert_eq!(sent["host"], "node");
+        let one = format!("{base}/{id}");
+        let (status, got) = call(&app, bearer(Method::GET, &one, "", &read)).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["branch"], "autopilot/feat-v2");
+        let revoke =
+            json!({"lease":started["lease"],"expected_revision":1,"revoke":true}).to_string();
+        assert_eq!(
+            call(&app, bearer(Method::POST, &one, &revoke, &read))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(&app, bearer(Method::POST, &one, &revoke, &write))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Another project's repository, and an unknown repository.
+        assert_eq!(
+            call(
+                &app,
+                bearer(
+                    Method::POST,
+                    "/v1/projects/beta/repositories/site/previews",
+                    start,
+                    &write
+                )
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &app,
+                request(
+                    Method::POST,
+                    "/v1/projects/alpha/repositories/nope/previews",
+                    start,
+                    true
+                )
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        // A refused template comes back as the service's code.
+        let (status, refused) = call(
+            &app,
+            bearer(Method::POST, base, r#"{"branch":"bad-template"}"#, &write),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["error"], "dev-template-required");
+        let (_, report) = call(
+            &app,
+            request(
+                Method::GET,
+                "/v1/projects/alpha/repositories/site/requirements",
+                "",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(report["previews_configured"], true);
+    }
+
+    #[tokio::test]
     async fn repositories_are_owner_configured_project_scoped_and_runs_get_tokens_at_admission() {
         const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
         const API_TOKEN: &str = repositories::mock::SECRET;
@@ -4214,6 +4456,7 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{minted}");
         assert_eq!(minted["remote"], remote);
         assert_eq!(minted["access"], "read");
+        assert_eq!(minted["auth"], "bearer");
         let (status, _) = call(
             &app,
             bearer(Method::POST, tokens, r#"{"access":"write"}"#, &read),
