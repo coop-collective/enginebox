@@ -92,6 +92,7 @@ pub async fn register(
             workloads: Workloads {
                 ci: false,
                 agents: false,
+                engine: false,
             },
         }
     };

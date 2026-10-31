@@ -48,6 +48,7 @@ async fn renewed_invitation_recovers_real_pending_file_without_replacing_key_or_
         workloads: Workloads {
             ci: true,
             agents: true,
+            engine: false,
         },
     };
     let issued = service.issue(invitation.clone()).unwrap();

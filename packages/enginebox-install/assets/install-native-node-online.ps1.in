@@ -4,7 +4,8 @@ param(
   [ValidateSet('Install','Inspect')][string]$Mode='Install',
   [string]$Controller,
   [string]$EnrollmentCode,
-  [ValidateSet('worker','gpu')][string]$Workload='worker',
+  [ValidateSet('engine','worker','gpu')][string]$Workload='engine',
+  [long]$EnrollmentExpires,
   [ValidateRange(1,256)][int]$Cpu=4,
   [ValidateRange(2,4096)][int]$MemoryGiB=8,
   [ValidateRange(10,65536)][int]$DiskGiB=50,
@@ -60,6 +61,35 @@ New-Item -ItemType Directory -Path $scratch | Out-Null
 try {
   Write-Host 'Downloading and verifying the Windows node package...'
   Get-VerifiedNodePackage -Uri '@@ARCHIVE_URL@@' -Sha256 '@@ARCHIVE_SHA256@@' -Destination $scratch
+  if ($Mode -eq 'Install' -and $Workload -eq 'engine') {
+    # Engine machines run their owner's engine sessions under a dedicated, automatically signed-in account,
+    # which only an elevated install can create. Size the allowance from this machine unless given.
+    $computer=Get-CimInstance Win32_ComputerSystem
+    if (-not $PSBoundParameters.ContainsKey('Cpu')) { $Cpu=[Math]::Max(2,[int]$computer.NumberOfLogicalProcessors-2) }
+    if (-not $PSBoundParameters.ContainsKey('MemoryGiB')) { $MemoryGiB=[Math]::Max(2,[int][Math]::Floor([double]$computer.TotalPhysicalMemory/1GB*0.75)) }
+    if (-not $PSBoundParameters.ContainsKey('DiskGiB')) { $DiskGiB=200 }
+    $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $scratch 'install-worker-node.ps1'),'-EngineAccount',
+      '-ExpectedBinarySha256','@@BINARY_SHA256@@','-Cpu',$Cpu,'-MemoryGiB',$MemoryGiB,'-DiskGiB',$DiskGiB,'-SkipDependencies')
+    if ($Controller) { $arguments+=@('-Controller',$Controller) }
+    if ($EnrollmentCode) { $arguments+=@('-EnrollmentCode',$EnrollmentCode) }
+    $principal=[Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      & powershell.exe @arguments; $exit=$LASTEXITCODE
+    } else {
+      Write-Host 'Windows will ask for administrator approval to create the engine account.'
+      # The elevated run records a transcript so its output and any error appear here too.
+      $transcript=Join-Path $scratch 'engine-install.log'
+      $literal={ param($v) "'"+([string]$v).Replace("'","''")+"'" }
+      $script=(& $literal $arguments[4])
+      $rest=($arguments[5..($arguments.Count-1)] | ForEach-Object { if ([string]$_ -like '-*') { $_ } else { & $literal $_ } }) -join ' '
+      $command="Start-Transcript -LiteralPath $(& $literal $transcript) | Out-Null; try { & $script $rest; `$c=`$LASTEXITCODE } catch { Write-Host `$_; `$c=1 } finally { Stop-Transcript | Out-Null }; exit `$c"
+      $exit=(Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$command)).ExitCode
+      if (Test-Path -LiteralPath $transcript) { Get-Content -LiteralPath $transcript | Write-Host }
+    }
+    if ($exit -ne 0) { throw 'Engine machine setup failed; see the error above.' }
+    Write-Host 'Engine machine registered. Restart Windows to start it; it signs in to its engine account by itself from then on.'
+    return
+  }
   if ($Mode -eq 'Install' -and $Workload -eq 'worker') {
     $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $scratch 'install-worker-node.ps1'),
       '-ExpectedBinarySha256','@@BINARY_SHA256@@','-Cpu',$Cpu,'-MemoryGiB',$MemoryGiB,'-DiskGiB',$DiskGiB)

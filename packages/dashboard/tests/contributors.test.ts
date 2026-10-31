@@ -21,6 +21,8 @@ beforeEach(()=>{
   process.env.ENGINEBOX_NODE_INSTALLER_SHA256='f'.repeat(64);
   process.env.ENGINEBOX_LINUX_NODE_INSTALLER_URL='https://github.com/coop-collective/enginebox/releases/download/linux-node-preview-test/install-linux-node.sh';
   process.env.ENGINEBOX_LINUX_NODE_INSTALLER_SHA256='d'.repeat(64);
+  process.env.ENGINEBOX_ENGINE_NODE_INSTALLER_URL='https://github.com/coop-collective/enginebox/releases/download/native-node-test/install.ps1';
+  process.env.ENGINEBOX_ENGINE_NODE_INSTALLER_SHA256='e'.repeat(64);
   delete process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN;
 });
 function ownerRequest(body:unknown, auth=true) {return new Request(`${origin}/api/contributors/enrollments`,{method:'POST',headers:{origin,'Content-Type':'application/json',...(auth?{cookie:sessionCookie().split(';')[0]}:{})},body:JSON.stringify(body)});}
@@ -164,4 +166,39 @@ test('generated Bash command verifies downloaded bytes before execution and alwa
     await assert.rejects(access(marker));
     await assert.rejects(access(await readFile(download,'utf8')));
   } finally {await rm(root,{recursive:true,force:true});}
+});
+
+test('engine machines pin the native node bootstrap and run its engine workload',async t=>{
+  let forwarded:unknown;
+  t.mock.method(globalThis,'fetch',async (url:string,options:RequestInit)=>{
+    if (url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
+    forwarded=JSON.parse(String(options.body));
+    return Response.json({id:'a'.repeat(32),code,expires:Math.floor(Date.now()/1000)+600});
+  });
+  const response=await contributors(ownerRequest({platform:'windows',label:'RTX',workloads:{ci:false,agents:false,engine:true}}),['enrollments']);
+  const value=await response.json();
+  assert.deepEqual(forwarded,{label:'RTX',workloads:{ci:false,agents:false,engine:true}});
+  assert.ok(value.command.includes('native-node-test/install.ps1'));assert.ok(value.command.includes('e'.repeat(64)));
+  assert.match(value.command,/-Workload 'engine'/);assert.ok(!value.command.includes('test-1/install.ps1'));
+});
+test('engine machines take no CI or agent work and need their own installer pin',async t=>{
+  const fetch=t.mock.method(globalThis,'fetch',async ()=>Response.json({node_protocol:1}));
+  await assert.rejects(contributors(ownerRequest({platform:'windows',label:'RTX',workloads:{ci:true,agents:false,engine:true}}),['enrollments']),(e:unknown)=>e instanceof HttpError&&e.status===400);
+  assert.equal(fetch.mock.callCount(),0);
+  delete process.env.ENGINEBOX_ENGINE_NODE_INSTALLER_SHA256;
+  await assert.rejects(contributors(ownerRequest({platform:'windows',label:'RTX',workloads:{ci:false,agents:false,engine:true}}),['enrollments']),(e:unknown)=>e instanceof HttpError&&e.status===503);
+  assert.equal(fetch.mock.callCount(),0);
+  const response=await contributors(ownerRequest({platform:'windows',label:'WSL',workloads:{ci:true,agents:true}}),['enrollments']).catch(e=>e);
+  assert.ok(!(response instanceof HttpError&&response.status===503&&/engine/.test(response.message)));
+});
+test('renewing an engine registration keeps the engine installer',async t=>{
+  const id='c'.repeat(32);
+  t.mock.method(globalThis,'fetch',async (url:string)=>{
+    if (url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
+    if (url.endsWith('/v1/contributors')) return Response.json({nodes:[{id,kind:'workspace',enrolled:false,revoked:false,workloads:{ci:false,agents:false,engine:true}}]});
+    return Response.json({id,code:`${id}.${'b'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+600});
+  });
+  const request=new Request(`${origin}/api/contributors/${id}/renew-enrollment`,{method:'POST',headers:{origin,'Content-Type':'application/json',cookie:sessionCookie().split(';')[0]},body:'{}'});
+  const value=await (await contributors(request,[id,'renew-enrollment'])).json();
+  assert.ok(value.command.includes('native-node-test/install.ps1'));assert.match(value.command,/-Workload 'engine'/);
 });

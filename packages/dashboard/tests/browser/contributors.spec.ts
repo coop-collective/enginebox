@@ -18,6 +18,9 @@ test('copies the installer and raw code separately, renews the same identity, an
   const command=page.getByLabel('PowerShell install command');
   await expect(command).not.toHaveValue(/-Cpu|-MemoryGiB|-DiskGiB/);
   await expect(command).toHaveValue(/https:\/\/controller.fixture.example/);
+  // A GPU engine machine is the default Windows choice and pins the native node bootstrap.
+  await expect(command).toHaveValue(/native-node-fixture\/install\.ps1/);
+  await expect(command).toHaveValue(/-Workload 'engine'/);
   await expect(page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem', {name:'Machine Windows RTX',exact:true})).toHaveCount(0);
   await expect(page.getByRole('list',{name:'Pending registrations'})).not.toBeVisible();
   await page.context().grantPermissions(['clipboard-read','clipboard-write']);

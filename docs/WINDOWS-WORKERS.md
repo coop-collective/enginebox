@@ -66,6 +66,60 @@ not an unattended Windows Service. Private identity and receipts are under
 The installer restricts that directory to the installing user's SID. Trusted
 same-user native jobs remain capable of reading that user's files.
 
+### Unattended GPU hosts: automatic sign-in
+
+Engines that render to a window (the Unity Editor's Game view, Unreal) need a
+signed-in desktop session. For a dedicated host, run the installer from an
+elevated PowerShell with `-AutoLogon` so the node starts at every boot without
+anyone at the keyboard:
+
+```powershell
+.\install-worker-node.ps1 -Controller https://enginebox.example.com -ExpectedBinarySha256 $hash -AutoLogon
+```
+
+It prompts for the installing user's Windows password, or reads one line from
+piped input; the password is never an argument. Windows checks it with an
+interactive `LogonUser` first, so a wrong password changes nothing. It is stored
+as the LSA secret `DefaultPassword` (as Sysinternals Autologon does), never as a
+plaintext registry value, and Winlogon's `AutoAdminLogon`, `DefaultUserName` and
+`DefaultDomainName` are set. The installer also turns off Windows Hello
+passwordless mode (which ignores password sign-in), disables sleep and
+hibernation on AC power, and registers an owned **Enginebox Lock After Sign-in**
+task that locks the console right after the automatic sign-in; engines keep
+rendering in the locked session. Local accounts on machines that are not
+domain-joined only. Anyone with administrator rights on the machine can read
+the LSA secret, so use this only on a host dedicated to Engine Box.
+
+The receipt records the choice; later installs keep it, and `-Mode Uninstall`
+(elevated) removes the secret, resets `AutoAdminLogon` and deletes the lock task.
+
+### Dedicated engine account (personal GPU machines)
+
+**Add machine → Windows → Use: GPU engine machine** is the default Windows
+choice. It registers the `engine` workload only (never CI or agents) and the
+copied command runs the native node bootstrap with `-Workload engine`, which asks
+once for administrator approval and runs `install-worker-node.ps1 -EngineAccount`,
+sizing the allowance from the machine (all CPUs but two, 75% of memory, 200 GiB
+of disk) unless `-Cpu`, `-MemoryGiB` or `-DiskGiB` are given. The `engine`
+workload is serialized only when set, so CI and agent machines keep working with
+node releases that predate it; engine machines need a release that includes it.
+
+On an owner's own Windows PC, engine sessions run natively for full graphics
+(DirectX 12, Vulkan, Unreal) but never in the owner's account. `-EngineAccount`
+(elevated, implies `-AutoLogon`) creates a standard local user `enginebox`
+(member of Users only, described as `Enginebox engine sessions account`) with a
+random password that is never displayed, stores that password as the LSA
+automatic sign-in secret, and installs the node to
+`%ProgramData%\Enginebox\engine-node` as the **Enginebox Engine Node** task running
+as that user at its sign-in. The installation directory grants only the engine
+account, SYSTEM and Administrators; `private\` is handed to the engine account in
+the owner-only shape the node enforces. Each install rotates the password and the
+secret together. An existing `enginebox` user that Engine Box did not create is
+refused. The node starts at the next sign-in, so restart Windows after the first
+install. `-Mode Uninstall` also deletes the account and its profile. These hosts
+run only their owner's sessions; other organisations' sessions are never placed
+on them.
+
 Revocation stops new assignments immediately; the local worker stops its owned
 process tree when its next heartbeat is rejected. Lost leases, controller restart
 and uncertain execution are fenced, never replayed. An owner must reconcile an
@@ -100,6 +154,10 @@ The deployed dashboard requires:
 - `ENGINEBOX_NODE_INSTALLER_URL`: an exact versioned Enginebox GitHub release
   `install.ps1` URL.
 - `ENGINEBOX_NODE_INSTALLER_SHA256`: the lowercase SHA-256 of that file.
+- `ENGINEBOX_ENGINE_NODE_INSTALLER_URL` and `ENGINEBOX_ENGINE_NODE_INSTALLER_SHA256`:
+  the native node release's `install.ps1` bootstrap and its SHA-256, used for
+  **GPU engine machines**. Without them, engine machine registration returns a
+  visible error; WSL registration is unaffected.
 - Optional `ENGINEBOX_NODE_PUBLIC_ORIGIN`: HTTPS origin used by installed nodes;
   defaults to the dashboard origin. Paths, queries and URL credentials are refused.
 
