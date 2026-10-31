@@ -1,6 +1,7 @@
 use crate::{
     auth, delegation,
     launch_events::{self, LaunchEvent, LaunchEvents, LaunchFailure, Stage},
+    lifecycle::{self, IdleAction, IdlePolicy, MemberView, Reclaim, StartPath, VmState},
     native, pools, process, profile,
     queue::{self, Entry, EntryState, HostLoad, Placement, QueueLimits, StoredCallback, Target},
     repository, run_details, security, usage,
@@ -28,6 +29,12 @@ const QUEUE_ENTRY_LIMIT: usize = 128 * 1024;
 const RETAINED_FINISHED: usize = 100;
 /// Wait after a failed pool workspace creation before trying again.
 const CREATE_BACKOFF: Duration = Duration::from_secs(60);
+/// How often idle pool members are checked (docs/QUEUE.md, "Idle members").
+const LIFECYCLE_EVERY: Duration = Duration::from_secs(15);
+/// Stopped members starting at once on one host (frozen resumes are not limited).
+const MAX_BOOTS_PER_HOST: usize = 4;
+/// Members' idle-since times, kept across controller restarts.
+const IDLE_FILE: &str = "agent-pool-idle.json";
 /// How long a workspace's guest helper, once seen at this release, is
 /// trusted before placement checks it again.
 const GUEST_CHECK_TTL: Duration = Duration::from_secs(600);
@@ -90,6 +97,23 @@ struct Sched {
     backoff: BTreeMap<String, (Instant, String)>,
     waiting: BTreeMap<String, (usize, String)>,
     dirty: bool,
+    /// Per pool member: when it last became free (no run, no lease).
+    idle_since: BTreeMap<(String, String), Instant>,
+    /// Per pool member: its Incus state at the last lifecycle pass.
+    vm_states: BTreeMap<(String, String), VmState>,
+    /// Members a lifecycle action (freeze, stop, delete) is changing now:
+    /// nothing is placed on them meanwhile.
+    holding: BTreeSet<(String, String)>,
+    /// Members just claimed from a warm reserve or created, for their first
+    /// run's start path.
+    fresh: BTreeMap<(String, String), StartPath>,
+    lifecycle_at: Option<Instant>,
+    lifecycle_running: bool,
+    /// Stopped members starting now, per host.
+    booting: BTreeMap<String, usize>,
+    /// `idle_since` changed since it was last written.
+    idle_dirty: bool,
+    idle_loaded: bool,
 }
 struct Queued {
     entry: Entry,
@@ -1787,6 +1811,7 @@ impl AgentService {
                     break;
                 }
                 service.dispatch();
+                service.maybe_lifecycle();
                 let sched = service.inner.sched.lock().unwrap();
                 if !sched.dirty {
                     let _ = service
@@ -1857,11 +1882,14 @@ impl AgentService {
             .pools
             .get(pool)
             .ok_or_else(|| anyhow::anyhow!("Unknown pool."))?;
-        ensure!(
+        crate::require(
             definition.profile.is_none()
-                || options.profile.as_ref().map(|p| &p.name) == definition.profile.as_ref(),
-            "Runs in this pool use the pool's profile."
-        );
+                || options
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| definition.allows_profile(&p.name)),
+            "Runs in this pool use the pool's profile or one of its profiles.",
+        )?;
         let profile_template = options.profile.as_ref().and_then(|p| p.template.clone());
         ensure!(
             definition.template.is_none()
@@ -1903,6 +1931,13 @@ impl AgentService {
             .map(|(_, r)| Placement {
                 host_id: r["host_id"].as_str().unwrap_or("").to_owned(),
                 name: r["name"].as_str().unwrap_or("").to_owned(),
+            })
+            // A reclaimed member took its sessions with it: refuse the resume.
+            .filter(|home| {
+                self.inner
+                    .pools
+                    .get(pool)
+                    .is_some_and(|p| p.members().contains(home))
             })
     }
     fn enqueue(
@@ -2161,6 +2196,7 @@ impl AgentService {
                 .values()
                 .map(|p| (p.host_id.clone(), p.name.clone())),
         );
+        busy.extend(sched.holding.iter().cloned());
         busy.extend(
             self.inner
                 .records
@@ -2223,6 +2259,20 @@ impl AgentService {
                         .get(&def.name)
                         .filter(|(until, _)| *until > now)
                         .map(|(_, why)| why.clone()),
+                    member_rank: def
+                        .members()
+                        .into_iter()
+                        .map(|m| {
+                            let key = (m.host_id, m.name);
+                            let rank = sched
+                                .vm_states
+                                .get(&key)
+                                .copied()
+                                .unwrap_or_default()
+                                .placement_rank();
+                            (key, rank)
+                        })
+                        .collect(),
                 },
             );
         }
@@ -2278,6 +2328,513 @@ impl AgentService {
         for (pool, host) in plan.create {
             *sched.creating.entry(pool.clone()).or_default() += 1;
             self.spawn_create(pool, host);
+        }
+    }
+    /// Start a lifecycle pass when one is due and none is running. Passes
+    /// read host inventories and change VMs, so they run off the scheduler
+    /// thread.
+    fn maybe_lifecycle(&self) {
+        {
+            let mut sched = self.inner.sched.lock().unwrap();
+            if sched.lifecycle_running
+                || sched
+                    .lifecycle_at
+                    .is_some_and(|at| at.elapsed() < LIFECYCLE_EVERY)
+                || self.inner.pools.all().is_empty()
+            {
+                return;
+            }
+            sched.lifecycle_running = true;
+            sched.lifecycle_at = Some(Instant::now());
+        }
+        let this = self.clone();
+        thread::spawn(move || {
+            this.lifecycle_pass();
+            this.inner.sched.lock().unwrap().lifecycle_running = false;
+        });
+    }
+    /// Members busy now: a run, a writer lease, an unresolved lease, or a
+    /// lifecycle action in flight. Takes `leases` and `records` (callers hold
+    /// `sched`, which comes first in the lock order).
+    fn busy_members(&self, sched: &Sched) -> BTreeSet<(String, String)> {
+        let mut busy: BTreeSet<(String, String)> = self
+            .inner
+            .leases
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, n, _)| (h.clone(), n.clone()))
+            .collect();
+        busy.extend(
+            sched
+                .running
+                .values()
+                .map(|p| (p.host_id.clone(), p.name.clone())),
+        );
+        busy.extend(sched.holding.iter().cloned());
+        busy.extend(
+            self.inner
+                .records
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|v| v["execution_uncertain"] == true)
+                .map(|v| {
+                    (
+                        v["host_id"].as_str().unwrap_or("").to_owned(),
+                        v["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                }),
+        );
+        busy
+    }
+    /// Refresh member states, track idle time, then freeze or stop idle
+    /// members by their pool's policy.
+    fn lifecycle_pass(&self) {
+        if !std::mem::replace(&mut self.inner.sched.lock().unwrap().idle_loaded, true) {
+            self.load_idle();
+        }
+        let pools = self.inner.pools.all();
+        let hosts: BTreeSet<String> = pools
+            .iter()
+            .flat_map(|p| p.members().into_iter().map(|m| m.host_id))
+            .collect();
+        let mut states: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for host in hosts {
+            if let Ok(s) = self.inner.fleet.instance_states(&host) {
+                states.insert(host, s);
+            }
+        }
+        let now = Instant::now();
+        let actions: Vec<(String, Placement, IdleAction, Duration)> = {
+            let mut sched = self.inner.sched.lock().unwrap();
+            let busy = self.busy_members(&sched);
+            // Queued runs a pool's free members could take, and runs pinned
+            // to one member: those members stay up.
+            let mut demand: BTreeSet<String> = BTreeSet::new();
+            let mut pinned: BTreeSet<(String, String)> = BTreeSet::new();
+            for q in sched
+                .entries
+                .values()
+                .filter(|q| q.entry.state == EntryState::Queued)
+            {
+                match &q.entry.target {
+                    Target::Pool { pool, pinned: None } => {
+                        demand.insert(pool.clone());
+                    }
+                    Target::Pool {
+                        pinned: Some(p), ..
+                    } => {
+                        pinned.insert((p.host_id.clone(), p.name.clone()));
+                    }
+                    Target::Workspace { host_id, name } => {
+                        pinned.insert((host_id.clone(), name.clone()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            let mut seen = BTreeSet::new();
+            for def in &pools {
+                let policy = IdlePolicy {
+                    freeze_after: def.freeze_after(),
+                    stop_after: def.stop_after(),
+                };
+                for m in def.members() {
+                    let key = (m.host_id.clone(), m.name.clone());
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    let Some(host_states) = states.get(&m.host_id) else {
+                        continue;
+                    };
+                    let state = host_states
+                        .get(&m.name)
+                        .map_or(VmState::Other, |s| VmState::from_status(s));
+                    sched.vm_states.insert(key.clone(), state);
+                    if busy.contains(&key) {
+                        if sched.idle_since.remove(&key).is_some() {
+                            sched.idle_dirty = true;
+                        }
+                        continue;
+                    }
+                    if !sched.idle_since.contains_key(&key) {
+                        sched.idle_dirty = true;
+                    }
+                    let since = *sched.idle_since.entry(key.clone()).or_insert(now);
+                    let idle = now.saturating_duration_since(since);
+                    let wanted = demand.contains(&def.name) || pinned.contains(&key);
+                    if let Some(action) = lifecycle::idle_action(state, idle, policy, wanted) {
+                        sched.holding.insert(key);
+                        out.push((def.name.clone(), m, action, idle));
+                    }
+                }
+            }
+            out
+        };
+        for (pool, m, action, idle) in actions {
+            let op = match action {
+                IdleAction::Freeze => "pause",
+                IdleAction::Stop => "stop",
+            };
+            let result = self.inner.fleet.scheduler_action(&m.host_id, &m.name, op);
+            self.lifecycle_event(
+                &pool,
+                &m,
+                match action {
+                    IdleAction::Freeze => "workspace_frozen",
+                    IdleAction::Stop => "workspace_stopped",
+                },
+                &format!("idle_{}s", idle.as_secs()),
+                result.as_ref().err(),
+            );
+            let mut sched = self.inner.sched.lock().unwrap();
+            let key = (m.host_id.clone(), m.name.clone());
+            sched.holding.remove(&key);
+            if result.is_ok() {
+                sched.vm_states.insert(
+                    key,
+                    match action {
+                        IdleAction::Freeze => VmState::Frozen,
+                        IdleAction::Stop => VmState::Stopped,
+                    },
+                );
+            }
+            sched.dirty = true;
+        }
+        self.save_idle();
+        self.inner.wake.notify_all();
+    }
+    fn lifecycle_event(
+        &self,
+        pool: &str,
+        m: &Placement,
+        kind: &str,
+        reason: &str,
+        error: Option<&anyhow::Error>,
+    ) {
+        self.record_launch(LaunchEvent {
+            kind: kind.into(),
+            outcome: if error.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .into(),
+            pool: (!pool.is_empty()).then(|| pool.to_owned()),
+            host_id: Some(m.host_id.clone()),
+            workspace: Some(m.name.clone()),
+            stage: Stage::Place.as_str().into(),
+            reason: reason.into(),
+            message: error
+                .map(|e| launch_events::clip_message(&format!("{e:#}"), &BTreeMap::new()))
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+    }
+    /// The reclaimers' view of every pool member on `host`.
+    fn member_views(&self, host: &str) -> Vec<MemberView> {
+        let now = Instant::now();
+        let sched = self.inner.sched.lock().unwrap();
+        let busy = self.busy_members(&sched);
+        let mut out = Vec::new();
+        for def in self.inner.pools.all() {
+            for m in def.members().into_iter().filter(|m| m.host_id == host) {
+                let key = (m.host_id.clone(), m.name.clone());
+                let session_age = self.inner.pools.session_on(&m).and_then(|at| {
+                    chrono::DateTime::parse_from_rfc3339(&at)
+                        .ok()
+                        .and_then(|at| chrono::Utc::now().signed_duration_since(at).to_std().ok())
+                });
+                let idle = if busy.contains(&key) {
+                    None
+                } else {
+                    sched
+                        .idle_since
+                        .get(&key)
+                        .map(|s| now.saturating_duration_since(*s))
+                };
+                out.push(MemberView {
+                    pool: def.name.clone(),
+                    created: def.created.contains(&m) && !def.workspaces.contains(&m),
+                    state: sched.vm_states.get(&key).copied().unwrap_or(VmState::Other),
+                    idle,
+                    session_age,
+                    placement: m,
+                });
+            }
+        }
+        out
+    }
+    /// Stop frozen idle members on `host`, lowest reuse score first, until
+    /// `fits` says the pending start fits. Returns how many were stopped.
+    fn relieve_memory(&self, host: &str, fits: &dyn Fn() -> bool) -> usize {
+        let mut stopped = 0;
+        for m in lifecycle::memory_victims(&self.member_views(host), host) {
+            if fits() {
+                break;
+            }
+            let key = (m.host_id.clone(), m.name.clone());
+            {
+                let mut sched = self.inner.sched.lock().unwrap();
+                if self.busy_members(&sched).contains(&key) {
+                    continue;
+                }
+                sched.holding.insert(key.clone());
+            }
+            let result = self
+                .inner
+                .fleet
+                .scheduler_action(&m.host_id, &m.name, "stop_fast");
+            let pool = self.pool_of(&m).unwrap_or_default();
+            self.lifecycle_event(
+                &pool,
+                &m,
+                "workspace_stopped",
+                "memory_pressure",
+                result.as_ref().err(),
+            );
+            let mut sched = self.inner.sched.lock().unwrap();
+            sched.holding.remove(&key);
+            if result.is_ok() {
+                sched.vm_states.insert(key, VmState::Stopped);
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+    /// Delete one thing disk reclamation allows on `host`; true when
+    /// something was deleted.
+    fn reclaim_disk(&self, host: &str) -> bool {
+        let bases = self.inner.fleet.stale_bases(host).unwrap_or_default();
+        let views = self.member_views(host);
+        let pools = self.inner.pools.all();
+        let created = |pool: &str| {
+            pools
+                .iter()
+                .find(|p| p.name == pool)
+                .map_or(0, |p| p.created.len())
+        };
+        let minimum = |pool: &str| {
+            pools
+                .iter()
+                .find(|p| p.name == pool)
+                .map_or(usize::MAX, |p| p.min_workspaces())
+        };
+        for victim in lifecycle::delete_victims(host, &bases, &views, &minimum, &created) {
+            match victim {
+                Reclaim::Base { host_id, name } => {
+                    let result = self
+                        .inner
+                        .fleet
+                        .scheduler_action(&host_id, &name, "delete_base");
+                    let m = Placement { host_id, name };
+                    self.lifecycle_event(
+                        "",
+                        &m,
+                        "workspace_reclaimed",
+                        "stale_base",
+                        result.as_ref().err(),
+                    );
+                    if result.is_ok() {
+                        return true;
+                    }
+                }
+                Reclaim::Member { pool, placement } => {
+                    let key = (placement.host_id.clone(), placement.name.clone());
+                    {
+                        let mut sched = self.inner.sched.lock().unwrap();
+                        if self.busy_members(&sched).contains(&key) {
+                            continue;
+                        }
+                        sched.holding.insert(key.clone());
+                    }
+                    let result = self
+                        .inner
+                        .fleet
+                        .scheduler_action(&placement.host_id, &placement.name, "delete")
+                        .and_then(|_| self.inner.pools.remove_created(&pool, &placement));
+                    self.lifecycle_event(
+                        &pool,
+                        &placement,
+                        "workspace_reclaimed",
+                        "idle_stopped_member",
+                        result.as_ref().err(),
+                    );
+                    let mut sched = self.inner.sched.lock().unwrap();
+                    sched.holding.remove(&key);
+                    if result.is_ok() {
+                        sched.vm_states.remove(&key);
+                        sched.idle_since.remove(&key);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn pool_of(&self, m: &Placement) -> Option<String> {
+        self.inner
+            .pools
+            .all()
+            .into_iter()
+            .find(|p| p.members().contains(m))
+            .map(|p| p.name)
+    }
+    /// Bring a pool member up for the run that holds it: resume a frozen one,
+    /// start a stopped one. A start first stops frozen idle members when RAM
+    /// or instance slots are short, and waits for one of the host's
+    /// [`MAX_BOOTS_PER_HOST`] boot slots. Returns how it came up.
+    fn wake_member(&self, run: &AdmittedRun) -> std::result::Result<StartPath, LaunchFailure> {
+        let key = (run.host_id.clone(), run.name.clone());
+        if let Some(path) = self.inner.sched.lock().unwrap().fresh.remove(&key) {
+            return Ok(path);
+        }
+        let states = self
+            .inner
+            .fleet
+            .instance_states(&run.host_id)
+            .map_err(|e| LaunchFailure::from_error(Stage::Place, "workspace_unavailable", &e))?;
+        let state = states
+            .get(&run.name)
+            .map_or(VmState::Other, |s| VmState::from_status(s));
+        let booting = match state {
+            VmState::Frozen => false,
+            VmState::Stopped => {
+                let fleet = &self.inner.fleet;
+                let fits = || {
+                    fleet
+                        .wake_room(&run.host_id, &run.name)
+                        .is_ok_and(|(needed, free, slots)| needed <= free && slots >= 1)
+                };
+                if !fits() {
+                    self.relieve_memory(&run.host_id, &fits);
+                }
+                // Boots overlap, but a burst of them is bounded per host.
+                let wait_until = Instant::now() + HOST_LOCK_WAIT;
+                loop {
+                    {
+                        let mut sched = self.inner.sched.lock().unwrap();
+                        let n = sched.booting.entry(run.host_id.clone()).or_default();
+                        if *n < MAX_BOOTS_PER_HOST {
+                            *n += 1;
+                            break;
+                        }
+                    }
+                    if Instant::now() >= wait_until {
+                        return Err(LaunchFailure::new(
+                            Stage::Place,
+                            "workspace_wake_failed",
+                            "Too many workspaces are starting on this host.",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+                true
+            }
+            _ => return Ok(StartPath::Hot),
+        };
+        let woke = self.inner.fleet.wake(&run.host_id, &run.name);
+        if booting {
+            let mut sched = self.inner.sched.lock().unwrap();
+            if let Some(n) = sched.booting.get_mut(&run.host_id) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        let (_, from) =
+            woke.map_err(|e| LaunchFailure::from_error(Stage::Place, "workspace_wake_failed", &e))?;
+        let mut sched = self.inner.sched.lock().unwrap();
+        sched.vm_states.insert(key.clone(), VmState::Running);
+        sched.idle_since.remove(&key);
+        sched.idle_dirty = true;
+        Ok(match from.as_str() {
+            "Frozen" => StartPath::Frozen,
+            "Stopped" => StartPath::Stopped,
+            _ => StartPath::Hot,
+        })
+    }
+    /// Whether a queued pool run could use a slot on `host` (warm refill then
+    /// leaves the host's last instance slot alone).
+    pub fn pool_demand_on(&self, host: &str) -> bool {
+        let sched = self.inner.sched.lock().unwrap();
+        sched
+            .entries
+            .values()
+            .filter(|q| q.entry.state == EntryState::Queued)
+            .any(|q| match &q.entry.target {
+                Target::Pool {
+                    pinned: Some(p), ..
+                } => p.host_id == host,
+                Target::Pool { pool, pinned: None } => {
+                    self.inner.pools.get(pool).is_some_and(|def| {
+                        def.members().iter().any(|m| m.host_id == host)
+                            || def
+                                .autoscale
+                                .as_ref()
+                                .is_some_and(|a| a.hosts.iter().any(|h| h == host))
+                    })
+                }
+                Target::Workspace { .. } => false,
+            })
+    }
+    /// Persist members' idle-since times (RFC 3339), so a controller restart
+    /// does not reset the freeze and stop clocks. Kept in the controller's
+    /// private state, not in the instance: a frozen guest blocks `user.*`
+    /// config writes, and a claimed warm member's description carries its
+    /// reservation.
+    fn save_idle(&self) {
+        let snapshot: BTreeMap<String, String> = {
+            let mut sched = self.inner.sched.lock().unwrap();
+            if !sched.idle_dirty {
+                return;
+            }
+            sched.idle_dirty = false;
+            let now = chrono::Utc::now();
+            sched
+                .idle_since
+                .iter()
+                .filter_map(|((h, n), at)| {
+                    let ago = chrono::Duration::from_std(at.elapsed()).ok()?;
+                    Some((format!("{h}/{n}"), (now - ago).to_rfc3339()))
+                })
+                .collect()
+        };
+        let _ = security::write_json(
+            &self.inner.root,
+            IDLE_FILE,
+            &json!({"idle_since": snapshot}),
+        );
+    }
+    /// Seed idle-since times from the last controller's record.
+    fn load_idle(&self) {
+        let Ok(Some(value)) = security::read_json(&self.inner.root, IDLE_FILE) else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let mut sched = self.inner.sched.lock().unwrap();
+        for (key, at) in value["idle_since"].as_object().into_iter().flatten() {
+            let (Some((h, n)), Some(at)) = (
+                key.split_once('/'),
+                at.as_str()
+                    .and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok()),
+            ) else {
+                continue;
+            };
+            let ago = now.signed_duration_since(at).to_std().unwrap_or_default();
+            if let Some(since) = Instant::now().checked_sub(ago) {
+                sched
+                    .idle_since
+                    .entry((h.to_owned(), n.to_owned()))
+                    .or_insert(since);
+            }
+        }
+    }
+    /// Record how a run's workspace came up and how long that took.
+    fn note_start(&self, id: &str, path: StartPath, latency: Duration) {
+        let mut records = self.inner.records.lock().unwrap();
+        if let Some(record) = records.get_mut(id) {
+            record["start_path"] = json!(path.as_str());
+            record["start_latency_ms"] = json!(latency.as_millis() as u64);
+            let _ = self.save_record(record);
         }
     }
     fn refresh_measurements(&self, hosts: &BTreeSet<String>) {
@@ -2561,6 +3118,25 @@ impl AgentService {
             }
             return;
         }
+        // A pool member may be frozen or stopped: bring it up first (its run
+        // holds the lease, so nothing else changes it meanwhile).
+        let woke = if run.pool.is_some() {
+            match self.wake_member(run) {
+                Ok(path) => path,
+                Err(failure) => {
+                    self.launch_failed(
+                        run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                    return;
+                }
+            }
+        } else {
+            StartPath::Hot
+        };
         let prepared = self
             .prepare(run, template.as_deref(), resolved.as_ref())
             .and_then(|(host, guest_current)| {
@@ -2571,6 +3147,7 @@ impl AgentService {
             });
         match prepared {
             Ok((host, guest_current)) => {
+                self.note_start(&run.id, woke, started.elapsed());
                 let request = run.request.clone();
                 // Checkouts need a guest helper from this release; an older
                 // one keeps the previous in-workspace behavior.
@@ -2881,6 +3458,23 @@ impl AgentService {
     pub fn launch_events(&self, filter: &launch_events::Filter) -> Value {
         self.inner.launch_events.list(filter)
     }
+    /// After a refused creation: stop frozen idle members when memory was
+    /// short, or reclaim one slot when instance slots ran out. True when
+    /// something was freed and the creation should be retried once.
+    fn relieve_for_create(&self, host: &str, error: &anyhow::Error) -> bool {
+        let message = format!("{error:#}");
+        if message.contains("no instance slots") || message.contains("(memory:") {
+            // Slots count live (running and frozen) instances, and a frozen
+            // member holds its RAM: stopping the lowest-scored one frees both.
+            // How much the retry needs is not known here, so one at a time.
+            let stopped = std::cell::Cell::new(false);
+            self.relieve_memory(host, &|| stopped.replace(true)) > 0
+        } else if message.contains("(disk:") {
+            self.reclaim_disk(host)
+        } else {
+            false
+        }
+    }
     fn spawn_create(&self, pool: String, host: String) {
         let this = self.clone();
         thread::spawn(move || {
@@ -2918,23 +3512,45 @@ impl AgentService {
                 })?;
                 event.workspace = Some(name.clone());
                 let hook = this.inner.hooks.create.lock().unwrap().clone();
-                match hook {
-                    Some(create) => create(&host, &name, &template, size.as_deref()),
-                    None => {
-                        let mut params = json!({"name":name,"template":template});
-                        if let Some(size) = &size {
-                            params["size"] = json!(size);
+                // A warm reserve of the template is claimed before a VM is
+                // created ("allocate" falls back to a cold create). Memory or
+                // slot shortage is relieved once, then the creation retried.
+                let attempt = || -> Result<(String, StartPath)> {
+                    match &hook {
+                        Some(create) => create(&host, &name, &template, size.as_deref())
+                            .map(|()| (name.clone(), StartPath::Created)),
+                        None => {
+                            let mut params = json!({"name":name,"template":template});
+                            if let Some(size) = &size {
+                                params["size"] = json!(size);
+                            }
+                            let v = this.inner.fleet.operate(&host, "allocate", &params)?;
+                            let actual = v["name"].as_str().unwrap_or(&name).to_owned();
+                            let path = if v["startup"] == "cold" {
+                                StartPath::Created
+                            } else {
+                                StartPath::Warm
+                            };
+                            Ok((actual, path))
                         }
-                        this.inner
-                            .fleet
-                            .operate(&host, "create", &params)
-                            .map(|_| ())
                     }
+                };
+                let created = match attempt() {
+                    Err(e) if hook.is_none() && this.relieve_for_create(&host, &e) => attempt(),
+                    other => other,
                 }
                 .map_err(|e| match e.downcast::<LaunchFailure>() {
                     Ok(failure) => failure,
                     Err(e) => LaunchFailure::from_error(Stage::Create, "create_failed", &e),
                 })?;
+                let (name, path) = created;
+                event.workspace = Some(name.clone());
+                this.inner
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .fresh
+                    .insert((host.clone(), name.clone()), path);
                 this.inner
                     .pools
                     .add_created(
@@ -2994,7 +3610,14 @@ impl AgentService {
                 let busy = leases
                     .iter()
                     .any(|(h, n, _)| *h == m.host_id && *n == m.name);
-                json!({"host_id":m.host_id,"name":m.name,"busy":busy})
+                let key = (m.host_id.clone(), m.name.clone());
+                let state = sched.vm_states.get(&key).map(|s| s.as_str());
+                let idle_since = sched.idle_since.get(&key).and_then(|at| {
+                    chrono::Duration::from_std(at.elapsed())
+                        .ok()
+                        .map(|ago| (chrono::Utc::now() - ago).to_rfc3339())
+                });
+                json!({"host_id":m.host_id,"name":m.name,"busy":busy,"state":state,"idle_since":idle_since})
             })
             .collect();
         let in_pool = |state: EntryState| {

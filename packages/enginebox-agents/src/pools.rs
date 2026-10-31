@@ -21,6 +21,12 @@ const MAX_SESSIONS: usize = 4096;
 const SESSIONS_FILE: &str = "agent-pool-sessions.json";
 const SESSIONS_LIMIT: usize = 2 * 1024 * 1024;
 const SIZES: [&str; 5] = ["minimum", "recommended", "small", "standard", "large"];
+/// Default idle time before a free member is frozen (paused, RAM kept).
+pub const DEFAULT_IDLE_FREEZE_SECONDS: u64 = 120;
+/// Default idle time before a free member is stopped (RAM released).
+pub const DEFAULT_IDLE_STOP_SECONDS: u64 = 3600;
+const MAX_IDLE_SECONDS: u64 = 7 * 24 * 3600;
+const MAX_PROFILES: usize = 16;
 
 /// Project of pools created before pools carried one, and of new pools whose
 /// request names none.
@@ -90,9 +96,24 @@ pub struct Pool {
     pub org_id: Option<String>,
     #[serde(default)]
     pub description: String,
-    /// Profile every run in the pool uses. A run may omit it or name it.
+    /// The pool's default profile: a run that names none uses it.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Further profiles a run in this pool may name (`profile` is always
+    /// allowed). Granting the pool grants all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    /// Seconds a free member stays idle before it is frozen (default 120;
+    /// 0 never freezes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_freeze_seconds: Option<u64>,
+    /// Seconds a free member stays idle before it is stopped (default 3600;
+    /// 0 never stops).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_stop_seconds: Option<u64>,
+    /// Created members slot reclamation keeps, even stopped (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_workspaces: Option<usize>,
     /// Template every member must come from; required for `autoscale`.
     #[serde(default)]
     pub template: Option<String>,
@@ -128,6 +149,31 @@ impl Pool {
     pub fn org(&self) -> &str {
         self.org_id.as_deref().unwrap_or(DEFAULT_ORG)
     }
+    /// Whether a run in this pool may use `profile`.
+    pub fn allows_profile(&self, profile: &str) -> bool {
+        self.profile.as_deref() == Some(profile) || self.profiles.iter().any(|p| p == profile)
+    }
+    /// Every profile a run in this pool may use, the default first.
+    pub fn allowed_profiles(&self) -> Vec<String> {
+        self.profile
+            .iter()
+            .chain(self.profiles.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+    pub fn freeze_after(&self) -> Option<std::time::Duration> {
+        let s = self
+            .idle_freeze_seconds
+            .unwrap_or(DEFAULT_IDLE_FREEZE_SECONDS);
+        (s > 0).then(|| std::time::Duration::from_secs(s))
+    }
+    pub fn stop_after(&self) -> Option<std::time::Duration> {
+        let s = self.idle_stop_seconds.unwrap_or(DEFAULT_IDLE_STOP_SECONDS);
+        (s > 0).then(|| std::time::Duration::from_secs(s))
+    }
+    pub fn min_workspaces(&self) -> usize {
+        self.min_workspaces.unwrap_or(1)
+    }
     pub fn max_workspaces(&self) -> usize {
         self.autoscale
             .as_ref()
@@ -154,6 +200,25 @@ impl Pool {
         );
         if let Some(p) = &self.profile {
             ensure!(crate::profile::valid_name(p), "Invalid profile name");
+        }
+        ensure!(
+            self.profiles.len() <= MAX_PROFILES
+                && self.profiles.iter().collect::<BTreeSet<_>>().len() == self.profiles.len()
+                && self.profiles.iter().all(|p| crate::profile::valid_name(p)),
+            "profiles must list at most 16 distinct profile names"
+        );
+        ensure!(
+            self.profiles.is_empty() || self.profile.is_some(),
+            "profiles needs a default profile"
+        );
+        for v in [self.idle_freeze_seconds, self.idle_stop_seconds]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                v <= MAX_IDLE_SECONDS,
+                "idle_freeze_seconds and idle_stop_seconds must be 0-604800"
+            );
         }
         if let Some(t) = &self.template {
             enginebox_core::identifier(t, false)?;
@@ -186,6 +251,10 @@ impl Pool {
                 (1..=MAX_MEMBERS).contains(&a.max_workspaces),
                 "autoscale.max_workspaces must be 1-256"
             );
+            ensure!(
+                self.min_workspaces.is_none_or(|m| m <= a.max_workspaces),
+                "min_workspaces must not exceed autoscale.max_workspaces"
+            );
             if let Some(size) = &a.size {
                 ensure!(SIZES.contains(&size.as_str()), "Unknown autoscale size");
             }
@@ -204,6 +273,10 @@ impl Pool {
             "org_id":self.org(),
             "description":self.description,
             "profile":self.profile,
+            "profiles":self.profiles,
+            "idle_freeze_seconds":self.idle_freeze_seconds.unwrap_or(DEFAULT_IDLE_FREEZE_SECONDS),
+            "idle_stop_seconds":self.idle_stop_seconds.unwrap_or(DEFAULT_IDLE_STOP_SECONDS),
+            "min_workspaces":self.min_workspaces(),
             "template":self.template,
             "workspaces":self.workspaces,
             "created_workspaces":self.created,
@@ -282,6 +355,10 @@ impl Pools {
                     "org_id",
                     "description",
                     "profile",
+                    "profiles",
+                    "idle_freeze_seconds",
+                    "idle_stop_seconds",
+                    "min_workspaces",
                     "template",
                     "workspaces",
                     "autoscale",
@@ -389,6 +466,40 @@ impl Pools {
         *p = next;
         Ok(())
     }
+    /// Drop a created member (reclaimed) and every session index entry on it,
+    /// so a resume pinned to it fails cleanly instead of waiting forever.
+    pub fn remove_created(&self, pool: &str, member: &Placement) -> Result<()> {
+        {
+            let mut pools = self.pools.lock().unwrap();
+            let p = pools.get_mut(pool).context("Unknown pool")?;
+            let mut next = p.clone();
+            next.created.retain(|m| m != member);
+            self.save(&next)?;
+            *p = next;
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, s| !(s.host_id == member.host_id && s.name == member.name));
+        if sessions.len() != before {
+            security::write_bytes(
+                &self.root,
+                SESSIONS_FILE,
+                &serde_json::to_vec(&json!({"sessions":*sessions}))?,
+                SESSIONS_LIMIT,
+            )?;
+        }
+        Ok(())
+    }
+    /// Whether some pool session index entry lives on `member`, with its time.
+    pub fn session_on(&self, member: &Placement) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.host_id == member.host_id && s.name == member.name)
+            .map(|s| s.at.clone())
+            .max()
+    }
     /// Remember which workspace holds a native session started in a pool.
     pub fn remember_session(&self, session: &str, pool: &str, at: &Placement) -> Result<()> {
         ensure!(security::exact_uuid(session), "Invalid native session ID.");
@@ -430,5 +541,45 @@ impl Pools {
                 host_id: s.host_id.clone(),
                 name: s.name.clone(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reclaimed_member_leaves_the_pool_with_its_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let pools = Pools::open(&root).unwrap();
+        pools
+            .put(
+                json!({"name":"shared","profile":"builder","profiles":["reader"],"template":"native-dev",
+                    "autoscale":{"hosts":["h"],"max_workspaces":4}}),
+                &|_| true,
+            )
+            .unwrap();
+        let def = pools.get("shared").unwrap();
+        assert!(def.allows_profile("builder") && def.allows_profile("reader"));
+        assert!(!def.allows_profile("other"));
+        assert_eq!(
+            def.freeze_after(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(def.stop_after(), Some(std::time::Duration::from_secs(3600)));
+        let m = Placement {
+            host_id: "h".into(),
+            name: "ebox-shared-1".into(),
+        };
+        pools.add_created("shared", m.clone()).unwrap();
+        let session = "0e2b7d1c-4b53-4a8f-9a1e-2f6c1d9b8a70";
+        pools.remember_session(session, "shared", &m).unwrap();
+        assert!(pools.session_on(&m).is_some());
+        pools.remove_created("shared", &m).unwrap();
+        assert!(pools.get("shared").unwrap().members().is_empty());
+        assert_eq!(pools.session_home(session, "shared"), None);
+        let again = Pools::open(&root).unwrap();
+        assert_eq!(again.session_home(session, "shared"), None);
     }
 }

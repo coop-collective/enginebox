@@ -4,6 +4,7 @@ pub mod browser;
 pub mod clients;
 pub mod delegation;
 pub mod launch_events;
+pub mod lifecycle;
 pub mod native;
 pub mod pools;
 pub mod process;
