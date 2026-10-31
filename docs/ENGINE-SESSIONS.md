@@ -55,7 +55,8 @@ admission, the per-session relay broker, OAuth) is still design.
   yours, `404` unknown repository, `429` more than four open sessions.
 - `GET /v1/projects/{p}/engine-sessions[/{id}]`: the member's own sessions (the owner token without a member sees
   all of the org's). When `ready`, **only the starting member's** read adds
-  `stream:{relay_url, url, namespace, session, tag, width, height, audience:{token}, control:{control_key}}`. The
+  `stream:{relay_url, url, namespace, session, tag, width, height, audience:{token}, control:{control_key, token}}`
+  (`control.token` only when the owner configured `MOQ_CONTROL_TOKEN`, below). The
   owner, other members and every other response never carry a token; the node's publish token never leaves the poll.
 - `POST …/{id}/renew {lease, ttl_seconds}`, `POST …/{id}/end {}` (or `{lease}`).
 - Owner: `GET /v1/engine-sessions`, `POST /v1/engine-sessions/{id}/end`.
@@ -124,8 +125,9 @@ reports in order. If the engine channel fails for a minute, it stops its session
 6. `enginebox-stream-host.exe --moq-session <session>\moq-session.json` with
    `{schema:1, token:<publish>, controlKey, session, namespace, tag, durationSeconds:600, width, height,
    capture:{kind:"unity-editor", origin:"http://127.0.0.1:<port>", tokenFile, ffmpeg}}`. Its first
-   `moq-source-running` line reports `ready`. The stream host's permit is fixed at 600 s, so the node restarts it
-   while the session runs (viewers reconnect); five quick failures in a row fail the session.
+   `moq-source-running` line reports `ready`. The stream host's permit is fixed at 600 s and it also ends cleanly
+   when no controlling client keeps it alive, so the node restarts it while the session runs (viewers reconnect);
+   five quick non-zero exits in a row fail the session.
 7. Stop, lease loss, an epoch change or a controller outage terminate the session's Job Object (every descendant),
    remove the session directory and write `config\engine-receipts\<id>.json` (commit, timings, outcome; no secrets),
    then report `ended` or `failed`.
@@ -159,15 +161,32 @@ reports in order. If the engine channel fails for a minute, it stops its session
 
 ### Platform configuration
 
-- `cloudflare-moq` (platform org, `secret_source`, provider `stored`): `MOQ_PUBLISH_TOKEN`, `MOQ_SUBSCRIBE_TOKEN`.
+- `cloudflare-moq` (platform org, `secret_source`, provider `stored`): `MOQ_PUBLISH_TOKEN` (the node's),
+  `MOQ_SUBSCRIBE_TOKEN` (viewers), and optionally `MOQ_CONTROL_TOKEN`, a separate relay token with publish rights for
+  the starting member's browser to act as the controlling client (it publishes `<namespace>-input` liveness and input
+  with the control key). Without a controlling client the stream host ends itself about 15 s after start
+  (`control-liveness-expired`) and the node restarts it, so a steady stream needs `MOQ_CONTROL_TOKEN`.
 - Each member saves their Unity account on the Agents page (PR #92).
 - The repository is hosted or GitHub-linked in the project, or has an `engine-repo-<name>` connection.
+
+### Qualified so far (RTX 4080 Windows machine, November 1, 2026)
+
+- `enginebox-install` engine tests and clippy pass on Windows; `engine-check` accepts the machine's Unity
+  6000.6.5f1, FFmpeg 7.1 (Gyan full), Gamejam's editor bridge and Git for Windows with git-lfs 3.5.1.
+- `engine-rehearse` on a copy of Queen of Hearts: exact commit checked out with all 979 LFS files materialised in
+  about 10 s, manifest gains both packages, the bundled licensing client runs, the session Job Object ends a
+  process tree in milliseconds and the sweep removes the session directory. The original checkout was untouched.
+- The Gamejam stream host (PR #38 branch, built with `--features moq`) accepted a session file in exactly the
+  node's format with owner-only ACLs and published 535 VP8 frames (1.8 MB) from a stand-in bridge to the draft-16
+  relay, then stopped cleanly on `control-liveness-expired`.
+- Not yet run: Unity activation and the Editor (the owner's Unity account is not saved yet), a controller-driven
+  session end to end, and a browser viewer.
 
 ### Known v1 limits
 
 - One session per engine machine; no capacity measurement; no `UsageEvent`.
-- The browser viewer gets the subscribe token and control key, but sending input also needs a publish token on
-  `<namespace>-input`, so v1 streams are view-only.
+- Without `MOQ_CONTROL_TOKEN` streams are view-only and restart about every 15 s (see above). The control token is
+  relay-wide, so hand it only to members you trust with the relay until per-session tokens exist.
 - The stream host restart every ten minutes is visible to viewers.
 - The node exits on a failed heartbeat (existing behavior); its process Job Object then ends every session.
 

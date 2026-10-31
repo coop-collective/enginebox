@@ -45,6 +45,10 @@ pub const MAX_OPEN_PER_MEMBER: usize = 4;
 pub const MOQ_CONNECTION: &str = "cloudflare-moq";
 pub const MOQ_PUBLISH: &str = "MOQ_PUBLISH_TOKEN";
 pub const MOQ_SUBSCRIBE: &str = "MOQ_SUBSCRIBE_TOKEN";
+/// Optional: a relay token with publish rights the owner lets members'
+/// browsers use to control their own sessions (the stream host stops after
+/// about 15 s without a controlling client's liveness).
+pub const MOQ_CONTROL: &str = "MOQ_CONTROL_TOKEN";
 /// The relay the stream host publishes to (it is fixed in the stream host).
 pub const DEFAULT_RELAY: &str = "https://draft-16.cloudflare.mediaoverquic.com";
 /// v1 fallback for repositories Engine Box neither hosts nor links: an
@@ -269,6 +273,7 @@ pub struct Relay {
     pub url: String,
     pub publish_token: String,
     pub subscribe_token: String,
+    pub control_token: Option<String>,
 }
 
 /// What the controller provides to sessions; the runtime implements it over
@@ -769,7 +774,7 @@ impl EngineSessions {
                 "session": session_uuid(&s.id),
                 "tag": s.tag, "width": s.width, "height": s.height,
                 "audience": {"token": relay.subscribe_token},
-                "control": {"control_key": s.control_key},
+                "control": {"control_key": s.control_key, "token": relay.control_token},
             });
         }
         Ok(v)
@@ -1082,6 +1087,7 @@ pub(crate) mod tests {
                 url: DEFAULT_RELAY.into(),
                 publish_token: "moq-publish-secret".into(),
                 subscribe_token: "moq-subscribe-secret".into(),
+                control_token: Some("moq-control-secret".into()),
             })
         }
         fn audit(&self, _: &str, _: &str, action: &str, _: &str, ok: bool, _: Value) {
@@ -1148,6 +1154,7 @@ pub(crate) mod tests {
         assert_eq!(read["state"], "ready");
         assert_eq!(read["commit"], "c".repeat(40));
         assert_eq!(read["stream"]["audience"]["token"], "moq-subscribe-secret");
+        assert_eq!(read["stream"]["control"]["token"], "moq-control-secret");
         assert_eq!(read["stream"]["namespace"], format!("eb-{id}"));
         assert_eq!(read["stream"]["session"], session_uuid(&id));
         let text = read.to_string();

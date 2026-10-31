@@ -961,11 +961,14 @@ pub async fn run_session(
                     },
                 }
             }
-            let _ = g.child(index).wait().await;
+            let exit = g.child(index).wait().await?;
             if g.child(editor_index).try_wait()?.is_some() {
                 bail!("The Unity Editor exited");
             }
-            if launched.elapsed() < Duration::from_secs(30) {
+            // A clean exit is the stream host's own end: its fixed permit ran
+            // out, or no controlling client kept it alive (about 15 s without
+            // control liveness). Restart it; only failures count.
+            if !exit.success() && launched.elapsed() < Duration::from_secs(30) {
                 quick_failures += 1;
                 ensure!(quick_failures < 5, "The stream host keeps failing to publish");
             } else {

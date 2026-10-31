@@ -1770,6 +1770,7 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
                 url: engine_sessions::DEFAULT_RELAY.into(),
                 publish_token,
                 subscribe_token,
+                control_token: value(engine_sessions::MOQ_CONTROL).ok(),
             }),
             _ => Err(engine_sessions::relay_missing()),
         }
