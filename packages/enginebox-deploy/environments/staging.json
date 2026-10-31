@@ -4,7 +4,7 @@
   "remote_node": "/usr/local/bin/node",
   "controller": {
     "prefix": "/opt/enginebox-staging/controller",
-    "installer": "/opt/enginebox-staging/controller/releases/0.3.1-workers.41226420500/bin/enginebox-install",
+    "installer": "/opt/enginebox-staging/controller/releases/0.3.1-workers.41233899044/bin/enginebox-install",
     "supervisor_config": "/opt/enginebox-staging/controller/etc/supervisor.json",
     "state_dir": "/opt/enginebox-staging/state",
     "token_file": "/opt/enginebox-staging/controller/etc/api-token",

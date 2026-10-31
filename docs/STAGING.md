@@ -53,8 +53,8 @@ production currently has — which is exactly the order a production cutover goe
    directory such as a deploy build or the `controller-preview` artifact):
 
    ```sh
-   packages/enginebox-deploy/staging/bootstrap.sh --version 0.3.1-workers.41226420500 --artifacts DIR        # plan
-   packages/enginebox-deploy/staging/bootstrap.sh --version 0.3.1-workers.41226420500 --artifacts DIR --apply
+   packages/enginebox-deploy/staging/bootstrap.sh --version 0.3.1-workers.41233899044 --artifacts DIR        # plan
+   packages/enginebox-deploy/staging/bootstrap.sh --version 0.3.1-workers.41233899044 --artifacts DIR --apply
    ```
 
    It is idempotent and refuses to run if staging paths overlap production's or the staging port is taken by
