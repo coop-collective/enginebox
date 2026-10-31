@@ -29,7 +29,17 @@ export function loopback(value) {
 }
 function id(value) { check(typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,48}$/.test(value), 'invalid-id'); return value; }
 export function config(value) {
-  fields(value, ['schema_version', 'target', 'remote_node', 'controller', 'templates']);
+  fields(value, ['schema_version', 'target', 'remote_node', 'controller', 'templates', 'node', 'smoke', 'watch'], ['schema_version', 'target', 'remote_node', 'controller', 'templates']);
+  // Optional: the root-owned node helper installation workspaces refresh their guest helper from. Each controller
+  // deploy stages and activates the same release there and republishes the host helper, so they never drift apart.
+  // Only one environment per host may own it (production); a staging config omits it.
+  if (value.node !== undefined) {
+    fields(value.node, ['prefix', 'sudo']);
+    path(value.node.prefix);
+    path(value.node.sudo);
+  }
+  if (value.smoke !== undefined) smokeConfig(value.smoke);
+  if (value.watch !== undefined) watchConfig(value.watch);
   check(value.schema_version === 1 && value.target === 'x86_64-unknown-linux-gnu', 'unsupported-deployment-platform');
   path(value.remote_node);
   fields(value.controller, ['prefix', 'installer', 'supervisor_config', 'state_dir', 'token_file', 'url']);
@@ -45,6 +55,45 @@ export function config(value) {
   for (const file of value.templates.files) check(typeof file === 'string' && /^templates\/[a-z0-9][a-z0-9-]*\.json$/.test(file), 'template-file-path');
   check(Number.isInteger(value.templates.timeout_seconds) && value.templates.timeout_seconds >= 15 && value.templates.timeout_seconds <= 7200, 'template-timeout');
   return value;
+}
+/** Post-deploy gate on one environment: reads always; a trivial pool run only when a pool and provider are named. */
+export function smokeConfig(value) {
+  fields(value, ['pool', 'provider', 'prompt', 'expect', 'timeout_seconds'], []);
+  if (value.pool !== undefined) id(value.pool);
+  if (value.provider !== undefined) check(['codex', 'claude', 'cursor'].includes(value.provider), 'smoke-provider');
+  check((value.pool === undefined) === (value.provider === undefined), 'smoke-run-needs-pool-and-provider');
+  if (value.prompt !== undefined) check(typeof value.prompt === 'string' && value.prompt.length >= 1 && value.prompt.length <= 500, 'smoke-prompt');
+  if (value.expect !== undefined) check(typeof value.expect === 'string' && value.expect.length >= 1 && value.expect.length <= 100, 'smoke-expect');
+  if (value.timeout_seconds !== undefined) check(Number.isInteger(value.timeout_seconds) && value.timeout_seconds >= 30 && value.timeout_seconds <= 1800, 'smoke-timeout');
+  return value;
+}
+/** Post-promotion watch: how long, how often, and what counts as a regression worth an automatic rollback. */
+export function watchConfig(value) {
+  fields(value, ['seconds', 'interval_seconds', 'max_unready_checks', 'max_start_failures', 'max_start_failure_ratio'], []);
+  const int = (v, lo, hi, code) => check(v === undefined || (Number.isInteger(v) && v >= lo && v <= hi), code);
+  int(value.seconds, 0, 3600, 'watch-seconds');
+  int(value.interval_seconds, 5, 300, 'watch-interval');
+  int(value.max_unready_checks, 1, 60, 'watch-unready');
+  int(value.max_start_failures, 1, 1000, 'watch-start-failures');
+  check(value.max_start_failure_ratio === undefined || (typeof value.max_start_failure_ratio === 'number' && value.max_start_failure_ratio > 0 && value.max_start_failure_ratio <= 1), 'watch-ratio');
+  return value;
+}
+export const WATCH_DEFAULTS = { seconds: 600, interval_seconds: 30, max_unready_checks: 3, max_start_failures: 3, max_start_failure_ratio: 0.5 };
+/**
+ * The watch verdict from what was observed since the cutover: lost readiness for N consecutive checks, or start
+ * failures (runs that failed before their agent started) both above a count and a share of new runs.
+ */
+export function watchVerdict(observed, settings = {}) {
+  const w = { ...WATCH_DEFAULTS, ...settings };
+  if (observed.consecutive_unready >= w.max_unready_checks) return { regressed: true, reason: 'controller-lost-readiness' };
+  if (observed.start_failures >= w.max_start_failures && observed.new_runs > 0 && observed.start_failures / observed.new_runs >= w.max_start_failure_ratio) return { regressed: true, reason: 'run-start-failures' };
+  return { regressed: false, reason: null };
+}
+/** A run summary that failed before its agent did any work (admission/placement/launch), not an agent's own failure. */
+export function startFailure(run) {
+  if (!run || run.status !== 'failed') return false;
+  const exit = run.result?.exit_code ?? run.exit_code;
+  return exit === undefined || exit === null;
 }
 export function template(value, deployment) {
   fields(value, ['schema_version', 'id', 'revision', 'label', 'description', 'recipe', 'source_image', 'minimum', 'recommended', 'native_clients', 'config'], ['schema_version', 'id', 'revision', 'label', 'minimum', 'recommended']);
@@ -127,6 +176,15 @@ export function installerArgs(deployment, operation, pin, artifact) {
   check(operation === 'update' || operation === 'rollback', 'invalid-deployment-operation');
   // Rollback is an explicit retained version; never race the mutable previous pointer.
   return [...base, 'update', '--version', pin, '--url', deployment.controller.url, '--token-file', deployment.controller.token_file];
+}
+/** The node installation's installer argv (run through sudo with the new release's own installer). */
+export function nodeInstallerArgs(deployment, operation, pin, artifact) {
+  version(pin);
+  const base = ['--prefix', deployment.node.prefix];
+  if (operation === 'stage') return [...base, 'stage', '--version', pin, '--manifest', artifact.manifest, '--manifest-sha256', artifact.manifest_sha256, '--archive', artifact.archive];
+  if (operation === 'activate') return [...base, 'activate', '--version', pin];
+  check(operation === 'expose-host', 'invalid-node-operation');
+  return [...base, 'expose-host', '--apply'];
 }
 export async function run(program, args, { cwd, input, timeout = 120000, inherit = false, env = process.env, safeJsonErrors = false } = {}) {
   return new Promise((resolveResult, reject) => {

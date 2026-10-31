@@ -1,7 +1,18 @@
 name: Deploy private controller
+# Every push to main ships: build once → deploy that exact artifact to staging → smoke gate → promote the same
+# artifact to production → watch ~10 minutes and roll back automatically on a regression. Nothing waits on a timer.
+# ENGINEBOX_PROD_HOLD=true keeps new builds in staging. See docs/UPDATES.md "Staging and production pipeline".
 on:
   push:
     branches: [main]
+    # Docs, examples and other workflows never change the controller.
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!examples/**'
+      - '!**/*.md'
+      - '!.github/workflows/**'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
     inputs:
       operation:
@@ -9,15 +20,17 @@ on:
         type: choice
         options: [update, rollback, status]
         default: update
+      target:
+        description: pipeline (staging then production), or one environment
+        type: choice
+        options: [pipeline, staging, production]
+        default: pipeline
       version:
         description: Exact version (required for rollback; update defaults to VERSION_BASE-live.RUN_NUMBER)
         type: string
         required: false
 permissions:
   contents: read
-concurrency:
-  group: enginebox-controller-deployment
-  cancel-in-progress: false
 jobs:
   plan:
     if: vars.ENGINEBOX_DEPLOY_ENABLED == 'true' && (github.event.repository.private == true || vars.ENGINEBOX_DEPLOY_ALLOW_PUBLIC == 'true') && github.ref == 'refs/heads/main'
@@ -25,6 +38,9 @@ jobs:
     outputs:
       operation: ${{ steps.plan.outputs.operation }}
       version: ${{ steps.plan.outputs.version }}
+      staging: ${{ steps.plan.outputs.staging }}
+      production: ${{ steps.plan.outputs.production }}
+      held: ${{ steps.plan.outputs.held }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,12 +51,18 @@ jobs:
       - id: plan
         env:
           ENGINEBOX_DEPLOY_OPERATION: ${{ inputs.operation || 'update' }}
+          ENGINEBOX_DEPLOY_TARGET: ${{ inputs.target || 'pipeline' }}
           ENGINEBOX_DEPLOY_VERSION: ${{ inputs.version }}
           ENGINEBOX_DEPLOY_VERSION_BASE: ${{ vars.ENGINEBOX_DEPLOY_VERSION_BASE || '0.3.1' }}
+          ENGINEBOX_PROD_HOLD: ${{ vars.ENGINEBOX_PROD_HOLD }}
         run: node packages/enginebox-deploy/src/ci-plan.mjs
   build:
     needs: plan
     if: needs.plan.outputs.operation == 'update'
+    # A newer commit cancels an older build: only the newest artifact is worth shipping.
+    concurrency:
+      group: enginebox-deploy-build
+      cancel-in-progress: true
     runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 90
     steps:
@@ -62,12 +84,74 @@ jobs:
           path: .state/deploy-artifact/
           retention-days: 30
           if-no-files-found: error
-  deploy:
+  staging:
     needs: [plan, build]
-    if: always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.plan.outputs.operation != 'update')
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.staging == 'true' && (needs.build.result == 'success' || needs.plan.outputs.operation != 'update')
+    # One staging deployment at a time; a newer run's pending staging job replaces an older pending one.
+    concurrency:
+      group: enginebox-deploy-staging
+      cancel-in-progress: false
+    runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
+    timeout-minutes: 90
+    environment: staging
+    env:
+      ENGINEBOX_DEPLOY_WORKFLOW_TEMP: '1'
+      VERSION: ${{ needs.plan.outputs.version }}
+      OPERATION: ${{ needs.plan.outputs.operation }}
+      DEPLOY_CONFIG: ${{ vars.ENGINEBOX_STAGING_CONFIG || 'packages/enginebox-deploy/environments/staging.json' }}
+      ENGINEBOX_DEPLOY_PORT: ${{ vars.ENGINEBOX_DEPLOY_PORT || '22' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - if: needs.plan.outputs.operation == 'update'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: enginebox-controller-${{ github.run_id }}
+          path: .state/deploy-artifact
+      - name: Create owned temporary credential directory
+        run: node packages/enginebox-deploy/src/temporary.mjs create
+      - name: Deploy to staging
+        env:
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact
+      - name: Smoke gate
+        if: needs.plan.outputs.operation == 'update'
+        env:
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation smoke --version "$VERSION"
+      - name: Production held
+        if: needs.plan.outputs.held == 'true'
+        run: echo "::notice::ENGINEBOX_PROD_HOLD is true; $VERSION stays in staging."
+      - name: Remove temporary deployment credentials
+        if: always()
+        run: node packages/enginebox-deploy/src/temporary.mjs cleanup
+  production:
+    needs: [plan, build, staging]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.production == 'true' && (needs.staging.result == 'success' || needs.plan.outputs.staging != 'true') && (needs.build.result == 'success' || needs.plan.outputs.operation != 'update')
+    # Never cancel a production cutover or its watch mid-flight; a newer run's pending job replaces an older pending
+    # one, so only the newest artifact that passed staging is promoted.
+    concurrency:
+      group: enginebox-deploy-production
+      cancel-in-progress: false
     runs-on: ${{ fromJSON(vars.ENGINEBOX_DEPLOY_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 180
     environment: ${{ vars.ENGINEBOX_DEPLOY_ENVIRONMENT || 'production' }}
+    env:
+      ENGINEBOX_DEPLOY_WORKFLOW_TEMP: '1'
+      VERSION: ${{ needs.plan.outputs.version }}
+      OPERATION: ${{ needs.plan.outputs.operation }}
+      DEPLOY_CONFIG: ${{ vars.ENGINEBOX_DEPLOY_CONFIG || 'packages/enginebox-deploy/environments/production.json' }}
+      ENGINEBOX_DEPLOY_PORT: ${{ vars.ENGINEBOX_DEPLOY_PORT || '22' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,17 +167,37 @@ jobs:
       - name: Create owned temporary credential directory
         run: node packages/enginebox-deploy/src/temporary.mjs create
       - name: Stage, switch and verify without replacing server secrets
+        id: deploy
         env:
-          ENGINEBOX_DEPLOY_WORKFLOW_TEMP: '1'
-          VERSION: ${{ needs.plan.outputs.version }}
-          OPERATION: ${{ needs.plan.outputs.operation }}
-          DEPLOY_CONFIG: ${{ vars.ENGINEBOX_DEPLOY_CONFIG || 'packages/enginebox-deploy/environments/production.json' }}
-          ENGINEBOX_DEPLOY_PORT: ${{ vars.ENGINEBOX_DEPLOY_PORT || '22' }}
           ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
           ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
           ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
           ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
-        run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact
+        run: |
+          out=$(node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation "$OPERATION" --version "$VERSION" --artifacts .state/deploy-artifact)
+          printf '%s\n' "$out"
+          previous=$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).previous_version;process.stdout.write(/^[0-9A-Za-z.+-]{1,99}$/.test(v??"")?v:"")})')
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+      - name: Watch the new version
+        id: watch
+        if: needs.plan.outputs.operation == 'update'
+        env:
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation watch --version "$VERSION"
+      - name: Roll back to the previous version
+        if: failure() && steps.watch.outcome == 'failure' && steps.deploy.outputs.previous != '' && steps.deploy.outputs.previous != needs.plan.outputs.version
+        env:
+          PREVIOUS: ${{ steps.deploy.outputs.previous }}
+          ENGINEBOX_DEPLOY_HOST: ${{ secrets.ENGINEBOX_DEPLOY_HOST }}
+          ENGINEBOX_DEPLOY_USER: ${{ secrets.ENGINEBOX_DEPLOY_USER }}
+          ENGINEBOX_DEPLOY_SSH_KEY: ${{ secrets.ENGINEBOX_DEPLOY_SSH_KEY }}
+          ENGINEBOX_DEPLOY_KNOWN_HOSTS: ${{ secrets.ENGINEBOX_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          echo "::error::$VERSION regressed after promotion; rolling back to $PREVIOUS"
+          node packages/enginebox-deploy/src/deploy.mjs --config "$DEPLOY_CONFIG" --operation rollback --version "$PREVIOUS"
       - name: Remove temporary deployment credentials
         if: always()
         run: node packages/enginebox-deploy/src/temporary.mjs cleanup

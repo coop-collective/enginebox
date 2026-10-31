@@ -43,7 +43,7 @@ test('config and template policies reject commands, secrets, traversal and unown
 });
 test('exact pins and CI plans cannot inject workflow outputs or reuse a mutable previous pointer', () => {
   for (const value of ['latest', 'v0.3.1', '0.3.1+sha', '0.3.1-live.01', '0.3.1\nother=x']) assert.throws(() => version(value));
-  assert.deepEqual(plan({ GITHUB_RUN_NUMBER: '42' }), { operation: 'update', version: '0.3.1-live.42' });
+  assert.deepEqual(plan({ GITHUB_RUN_NUMBER: '42' }), { operation: 'update', version: '0.3.1-live.42', target: 'pipeline', staging: true, production: true, held: false });
   assert.throws(() => plan({ ENGINEBOX_DEPLOY_OPERATION: 'rollback' }));
   assert.equal(plan({ ENGINEBOX_DEPLOY_OPERATION: 'rollback', ENGINEBOX_DEPLOY_VERSION: '0.3.0' }).version, '0.3.0');
   const args = installerArgs(example, 'rollback', '0.3.0');

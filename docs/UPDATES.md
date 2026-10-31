@@ -53,6 +53,19 @@ Retained release directories supply old hash-named `/_next/static/` JS/CSS/media
 
 The stable supervisor creates authenticated per-child loopback lifetime sockets. If it exits unexpectedly, the controller detects EOF and drains before releasing state; the replacement supervisor retries a busy ownership lock for the configured deadline. This is designed to avoid orphan controller writers. A full supervisor crash still interrupts its listener connections and can exceed the recovery deadline when work remains active.
 
+## Staging and production pipeline
+
+The deploy workflow ships every push to `main` through two isolated environments on the same host: build once, deploy
+that exact artifact to **staging**, run the smoke gate, promote the same artifact to **production**, then watch the
+new version for ten minutes and roll back to the previous version automatically on lost readiness or a burst of run
+start failures. `ENGINEBOX_PROD_HOLD=true` keeps builds in staging. Production deploys also roll out the host node
+helper; staging never touches it. Manual runs can target one environment (`update`, `rollback` or `status`).
+Environments, isolation, enablement and provider sign-ins for staging are in [STAGING.md](STAGING.md); the deploy
+client itself is described in `packages/enginebox-deploy/README.md`.
+
+The pipeline relies on the drained handoff above for each cutover. Work that outlives the drain timeout is covered
+by the separate handoff work that carries running agent runs and CI jobs across a controller change.
+
 ## State compatibility is a rollback gate
 
 Manifests declare the state schema a release writes and the range it can read. An online update or rollback is accepted only when it can read the active schema **and writes the same schema**. Version numbers alone do not make state reversible. No implicit migration is performed, and no snapshot of live credential/session data is mistaken for a safe rollback.

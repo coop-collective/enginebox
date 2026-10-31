@@ -155,8 +155,17 @@ and reservation protocol, then calls `enginebox-install update`. It never calls
 offline `activate` against the running installation. Rollback uses the same
 supervisor health/schema/drain path with an explicit retained target, and does
 not downgrade or re-register templates. Old releases without the required
-attachment-aware protocol are rejected. Node helper updates remain a separate
-compatibility maintenance operation.
+attachment-aware protocol are rejected. With an optional `node` section
+(`{"prefix","sudo"}`), an update also stages the same verified release into the
+host node installation, activates it and republishes the host helper; a rollback
+re-activates the retained node release of that version. Only one environment per
+host may set `node`.
+
+Two more operations support the [staging→production pipeline](../../docs/STAGING.md):
+`--operation smoke --version V` checks that V is active and serving reads (and, with
+a `smoke` pool and provider, that a trivial run succeeds); `--operation watch
+--version V` observes readiness and run start failures for `watch.seconds` and exits
+nonzero on a regression so the workflow can roll back.
 
 The stable supervisor remains in place; updates do not replace its service unit,
 restart VMs, copy provider homes or restore older refresh credentials. Successful

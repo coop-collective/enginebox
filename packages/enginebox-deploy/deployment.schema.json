@@ -31,6 +31,37 @@
         "files": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "type": "string", "pattern": "^templates/[a-z0-9][a-z0-9-]*\\.json$" } },
         "timeout_seconds": { "type": "integer", "minimum": 15, "maximum": 7200 }
       }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prefix", "sudo"],
+      "description": "The host's shared node helper installation. Only one environment per host (production) may own it.",
+      "properties": { "prefix": { "$ref": "#/$defs/path" }, "sudo": { "$ref": "#/$defs/path" } }
+    },
+    "smoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Post-deploy gate. Reads always; a trivial pool run only when pool and provider are both set.",
+      "properties": {
+        "pool": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,48}$" },
+        "provider": { "enum": ["codex", "claude", "cursor"] },
+        "prompt": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "expect": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "timeout_seconds": { "type": "integer", "minimum": 30, "maximum": 1800 }
+      }
+    },
+    "watch": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Post-promotion watch; a regression rolls back to the previous version.",
+      "properties": {
+        "seconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+        "interval_seconds": { "type": "integer", "minimum": 5, "maximum": 300 },
+        "max_unready_checks": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "max_start_failures": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_start_failure_ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      }
     }
   },
   "$defs": { "path": { "type": "string", "pattern": "^/[A-Za-z0-9_./-]+$", "description": "Absolute Linux path; executable validation additionally rejects dot/parent/empty components and symlinks." } }
