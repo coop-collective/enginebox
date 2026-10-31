@@ -156,9 +156,12 @@ pub fn capacity(host: &Host, facts: &Value) -> Result<Value> {
     let disk_allocation_budget = scale(pool_total.saturating_sub(reserve_disk), disk_overcommit);
     let disk_allocation_room = disk_allocation_budget.saturating_sub(committed);
     let disk_room = disk_usage_room.min(disk_allocation_room);
+    // Slots bound live instances (running, frozen, transitional); stopped ones
+    // hold no CPU or RAM and are bounded by the disk allocation budget.
     let count = items
         .iter()
         .filter(|v| v["managed"] == true && v["project"] == host.project)
+        .filter(|v| v["status"] != "Stopped")
         .count() as u64;
     let slots = host.max_instances.saturating_sub(count);
     let mut additional = serde_json::Map::new();

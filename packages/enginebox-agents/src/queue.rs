@@ -277,6 +277,9 @@ pub struct PoolState {
     pub backoff: bool,
     /// The failed creation's message while backing off.
     pub backoff_reason: Option<String>,
+    /// Placement preference per member (lower first: running, frozen,
+    /// stopped; see `lifecycle::VmState::placement_rank`). Absent: running.
+    pub member_rank: BTreeMap<(String, String), u8>,
 }
 
 /// A queued run as the planner sees it.
@@ -442,7 +445,8 @@ pub fn plan(mut input: PlanInput) -> Plan {
             Target::Pool { pool, pinned: None } => match input.pools.get(pool) {
                 None => Err(format!("pool {pool} is not defined")),
                 Some(state) => {
-                    let mut best: Option<(&Placement, usize, usize)> = None;
+                    // (member, rank, free run slots on its host)
+                    let mut best: Option<(&Placement, u8, usize)> = None;
                     let mut host_reason = None;
                     let mut fenced = Vec::new();
                     for m in &state.members {
@@ -458,8 +462,13 @@ pub fn plan(mut input: PlanInput) -> Plan {
                             Ok(()) => {
                                 let h = h.unwrap();
                                 let free = h.max_runs - h.running;
-                                if best.is_none_or(|(_, f, _)| free > f) {
-                                    best = Some((m, free, h.running));
+                                let rank = state.member_rank.get(&key).copied().unwrap_or(0);
+                                // A running member first, then frozen, then
+                                // stopped; among equals, the host with most room.
+                                if best.is_none_or(|(_, r, f)| {
+                                    (rank, std::cmp::Reverse(free)) < (r, std::cmp::Reverse(f))
+                                }) {
+                                    best = Some((m, rank, free));
                                 }
                             }
                             Err(r) => host_reason = host_reason.or(Some(r)),
@@ -739,6 +748,7 @@ mod tests {
                 max_workspaces: 4,
                 backoff: false,
                 backoff_reason: None,
+                member_rank: BTreeMap::new(),
             },
         );
         let p = plan(i);
@@ -754,6 +764,49 @@ mod tests {
                 .1
                 .contains("creating a workspace for pool workers")
         );
+    }
+
+    #[test]
+    fn placement_prefers_a_running_member_then_frozen_then_stopped() {
+        let c = vec![pool_run("p", 1, None)];
+        let mut i = input(
+            &c,
+            vec![
+                ("h1", host(8, 0, Some(roomy()))),
+                ("h2", host(8, 0, Some(roomy()))),
+            ],
+        );
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![
+                    member("h1", "ebox-stopped"),
+                    member("h1", "ebox-frozen"),
+                    member("h2", "ebox-running"),
+                ],
+                max_workspaces: 3,
+                member_rank: BTreeMap::from([
+                    (("h1".into(), "ebox-stopped".into()), 2),
+                    (("h1".into(), "ebox-frozen".into()), 1),
+                ]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan(i).admit[0].1, member("h2", "ebox-running"));
+        let mut i = input(&c, vec![("h1", host(8, 0, Some(roomy())))]);
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![member("h1", "ebox-stopped"), member("h1", "ebox-frozen")],
+                max_workspaces: 2,
+                member_rank: BTreeMap::from([
+                    (("h1".into(), "ebox-stopped".into()), 2),
+                    (("h1".into(), "ebox-frozen".into()), 1),
+                ]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan(i).admit[0].1, member("h1", "ebox-frozen"));
     }
 
     #[test]

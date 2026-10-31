@@ -4,7 +4,7 @@ use crate::{
     model::{Host, Resources, identifier, load_hosts, preset, sizes},
     state,
     templates::Registry,
-    transport::{EngineBox, operation_lock},
+    transport::{EngineBox, operation_lock, operation_lock_wait},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -17,6 +17,8 @@ use std::{
 type LifecycleGuard = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
 type AdmissionGuard = Arc<dyn Fn(&Host) -> Result<()> + Send + Sync>;
 type PostStart = Arc<dyn Fn(&str, &str) -> Result<Value> + Send + Sync>;
+/// Whether warm refill may take one of a host's last instance slots.
+pub type RefillGuard = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub(crate) enum CopyMode<'a> {
     Start(Option<&'a Value>),
     Reserved(&'a Value),
@@ -31,6 +33,7 @@ pub(crate) struct Inner {
     locks: BTreeMap<String, Mutex<()>>,
     guard: RwLock<Option<LifecycleGuard>>,
     post_start: RwLock<Option<PostStart>>,
+    refill_guard: RwLock<Option<RefillGuard>>,
     admission: RwLock<Option<AdmissionGuard>>,
 }
 impl Fleet {
@@ -56,6 +59,7 @@ impl Fleet {
                 hosts: map,
                 guard: RwLock::new(None),
                 post_start: RwLock::new(None),
+                refill_guard: RwLock::new(None),
                 admission: RwLock::new(None),
             }),
         })
@@ -398,6 +402,197 @@ impl Fleet {
             );
         }
         Ok(result)
+    }
+    /// Stopped bases no template deployment references, current or
+    /// superseded (`stale_instances`): what slot reclamation may delete.
+    pub fn stale_bases(&self, id: &str) -> Result<Vec<String>> {
+        let h = self.host(id)?;
+        let facts = inventory(&h)?;
+        self.stale_bases_in(&h, &facts)
+    }
+    fn stale_bases_in(&self, h: &Host, facts: &Value) -> Result<Vec<String>> {
+        let deployments = self.registry.deployments(Some(&h.id))?;
+        let mut sources = h
+            .templates
+            .iter()
+            .map(|t| t.source.as_str())
+            .collect::<Vec<_>>();
+        sources.extend(deployments.iter().filter_map(|d| d["source"].as_str()));
+        Ok(crate::capacity::stale_instances(h, facts, &sources)
+            .into_iter()
+            .filter_map(|v| v["name"].as_str().map(str::to_owned))
+            .collect())
+    }
+    /// A lifecycle action the agent scheduler takes on its own pool members:
+    /// `pause` (freeze an idle member, after flushing its disks), `stop` (an
+    /// idle member: graceful when running; a frozen one is unfrozen and then
+    /// forced, since a paused guest cannot shut down), `stop_fast` (memory or
+    /// slot pressure: forced either way, milliseconds), `wake` (resume a frozen
+    /// or start a stopped member for the run that holds its lease; see
+    /// [`Fleet::wake`]), `delete` (a stopped fleet-managed member being
+    /// reclaimed) and `delete_base` (a stale base). The caller guarantees no
+    /// run or unresolved lease holds the member.
+    pub fn scheduler_action(&self, id: &str, name: &str, action: &str) -> Result<Value> {
+        ensure!(
+            [
+                "pause",
+                "stop",
+                "stop_fast",
+                "wake",
+                "delete",
+                "delete_base"
+            ]
+            .contains(&action),
+            "Unsupported scheduler action"
+        );
+        if action == "wake" {
+            return self.wake(id, name).map(|(v, _)| v);
+        }
+        identifier(name, true)?;
+        ensure!(
+            name.starts_with("ebox-"),
+            "Only fleet instances can be changed"
+        );
+        let h = self.host(id)?;
+        let _controller = self.controller_lock(id)?;
+        // Idle housekeeping never waits for the host: it retries next pass.
+        let _lock = operation_lock(&h)?;
+        let facts = inventory(&h)?;
+        let bx = h.engine_box();
+        if action == "delete_base" {
+            ensure!(
+                self.stale_bases_in(&h, &facts)?.iter().any(|b| b == name),
+                "Only stale, unreferenced bases are reclaimed"
+            );
+            bx.call(&["delete", name])?;
+            return Ok(json!({"name":name,"deleted":true}));
+        }
+        let vm = private_workspace(&h, name, &facts)?;
+        let state = vm["status"].as_str().unwrap_or("");
+        if let Some(guard) = self.inner.guard.read().unwrap().clone() {
+            guard(id, name)?;
+        }
+        Ok(match (action, state) {
+            ("pause", "Running") => {
+                // A frozen guest may be stopped by force later: flush first.
+                let _ = bx.call(&["exec", name, "--", "sync"]);
+                bx.lifecycle(name, "pause")?
+            }
+            ("stop", "Running") => bx.lifecycle(name, "stop")?,
+            ("stop" | "stop_fast", "Frozen") => {
+                bx.call(&["start", name])?;
+                bx.call(&["stop", name, "--force"])?;
+                bx.status(name)?
+            }
+            ("stop_fast", "Running") => {
+                bx.call(&["stop", name, "--force"])?;
+                bx.status(name)?
+            }
+            ("delete", "Stopped") => {
+                bx.call(&["delete", name])?;
+                json!({"name":name,"deleted":true})
+            }
+            _ => bail!("Cannot {action} a workspace in state {state}"),
+        })
+    }
+    /// Bring a frozen or stopped member up for the run that holds its lease
+    /// (so the lifecycle guard is not consulted). Only the state change holds
+    /// the host lock; readiness is awaited after it is released, so several
+    /// wakes on one host overlap. A member that was frozen gets its clock
+    /// stepped to the host's and its DHCP lease renewed: a long freeze lets
+    /// both lapse. Returns the result and the state it woke from.
+    pub fn wake(&self, id: &str, name: &str) -> Result<(Value, String)> {
+        identifier(name, true)?;
+        ensure!(
+            name.starts_with("ebox-"),
+            "Only fleet instances can be changed"
+        );
+        self.assert_admission(id)?;
+        let h = self.host(id)?;
+        let bx = h.engine_box();
+        let state = {
+            let _controller = self.controller_lock(id)?;
+            let _lock = operation_lock_wait(&h, Duration::from_secs(300))?;
+            let facts = inventory(&h)?;
+            let vm = private_workspace(&h, name, &facts)?;
+            let state = vm["status"].as_str().unwrap_or("").to_owned();
+            match state.as_str() {
+                "Running" => return Ok((json!({"name":name,"status":"Running"}), state)),
+                "Stopped" => {
+                    let room = capacity(&h, &facts)?;
+                    ensure!(
+                        number(&room["instance_slots_available"]) >= 1,
+                        "Insufficient CPU, memory, disk or instance slots; preserve reserves (no instance slots (max_instances {}))",
+                        h.max_instances
+                    );
+                    ensure!(
+                        number(&vm["cpu"]) <= number(&room["cpu_available"])
+                            && number(&vm["memory_bytes"])
+                                <= number(&room["memory_budget_available_bytes"]),
+                        "Insufficient CPU, memory, disk or instance slots; preserve reserves (memory: to start {name})"
+                    );
+                }
+                "Frozen" => {}
+                other => bail!("Cannot wake a workspace in state {other}"),
+            }
+            bx.lifecycle(name, "resume")?;
+            state
+        };
+        let mut value = json!({"name":name,"status":"Running","woke_from":state});
+        value["readiness"] = wait_ready_unlocked(&bx, name)?;
+        if state == "Frozen" {
+            let epoch = chrono::Utc::now().timestamp();
+            // Best effort: a guest without networkd still has its clock set.
+            let script = format!(
+                "date -u -s @{epoch} >/dev/null 2>&1; for i in $(ls /sys/class/net); do [ \"$i\" = lo ] || networkctl renew \"$i\" >/dev/null 2>&1; done; true"
+            );
+            let _ = bx.call(&["exec", name, "--", "sh", "-c", &script]);
+        }
+        Ok((value, state))
+    }
+    /// For starting a stopped member: the memory it needs, the memory
+    /// admission has free, and the free instance slots.
+    pub fn wake_room(&self, id: &str, name: &str) -> Result<(u64, u64, u64)> {
+        let h = self.host(id)?;
+        let facts = inventory(&h)?;
+        let vm = private_workspace(&h, name, &facts)?;
+        let room = capacity(&h, &facts)?;
+        Ok((
+            number(&vm["memory_bytes"]),
+            number(&room["memory_budget_available_bytes"]),
+            number(&room["instance_slots_available"]),
+        ))
+    }
+    /// Set the check warm refill asks before taking one of the last instance
+    /// slots on a host (false: a pool's queued runs need it).
+    pub fn set_refill_guard(&self, guard: RefillGuard) {
+        *self.inner.refill_guard.write().expect("hook lock") = Some(guard);
+    }
+    pub(crate) fn refill_allowed(&self, id: &str) -> bool {
+        self.inner
+            .refill_guard
+            .read()
+            .unwrap()
+            .clone()
+            .is_none_or(|g| g(id))
+    }
+    /// Workspace states (`Running`, `Frozen`, `Stopped`, ...) by name in the
+    /// host project.
+    pub fn instance_states(&self, id: &str) -> Result<BTreeMap<String, String>> {
+        let h = self.host(id)?;
+        let facts = inventory(&h)?;
+        Ok(facts["instances"]
+            .as_array()
+            .context("Invalid inventory")?
+            .iter()
+            .filter(|v| v["project"] == h.project)
+            .filter_map(|v| {
+                Some((
+                    v["name"].as_str()?.to_owned(),
+                    v["status"].as_str().unwrap_or("").to_owned(),
+                ))
+            })
+            .collect())
     }
     pub(crate) fn create_locked(
         &self,

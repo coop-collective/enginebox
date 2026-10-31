@@ -68,6 +68,8 @@ those artifacts through the operator tools instead.
 resources and any refill error. A count is a point-in-time observation, not a
 reservation for a later request.
 
+Pool autoscale claims a reserve the same way: a pool that needs a new member allocates one, so an eligible reserve of the pool's template becomes the member (keeping its `ebox-warm-*` name) and only a missing reserve leads to a cold creation. The run records `start_path` `warm` or `created`.
+
 ## Identity and assignment
 
 Each member has its own machine identity and private writable disk before it

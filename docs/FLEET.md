@@ -167,6 +167,8 @@ Admission is recalculated immediately before each creation or stopped-VM resume.
   | `Frozen` (paused, e.g. a warm spare) | not counted | counted (it holds its RAM) | counted |
   | `Stopped` (templates, parked workspaces) | not counted | not counted | counted |
 
+  `max_instances` counts live instances (running, frozen, transitional); stopped ones are bounded by the disk allocation budget.
+
 - A CPU budget of `(cpu_total - reserve_cpu) * cpu_overcommit` running vCPUs. An instance's `limits.cpu` is a ceiling, not a reservation, and agent workloads mostly wait on inference, so `cpu_overcommit` defaults to `4.0` (range 1.0–64.0; set `1.0` for strict one-vCPU-per-core accounting). A frozen VM's vCPUs count again once it runs.
 - Memory with no overcommit: the configured memory of every instance that holds RAM plus `reserve_memory_gib` must fit in total memory, and new instances must also fit in the actual available host memory after the reserve.
 - An optional `contribution_cpu` / `contribution_memory_gib` ceiling on a contributed machine is an owner's promise and is never overcommitted.
@@ -202,6 +204,8 @@ One in-process operation runs per host. A root-owned `/run/lock/enginebox-host.l
 There are four background workers and at most 32 admitted queued/running jobs per service. This is a bounded operation queue, not a fair cluster scheduler. Templates and workloads remain on the selected host; cross-host migration is not implemented. Native agent runs are scheduled separately, with placement only within a [pool](QUEUE.md#pools).
 
 Inventory uses Incus metadata and bridge leases rather than asking frozen guests for state. Its IP addresses are lease observations, not a claim that a suspended guest is reachable.
+
+The agent scheduler changes its own pool members without a job: it freezes and stops idle members, resumes or starts a member for the run that holds it, and stops frozen idle members when RAM or instance slots run out, and deletes stopped created members or stale bases when disk runs out. Each action takes the host operation lock, checks the instance is a fleet-managed workspace (or a stale base) in the expected state, and never touches a workspace with a native session in progress; see [Idle members and reclamation](QUEUE.md#idle-members-and-reclamation).
 
 ## What “ready” means
 

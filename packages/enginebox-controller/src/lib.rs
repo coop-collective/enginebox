@@ -284,6 +284,14 @@ impl Controller {
             );
             Ok(())
         }));
+        // Warm refill leaves a host's last instance slot to queued pool runs.
+        let owner_refill = Arc::downgrade(self);
+        self.fleet.set_refill_guard(Arc::new(move |host| {
+            owner_refill
+                .upgrade()
+                .and_then(|owner| owner.runtime().ok())
+                .is_none_or(|runtime| !runtime.agents.pool_demand_on(host))
+        }));
         let owner_attach = Arc::downgrade(self);
         self.fleet.set_post_start(Arc::new(move |host, name| {
             let owner = owner_attach
@@ -2266,18 +2274,24 @@ async fn start_run(
             Some(string(&callback, "url")?.to_owned())
         }
     };
-    // A pool's profile applies to every run in it; granting the pool grants
-    // its profile.
+    // A pool's default profile applies to runs that name none; a run may name
+    // one of the pool's `profiles` instead. Granting the pool grants them all.
     let mut pool_profile = false;
     if let RunTarget::Pool(pool) = &target {
         let Some(definition) = runtime.agents.pools().get(pool) else {
             return Ok((StatusCode::NOT_FOUND, json!({"error":"Unknown pool."})));
         };
-        if let Some(fixed) = definition.profile {
-            if profile_name.as_ref().is_some_and(|p| *p != fixed) {
-                anyhow::bail!("Runs in this pool use the pool's profile");
+        if let Some(default) = &definition.profile {
+            match &profile_name {
+                Some(p) if !definition.allows_profile(p) => {
+                    return Ok((
+                        StatusCode::BAD_REQUEST,
+                        json!({"error":"Runs in this pool use the pool's profile or one of its profiles."}),
+                    ));
+                }
+                Some(_) => {}
+                None => profile_name = Some(default.clone()),
             }
-            profile_name = Some(fixed);
             pool_profile = true;
         }
     }
@@ -3882,6 +3896,80 @@ mod tests {
             .unwrap()
             .agents
             .set_measure_hook(Arc::new(|_| anyhow::bail!("fixture host is offline")));
+    }
+
+    #[tokio::test]
+    async fn a_shared_pool_lets_a_run_pick_one_of_its_profiles_and_refuses_others() {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        queue_fixture(&c);
+        for name in ["builder", "reader", "other"] {
+            let p = json!({"name":name,"providers":{"claude":{"max_turns":50}}});
+            let (status, body) = call(
+                &app,
+                request(Method::POST, "/v1/profiles", &p.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        // profiles without a default is refused, with the rule named
+        let (status, body) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools",
+                &json!({"name":"shared","profiles":["reader"],"workspaces":[{"host_id":"worker","name":"ebox-p1"}]}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "profiles needs a default profile");
+        let pool = json!({"name":"shared","profile":"builder","profiles":["reader"],
+            "idle_freeze_seconds":120,"idle_stop_seconds":3600,
+            "workspaces":[{"host_id":"worker","name":"ebox-p1"}]});
+        let (status, saved) = call(
+            &app,
+            request(Method::POST, "/v1/pools", &pool.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["pool"]["profiles"], json!(["reader"]));
+        assert_eq!(saved["pool"]["min_workspaces"], 1);
+        let ops = json!(["agent_runs.start", "agent_runs.get"]);
+        let (_, secret) = mint(
+            &app,
+            json!({"label":"shared","scopes":[],"pools":["shared"],"operations":ops}),
+        )
+        .await;
+        // the default, an allowed profile (granted with the pool), and a refusal
+        for (profile, expected) in [
+            (None, StatusCode::ACCEPTED),
+            (Some("reader"), StatusCode::ACCEPTED),
+            (Some("other"), StatusCode::BAD_REQUEST),
+        ] {
+            let mut start = json!({"provider":"claude","prompt":"work"});
+            if let Some(p) = profile {
+                start["profile"] = json!(p);
+            }
+            let (status, body) = call(
+                &app,
+                bearer(
+                    Method::POST,
+                    "/v1/pools/shared/agent-runs",
+                    &start.to_string(),
+                    &secret,
+                ),
+            )
+            .await;
+            assert_eq!(status, expected, "{profile:?}: {body}");
+            if expected == StatusCode::BAD_REQUEST {
+                assert_eq!(
+                    body["error"],
+                    "Runs in this pool use the pool's profile or one of its profiles."
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::{
     Fleet, GIB,
-    capacity::{inventory, number, resource_fits},
+    capacity::{capacity, inventory, number, resource_fits},
     fleet::{check_name, required, template_snapshot, wait_ready},
     model::{Host, Resources, preset},
     state,
@@ -276,6 +276,18 @@ pub fn reconcile_once(f: &Fleet, h: &Host) -> Result<Value> {
             }
             if ready + preparing >= p.ready {
                 record_error(f, h, &p.template, &p.size, None)?;
+                continue;
+            }
+            if number(&capacity(h, &facts)?["instance_slots_available"]) <= 1
+                && !f.refill_allowed(&h.id)
+            {
+                record_error(
+                    f,
+                    h,
+                    &p.template,
+                    &p.size,
+                    Some("Warm refill leaves the last instance slot to queued pool runs"),
+                )?;
                 continue;
             }
             if !resource_fits(h, &facts, r)? {
