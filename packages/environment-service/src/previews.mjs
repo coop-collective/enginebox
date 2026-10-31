@@ -1,10 +1,13 @@
 // Leased draft environments reuse project template preparation and lifecycle.
 // The projection command is operator-owned; request bodies never supply paths,
 // commands, source bytes, runtime credentials or an accepted-main replacement.
+// A draft comes from an open LayerFS workspace (`workspace`) or from one branch
+// of a hosted or linked repository (`repository` + `branch`, exported by the
+// host's operator-owned `repositoryCommand`; src/repository-export.mjs).
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { ProjectBootstrap } from './bootstrap.mjs';
-import { check, fields, id, validateConfig } from './config.mjs';
+import { branchName, check, fields, id, repositoryRef, validateConfig } from './config.mjs';
 import { digest, projectId } from './project-template.mjs';
 import { load } from './state.mjs';
 
@@ -20,7 +23,7 @@ export class WorkspacePreviews extends ProjectBootstrap {
     this.records = await load(this.file, {});
     check(this.records && typeof this.records === 'object' && !Array.isArray(this.records) && Object.keys(this.records).length <= 256, 'invalid-preview-registry');
     for (const p of Object.values(this.records)) {
-      check(id(p.id) && projectId(p.host) && projectId(p.project) && projectId(p.workspace) && projectId(p.task)
+      check(id(p.id) && projectId(p.host) && projectId(p.task) && (p.repository !== undefined ? repositoryRef(p.repository) && branchName(p.branch) : projectId(p.project) && projectId(p.workspace))
         && /^[a-f0-9]{64}$/.test(p.lease) && Number.isSafeInteger(p.revision) && Number.isFinite(Date.parse(p.expiresAt)), 'invalid-preview-record');
       for (const release of [p.active, p.pending, p.retired].filter(Boolean)) this.add(release.env);
     }
@@ -30,13 +33,18 @@ export class WorkspacePreviews extends ProjectBootstrap {
   source(p) {
     check(this.live(p), 'preview-lease-expired');
     const host = this.policy?.hosts.find(h => h.id === p.host);
+    if (p.repository !== undefined) {
+      check(host?.repositoryCommand && p.binding === digest(host), 'preview-source-binding-changed');
+      return { kind: 'repository', repository: p.repository, branch: p.branch, preview: p.id, lease: p.lease,
+        command: [...host.repositoryCommand, p.repository, p.branch] };
+    }
     check(host?.workspaceCommand && p.binding === digest(host), 'preview-source-binding-changed');
     return { kind: 'workspace', project: p.project, workspace: p.workspace, preview: p.id, lease: p.lease,
       command: [...host.workspaceCommand, p.project, p.workspace] };
   }
   assertSource(source) {
     const p = this.records[source.preview];
-    check(p && p.lease === source.lease && p.project === source.project && p.workspace === source.workspace && this.live(p), 'preview-lease-expired');
+    check(p && p.lease === source.lease && (source.kind === 'repository' ? p.repository === source.repository && p.branch === source.branch : p.project === source.project && p.workspace === source.workspace) && this.live(p), 'preview-lease-expired');
     check(digest(this.source(p)) === digest(source), 'preview-source-binding-changed');
   }
   async bindProjection(source, manifest) {
@@ -45,9 +53,16 @@ export class WorkspacePreviews extends ProjectBootstrap {
     check(!p.projection || digest(p.projection) === digest(identity), 'workspace-projection-identity-changed');
     if (!p.projection) { p.projection = identity; await this.save(); }
   }
+  // The branch commit last exported, for display: the draft's source revision
+  // is the content hash of that commit's tree.
+  async noteCommit(source, commit) {
+    this.assertSource(source);
+    const p = this.records[source.preview];
+    if (p.commit !== commit) { p.commit = commit; await this.save(); }
+  }
   summary(p) {
     const value = super.summary(p);
-    return { ...value, workspace: p.workspace, task: p.task, lease: p.lease, revision: p.revision,
+    return { ...value, workspace: p.workspace, repository: p.repository, branch: p.branch, commit: p.commit, task: p.task, lease: p.lease, revision: p.revision,
       sourceRevision: value.revision, desiredSourceRevision: value.desiredRevision, desiredRevision: undefined,
       expiresAt: p.expiresAt, healthy: this.live(p) && value.healthy,
       urls: this.live(p) ? value.urls : [], status: !this.live(p) ? (p.revoked ? 'revoked' : 'expired') : value.status };
@@ -74,6 +89,7 @@ export class WorkspacePreviews extends ProjectBootstrap {
   }
   async register(value) {
     if (value.id !== undefined) return this.changeLease(value);
+    if (value.repository !== undefined) return this.registerRepository(value);
     return this.exclusive(async () => {
       check(this.policy, 'project-bootstrap-not-configured');
       fields(value, ['host', 'project', 'workspace', 'task', 'ttlSeconds']);
@@ -86,6 +102,25 @@ export class WorkspacePreviews extends ProjectBootstrap {
       await this.manager.assertAdmission();
       check(Object.values(this.records).filter(p => this.live(p)).length < this.policy.maxProjects && Object.keys(this.records).length < 256, 'preview-capacity-limit');
       const p = { id: `w-${randomBytes(10).toString('hex')}`, host: value.host, project: value.project, workspace: value.workspace, task: value.task,
+        binding: digest(host), lease: randomBytes(32).toString('hex'), revision: 1, expiresAt, status: 'queued' };
+      this.records[p.id] = p; await this.save(); this.arm(p); return this.summary(p);
+    });
+  }
+  // One live draft per host, repository and branch: a task asking again gets
+  // the same draft (and lease) back, never a second copy of the branch.
+  async registerRepository(value) {
+    return this.exclusive(async () => {
+      check(this.policy, 'project-bootstrap-not-configured');
+      fields(value, ['host', 'repository', 'branch', 'task', 'ttlSeconds']);
+      check(projectId(value.host) && repositoryRef(value.repository) && branchName(value.branch) && projectId(value.task), 'invalid-preview-request');
+      const expiresAt = this.expiry(value.ttlSeconds);
+      const host = this.policy.hosts.find(h => h.id === value.host);
+      check(host?.repositoryCommand, 'repository-preview-not-configured');
+      const current = Object.values(this.records).find(p => this.live(p) && p.host === value.host && p.repository === value.repository && p.branch === value.branch);
+      if (current) return this.summary(current);
+      await this.manager.assertAdmission();
+      check(Object.values(this.records).filter(p => this.live(p)).length < this.policy.maxProjects && Object.keys(this.records).length < 256, 'preview-capacity-limit');
+      const p = { id: `r-${randomBytes(10).toString('hex')}`, host: value.host, repository: value.repository, branch: value.branch, task: value.task,
         binding: digest(host), lease: randomBytes(32).toString('hex'), revision: 1, expiresAt, status: 'queued' };
       this.records[p.id] = p; await this.save(); this.arm(p); return this.summary(p);
     });

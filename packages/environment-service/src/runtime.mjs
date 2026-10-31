@@ -67,7 +67,7 @@ export class Environments {
   }
   async save() { await atomic(this.stateFile, this.states); }
   async render() {
-    const write = this.gatewayWrites.then(() => atomic(this.dynamicFile, gatewayConfig(this.routes, this.config, new Set(Object.entries(this.states).filter(([id, s]) => { const source = this.config.environments.find(e => e.id === id)?.source; return s.healthy && (source?.kind !== 'workspace' || this.previews.live(this.previews.records[source.preview] ?? {})); }).map(([id]) => id)))));
+    const write = this.gatewayWrites.then(() => atomic(this.dynamicFile, gatewayConfig(this.routes, this.config, new Set(Object.entries(this.states).filter(([id, s]) => { const source = this.config.environments.find(e => e.id === id)?.source; return s.healthy && (!['workspace', 'repository'].includes(source?.kind) || this.previews.live(this.previews.records[source.preview] ?? {})); }).map(([id]) => id)))));
     this.gatewayWrites = write.catch(() => {}); await write;
   }
   catalog() {
@@ -83,7 +83,7 @@ export class Environments {
   }
   async setRoute(route) {
     const source = this.config.environments.find(e => e.id === route.environment)?.source;
-    if (source?.kind === 'workspace') this.previews.assertSource(source);
+    if (['workspace', 'repository'].includes(source?.kind)) this.previews.assertSource(source);
     const projectEnvs = [...Object.values(this.projects.records), ...Object.values(this.previews.records)].flatMap(p => [p.pending?.env.id, p.retired?.env.id]).filter(Boolean);
     check(!projectEnvs.includes(route.environment), 'project-environment-not-active');
     await this.updateRoutes(routes => routes.filter(v => v.id !== route.id).concat([route]));
@@ -114,10 +114,11 @@ export class Environments {
   async source(env) {
     await this.assertAdmission();
     const root = join(this.config.stateDir, env.id); await mkdir(root, { recursive: true, mode: 0o700 });
-    if (['accepted', 'layerfs', 'workspace'].includes(env.source.kind)) {
-      if (env.source.kind === 'workspace') this.previews.assertSource(env.source);
+    if (['accepted', 'layerfs', 'workspace', 'repository'].includes(env.source.kind)) {
+      if (['workspace', 'repository'].includes(env.source.kind)) this.previews.assertSource(env.source);
       const source = env.source.kind === 'accepted' ? await acceptedSource(env, this.config.stateDir) : await layerfsSource(env, this.config.stateDir, this.run);
       if (env.source.kind === 'workspace') await this.previews.bindProjection(env.source, source.manifest);
+      if (env.source.kind === 'repository') await this.previews.noteCommit(env.source, source.manifest.commit);
       for (const [path, hash] of Object.entries(env.sourceInputs ?? {})) {
         const entries = source.manifest.entries.filter(e => e.path === path);
         check(entries.length === 1 && entries[0].kind === 'file' && entries[0].sha256 === hash, 'project-configuration-changed');
@@ -192,7 +193,7 @@ export class Environments {
   }
   async start(env, revision) {
     await this.assertAdmission();
-    if (env.source.kind === 'workspace') this.previews.assertSource(env.source);
+    if (['workspace', 'repository'].includes(env.source.kind)) this.previews.assertSource(env.source);
     const root = join(this.config.stateDir, env.id); const data = join(this.config.stateDir, env.dataId ?? env.id, 'data');
     await mkdir(data, { recursive: true, mode: 0o700 });
     await this.remove(env);

@@ -1113,13 +1113,15 @@ impl Repositories {
     /// caller's own short use. Nothing about it is stored.
     pub fn mint(&self, project: &str, name: &str, access: Access, ttl: u64) -> Result<Value> {
         let record = self.record(project, name)?;
-        let (minted, _) = self.mint_for(&record, access, ttl)?;
+        let (minted, auth) = self.mint_for(&record, access, ttl)?;
         Ok(json!({
             "token":minted.token,
             "expires_at":minted.expires_at,
             "remote":record.remote,
             "default_branch":record.default_branch,
             "access":access.as_str(),
+            // How git presents it: bearer, or github_token (Basic x-access-token).
+            "auth":auth,
         }))
     }
     /// A run's write token (`<project>/<name>`), minted at admission.
