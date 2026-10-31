@@ -981,7 +981,15 @@ pub async fn run_session(
     if let Some(g) = group.as_mut() {
         g.terminate().await;
     }
-    // Secrets on disk go with the session directory.
+    // Keep the Editor log (its last MiB) beside the receipt for the owner;
+    // secrets on disk go with the session directory.
+    let receipts = ctx.private.join("engine-receipts");
+    if private_dir(&receipts).is_ok()
+        && let Ok(log) = std::fs::read(session_dir.join("unity.log"))
+    {
+        let tail = &log[log.len().saturating_sub(1 << 20)..];
+        let _ = std::fs::write(receipts.join(format!("{id}.unity.log")), tail);
+    }
     let _ = std::fs::remove_dir_all(&session_dir);
     let stopped = *stop.borrow();
     let error = match &outcome {
@@ -1000,7 +1008,6 @@ pub async fn run_session(
     receipt["error"] = json!(error);
     receipt["seconds"] = json!(started.elapsed().as_secs());
     receipt["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
-    let receipts = ctx.private.join("engine-receipts");
     if private_dir(&receipts).is_ok() {
         let _ = atomic_json(&receipts.join(format!("{id}.json")), &receipt);
     }
@@ -1232,7 +1239,10 @@ pub async fn rehearse(config_path: &Path, work: &Path, spec: Value, remote: &str
         "project": project, "bridge_config": bridge, "bridge_token_file": token_file, "bridge_port": port,
         "manifest_bridge": manifest["dependencies"][BRIDGE_PACKAGE],
         "manifest_session": manifest["dependencies"][SESSION_PACKAGE],
-        "unity_argv": unity_argv(&project, &bridge, &session_dir.join("unity.log")),
+        "unity_argv": unity_argv(&project, &bridge, &session_dir.join("unity.log"))
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
         "licensing_client": licensing_client(&unity), "licensing_help_exit": licensing_exit,
         "job_terminated_tree": terminated, "terminate_ms": t.elapsed().as_millis() as u64,
         "sweep": swept,
