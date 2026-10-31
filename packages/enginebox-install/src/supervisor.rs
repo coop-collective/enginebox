@@ -114,6 +114,8 @@ impl Drop for RequestLease {
         self.0.requests.fetch_sub(1, Ordering::SeqCst);
     }
 }
+/// Attempts to give ownership back to the old controller after a failed handoff.
+const RESTORE_ATTEMPTS: u32 = 6;
 #[derive(Clone)]
 pub struct Supervisor {
     pub config: SupervisorConfig,
@@ -155,6 +157,7 @@ impl Supervisor {
             .route("/__enginebox/status", get(status))
             .route("/__enginebox/update", post(update))
             .route("/__enginebox/rollback", post(rollback))
+            .route("/__enginebox/reload", post(reload))
             .fallback(proxy_api)
             .with_state(self.clone())
     }
@@ -209,6 +212,25 @@ impl Supervisor {
             response.status()
         );
         Ok(response.json().await?)
+    }
+    /// Give ownership back to the old controller after a failed handoff,
+    /// retrying with backoff: one lost request must not leave it drained.
+    async fn restore(&self, old: &Candidate) -> Result<serde_json::Value> {
+        let mut last = None;
+        for attempt in 0..RESTORE_ATTEMPTS {
+            match self.control(old, "/internal/undrain").await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    eprintln!(
+                        "Restoring the old controller failed (attempt {}): {error:#}",
+                        attempt + 1
+                    );
+                    last = Some(error);
+                    tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+                }
+            }
+        }
+        Err(last.unwrap())
     }
     async fn ready(&self, candidate: &Candidate) -> Result<Ready> {
         let ready: Ready = self
@@ -284,7 +306,7 @@ impl Supervisor {
             .await
             .context("existing HTTP mutation did not finish before drain deadline")?;
         if let Err(error) = self.drain(&old).await {
-            self.control(&old, "/internal/undrain")
+            self.restore(&old)
                 .await
                 .context("failed to reactivate old controller after drain failure")?;
             return Err(error);
@@ -294,7 +316,7 @@ impl Supervisor {
             self.drain(&candidate)
                 .await
                 .context("candidate activation was uncertain and could not be safely drained")?;
-            self.control(&old, "/internal/undrain")
+            self.restore(&old)
                 .await
                 .context("failed to restore old controller ownership")?;
             return Err(error);
@@ -302,14 +324,14 @@ impl Supervisor {
         let activated = self.ready(&candidate).await;
         if !matches!(activated,Ok(ref state) if state.mode=="active") {
             self.drain(&candidate).await?;
-            self.control(&old, "/internal/undrain").await?;
+            self.restore(&old).await?;
             bail!("candidate did not become active; old controller restored");
         }
         let activation = match self.config.install.activate(&candidate.version) {
             Ok(value) => value,
             Err(error) => {
                 self.drain(&candidate).await?;
-                self.control(&old, "/internal/undrain").await?;
+                self.restore(&old).await?;
                 return Err(error);
             }
         };
@@ -323,6 +345,14 @@ impl Supervisor {
             self.current_version().await != version,
             "requested version is already active"
         );
+        let manifest = self.config.install.manifest(&version)?;
+        let candidate = spawn_candidate(&self.config, &manifest).await?;
+        self.handoff(candidate).await
+    }
+    /// A handoff to a new process of the active version: it re-reads configuration
+    /// (fleet.toml, environment.json) with the usual standby, drain and activation checks.
+    pub async fn reload(&self) -> Result<Activation> {
+        let version = self.current_version().await;
         let manifest = self.config.install.manifest(&version)?;
         let candidate = spawn_candidate(&self.config, &manifest).await?;
         self.handoff(candidate).await
@@ -417,6 +447,19 @@ async fn update(
         Err(_) => failure(
             StatusCode::INTERNAL_SERVER_ERROR,
             "upgrade task failed; inspect private service logs",
+        ),
+    }
+}
+async fn reload(State(supervisor): State<Supervisor>, headers: HeaderMap) -> Response {
+    if !supervisor.authorized(&headers) {
+        return failure(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    match tokio::spawn(async move { supervisor.reload().await }).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(e)) => failure(StatusCode::CONFLICT, e),
+        Err(_) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reload task failed; inspect private service logs",
         ),
     }
 }

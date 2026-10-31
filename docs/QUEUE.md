@@ -106,6 +106,10 @@ Every 15 seconds the scheduler reads each pool host's instance states and tracks
 
 Each run records `start_path` (`hot`, `frozen`, `stopped`, `warm` or `created`) and `start_latency_ms` (admission to the native start, including any wake, readiness and preparation) on `GET` of the run. `GET /v1/pools/{pool}` member status shows each member's `state` (`running`, `frozen`, `stopped`, `unknown`) and `idle_since`. Lifecycle actions are launch events: `workspace_frozen`, `workspace_stopped` (reason `idle_<seconds>s` or `memory_pressure`) and `workspace_reclaimed` (reason `stale_base` or `idle_stopped_member`). Slots used and free, stale bases and every instance's state stay in the host inventory (`GET /v1/hosts`: `capacity.instance_slots_available`, `stale_instances`).
 
+## Across a controller handoff
+
+An admitted run started detached in its guest no longer holds the drain. The next owner adopts it from `agent-runs-detached/` and keeps its workspace lease and queue entry until the run ends. Its callback is delivered once, by whichever owner records the result. See [Work that outlives a controller](UPDATES.md#work-that-outlives-a-controller).
+
 ## Launch events
 
 Every admission or placement failure of a run, every pool member creation (success or failure), every change in the lease check of a [fenced workspace](#workspaces-fenced-by-an-uncertain-run), and every [guest helper refresh](REPOSITORIES.md#guest-helper-refresh) attempt produces one structured log line on the controller's stderr (`{"event":"enginebox.launch",…}`) and one event in a bounded history: the newest 500, kept in memory and in the private file `launch-events.json` (mode 0600) under the controller root, so it survives restarts.

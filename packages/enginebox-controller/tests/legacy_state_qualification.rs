@@ -312,6 +312,12 @@ fn qualify(source: &Path, config: &Path) -> Checked<Value> {
             "controller-drain",
         )?;
         drop(controller);
+        // Activation sets an unreadable run record aside instead of refusing:
+        // qualification still reports it.
+        require(
+            !destination.join("agent-runs-quarantine").exists(),
+            "run-record-set-aside",
+        )?;
         files_absent(&destination.join("agents"))?;
         for (path, record) in &before.records {
             if path.extension().and_then(|s| s.to_str()) != Some("lock") {
@@ -538,14 +544,26 @@ fn disposable_controller_accepts_completed_records_and_rejects_invalid_runs() {
                 && report["source_unchanged"] == true,
             "fixture-qualification-result",
         )?;
+        // A small scalar field from another release is tolerated.
         record["unknown_legacy_field"] = json!(true);
+        phase(
+            fs::write(&run_path, phase(serde_json::to_vec(&record), "fixture")?),
+            "fixture",
+        )?;
+        require(
+            qualify(&root, &config).is_ok_and(|r| r["passed"] == true),
+            "fixture-tolerated-field-refused",
+        )?;
+        // A structured unknown field is not: the record is set aside, never
+        // loaded, and qualification reports it without refusing activation.
+        record["unknown_legacy_field"] = json!({"nested":true});
         phase(
             fs::write(&run_path, phase(serde_json::to_vec(&record), "fixture")?),
             "fixture",
         )?;
         let before = collect(&root)?;
         require(
-            qualify(&root, &config) == Err("controller-activate"),
+            qualify(&root, &config) == Err("run-record-set-aside"),
             "fixture-invalid-run-accepted",
         )?;
         require(collect(&root)? == before, "fixture-source-modified")?;

@@ -313,7 +313,14 @@ impl Installation {
         }
         let activation = Activation {
             current: version.clone(),
-            previous: old.filter(|v| v.current != *version).map(|v| v.current),
+            // A reload (same version) keeps the rollback target.
+            previous: old.and_then(|v| {
+                if v.current == *version {
+                    v.previous
+                } else {
+                    Some(v.current)
+                }
+            }),
             state_schema: target.state_schema,
         };
         atomic_json(&self.root.join("current.json"), &activation)?;

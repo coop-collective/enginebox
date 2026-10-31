@@ -76,7 +76,7 @@ assignment exists. A failure after allocation starts, an incomplete inventory, o
 unconfirmed registration cleanup still requires operator reconciliation. Existing
 uncertain attempts are never automatically reclassified or replayed.
 
-Drain stops new provisioning while admitted workers finish. Controller handoff also waits for workers, so a long job can delay an upgrade. Standby does not recover GitHub state. Running records found after an active-owner restart become uncertain. The first implementation has no takeover of an orphaned worker, uncertain-job repair button or periodic GitHub queue backfill. Failed webhook deliveries must be inspected/redelivered in GitHub; the integration does not promise recovery of events it never received.
+Drain stops new provisioning. Workers run detached (their own process group, the report written to a private file), so a controller handoff neither waits for nor interrupts them, and the next owner adopts a live worker by its recorded pid and program ([Work that outlives a controller](UPDATES.md#work-that-outlives-a-controller)). Standby does not recover GitHub state. A running job whose worker is gone becomes uncertain. Background reconciliation finishes an uncertain job once GitHub shows it completed and its runner idle or gone: the runner registration is removed and `enginebox-ci-worker --reclaim <name>` deletes only the VM matching that request's receipt. Nothing is replayed. There is no periodic GitHub queue backfill. Failed webhook deliveries must be inspected/redelivered in GitHub; the integration does not promise recovery of events it never received.
 
 ## Setup and supported interfaces
 
