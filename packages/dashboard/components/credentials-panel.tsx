@@ -3,21 +3,23 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api, errorMessage } from "@/lib/client";
 import { activeAuth, officialAuthorizationUrl, providerIds, providerLabels } from "@/lib/accounts";
 import type { AuthSession, ProviderId } from "@/lib/types";
+import { UnityAccountCard, type UnityAccount } from "@/components/unity-account";
 
 type Credential = {
   id: string;
-  provider: ProviderId;
+  provider: ProviderId | "unity";
   kind: "personal" | "team" | "api_key";
   label: string;
   owner_user_id: string | null;
   share_with_org_pools: boolean;
-  status: "pending" | "connected" | "failed";
+  status: "pending" | "connected" | "failed" | "unverified";
   has_key: boolean;
   connected_at: string | null;
 };
 type Listing = { me: string | null; role: "owner" | "admin" | "member"; credentials: Credential[] };
 
 const kindLabel = { personal: "Personal", team: "Team account", api_key: "API key" } as const;
+const providerName = (p: Credential["provider"]) => (p === "unity" ? "Unity" : providerLabels[p]);
 
 /**
  * Agent accounts in this org: connect your own subscription (personal), share
@@ -84,6 +86,9 @@ export function CredentialsPanel() {
 
   if (!listing) return error ? <div className="alert">{error}</div> : null;
   const admin = listing.role === "owner" || listing.role === "admin";
+  // Your own Unity account has its own card; admins still see others' to remove them.
+  const myUnity = listing.credentials.find((c) => c.provider === "unity" && c.owner_user_id === listing.me) as (Credential & UnityAccount) | undefined;
+  const rows = listing.credentials.filter((c) => c !== myUnity);
   const url = session ? officialAuthorizationUrl(session.provider, session.authorization_url) : null;
 
   return (
@@ -95,21 +100,23 @@ export function CredentialsPanel() {
         </div>
       </div>
       {error && <div role="alert" className="alert">{error}</div>}
+      <UnityAccountCard account={myUnity ?? null} signedIn={!!listing.me} refresh={refresh} />
       <div className="host-card">
         <table className="table">
           <thead><tr><th>Account</th><th>Kind</th><th>Status</th><th>Org pools</th><th /></tr></thead>
           <tbody>
-            {listing.credentials.length === 0 && <tr><td colSpan={5}>No accounts yet.</td></tr>}
-            {listing.credentials.map((c) => {
+            {rows.length === 0 && <tr><td colSpan={5}>No accounts yet.</td></tr>}
+            {rows.map((c) => {
               const mine = c.kind === "personal" && c.owner_user_id === listing.me;
-              const canSignIn = c.kind !== "api_key" && (mine || (c.kind === "team" && admin));
+              const unity = c.provider === "unity";
+              const canSignIn = !unity && c.kind !== "api_key" && (mine || (c.kind === "team" && admin));
               return (
                 <tr key={c.id}>
-                  <td>{c.label} · {providerLabels[c.provider]}{mine ? " (yours)" : ""}</td>
+                  <td>{c.label} · {providerName(c.provider)}{mine ? " (yours)" : ""}</td>
                   <td>{kindLabel[c.kind]}</td>
-                  <td>{c.status === "connected" ? (c.kind === "api_key" ? "Key stored" : "Connected") : c.status === "failed" ? "Sign-in failed" : "Not connected"}</td>
+                  <td>{c.status === "connected" ? (c.kind === "api_key" ? "Key stored" : "Connected") : c.status === "failed" ? "Sign-in failed" : c.status === "unverified" ? "Saved, not verified" : "Not connected"}</td>
                   <td>
-                    {c.kind === "personal" ? (
+                    {unity ? "Owner's sessions only" : c.kind === "personal" ? (
                       mine ? (
                         <label>
                           <input type="checkbox" checked={c.share_with_org_pools} disabled={!!busy} onChange={(e) => act(`share:${c.id}`, () => post(`/api/credentials/${c.id}/share`, { share: e.target.checked }))} /> Share
