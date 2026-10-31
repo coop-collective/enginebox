@@ -133,6 +133,7 @@ fn public(v: &Value) -> Value {
     json!({
         "id": v["id"], "repository": v["repository"], "branch": v["branch"], "commit": v["commit"],
         "status": v["status"], "healthy": v["healthy"], "urls": v["urls"], "error": v["error"],
+        "warnings": v["warnings"].as_array().cloned().unwrap_or_default(),
         "lease": v["lease"], "revision": v["revision"], "expires_at": v["expiresAt"],
         "source_revision": v["sourceRevision"],
     })

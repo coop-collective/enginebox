@@ -133,3 +133,24 @@ test('the exporter fetches the branch head, inventories its tree and reuses the 
     assert.equal(authHeader('t', 'bearer'), 'Authorization: Bearer t');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('a project shares one pnpm store across its repositories, and a repository on npm is warned', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ebox-repo-preview-pm-'));
+  try {
+    const h = await harness(root); const m = await h.create();
+    h.setFiles({ ...files(), 'package-lock.json': '{}' });
+    const npm = await m.previews.register(request());
+    await m.tick();
+    const warned = m.previews.summary(m.previews.records[npm.id]);
+    assert.equal(warned.status, 'ready'); assert.match(warned.warnings[0], /^package-manager-npm: environments are tuned for pnpm/);
+    h.setFiles({ ...files(), 'pnpm-lock.yaml': '' });
+    const pnpm = await m.previews.register({ ...request(), repository: 'ideator-apps/other' });
+    await m.tick();
+    assert.deepEqual(m.previews.summary(m.previews.records[pnpm.id]).warnings, []);
+    const stores = new Set(); const caches = new Set();
+    for (const env of m.config.environments) {
+      const { cache, store } = await m.packageCache(env); caches.add(cache); stores.add(store);
+    }
+    assert.equal(stores.size, 1, 'one store for the project'); assert.equal(caches.size, 2, 'a cache per repository');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

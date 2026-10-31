@@ -68,6 +68,14 @@ the environment service validates and reports them but does not yet inject
 values into dev containers. Source remains read-only at runtime; `writableDirs` grants bounded
 ephemeral caches. Persistent simulated bindings and application data belong in
 `ENGINEBOX_DATA_DIR` (`/data`). Cache paths cannot overlap tracked source files.
+A writable directory cannot be a whole `node_modules` (it would hide what
+`prepare` installed); name the cache inside it, such as `node_modules/.cache`.
+
+Environments are tuned for pnpm. The project's repositories share one pnpm
+content-addressed store (`/pnpm-store`, through `pnpm_config_store_dir` and `npm_config_store_dir`; pnpm checks each
+file's integrity as it imports it), so a package downloads once per host. npm,
+yarn and bun work too, with a persistent cache per repository; a preview of a
+repository whose lockfile is not pnpm's carries a `package-manager-<name>` warning.
 
 Dev templates, native-agent VM templates and CI toolchain templates have different
 validated schemas and execution lifetimes. A CI automation continues selecting
