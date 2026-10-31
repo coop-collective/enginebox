@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "remote_node": "/usr/local/bin/node",
+  "controller": {
+    "prefix": "/opt/enginebox-staging/controller",
+    "installer": "/opt/enginebox-staging/controller/releases/0.3.1-workers.41226420500/bin/enginebox-install",
+    "supervisor_config": "/opt/enginebox-staging/controller/etc/supervisor.json",
+    "state_dir": "/opt/enginebox-staging/state",
+    "token_file": "/opt/enginebox-staging/controller/etc/api-token",
+    "url": "http://127.0.0.1:8865"
+  },
+  "templates": {
+    "namespace": "live",
+    "allow_ids": [
+      "native-dev"
+    ],
+    "files": [
+      "templates/native-dev.json"
+    ],
+    "timeout_seconds": 1800
+  },
+  "smoke": {}
+}

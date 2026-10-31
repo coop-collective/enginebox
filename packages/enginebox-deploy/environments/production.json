@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "target": "x86_64-unknown-linux-gnu",
+  "remote_node": "/usr/local/bin/node",
+  "controller": {
+    "prefix": "/opt/enginebox-rust/controller",
+    "installer": "/opt/enginebox-rust/controller/releases/0.3.0/bin/enginebox-install",
+    "supervisor_config": "/opt/enginebox-rust/controller/etc/supervisor.json",
+    "state_dir": "/opt/enginebox-control/state",
+    "token_file": "/opt/enginebox-rust/controller/etc/api-token",
+    "url": "http://127.0.0.1:8765"
+  },
+  "templates": {
+    "namespace": "live",
+    "allow_ids": [
+      "native-dev"
+    ],
+    "files": [
+      "templates/native-dev.json"
+    ],
+    "timeout_seconds": 1800
+  },
+  "node": {
+    "prefix": "/opt/enginebox-node",
+    "sudo": "/usr/bin/sudo"
+  },
+  "watch": {
+    "seconds": 600,
+    "interval_seconds": 30,
+    "max_unready_checks": 3,
+    "max_start_failures": 3,
+    "max_start_failure_ratio": 0.5
+  }
+}

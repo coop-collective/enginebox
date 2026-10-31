@@ -29,7 +29,7 @@ export function sshArgs(settings, temporary, remoteCommand) {
 export async function main(args = process.argv.slice(2)) {
   requireUnixClient();
   const options = cli(args, ['config', 'version', 'operation', 'artifacts']);
-  check(options.config && ['update', 'rollback', 'status'].includes(options.operation), 'deployment-arguments');
+  check(options.config && ['update', 'rollback', 'status', 'smoke', 'reads', 'watch'].includes(options.operation), 'deployment-arguments');
   const pin = options.operation === 'status' ? null : version(options.version);
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const request = { operation: options.operation, version: pin, ...await loadConfig(options.config, root, options.operation === 'update') };
@@ -66,7 +66,9 @@ export async function main(args = process.argv.slice(2)) {
       for (const file of [selected.manifest, selected.archive]) await run('scp', [...common, file, `${settings.user}@${address}:${remote}/${basename(file)}`], { env, timeout: 1200000 });
     }
     const invocation = `umask 077; exec ${command(['flock', '-n', `${request.config.controller.prefix}/deploy.lock`, request.config.remote_node, `${remote}/remote.mjs`, `${remote}/request.json`])}`;
-    const result = await ssh(invocation, undefined, (request.config.templates.timeout_seconds + 2400) * 1000, true);
+    // A watch holds the session for its whole window; everything else is bounded by template sync plus staging.
+    const window = options.operation === 'watch' ? (request.config.watch?.seconds ?? 600) + 600 : request.config.templates.timeout_seconds + 2400;
+    const result = await ssh(invocation, undefined, window * 1000, true);
     const parsed = JSON.parse(result);
     check(parsed.ok === true && (pin === null || parsed.version === pin), 'deployment-not-confirmed');
     completed = true;

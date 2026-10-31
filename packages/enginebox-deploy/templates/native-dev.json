@@ -1,0 +1,29 @@
+{
+  "config": {
+    "browser": true,
+    "desktop": false,
+    "guest_computer_mcp": false
+  },
+  "description": "Ubuntu 24.04 with official Codex, Claude Code and Cursor Agent, plus a browser MCP. Connect agents once on the controller; assigned workspaces receive native access automatically.",
+  "id": "native-dev",
+  "label": "Native development",
+  "minimum": {
+    "cpu": 2,
+    "disk_gib": 30,
+    "memory_gib": 2
+  },
+  "native_clients": [
+    "claude",
+    "codex",
+    "cursor"
+  ],
+  "recipe": "native-clients-v1",
+  "recommended": {
+    "cpu": 4,
+    "disk_gib": 40,
+    "memory_gib": 4
+  },
+  "revision": 7,
+  "schema_version": 1,
+  "source_image": "images:ubuntu/24.04/cloud"
+}

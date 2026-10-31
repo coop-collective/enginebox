@@ -1,7 +1,7 @@
 import { readFile, lstat } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { check, fields, config, template, version, json, regular, selectArtifact, manifest, installerArgs, run } from './lib.mjs';
+import { check, fields, config, template, version, json, regular, selectArtifact, manifest, installerArgs, nodeInstallerArgs, run, WATCH_DEFAULTS, watchVerdict, startFailure } from './lib.mjs';
 
 async function privateInput(file, directory = false) {
   if (directory) {
@@ -44,7 +44,7 @@ function protocol(report) {
 export async function execute(request, directory) {
   fields(request, ['operation', 'version', 'config', 'templates', 'manifest_sha256']);
   check(request.operation === 'update' ? /^[a-f0-9]{64}$/.test(request.manifest_sha256) : request.manifest_sha256 === null, 'request-manifest-pin');
-  check(['update', 'rollback', 'status'].includes(request.operation), 'invalid-deployment-operation');
+  check(['update', 'rollback', 'status', 'smoke', 'reads', 'watch'].includes(request.operation), 'invalid-deployment-operation');
   const deployment = config(request.config); const pin = request.operation === 'status' ? null : version(request.version); const c = deployment.controller;
   check(Array.isArray(request.templates) && request.templates.length <= 32, 'template-list');
   request.templates.forEach(v => template(v, deployment));
@@ -65,6 +65,9 @@ export async function execute(request, directory) {
     check(ready.version === previous.current && ready.mode === 'active', 'controller-not-ready');
     return { ok: true, operation: 'status', version: previous.current, ready: true, private_state_preserved: true };
   }
+  if (request.operation === 'smoke') return smoke(deployment, c.url, token, pin, previous);
+  if (request.operation === 'reads') return { ok: true, operation: 'reads', version: pin, ...(await reads(c.url, token, pin, previous)) };
+  if (request.operation === 'watch') return watch(deployment, c.url, token, pin, previous);
   const release = join(c.prefix, 'releases', pin);
   if (request.operation === 'update') {
     const selected = await selectArtifact(directory, pin, deployment.target);
@@ -85,7 +88,14 @@ export async function execute(request, directory) {
   protocol(report);
   const builtVersion = (await run(join(release, 'bin/enginebox-controller'), ['--version'])).trim();
   check(builtVersion === `enginebox-controller ${pin}`, 'candidate-binary-version-mismatch');
-  if (previous.current !== pin) await run(c.installer, installerArgs(deployment, request.operation, pin), { timeout: 1200000 });
+  if (previous.current !== pin) {
+    try {
+      await run(c.installer, installerArgs(deployment, request.operation, pin), { timeout: 1200000 });
+    } catch {
+      // A refused activation must never look like a retryable blip: name what state the controller was left in.
+      throw new Error(await cutoverFailure(c.url, token, pin, previous.current));
+    }
+  }
   const ready = await api(c.url, token, '/readyz');
   check(ready.version === pin && ready.mode === 'active', 'deployed-controller-not-ready');
   const expected = [];
@@ -99,7 +109,130 @@ export async function execute(request, directory) {
     check(Date.now() < deadline, 'template-sync-timeout-inspect-controller');
     await new Promise(resolveWait => setTimeout(resolveWait, 10000));
   }
-  return { ok: true, operation: request.operation, version: pin, previous_version: previous.current, templates_ready: expected.length, node_rollout: false, private_state_preserved: true };
+  let nodeRollout = false;
+  if (deployment.node) {
+    // Same release, same verified artifact: stage it in the node installation (once), make it current, republish the
+    // host helper. Workspaces then refresh their guest helper from the version this controller expects. A rollback
+    // re-activates the retained node release of the same version, so controller and helper never drift apart.
+    const sudo = deployment.node.sudo;
+    const installer = join(release, 'bin/enginebox-install');
+    let staged = true;
+    try { await run(sudo, ['-n', 'test', '-d', join(deployment.node.prefix, 'releases', pin)]); } catch { staged = false; }
+    if (!staged) {
+      check(request.operation === 'update', 'rollback-node-release-not-retained');
+      const selected = await selectArtifact(directory, pin, deployment.target);
+      await run(sudo, ['-n', installer, ...nodeInstallerArgs(deployment, 'stage', pin, selected)], { timeout: 600000 });
+    }
+    const current = JSON.parse(await run(sudo, ['-n', 'cat', join(deployment.node.prefix, 'current.json')]));
+    if (current.current !== pin) await run(sudo, ['-n', installer, ...nodeInstallerArgs(deployment, 'activate', pin)], { timeout: 600000 });
+    await run(sudo, ['-n', installer, ...nodeInstallerArgs(deployment, 'expose-host', pin)], { timeout: 120000 });
+    nodeRollout = true;
+  }
+  return { ok: true, operation: request.operation, version: pin, previous_version: previous.current, templates_ready: expected.length, node_rollout: nodeRollout, private_state_preserved: true };
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const listRuns = async (base, token) => {
+  const value = await api(base, token, '/v1/agent-runs');
+  check(Array.isArray(value.runs), 'agent-runs-shape');
+  return value.runs;
+};
+
+/**
+ * After a failed installer switch: which state the controller is in. The supervisor restores the old controller on a
+ * refused activation; when that restore fails too, the controller is left drained (serving nothing) until the next
+ * activation, which is the incident this classification exists for.
+ */
+export async function cutoverFailure(base, token, pin, before, probe = api) {
+  let status;
+  try { status = await probe(base, token, '/__enginebox/status'); } catch { return 'cutover-failed-controller-unreachable'; }
+  let ready = null;
+  try { ready = await probe(base, token, '/readyz'); } catch { ready = null; }
+  if (!ready || ready.mode !== 'active') return 'cutover-failed-controller-drained';
+  if (status.current === before && ready.version === before) return 'cutover-refused-previous-version-restored';
+  if (status.current === pin && ready.version === pin) return 'cutover-failed-after-switch';
+  return 'cutover-failed-version-mismatch';
+}
+
+/** The exact version is active and serving the main reads. */
+async function reads(base, token, pin, status) {
+  check(status.current === pin, 'version-not-active');
+  const ready = await api(base, token, '/readyz');
+  check(ready.version === pin && ready.mode === 'active', 'controller-not-ready');
+  for (const endpoint of ['/v1/pools', '/v1/agent-runs', '/v1/templates']) await api(base, token, endpoint);
+  return { reads: 'ok' };
+}
+
+/**
+ * Durable state written by this release, so the rollback round trip makes the previous release read it: a pool record
+ * and an agent-run record (queued on the empty smoke pool, then cancelled). Agent-run record fields are exactly what
+ * broke a previous release's activation validator once.
+ */
+const SEED_POOL = 'smoke-state';
+async function seed(base, token) {
+  await api(base, token, '/v1/pools', { name: SEED_POOL, description: 'Deploy smoke state (staging only)', workspaces: [] });
+  let run = 'refused';
+  try {
+    const started = await api(base, token, `/v1/pools/${SEED_POOL}/agent-runs`, { provider: 'codex', prompt: 'Deploy smoke state record; never placed.', timeout_seconds: 60 });
+    const id = started.run?.id ?? started.id;
+    if (typeof id === 'string' && /^[a-f0-9]{32}$/.test(id)) {
+      await api(base, token, `/v1/pools/${SEED_POOL}/agent-runs/${id}/cancel`, {});
+      run = 'queued-and-cancelled';
+    }
+  } catch { run = 'refused'; }
+  return { pool: SEED_POOL, run };
+}
+
+/**
+ * The staging gate: the exact version is active and serving reads, it writes durable state for the rollback round
+ * trip, and with a pool and provider a trivial run succeeds.
+ */
+async function smoke(deployment, base, token, pin, status) {
+  await reads(base, token, pin, status);
+  const seeded = await seed(base, token);
+  const s = deployment.smoke ?? {};
+  if (!s.pool) return { ok: true, operation: 'smoke', version: pin, seeded, run: 'skipped' };
+  const started = await api(base, token, `/v1/pools/${s.pool}/agent-runs`, { provider: s.provider, prompt: s.prompt ?? 'Reply with exactly: OK', timeout_seconds: s.timeout_seconds ?? 300 });
+  const id = started.run?.id ?? started.id;
+  check(typeof id === 'string' && /^[a-f0-9]{32}$/.test(id), 'smoke-run-not-started');
+  const deadline = Date.now() + ((s.timeout_seconds ?? 300) + 120) * 1000;
+  for (;;) {
+    const read = await api(base, token, `/v1/pools/${s.pool}/agent-runs/${id}`);
+    const run = read.run ?? read;
+    if (['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+      check(run.status === 'succeeded', 'smoke-run-failed');
+      const output = String(run.result?.output ?? '');
+      check(output.includes(s.expect ?? 'OK'), 'smoke-run-unexpected-output');
+      return { ok: true, operation: 'smoke', version: pin, seeded, run: { status: run.status, start_path: run.start_path ?? null, start_latency_ms: run.start_latency_ms ?? null } };
+    }
+    check(Date.now() < deadline, 'smoke-run-timeout');
+    await sleep(5000);
+  }
+}
+
+/**
+ * The post-promotion watch: readiness and new runs' start failures since the cutover. A regression exits nonzero
+ * with its reason so the workflow rolls back to the previous version.
+ */
+async function watch(deployment, base, token, pin, status) {
+  check(status.current === pin, 'watch-version-not-active');
+  const w = { ...WATCH_DEFAULTS, ...(deployment.watch ?? {}) };
+  const baseline = new Set((await listRuns(base, token)).map(r => r.id));
+  const seen = new Map();
+  let consecutive = 0; let checks = 0;
+  const deadline = Date.now() + w.seconds * 1000;
+  do {
+    checks++;
+    let readyNow = false;
+    try { const ready = await api(base, token, '/readyz'); readyNow = ready.version === pin && ready.mode === 'active'; } catch { readyNow = false; }
+    consecutive = readyNow ? 0 : consecutive + 1;
+    if (readyNow) for (const r of await listRuns(base, token)) if (!baseline.has(r.id)) seen.set(r.id, r);
+    const observed = { consecutive_unready: consecutive, new_runs: seen.size, start_failures: [...seen.values()].filter(startFailure).length };
+    const verdict = watchVerdict(observed, w);
+    if (verdict.regressed) throw new Error(`watch-regressed-${verdict.reason}`);
+    if (Date.now() >= deadline) return { ok: true, operation: 'watch', version: pin, checks, ...observed };
+    await sleep(w.interval_seconds * 1000);
+  } while (true);
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
