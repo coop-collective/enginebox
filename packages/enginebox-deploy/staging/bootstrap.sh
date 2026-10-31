@@ -46,7 +46,8 @@ MANIFEST=$ARTIFACTS/enginebox-$VERSION-$TARGET.json
 ARCHIVE=$ARTIFACTS/enginebox-$VERSION-$TARGET.tar.gz
 [ -f "$MANIFEST" ] && [ -f "$ARCHIVE" ] || { echo "missing $MANIFEST or $ARCHIVE" >&2; exit 2; }
 
-run() { if [ "$APPLY" = 1 ]; then "$@"; else printf 'would run:'; printf ' %q' "$@"; printf '\n'; fi; }
+# Commands never read stdin: `incus project create/set` read YAML from a non-terminal stdin (and would eat a loop's input).
+run() { if [ "$APPLY" = 1 ]; then "$@" </dev/null; else printf 'would run:'; printf ' %q' "$@"; printf '\n'; fi; }
 write_new() { # write_new FILE MODE: content from stdin, only when FILE does not exist yet
   local file=$1 mode=$2 content; content=$(cat)
   if [ -e "$file" ]; then echo "keep $file"; return; fi
