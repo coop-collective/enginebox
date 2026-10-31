@@ -944,6 +944,7 @@ mod tests {
         g.hand_off();
         assert!(g.handed_off.load(Ordering::SeqCst));
     }
+    #[cfg(unix)]
     fn jit_fixture(prepared: bool, shared: bool, capacity_wait: bool) {
         use crate::tests::{account, api_fixture, service, shared_service};
         use std::{
