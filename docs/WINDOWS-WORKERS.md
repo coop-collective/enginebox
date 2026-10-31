@@ -66,6 +66,33 @@ not an unattended Windows Service. Private identity and receipts are under
 The installer restricts that directory to the installing user's SID. Trusted
 same-user native jobs remain capable of reading that user's files.
 
+### Unattended GPU hosts: automatic sign-in
+
+Engines that render to a window (the Unity Editor's Game view, Unreal) need a
+signed-in desktop session. For a dedicated host, run the installer from an
+elevated PowerShell with `-AutoLogon` so the node starts at every boot without
+anyone at the keyboard:
+
+```powershell
+.\install-worker-node.ps1 -Controller https://enginebox.example.com -ExpectedBinarySha256 $hash -AutoLogon
+```
+
+It prompts for the installing user's Windows password, or reads one line from
+piped input; the password is never an argument. Windows checks it with an
+interactive `LogonUser` first, so a wrong password changes nothing. It is stored
+as the LSA secret `DefaultPassword` (as Sysinternals Autologon does), never as a
+plaintext registry value, and Winlogon's `AutoAdminLogon`, `DefaultUserName` and
+`DefaultDomainName` are set. The installer also turns off Windows Hello
+passwordless mode (which ignores password sign-in), disables sleep and
+hibernation on AC power, and registers an owned **Enginebox Lock After Sign-in**
+task that locks the console right after the automatic sign-in; engines keep
+rendering in the locked session. Local accounts on machines that are not
+domain-joined only. Anyone with administrator rights on the machine can read
+the LSA secret, so use this only on a host dedicated to Engine Box.
+
+The receipt records the choice; later installs keep it, and `-Mode Uninstall`
+(elevated) removes the secret, resets `AutoAdminLogon` and deletes the lock task.
+
 Revocation stops new assignments immediately; the local worker stops its owned
 process tree when its next heartbeat is rejected. Lost leases, controller restart
 and uncertain execution are fenced, never replayed. An owner must reconcile an
