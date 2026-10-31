@@ -9,14 +9,23 @@ param(
   [string]$ExpectedBinarySha256,
   [switch]$SkipDependencies,
   [switch]$AutoLogon,
+  [switch]$EngineAccount,
   [string]$InstallDirectory=(Join-Path $env:LOCALAPPDATA 'Enginebox\worker-node')
 )
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+# -EngineAccount runs the node as a dedicated, automatically signed-in local user so engine sessions never run in the
+# owner's own account or see the owner's files.
+if ($EngineAccount) {
+  $AutoLogon=$true
+  if (-not $PSBoundParameters.ContainsKey('InstallDirectory')) { $InstallDirectory=Join-Path $env:ProgramData 'Enginebox\engine-node' }
+}
 $root=[IO.Path]::GetFullPath($InstallDirectory)
 $binary=Join-Path $root 'enginebox-node.exe'
 $config=Join-Path $root 'private\worker.json'
 $receiptPath=Join-Path $root 'installation.json'
-$taskName='Enginebox CI and Agents Node'
+$taskName=if ($EngineAccount) { 'Enginebox Engine Node' } else { 'Enginebox CI and Agents Node' }
+$engineUser='enginebox'
+$engineMarker='Enginebox engine sessions account'
 $marker='Enginebox contributor schema 1'
 $lockTaskName='Enginebox Lock After Sign-in'
 $winlogon='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
@@ -83,14 +92,15 @@ function Disable-AutoLogon {
   Remove-ItemProperty -LiteralPath $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue
   if (Owned-LockTask) { Unregister-ScheduledTask -TaskName $lockTaskName -Confirm:$false }
 }
-function Enable-AutoLogon {
+function Enable-AutoLogon([string]$User=$env:USERNAME,[string]$Password) {
   Assert-Elevated 'Automatic sign-in'
   $computer=Get-CimInstance Win32_ComputerSystem
   if ($computer.PartOfDomain) { throw 'Automatic sign-in is supported for local accounts only; this machine is domain-joined.' }
-  $user=$env:USERNAME
-  if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) { throw 'Automatic sign-in is supported for local accounts only.' }
+  $user=$User
+  $account=Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+  if (-not $account) { throw 'Automatic sign-in is supported for local accounts only.' }
   # Read the password from piped input or a hidden prompt, never from arguments.
-  if ([Console]::IsInputRedirected) { $password=[Console]::In.ReadLine() } else {
+  if ($PSBoundParameters.ContainsKey('Password')) { $password=$Password } elseif ([Console]::IsInputRedirected) { $password=[Console]::In.ReadLine() } else {
     $secret=Read-Host "Windows password for $user (stored as an LSA secret for automatic sign-in)" -AsSecureString
     $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
     try { $password=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secret.Dispose() }
@@ -111,11 +121,44 @@ function Enable-AutoLogon {
   & powercfg.exe /change standby-timeout-ac 0; & powercfg.exe /change hibernate-timeout-ac 0
   # Lock the console right after the automatic sign-in. Engines keep rendering in the locked session.
   Owned-LockTask | Out-Null
-  $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+  $sid=$account.SID
   $lockAction=New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\rundll32.exe') -Argument 'user32.dll,LockWorkStation'
   $lockTrigger=New-ScheduledTaskTrigger -AtLogOn -User $sid.Value
   $lockPrincipal=New-ScheduledTaskPrincipal -UserId $sid.Value -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName $lockTaskName -Action $lockAction -Trigger $lockTrigger -Principal $lockPrincipal -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) -Description $marker -Force | Out-Null
+}
+function New-EnginePassword {
+  # 32 random characters plus one from each class, so any local password policy accepts it. Nobody is shown it.
+  $chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
+  $bytes=New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  return (-join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] }))+'Aa9-'
+}
+function Ensure-EngineAccount {
+  Assert-Elevated 'The engine account'
+  $existing=Get-LocalUser -Name $engineUser -ErrorAction SilentlyContinue
+  if ($existing -and $existing.Description -ne $engineMarker) { throw "A local user named $engineUser exists and is not owned by Engine Box." }
+  $password=New-EnginePassword
+  $secure=ConvertTo-SecureString $password -AsPlainText -Force
+  if ($existing) { Set-LocalUser -Name $engineUser -Password $secure -PasswordNeverExpires $true }
+  else {
+    New-LocalUser -Name $engineUser -Password $secure -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires -FullName 'Engine Box' -Description $engineMarker | Out-Null
+    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $engineUser
+  }
+  return @{password=$password;sid=(Get-LocalUser -Name $engineUser).SID}
+}
+function Remove-EngineAccount {
+  $existing=Get-LocalUser -Name $engineUser -ErrorAction SilentlyContinue
+  if (-not $existing) { return }
+  if ($existing.Description -ne $engineMarker) { throw "The local user $engineUser is not owned by Engine Box; it was left in place." }
+  Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $existing.SID.Value } | Remove-CimInstance
+  Remove-LocalUser -Name $engineUser
+}
+function Reclaim-PrivateDirectory {
+  # A repeated engine install finds private\ handed to the engine account; give Administrators access back first.
+  $private=Split-Path -Parent $config
+  if (-not (Test-Path -LiteralPath $private)) { return }
+  & takeown.exe /F $private /R /A /D Y 2>$null | Out-Null
+  & icacls.exe $private /grant "*S-1-5-32-544:(OI)(CI)F" /T /C /Q 2>$null | Out-Null
 }
 function Find-Tool([string]$Name) {
   $cmd=Get-Command ($Name+'.exe') -ErrorAction SilentlyContinue
@@ -135,12 +178,16 @@ if (Test-Path -LiteralPath $receiptPath) {
 if ($Mode -eq 'Uninstall') {
   if (-not (Test-Path -LiteralPath $receiptPath)) { throw 'No owned installation exists.' }
   if ($task) { Stop-ScheduledTask -TaskName $taskName; Unregister-ScheduledTask -TaskName $taskName -Confirm:$false }
-  if ((Get-Content -Raw -LiteralPath $receiptPath | ConvertFrom-Json).PSObject.Properties['autoLogon']) { Disable-AutoLogon; Write-Output 'Automatic sign-in removed.' }
+  $installed=Get-Content -Raw -LiteralPath $receiptPath | ConvertFrom-Json
+  if ($installed.PSObject.Properties['autoLogon']) { Disable-AutoLogon; Write-Output 'Automatic sign-in removed.' }
+  if ($installed.PSObject.Properties['engineAccount']) { Remove-EngineAccount; Write-Output "Engine account $engineUser and its profile removed." }
   Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
   Write-Output 'Worker task and binary removed. Identity and work files retained. Revoke this machine in the dashboard.'
   exit 0
 }
 if ($AutoLogon) { Assert-Elevated 'Automatic sign-in' }
+$engine=$null
+if ($EngineAccount) { $engine=Ensure-EngineAccount; Reclaim-PrivateDirectory }
 if (-not $Controller) { $Controller=Read-Host 'Controller HTTPS origin' }
 $uri=$null
 if (-not [Uri]::TryCreate($Controller,[UriKind]::Absolute,[ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -ne '/') { throw 'Controller must be an HTTPS origin.' }
@@ -157,10 +204,17 @@ if (Test-Path -LiteralPath $config) {
   if ([Uri]$existing.controller -ne $uri -or $existing.budget.cpu -ne $Cpu -or $existing.budget.memory_gib -ne $MemoryGiB -or $existing.budget.disk_gib -ne $DiskGiB) { throw 'Existing registration has a different host or budget. Revoke it and use a fresh installation directory.' }
 }
 New-Item -ItemType Directory -Force -Path $root | Out-Null
-$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$sid=if ($engine) { $engine.sid } else { [Security.Principal.WindowsIdentity]::GetCurrent().User }
 $acl=New-Object Security.AccessControl.DirectorySecurity
-$acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false)
+$acl.SetAccessRuleProtection($true,$false)
 $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+if ($engine) {
+  # The installing administrator keeps control; the engine account owns nothing else on the machine.
+  $admins=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+  $acl.SetOwner($admins)
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($admins,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-18')),'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+} else { $acl.SetOwner($sid) }
 Set-Acl -LiteralPath $root -AclObject $acl
 if ($task) {
   Stop-ScheduledTask -TaskName $taskName
@@ -173,6 +227,7 @@ Copy-Item -LiteralPath $source -Destination $binary -Force
 $previousAutoLogon=(Test-Path -LiteralPath $receiptPath) -and [bool](Get-Content -Raw -LiteralPath $receiptPath | ConvertFrom-Json).PSObject.Properties['autoLogon']
 $receiptData=@{marker=$marker;root=$root;binarySha256=$ExpectedBinarySha256}
 if ($AutoLogon -or $previousAutoLogon) { $receiptData.autoLogon=$true }
+if ($engine) { $receiptData.engineAccount=$engineUser }
 $receiptData | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding UTF8
 if (-not (Test-Path -LiteralPath $config) -or -not (Get-Content -Raw -LiteralPath $config | ConvertFrom-Json).enrolled) {
   if (-not $EnrollmentCode) {
@@ -185,14 +240,38 @@ if (-not (Test-Path -LiteralPath $config) -or -not (Get-Content -Raw -LiteralPat
   $EnrollmentCode=$null
   if ($LASTEXITCODE -ne 0) { throw 'Registration failed. Retry the same command before expiry; an existing pending identity is retained.' }
 }
+$identity=Get-Content -Raw -LiteralPath $config | ConvertFrom-Json
+if ($engine) {
+  # Registration ran as the installing administrator, which made private\ its own. Hand it to the engine account in
+  # the shape the node itself enforces at start: owned by that account, one protected full-control entry.
+  $private=Split-Path -Parent $config
+  $engineSid="*$($engine.sid.Value)"
+  # Children first, while the administrator can still reach them: owned by the engine account and inheriting only.
+  & icacls.exe $private /setowner $engineSid /T /C /Q 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Could not give the engine account ownership of its private files.' }
+  & icacls.exe "$private\*" /reset /T /C /Q 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Could not reset private file permissions to inherit.' }
+  # Then the directory itself: one protected full-control entry for the engine account, nothing else.
+  & icacls.exe $private /inheritance:r /grant:r "$($engineSid):(OI)(CI)F" /Q 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Could not restrict the private directory to the engine account.' }
+  foreach ($ace in @((Get-Acl -LiteralPath $private).Access)) {
+    $aceSid=$ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier])
+    if ($aceSid -ne $engine.sid) { & icacls.exe $private /remove:g "*$($aceSid.Value)" /Q 2>$null | Out-Null }
+  }
+  if (@((Get-Acl -LiteralPath $private).Access).Count -ne 1) { throw 'The private directory kept access rules other than the engine account.' }
+}
 $action=New-ScheduledTaskAction -Execute $binary -Argument ('run-worker --config "{0}"' -f $config) -WorkingDirectory $root
 $trigger=New-ScheduledTaskTrigger -AtLogOn -User $sid.Value
 $principal=New-ScheduledTaskPrincipal -UserId $sid.Value -LogonType Interactive -RunLevel Limited
 $settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $marker -Force | Out-Null
-Start-ScheduledTask -TaskName $taskName
-if ($AutoLogon) { Enable-AutoLogon; Write-Output "Automatic sign-in enabled for $env:USERNAME; the console locks right after it. The node starts at every boot without anyone signing in." }
-$identity=Get-Content -Raw -LiteralPath $config | ConvertFrom-Json
+if ($engine) {
+  Enable-AutoLogon -User $engineUser -Password $engine.password; $engine.password=$null
+  Write-Output "Engine account $engineUser created and set to sign in automatically, then lock. The node starts at its next sign-in: restart Windows (or sign out) to start it."
+} else {
+  Start-ScheduledTask -TaskName $taskName
+  if ($AutoLogon) { Enable-AutoLogon; Write-Output "Automatic sign-in enabled for $env:USERNAME; the console locks right after it. The node starts at every boot without anyone signing in." }
+}
 if (-not $SkipDependencies) {
   $required=@()
   if ($identity.workloads.ci) { $required+=@(@{name='git';id='Git.Git'},@{name='pwsh';id='Microsoft.PowerShell'}) }

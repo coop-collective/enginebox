@@ -93,6 +93,24 @@ the LSA secret, so use this only on a host dedicated to Engine Box.
 The receipt records the choice; later installs keep it, and `-Mode Uninstall`
 (elevated) removes the secret, resets `AutoAdminLogon` and deletes the lock task.
 
+### Dedicated engine account (personal GPU machines)
+
+On an owner's own Windows PC, engine sessions run natively for full graphics
+(DirectX 12, Vulkan, Unreal) but never in the owner's account. `-EngineAccount`
+(elevated, implies `-AutoLogon`) creates a standard local user `enginebox`
+(member of Users only, described as `Enginebox engine sessions account`) with a
+random password that is never displayed, stores that password as the LSA
+automatic sign-in secret, and installs the node to
+`%ProgramData%\Enginebox\engine-node` as the **Enginebox Engine Node** task running
+as that user at its sign-in. The installation directory grants only the engine
+account, SYSTEM and Administrators; `private\` is handed to the engine account in
+the owner-only shape the node enforces. Each install rotates the password and the
+secret together. An existing `enginebox` user that Engine Box did not create is
+refused. The node starts at the next sign-in, so restart Windows after the first
+install. `-Mode Uninstall` also deletes the account and its profile. These hosts
+run only their owner's sessions; other organisations' sessions are never placed
+on them.
+
 Revocation stops new assignments immediately; the local worker stops its owned
 process tree when its next heartbeat is rejected. Lost leases, controller restart
 and uncertain execution are fenced, never replayed. An owner must reconcile an
