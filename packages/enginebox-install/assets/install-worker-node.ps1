@@ -262,6 +262,10 @@ if ($engine) {
 }
 $action=New-ScheduledTaskAction -Execute $binary -Argument ('run-worker --config "{0}"' -f $config) -WorkingDirectory $root
 $trigger=New-ScheduledTaskTrigger -AtLogOn -User $sid.Value
+# Task Scheduler restarts a task only when it fails to launch, not when the node exits after losing its controller.
+# A repeating trigger relaunches it within five minutes; IgnoreNew leaves a running node alone.
+$watchdog=New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 5)
+$trigger=@($trigger,$watchdog)
 $principal=New-ScheduledTaskPrincipal -UserId $sid.Value -LogonType Interactive -RunLevel Limited
 $settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $marker -Force | Out-Null
