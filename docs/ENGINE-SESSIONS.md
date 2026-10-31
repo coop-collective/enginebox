@@ -4,11 +4,18 @@ Status: design, October 31, 2026. Nothing here is implemented yet.
 
 ## Owner decisions (November 1, 2026)
 
-- **Isolation: one VM per session.** Each session runs in its own Hyper-V VM with a GPU partition (GPU-P), not a
-  container sharing a kernel. The container spec below becomes the in-VM process spec; the WSL container results
-  remain the fallback evidence. Guest OS is being qualified (Windows Server guest is the standard GPU-P path; Windows
-  client guests are generally not licensed for third-party hosting). Sessions start from golden images via
-  differencing disks and a warm VM pool.
+- **Node kinds and isolation (revised November 1).** WSL's paravirtual GPU tops out at OpenGL 4.6 over D3D12 with
+  no Vulkan (no Unreal, no HDRP, no ray tracing), so it is not the foundation. Two node kinds behind one API:
+  - **Personal Windows machines** run only their owner's sessions, natively (DirectX 12, Vulkan, Unreal, the Windows
+    stream host), under a dedicated `enginebox` Windows account that signs in automatically with a generated
+    password, separated from the owner's files. Other orgs' sessions are never placed on personal machines.
+  - **Cloud Linux GPU servers (NVIDIA L4 first)** run sessions as containers with the native driver through NVIDIA
+    Container Toolkit (Vulkan, OpenGL, NVENC). The cloud instance is the tenant boundary: one instance per org.
+  - Per-session Hyper-V GPU-P VMs and WSL GPU containers stay possible later tiers, not v1.
+- **Editor and player sessions.** Editor sessions run the engine editor on a project. Player sessions run a build
+  artifact (EngineBox engine builds), are lighter, and can be placed on any eligible node with headroom; the artifact
+  is cached per node, so one game's players spread across machines when one is loaded. Viewers cost no node GPU (MoQ
+  relay fan-out).
 - **Licensing: each org brings its own Unity credentials** as its own `secret_source` connection; activation is per
   (node, org) inside that org's VMs.
 - **Saves: LayerFS workspaces.** The session's project is a LayerFS workspace exported into the VM.
@@ -23,7 +30,7 @@ Status: design, October 31, 2026. Nothing here is implemented yet.
 An engine session is one tenant's game engine (Unity first; the API is engine-agnostic) running a given
 repository and ref in its own container on a GPU node, streamed to the requesting app over MoQ. Gamejam is the first
 client: its dev server, and later its Cloudflare deployment, starts sessions as an OAuth client of this controller.
-Sessions never run on a bare host.
+Sessions run in a container (cloud) or under a dedicated engine account on the owner's own machine (personal).
 
 ## Foundations reused
 
