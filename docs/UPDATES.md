@@ -63,8 +63,24 @@ helper; staging never touches it. Manual runs can target one environment (`updat
 Environments, isolation, enablement and provider sign-ins for staging are in [STAGING.md](STAGING.md); the deploy
 client itself is described in `packages/enginebox-deploy/README.md`.
 
-The pipeline relies on the drained handoff above for each cutover. Work that outlives the drain timeout is covered
-by the separate handoff work that carries running agent runs and CI jobs across a controller change.
+The pipeline relies on the drained handoff above for each cutover. Running agent runs and CI jobs no longer hold that drain;
+see [Work that outlives a controller](#work-that-outlives-a-controller).
+
+## Work that outlives a controller
+
+A handoff takes seconds whatever is running. Long work no longer holds the drain:
+
+- **Agent runs.** A guest helper from this release starts each run detached (`enginebox-guest detach`): in its own session inside the workspace, with an append-only spool under `~/.local/state/enginebox/detached/<run>` (the request, deleted as soon as the run reads it because it can carry run env; a receipt with the worker pid; then the result). The controller records the run in `agent-runs-detached/<run>.json` and polls `collect`. Once a run is detached it no longer counts toward the drain. A run on an older guest helper keeps the previous synchronous path, which still holds the drain.
+- **CI workers.** `enginebox-ci-worker` starts in its own process group with its stdin from a private file and its report written to `github/workers/<job>.out`, and the job records its pid. It no longer holds the drain either.
+- **Drain.** The old owner stops admission, finishes in-flight API mutations and journal writes, then hands off: its run and worker threads stop writing (they leave a detached run or a live worker untouched) and it releases the state lock.
+- **Adoption.** The new owner reads the index on activation. A detached run whose record is still `running` keeps its workspace lease, and the new owner polls it to the end with the deadline recorded when it was detached. It cancels a run that outlives that deadline and never starts a run again. A live CI worker (same pid and program) is followed to its report. Only work without an index or without a live worker becomes uncertain, as before.
+- **Reconciliation.** Every background tick looks at uncertain CI jobs (at most once every 10 minutes each). When GitHub shows the job completed and its runner idle or gone, the controller removes the runner registration, runs `enginebox-ci-worker --reclaim <name>` (which deletes only the VM whose instance UUID and allocation match that request's receipt) and marks the job finished. Nothing is replayed.
+- **Reload.** `enginebox-install reload` (or `POST /__enginebox/reload`) hands off to a fresh process of the active version, which re-reads `fleet.toml` and `environment.json` under the same standby, drain and activation checks. A configuration change never needs a supervisor restart. The rollback target is kept.
+- **One operation at a time.** Update, rollback and reload share the supervisor's transaction lock and the installation's `update.lock`. A second operation is refused with "another upgrade is already running"; it never interleaves with the first.
+
+### Activation never strands a drained controller
+
+Activation loads run records from both directions of a version step. Fields another release added are tolerated when they are small scalars, because they carry no authority; identity, scope and status stay strict. A record that still fails validation is moved to `agent-runs-quarantine/` and reported in the controller log, so it can no longer refuse activation. Records this release writes stay within the previous release's fields (`PREVIOUS_RELEASE_RECORD_FIELDS`), and the in-flight index lives outside the records, so a rollback activates over the new release's state. If a candidate's activation fails, the supervisor gives ownership back to the old controller and retries that with backoff. The controller log names the activation error, while the API reply stays generic.
 
 ## State compatibility is a rollback gate
 

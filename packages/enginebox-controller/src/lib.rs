@@ -308,6 +308,9 @@ impl Controller {
             owner.runtime()?.agents.attach_after_start(host, name)
         }));
         runtime.agents.start_scheduler();
+        // Runs a previous owner left detached in their guests continue here.
+        runtime.agents.adopt_detached();
+        runtime.github.adopt_workers();
         gate.runtime = Some(runtime);
         gate.owner = Some(owner);
         gate.mode = Mode::Active;
@@ -367,6 +370,11 @@ impl Controller {
             .as_ref()
             .map_or(0, |r| r.pending_jobs() + r.agents.pending());
         if g.requests == 0 && g.background == 0 && pending == 0 {
+            // Detached agent runs and CI workers carry on: the next owner adopts them.
+            if let Some(runtime) = &g.runtime {
+                runtime.agents.hand_off();
+                runtime.github.hand_off();
+            }
             g.owner.take();
             g.mode = Mode::Drained;
         }
@@ -702,10 +710,14 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             "/internal/activate" | "/internal/undrain" => {
                 return match blocking(move || controller.activate()).await {
                     Ok(v) => reply(StatusCode::OK, v),
-                    Err(_) => error(
-                        StatusCode::CONFLICT,
-                        "Controller activation failed; state remains owned by its current controller.",
-                    ),
+                    Err(e) => {
+                        // The operator's log names the cause; the reply stays generic.
+                        eprintln!("Controller activation failed: {e:#}");
+                        error(
+                            StatusCode::CONFLICT,
+                            "Controller activation failed; state remains owned by its current controller.",
+                        )
+                    }
                 };
             }
             _ => return error(StatusCode::NOT_FOUND, "Unknown endpoint."),

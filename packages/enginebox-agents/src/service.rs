@@ -82,6 +82,14 @@ struct Inner {
     owed_callbacks: Mutex<Vec<String>>,
     /// Bounded history of launch failures and pool member creations.
     launch_events: LaunchEvents,
+    /// Drain barriers of admitted runs not yet detached in their guest. A
+    /// detached run no longer holds the drain: the next owner adopts it.
+    attached: Mutex<BTreeMap<String, Pending>>,
+    /// Set (under `records`) when this owner hands state to the next one:
+    /// its threads then stop writing and leave detached runs to it.
+    handed_off: AtomicBool,
+    /// Detached runs found running at startup, adopted by [`AgentService::adopt_detached`].
+    adoptable: Mutex<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -325,6 +333,11 @@ impl AgentService {
         security::private_dir(&details_root)?;
         let queue_root = controller_root.join("agent-run-queue");
         security::private_dir(&queue_root)?;
+        // In-flight detached runs, outside the run records so a previous
+        // release (which validates records strictly) still reads the state.
+        let detached_root = controller_root.join(DETACHED_DIR);
+        security::private_dir(&detached_root)?;
+        let quarantine_root = controller_root.join("agent-runs-quarantine");
         let pools = pools::Pools::open(&controller_root)?;
         let launch_events = LaunchEvents::open(&controller_root)?;
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
@@ -372,6 +385,7 @@ impl AgentService {
             binaries.insert(p.into(), path);
         }
         let mut records: BTreeMap<String, Value> = BTreeMap::new();
+        let mut adoptable: Vec<String> = Vec::new();
         let record_pattern = regex::Regex::new(r"^[a-f0-9]{32}\.json$")?;
         for item in std::fs::read_dir(&runs_root)? {
             let item = item?;
@@ -379,20 +393,37 @@ impl AgentService {
             if !filename.ends_with(".json") {
                 continue;
             }
-            ensure!(
-                record_pattern.is_match(&filename),
-                "Invalid native run record name."
-            );
-            let raw =
-                security::read_bytes(&runs_root, &filename, native::MAX_OUTPUT * 7, true)?.unwrap();
-            let mut v: Value = serde_json::from_slice(&raw)?;
+            // A record this release cannot read is set aside, never a reason
+            // to refuse activation (and leave the controller drained).
+            let loaded = (|| -> Result<Value> {
+                ensure!(
+                    record_pattern.is_match(&filename),
+                    "Invalid native run record name."
+                );
+                let raw =
+                    security::read_bytes(&runs_root, &filename, native::MAX_OUTPUT * 7, true)?
+                        .ok_or_else(|| anyhow::anyhow!("Run record vanished."))?;
+                let v: Value = serde_json::from_slice(&raw)?;
+                validate_record(&v, filename.trim_end_matches(".json"))?;
+                Ok(v)
+            })();
+            let mut v = match loaded {
+                Ok(v) => v,
+                Err(error) => {
+                    quarantine(&runs_root, &quarantine_root, &filename, &error);
+                    continue;
+                }
+            };
             let id = filename.trim_end_matches(".json");
-            validate_record(&v, id)?;
             let still_queued = v["status"] == "queued"
                 && entries.get(id).is_some_and(|e| {
                     e.state == EntryState::Queued && matches!(e.target, Target::Workspace { .. })
                 });
-            if !still_queued && ["running", "queued"].contains(&v["status"].as_str().unwrap_or(""))
+            if v["status"] == "running" && detached_root.join(format!("{id}.json")).is_file() {
+                // Its guest still runs it: the new owner adopts it.
+                adoptable.push(id.to_owned());
+            } else if !still_queued
+                && ["running", "queued"].contains(&v["status"].as_str().unwrap_or(""))
             {
                 v["status"] = json!("failed");
                 v["execution_uncertain"] = json!(true);
@@ -419,6 +450,8 @@ impl AgentService {
                     records.get(id).is_some_and(|r| r["status"] == "queued")
                 }
                 (EntryState::Queued, Target::Pool { .. }) => !records.contains_key(id),
+                // An adopted run keeps its entry (placement, callback) until it finishes.
+                (EntryState::Admitted, _) if adoptable.contains(id) => true,
                 (EntryState::Admitted, _) => {
                     if records.contains_key(id) && e.callback.is_some() {
                         owed.push(id.clone());
@@ -502,6 +535,9 @@ impl AgentService {
                 hooks: Hooks::default(),
                 owed_callbacks: Mutex::new(owed),
                 launch_events,
+                attached: Mutex::new(BTreeMap::new()),
+                handed_off: AtomicBool::new(false),
+                adoptable: Mutex::new(adoptable),
             }),
         })
     }
@@ -2953,39 +2989,59 @@ impl AgentService {
             .or_default()
             .insert(id.to_owned());
         sched.waiting.remove(id);
+        self.inner
+            .attached
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), pending);
         let this = self.clone();
         thread::spawn(move || {
-            let _pending = pending;
             let id = run.id.clone();
             let pool = run.pool.clone();
             this.execute(run, resolved, template);
-            this.inner.leases.lock().unwrap().remove(&lease);
-            let session = this
-                .inner
-                .records
-                .lock()
-                .unwrap()
-                .get(&id)
-                .and_then(|r| r["native_session_id"].as_str().map(str::to_owned));
-            if let (Some(pool), Some(session)) = (pool, session) {
-                let _ = this
-                    .inner
-                    .pools
-                    .remember_session(&session, &pool, &placement);
+            this.inner.attached.lock().unwrap().remove(&id);
+            if this.inner.handed_off.load(Ordering::SeqCst) {
+                // The next owner adopted the run; this one writes nothing more.
+                return;
             }
-            {
-                let mut sched = this.inner.sched.lock().unwrap();
-                sched.running.remove(&id);
-                sched.entries.remove(&id);
-                for reserved in sched.admitted_since.values_mut() {
-                    reserved.remove(&id);
-                }
-                sched.dirty = true;
-            }
-            this.remove_entry_file(&id);
-            this.inner.wake.notify_all();
+            this.after_run(&id, pool, &placement, &lease);
         });
         Ok(())
+    }
+    /// Release an ended run's lease and queue slot and remember its session.
+    fn after_run(
+        &self,
+        id: &str,
+        pool: Option<String>,
+        placement: &Placement,
+        lease: &(String, String, String),
+    ) {
+        let this = self;
+        this.inner.leases.lock().unwrap().remove(lease);
+        let session = this
+            .inner
+            .records
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|r| r["native_session_id"].as_str().map(str::to_owned));
+        if let (Some(pool), Some(session)) = (pool, session) {
+            let _ = this
+                .inner
+                .pools
+                .remember_session(&session, &pool, placement);
+        }
+        {
+            let mut sched = this.inner.sched.lock().unwrap();
+            sched.running.remove(id);
+            sched.entries.remove(id);
+            for reserved in sched.admitted_since.values_mut() {
+                reserved.remove(id);
+            }
+            sched.dirty = true;
+        }
+        this.remove_entry_file(id);
+        this.inner.wake.notify_all();
     }
     /// Prepare the workspace and run the native CLI, or fail the run cleanly
     /// (and log a launch event) when it cannot start.
@@ -3157,13 +3213,15 @@ impl AgentService {
                     .filter(|_| run.repository_access.is_some() && guest_current)
                     .and_then(|r| repository::parse_ref(r).ok())
                     .map(|(_, name)| name);
-                if let Err(failure) = self.run_worker_with(
+                // A guest helper from this release runs it detached.
+                if let Err(failure) = self.run_worker_detachable(
                     host,
                     &run.name,
                     request,
                     &run.id,
                     resolved.clone(),
                     run.repository_access.clone().map(|a| (a, checkout)),
+                    guest_current,
                 ) {
                     self.launch_failed(
                         run,
@@ -3702,6 +3760,192 @@ impl AgentService {
         }
         Ok(())
     }
+    /// Start a run detached in its guest, release its drain barrier, and poll
+    /// it to the end. Returns [`HandedOff`] when this owner hands over first.
+    fn run_detached(
+        &self,
+        host: &Host,
+        name: &str,
+        id: &str,
+        mode: &str,
+        input: &[u8],
+        request: &native::RunRequest,
+    ) -> Result<Value> {
+        let command = guest_command(
+            host,
+            name,
+            &[
+                "detach".into(),
+                mode.into(),
+                host.guest.workspace.clone(),
+                id.into(),
+            ],
+        )?;
+        let started: Value = serde_json::from_str(&process::checked(
+            &command,
+            None,
+            None,
+            input,
+            60,
+            security::LIMIT,
+        )?)?;
+        ensure!(started["detached"] == true, "Guest did not detach the run.");
+        let deadline =
+            chrono::Utc::now().timestamp() as u64 + request.timeout_seconds + DETACH_GRACE;
+        security::write_json(
+            &self.inner.root.join(DETACHED_DIR),
+            &format!("{id}.json"),
+            &json!({"schema":1,"id":id,"detached_at":crate::now(),"deadline":deadline}),
+        )?;
+        // From here the guest owns the run: a drain no longer waits for it.
+        self.inner.attached.lock().unwrap().remove(id);
+        let collect = |id: &str| -> Result<Value> {
+            let command = guest_command(host, name, &["collect".into(), id.into()])?;
+            Ok(serde_json::from_str(&process::checked(
+                &command,
+                None,
+                None,
+                b"",
+                30,
+                native::MAX_OUTPUT * 7 + security::LIMIT,
+            )?)?)
+        };
+        let cancel = |id: &str| {
+            if let Ok(command) = guest_command(
+                host,
+                name,
+                &["cancel".into(), request.provider.clone(), id.into()],
+            ) {
+                let _ = process::checked(&command, None, None, b"", 30, security::LIMIT);
+            }
+        };
+        let result = poll_detached(
+            id,
+            deadline,
+            &self.inner.handed_off,
+            collect,
+            cancel,
+            POLL_INTERVAL,
+        )?;
+        if let Ok(command) = guest_command(host, name, &["forget".into(), id.into()]) {
+            let _ = process::checked(&command, None, None, b"", 30, security::LIMIT);
+        }
+        Ok(result)
+    }
+    /// This owner hands its state to the next controller: its run threads
+    /// stop writing, and detached runs are left for the next owner to adopt.
+    pub fn hand_off(&self) {
+        let _records = self.inner.records.lock().unwrap();
+        self.inner.handed_off.store(true, Ordering::SeqCst);
+        self.inner.wake.notify_all();
+    }
+    /// Adopt the detached runs found running at startup: hold their
+    /// workspace, poll each to its end and finish it once. Never re-runs.
+    pub fn adopt_detached(&self) {
+        let ids = std::mem::take(&mut *self.inner.adoptable.lock().unwrap());
+        for id in ids {
+            let Some(record) = self.inner.records.lock().unwrap().get(&id).cloned() else {
+                continue;
+            };
+            let host_id = record["host_id"].as_str().unwrap_or("").to_owned();
+            let name = record["name"].as_str().unwrap_or("").to_owned();
+            let provider = record["provider"].as_str().unwrap_or("").to_owned();
+            let placement = Placement {
+                host_id: host_id.clone(),
+                name: name.clone(),
+            };
+            let lease = (host_id.clone(), name.clone(), provider.clone());
+            let request = native::RunRequest::parse(json!({
+                "provider": provider, "prompt": "adopted run", "workdir": record["workdir"],
+                "resume_id": record["resume_id"],
+            }));
+            let pool = {
+                let mut sched = self.inner.sched.lock().unwrap();
+                sched.running.insert(id.clone(), placement.clone());
+                self.inner.leases.lock().unwrap().insert(lease.clone());
+                self.load_entry_pool(&id)
+            };
+            let deadline =
+                security::read_json(&self.inner.root.join(DETACHED_DIR), &format!("{id}.json"))
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v["deadline"].as_u64())
+                    .unwrap_or(0);
+            let this = self.clone();
+            thread::spawn(move || {
+                let outcome = (|| -> Result<Value> {
+                    let host = this.inner.fleet.host(&host_id)?;
+                    let collect = |id: &str| -> Result<Value> {
+                        let command = guest_command(&host, &name, &["collect".into(), id.into()])?;
+                        Ok(serde_json::from_str(&process::checked(
+                            &command,
+                            None,
+                            None,
+                            b"",
+                            30,
+                            native::MAX_OUTPUT * 7 + security::LIMIT,
+                        )?)?)
+                    };
+                    let cancel = |id: &str| {
+                        if let Ok(command) = guest_command(
+                            &host,
+                            &name,
+                            &["cancel".into(), provider.clone(), id.into()],
+                        ) {
+                            let _ =
+                                process::checked(&command, None, None, b"", 30, security::LIMIT);
+                        }
+                    };
+                    let result = poll_detached(
+                        &id,
+                        deadline,
+                        &this.inner.handed_off,
+                        collect,
+                        cancel,
+                        POLL_INTERVAL,
+                    )?;
+                    if let Ok(command) = guest_command(&host, &name, &["forget".into(), id.clone()])
+                    {
+                        let _ = process::checked(&command, None, None, b"", 30, security::LIMIT);
+                    }
+                    Ok(result)
+                })();
+                match outcome {
+                    Err(error) if error.is::<HandedOff>() => return,
+                    Ok(result) => match &request {
+                        Ok(request) => this.record_result(&id, request, result),
+                        Err(_) => this.finish(&id, |v| {
+                            v["status"] = json!("failed");
+                            v["error"] = json!("Adopted run record is invalid.");
+                        }),
+                    },
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        this.finish(&id, |v| {
+                            v["status"] = json!("failed");
+                            v["error"] = json!(adopted_error(&message));
+                        });
+                    }
+                }
+                if this.inner.handed_off.load(Ordering::SeqCst) {
+                    return;
+                }
+                this.after_run(&id, pool, &placement, &lease);
+            });
+        }
+    }
+    /// The pool of an admitted entry on disk, if any.
+    fn load_entry_pool(&self, id: &str) -> Option<String> {
+        let raw = security::read_bytes(
+            &self.inner.queue_root,
+            &format!("{id}.json"),
+            security::LIMIT * 4,
+            true,
+        )
+        .ok()??;
+        let entry: Entry = serde_json::from_slice(&raw).ok()?;
+        entry.pool().map(str::to_owned)
+    }
     fn save_record(&self, value: &Value) -> Result<()> {
         security::write_bytes(
             &self.inner.runs_root,
@@ -3716,7 +3960,20 @@ impl AgentService {
     }
     /// Run the guest helper. A guest launch failure is returned (stage
     /// `start`) after the run is marked failed and uncertain.
+    #[cfg(test)]
     fn run_worker_with(
+        &self,
+        host: Host,
+        name: &str,
+        request: native::RunRequest,
+        id: &str,
+        resolved: Option<ResolvedProfile>,
+        repository: Option<(repository::Access, Option<String>)>,
+    ) -> std::result::Result<(), LaunchFailure> {
+        self.run_worker_detachable(host, name, request, id, resolved, repository, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_worker_detachable(
         &self,
         host: Host,
         name: &str,
@@ -3725,6 +3982,7 @@ impl AgentService {
         resolved: Option<ResolvedProfile>,
         // The repository access and the checkout name, for repository runs.
         repository: Option<(repository::Access, Option<String>)>,
+        detach: bool,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
             self.inner
@@ -3760,6 +4018,9 @@ impl AgentService {
                     })?,
                 ),
             };
+            if detach {
+                return self.run_detached(&host, name, id, mode, &input, &request);
+            }
             let command = guest_command(
                 &host,
                 name,
@@ -3808,6 +4069,7 @@ impl AgentService {
         })();
         let result = match outcome {
             Ok(result) => result,
+            Err(error) if error.is::<HandedOff>() => return Ok(()),
             Err(error) => {
                 return Err(match error.downcast::<LaunchFailure>() {
                     Ok(failure) => failure,
@@ -3817,6 +4079,11 @@ impl AgentService {
                 });
             }
         };
+        self.record_result(id, request, result);
+        Ok(())
+    }
+    /// A run's result as its terminal state.
+    fn record_result(&self, id: &str, request: &native::RunRequest, result: Value) {
         self.finish(id, |v| {
             // A truncated transcript (head plus rolling tail) is not a failure: the run went on to its own exit.
             v["status"] = json!(
@@ -3839,12 +4106,15 @@ impl AgentService {
             }
             v["result"] = result;
         });
-        Ok(())
     }
     /// Apply the terminal state, persist, retain the newest finished runs and
     /// hand the run's callback (if any) to the deliverer, once.
     fn finish(&self, id: &str, terminal: impl FnOnce(&mut Value)) {
         let mut records = self.inner.records.lock().unwrap();
+        if self.inner.handed_off.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = security::remove(&self.inner.root.join(DETACHED_DIR), &format!("{id}.json"));
         if let Some(v) = records.get_mut(id) {
             v["finished_at"] = json!(crate::now());
             terminal(v);
@@ -4009,6 +4279,104 @@ fn host_binding(host: &Host) -> Result<String> {
 /// The durable record and sidecar for a new run. The record keeps its legacy
 /// shape so retained releases can still read it; the principal and env key
 /// names live in the sidecar. Env values never enter either.
+/// In-flight detached runs, relative to the controller root.
+pub const DETACHED_DIR: &str = "agent-runs-detached";
+/// The run record fields the previous release reads. Records this release
+/// writes must stay within them so a rollback activates over its state.
+pub const PREVIOUS_RELEASE_RECORD_FIELDS: &[&str] = &[
+    "id",
+    "host_id",
+    "name",
+    "provider",
+    "scope",
+    "state_scope",
+    "status",
+    "workdir",
+    "resume_id",
+    "created_at",
+    "finished_at",
+    "result",
+    "native_session_id",
+    "error",
+    "execution_uncertain",
+    "start_path",
+    "start_latency_ms",
+];
+/// Move an unreadable run record aside (kept for inspection, never loaded).
+fn quarantine(runs_root: &Path, quarantine_root: &Path, filename: &str, error: &anyhow::Error) {
+    eprintln!("Run record {filename} set aside: {error:#}");
+    if security::private_dir(quarantine_root).is_ok() {
+        let _ = std::fs::rename(runs_root.join(filename), quarantine_root.join(filename));
+    }
+}
+/// How long past its own timeout a detached run may take before the
+/// controller cancels it (the guest enforces the timeout itself).
+const DETACH_GRACE: u64 = 60;
+const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// A run left to the next owner at a handoff: not a failure, nothing written.
+#[derive(Debug)]
+pub struct HandedOff;
+impl std::fmt::Display for HandedOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("run handed to the next controller")
+    }
+}
+impl std::error::Error for HandedOff {}
+/// Poll a detached run until it finishes. `running` past the deadline is
+/// cancelled once, then given one more grace period. A guest that cannot be
+/// reached is retried until the deadline; `lost`/`failed`/`unknown` end it.
+pub fn poll_detached(
+    id: &str,
+    deadline: u64,
+    handed_off: &AtomicBool,
+    collect: impl Fn(&str) -> Result<Value>,
+    cancel: impl Fn(&str),
+    interval: Duration,
+) -> Result<Value> {
+    let mut cancelled_at: Option<u64> = None;
+    loop {
+        if handed_off.load(Ordering::SeqCst) {
+            return Err(HandedOff.into());
+        }
+        let now = chrono::Utc::now().timestamp() as u64;
+        match collect(id) {
+            Ok(state) => match state["state"].as_str() {
+                Some("finished") => {
+                    let result = state["result"].clone();
+                    native::validate_result(&result)?;
+                    return Ok(result);
+                }
+                Some("running") => {}
+                Some("failed") => {
+                    anyhow::bail!("The detached run failed before producing a result.")
+                }
+                Some("lost") => anyhow::bail!("The detached run ended without a result."),
+                _ => anyhow::bail!("The guest has no record of the detached run."),
+            },
+            Err(error) if now > deadline + DETACH_GRACE => {
+                return Err(error.context("The guest stayed unreachable past the run's deadline."));
+            }
+            Err(_) => {}
+        }
+        if now > deadline {
+            match cancelled_at {
+                None => {
+                    cancel(id);
+                    cancelled_at = Some(now);
+                }
+                Some(at) if now > at + DETACH_GRACE => {
+                    anyhow::bail!("The detached run did not stop after cancellation.")
+                }
+                Some(_) => {}
+            }
+        }
+        thread::sleep(interval);
+    }
+}
+fn adopted_error(message: &str) -> String {
+    let m: String = message.chars().take(300).collect();
+    format!("Adopted run ended without a usable result: {m}")
+}
 pub fn new_run_entries(
     id: &str,
     host_id: &str,
@@ -4149,12 +4517,33 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
         "start_path",
         "start_latency_ms",
     ];
+    // Fields a newer or older release added are tolerated when they are small
+    // scalars: they carry no authority, and refusing them would refuse
+    // activation after a rollback or upgrade. The fields that decide identity,
+    // scope and status stay strict below.
+    let extra_ok = |key: &str, value: &Value| {
+        key.len() <= 64
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && match value {
+                Value::Null | Value::Bool(_) | Value::Number(_) => true,
+                Value::String(s) => s.len() <= 512,
+                _ => false,
+            }
+    };
     ensure!(
-        v.as_object()
-            .is_some_and(|map| required.iter().all(|key| map.contains_key(*key))
-                && map.keys().all(
-                    |key| required.contains(&key.as_str()) || optional.contains(&key.as_str())
-                )),
+        v.as_object().is_some_and(|map| {
+            let extras = map
+                .iter()
+                .filter(|(key, _)| {
+                    !required.contains(&key.as_str()) && !optional.contains(&key.as_str())
+                })
+                .collect::<Vec<_>>();
+            required.iter().all(|key| map.contains_key(*key))
+                && extras.len() <= 16
+                && extras.iter().all(|(key, value)| extra_ok(key, value))
+        }),
         "Invalid native run record fields."
     );
     ensure!(
@@ -4576,5 +4965,191 @@ mod run_control_tests {
         assert!(
             !raw.contains(&key) && !raw.contains("token=abc") && !raw.contains("secret-value-2")
         );
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, PathBuf, Fleet) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let host = Host {
+            id: "test-node".into(),
+            target: "offline.invalid".into(),
+            ..Default::default()
+        };
+        let fleet = Fleet::from_hosts(vec![host], &root).unwrap();
+        (temp, root, fleet)
+    }
+    fn record(id: &str, status: &str) -> Value {
+        json!({"id":id,"host_id":"test-node","name":"ebox-private","provider":"codex","scope":"controller-owner","state_scope":"private-workspace","status":status,"workdir":".","resume_id":null,"created_at":crate::now()})
+    }
+    fn write(root: &Path, dir: &str, id: &str, value: &Value) {
+        let dir = root.join(dir);
+        security::private_dir(&dir).unwrap();
+        security::write_json(&dir, &format!("{id}.json"), value).unwrap();
+    }
+
+    #[test]
+    fn activation_tolerates_fields_from_another_release_and_sets_bad_records_aside() {
+        let (_t, root, fleet) = state();
+        let newer = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let bad = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let nested = "cccccccccccccccccccccccccccccccc";
+        // A newer release's small scalar field: tolerated.
+        let mut v = record(newer, "succeeded");
+        v["start_path"] = json!("frozen");
+        v["some_future_field"] = json!(42);
+        write(&root, "agent-runs", newer, &v);
+        // Wrong scope: never loaded, but never refuses activation either.
+        let mut b = record(bad, "failed");
+        b["scope"] = json!("someone-else");
+        write(&root, "agent-runs", bad, &b);
+        // An unknown structured field is not a harmless scalar: set aside.
+        let mut n = record(nested, "failed");
+        n["future_blob"] = json!({"x":1});
+        write(&root, "agent-runs", nested, &n);
+        let service = AgentService::new(&root, fleet).unwrap();
+        let records = service.inner.records.lock().unwrap();
+        assert!(records.contains_key(newer));
+        assert!(!records.contains_key(bad) && !records.contains_key(nested));
+        assert!(
+            root.join("agent-runs-quarantine")
+                .join(format!("{bad}.json"))
+                .is_file()
+        );
+        assert!(!root.join("agent-runs").join(format!("{bad}.json")).exists());
+    }
+
+    #[test]
+    fn records_this_release_writes_stay_readable_by_the_previous_release() {
+        // Round trip: the in-flight index lives outside the records, so a
+        // rollback reads every record this release writes.
+        let (_t, root, fleet) = state();
+        let id = "dddddddddddddddddddddddddddddddd";
+        write(&root, "agent-runs", id, &record(id, "running"));
+        write(
+            &root,
+            DETACHED_DIR,
+            id,
+            &json!({"schema":1,"id":id,"deadline":u64::MAX / 2}),
+        );
+        let service = AgentService::new(&root, fleet.clone()).unwrap();
+        // A detached run is adopted, not marked uncertain.
+        assert_eq!(
+            service.inner.adoptable.lock().unwrap().as_slice(),
+            [id.to_owned()]
+        );
+        let v = service.inner.records.lock().unwrap()[id].clone();
+        assert_eq!(v["status"], "running");
+        assert!(v["execution_uncertain"].is_null());
+        for key in v.as_object().unwrap().keys() {
+            assert!(
+                PREVIOUS_RELEASE_RECORD_FIELDS.contains(&key.as_str()),
+                "{key}"
+            );
+        }
+        // Without its index (a release that never detached) it stays uncertain.
+        let other = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        write(&root, "agent-runs", other, &record(other, "running"));
+        drop(service);
+        let restarted = AgentService::new(&root, fleet).unwrap();
+        let o = restarted.inner.records.lock().unwrap()[other].clone();
+        assert_eq!(o["status"], "failed");
+        assert_eq!(o["execution_uncertain"], true);
+    }
+
+    #[test]
+    fn a_handed_off_owner_writes_nothing_more() {
+        let (_t, root, fleet) = state();
+        let id = "ffffffffffffffffffffffffffffffff";
+        write(&root, "agent-runs", id, &record(id, "running"));
+        write(
+            &root,
+            DETACHED_DIR,
+            id,
+            &json!({"schema":1,"id":id,"deadline":u64::MAX / 2}),
+        );
+        let service = AgentService::new(&root, fleet).unwrap();
+        service.hand_off();
+        service.finish(id, |v| v["status"] = json!("succeeded"));
+        let on_disk = security::read_json(&root.join("agent-runs"), &format!("{id}.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk["status"], "running");
+        assert!(root.join(DETACHED_DIR).join(format!("{id}.json")).is_file());
+    }
+
+    #[test]
+    fn polling_collects_once_cancels_late_runs_and_yields_to_the_next_owner() {
+        let ok = json!({"exit_code":0,"timed_out":false,"output":"done","output_truncated":false});
+        let calls = AtomicUsize::new(0);
+        let off = AtomicBool::new(false);
+        let far = chrono::Utc::now().timestamp() as u64 + 3600;
+        let tick = Duration::from_millis(1);
+        let result = poll_detached(
+            "x",
+            far,
+            &off,
+            |_| {
+                Ok(if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    json!({"state":"running"})
+                } else {
+                    json!({"state":"finished","result":ok.clone()})
+                })
+            },
+            |_| panic!("not late"),
+            tick,
+        );
+        assert_eq!(result.unwrap()["output"], "done");
+        // Past its deadline: cancelled once.
+        let cancels = AtomicUsize::new(0);
+        let n = AtomicUsize::new(0);
+        let late = poll_detached(
+            "x",
+            0,
+            &off,
+            |_| {
+                Ok(if n.fetch_add(1, Ordering::SeqCst) < 3 {
+                    json!({"state":"running"})
+                } else {
+                    json!({"state":"finished","result":ok.clone()})
+                })
+            },
+            |_| {
+                cancels.fetch_add(1, Ordering::SeqCst);
+            },
+            tick,
+        );
+        assert!(late.is_ok());
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        // Lost is an end, never a retry; a handoff stops polling quietly.
+        let lost = poll_detached(
+            "x",
+            far,
+            &off,
+            |_| Ok(json!({"state":"lost"})),
+            |_| {},
+            tick,
+        );
+        assert!(lost.is_err());
+        off.store(true, Ordering::SeqCst);
+        let yielded = poll_detached(
+            "x",
+            far,
+            &off,
+            |_| Ok(json!({"state":"running"})),
+            |_| {},
+            tick,
+        )
+        .unwrap_err();
+        assert!(yielded.is::<HandedOff>());
     }
 }

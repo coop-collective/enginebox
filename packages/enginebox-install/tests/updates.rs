@@ -314,6 +314,9 @@ fn rollback_requires_state_compatibility() {
     );
     let state = install.activate(&Version::new(0, 3, 0)).unwrap();
     assert_eq!(state.previous, Some(Version::new(0, 4, 0)));
+    // A reload (same version) keeps the rollback target.
+    let state = install.activate(&Version::new(0, 3, 0)).unwrap();
+    assert_eq!(state.previous, Some(Version::new(0, 4, 0)));
 }
 #[cfg(unix)]
 #[test]
@@ -336,6 +339,8 @@ struct Mock {
     mutations: Arc<AtomicUsize>,
     fail_activation: Arc<AtomicBool>,
     drain_calls: Arc<AtomicUsize>,
+    /// Undrain requests to refuse before one succeeds.
+    fail_undrain: Arc<AtomicUsize>,
 }
 impl Mock {
     fn new(version: &str, mode: &str) -> Self {
@@ -347,6 +352,7 @@ impl Mock {
             mutations: Arc::new(AtomicUsize::new(0)),
             fail_activation: Arc::new(AtomicBool::new(false)),
             drain_calls: Arc::new(AtomicUsize::new(0)),
+            fail_undrain: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -370,6 +376,18 @@ async fn mock_activate(State(s): State<Mock>) -> (StatusCode, Json<serde_json::V
     }
     *s.mode.lock().await = "active".into();
     (StatusCode::OK, Json(serde_json::json!({"mode":"active"})))
+}
+async fn mock_undrain(State(s): State<Mock>) -> (StatusCode, Json<serde_json::Value>) {
+    if s.fail_undrain
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"injected undrain failure"})),
+        );
+    }
+    mock_activate(State(s)).await
 }
 async fn mock_get(State(s): State<Mock>) -> String {
     s.version
@@ -399,7 +417,7 @@ async fn mock_server(state: Mock) -> (String, tokio::task::JoinHandle<()>) {
             .route("/readyz", get(mock_ready))
             .route("/internal/drain", post(mock_drain))
             .route("/internal/activate", post(mock_activate))
-            .route("/internal/undrain", post(mock_activate))
+            .route("/internal/undrain", post(mock_undrain))
             .route("/value", get(mock_get).post(mock_mutation))
             .route("/v1/agents", get(mock_observation))
             .route("/v1/node/heartbeat", post(mock_node_heartbeat))
@@ -486,6 +504,35 @@ async fn failed_candidate_health_leaves_old_serving() {
             .unwrap(),
         "0.3.0"
     );
+}
+#[tokio::test]
+async fn a_failed_activation_restores_the_old_owner_even_when_the_first_restore_fails() {
+    let f = fixture().await;
+    f.new.fail_activation.store(true, Ordering::SeqCst);
+    // The first two restore attempts are refused (a lost request, a busy lock).
+    f.old.fail_undrain.store(2, Ordering::SeqCst);
+    assert!(f.supervisor.handoff(candidate(&f)).await.is_err());
+    assert_eq!(*f.old.mode.lock().await, "active");
+    assert_eq!(f.supervisor.current_version().await, Version::new(0, 3, 0));
+}
+#[tokio::test]
+async fn a_second_handoff_is_refused_while_one_runs() {
+    let f = fixture().await;
+    f.old.jobs.store(1, Ordering::SeqCst);
+    let sup = f.supervisor.clone();
+    let first = candidate(&f);
+    let running = tokio::spawn(async move { sup.handoff(first).await });
+    while f.old.drain_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let refused = f.supervisor.handoff(candidate(&f)).await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("another upgrade is already running")
+    );
+    f.old.jobs.store(0, Ordering::SeqCst);
+    running.await.unwrap().unwrap();
 }
 #[tokio::test]
 async fn drain_timeout_reactivates_old_without_killing_jobs() {

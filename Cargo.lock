@@ -563,6 +563,7 @@ dependencies = [
  "crypto_box",
  "enginebox-core",
  "enginebox-storage-layerfs",
+ "libc",
  "reqwest",
  "ring",
  "serde",

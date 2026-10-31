@@ -59,6 +59,14 @@ enum Action {
         #[arg(long)]
         token_file: PathBuf,
     },
+    /// Hand off to a fresh process of the active version: re-reads its configuration (fleet.toml,
+    /// environment) with the same health/drain checks, so a config change never restarts the supervisor.
+    Reload {
+        #[arg(long, default_value = "http://127.0.0.1:8765")]
+        url: String,
+        #[arg(long)]
+        token_file: PathBuf,
+    },
     /// Print a user-service definition; --apply installs and starts it without overwriting another service.
     Service {
         #[arg(long)]
@@ -151,6 +159,9 @@ async fn main() -> Result<()> {
         }
         Action::Rollback { url, token_file } => {
             management(&url, "rollback", &token_file, serde_json::json!({})).await?
+        }
+        Action::Reload { url, token_file } => {
+            management(&url, "reload", &token_file, serde_json::json!({})).await?
         }
         Action::Service { config, apply } => {
             let plan = bootstrap::service_plan(&install, &config)?;

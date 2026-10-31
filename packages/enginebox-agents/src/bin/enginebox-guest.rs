@@ -10,12 +10,50 @@ fn input(limit: usize) -> Result<Value> {
     ensure!(bytes.len() <= limit, "Request exceeds bound.");
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn input_limit(mode: &str) -> usize {
+    match mode {
+        "run-profile" => agents::profile::MAX_ENVELOPE_BYTES,
+        "run-repository" => agents::repository::MAX_ENVELOPE_BYTES,
+        _ => 16384,
+    }
+}
+/// One synchronous native run (the `run*` modes, also a detached worker's body).
+fn execute(
+    mode: &str,
+    home: &Path,
+    workspace: &str,
+    id: Option<&str>,
+    input: Value,
+) -> Result<Value> {
+    let workspace = Path::new(workspace);
+    Ok(match mode {
+        "run" => serde_json::to_value(native::execute_scoped(
+            &native::RunRequest::parse(input)?,
+            home,
+            workspace,
+            id,
+        )?)?,
+        "run-profile" => {
+            let envelope: agents::profile::Envelope = serde_json::from_value(input)?;
+            let id = id.ok_or_else(|| anyhow::anyhow!("Missing run ID."))?;
+            serde_json::to_value(native::execute_profiled(&envelope, home, workspace, id)?)?
+        }
+        "run-repository" => {
+            let envelope: agents::repository::Envelope = serde_json::from_value(input)?;
+            let id = id.ok_or_else(|| anyhow::anyhow!("Missing run ID."))?;
+            serde_json::to_value(native::execute_with_repository(
+                &envelope, home, workspace, id,
+            )?)?
+        }
+        _ => anyhow::bail!("Unknown run mode."),
+    })
+}
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mode = args.first().map(String::as_str).unwrap_or("--help");
     if matches!(mode, "--help" | "-h") {
         println!(
-            "enginebox-guest {}\nNative workspace helper\n\nCommands:\n  run WORKSPACE [ID]  Execute bounded native CLI request from JSON stdin\n  run-profile WORKSPACE ID  Execute a native CLI request under a profile envelope from JSON stdin\n  run-repository WORKSPACE ID  Execute a native CLI request with a hosted repository envelope from JSON stdin\n  cancel PROVIDER ID  Request cancellation of one controller run\n  lease PROVIDER      Report the native session writer lease\n  transfer            Deliver access-only native credentials from JSON stdin\n  status PROVIDER|all  Read native connection status\n  browser [OPTIONS]   Run the official Playwright MCP with a private profile\n  cursor-sandbox --home HOME --user USER --workspace PATH [--apply]",
+            "enginebox-guest {}\nNative workspace helper\n\nCommands:\n  run WORKSPACE [ID]  Execute bounded native CLI request from JSON stdin\n  run-profile WORKSPACE ID  Execute a native CLI request under a profile envelope from JSON stdin\n  run-repository WORKSPACE ID  Execute a native CLI request with a hosted repository envelope from JSON stdin\n  detach MODE WORKSPACE ID  Start a run* request from stdin in its own session and return\n  collect ID          Read a detached run: finished (with result), failed, running, lost or unknown\n  forget ID           Remove a collected run's spool\n  cancel PROVIDER ID  Request cancellation of one controller run\n  lease PROVIDER      Report the native session writer lease\n  transfer            Deliver access-only native credentials from JSON stdin\n  status PROVIDER|all  Read native connection status\n  browser [OPTIONS]   Run the official Playwright MCP with a private profile\n  cursor-sandbox --home HOME --user USER --workspace PATH [--apply]",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -39,38 +77,51 @@ fn run() -> Result<()> {
     let home = std::env::var("HOME")?;
     let home = Path::new(&home);
     let result = match mode {
-        "run" => {
+        "run" | "run-profile" | "run-repository" => {
             let workspace = args
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("Missing workspace."))?;
-            serde_json::to_value(native::execute_scoped(
-                &native::RunRequest::parse(input(16384)?)?,
+            ensure!(
+                mode == "run" || args.len() == 3,
+                "Expected workspace and run ID."
+            );
+            let input = input(input_limit(mode))?;
+            execute(
+                mode,
                 home,
-                Path::new(workspace),
+                workspace,
                 args.get(2).map(String::as_str),
-            )?)?
+                input,
+            )?
         }
-        "run-profile" => {
-            ensure!(args.len() == 3, "Expected workspace and run ID.");
-            let envelope: agents::profile::Envelope =
-                serde_json::from_value(input(agents::profile::MAX_ENVELOPE_BYTES)?)?;
-            serde_json::to_value(native::execute_profiled(
-                &envelope,
-                home,
-                Path::new(&args[1]),
-                &args[2],
-            )?)?
+        // Start a run in its own session and return at once; `collect` reads its result.
+        "detach" => {
+            ensure!(args.len() == 4, "Expected mode, workspace and run ID.");
+            let limit = input_limit(&args[1]);
+            let mut raw = Vec::new();
+            std::io::stdin()
+                .take(limit as u64 + 1)
+                .read_to_end(&mut raw)?;
+            ensure!(raw.len() <= limit, "Request exceeds bound.");
+            let exe = std::env::current_exe()?.display().to_string();
+            agents::detached::start(home, &args[3], &args[1], &args[2], &raw, &[exe])?
         }
-        "run-repository" => {
-            ensure!(args.len() == 3, "Expected workspace and run ID.");
-            let envelope: agents::repository::Envelope =
-                serde_json::from_value(input(agents::repository::MAX_ENVELOPE_BYTES)?)?;
-            serde_json::to_value(native::execute_with_repository(
-                &envelope,
-                home,
-                Path::new(&args[1]),
-                &args[2],
-            )?)?
+        "detached-worker" => {
+            ensure!(args.len() == 2, "Expected run ID.");
+            let id = args[1].clone();
+            agents::detached::run_worker(home, &id, |mode, workspace, input| {
+                execute(mode, home, workspace, Some(&id), input)
+            })?;
+            json!({"ok":true})
+        }
+        "collect" => {
+            ensure!(args.len() == 2, "Expected run ID.");
+            agents::detached::collect(home, &args[1])?
+        }
+        "forget" => {
+            ensure!(args.len() == 2, "Expected run ID.");
+            agents::detached::forget(home, &args[1])?;
+            json!({"ok":true})
         }
         "cancel" => {
             ensure!(args.len() == 3, "Expected provider and run ID.");
