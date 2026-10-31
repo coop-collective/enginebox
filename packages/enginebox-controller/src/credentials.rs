@@ -17,8 +17,17 @@
 //! [`Credentials::candidates`] is the selection interface the credential pool
 //! work will call, returning eligible credentials in priority order.
 //!
+//! A member's **Unity account** (provider `unity`, kind `personal` only) is a
+//! username and password, at most one per member per org. It is checked with
+//! Unity when saved ([`crate::unity`]) and only ever used for its owner's own
+//! sessions ([`Credentials::unity_for`], [`Credentials::unity_access_token`]).
+//!
 //! Records live under `agent-credentials/<id>.json`, homes under
 //! `agent-credentials/homes/<id>/`, keys under `agent-credentials/keys/<id>.json`.
+//! Unity accounts live under `agent-credentials/unity/<id>.json` (a directory
+//! older controllers do not read, so a rollback keeps working), their password
+//! in `agent-credentials/keys/<id>.json`.
+use crate::unity;
 use anyhow::{Context, Result, ensure};
 use enginebox_agents::{auth, native, pools, security};
 use enginebox_core::state;
@@ -96,6 +105,82 @@ impl Credential {
     }
 }
 
+/// Whether a saved Unity account worked when it was last saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnityStatus {
+    /// Unity accepted the username and password.
+    Connected,
+    /// Unity could not be asked; `last_error` says why.
+    Unverified,
+}
+
+/// A member's Unity account. The password is never part of the record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnityAccount {
+    pub id: String,
+    pub org_id: String,
+    pub owner_user_id: String,
+    /// The Unity ID email; also the account's label.
+    pub username: String,
+    pub status: UnityStatus,
+    /// Why the last save could not be verified: `unreachable`,
+    /// `service_error` or `unexpected_response`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_at: Option<String>,
+}
+impl UnityAccount {
+    pub fn public(&self) -> Value {
+        json!({
+            "id": self.id,
+            "org_id": self.org_id,
+            "provider": UNITY,
+            "kind": Kind::Personal,
+            "label": self.username,
+            "username": self.username,
+            "owner_user_id": self.owner_user_id,
+            "share_with_org_pools": false,
+            "status": self.status,
+            "has_key": true,
+            "last_error": self.last_error,
+            "validated_at": self.validated_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "connected_at": self.validated_at,
+        })
+    }
+}
+
+/// A refusal with the HTTP status the caller should see. Its message names
+/// the rule, never a username, password or token.
+#[derive(Debug)]
+pub struct Refusal {
+    pub status: u16,
+    pub message: String,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Refusal {}
+fn refuse(status: u16, message: &str) -> anyhow::Error {
+    anyhow::Error::new(Refusal {
+        status,
+        message: message.to_owned(),
+    })
+}
+
+pub const UNITY: &str = "unity";
+pub const UNITY_INVALID: &str =
+    "Unity did not accept this email and password. Check them and save again.";
+pub const UNITY_TWO_FACTOR: &str = "This Unity account asks for two-factor sign-in, which Engine Box cannot answer with a password. Turn off two-factor sign-in for this Unity account in your Unity ID settings, then save again.";
+
 /// One eligible credential for a run, as [`Credentials::candidates`] returns it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Candidate {
@@ -119,6 +204,8 @@ pub struct Credentials {
     binaries: Arc<BTreeMap<String, Option<String>>>,
     records: Arc<Mutex<BTreeMap<String, Credential>>>,
     sessions: Arc<Mutex<BTreeMap<String, Session>>>,
+    unity: Arc<Mutex<BTreeMap<String, UnityAccount>>>,
+    unity_login: unity::Client,
 }
 
 fn valid_user(id: &str) -> bool {
@@ -140,6 +227,14 @@ fn valid_label(label: &str) -> bool {
 fn valid_key(key: &str) -> bool {
     (8..=4096).contains(&key.len()) && key.bytes().all(|b| (33..=126).contains(&b))
 }
+fn valid_username(name: &str) -> bool {
+    (3..=254).contains(&name.len())
+        && name.contains('@')
+        && !name.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+fn valid_password(password: &str) -> bool {
+    (1..=1024).contains(&password.len()) && !password.chars().any(char::is_control)
+}
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -152,6 +247,7 @@ impl Credentials {
         state::private_dir(&records_dir)?;
         security::private_dir(&records_dir.join("homes"))?;
         security::private_dir(&records_dir.join("keys"))?;
+        state::private_dir(&records_dir.join(UNITY))?;
         let mut binaries = BTreeMap::new();
         let env = BTreeMap::from([(
             "PATH".to_owned(),
@@ -177,12 +273,29 @@ impl Credentials {
             );
             records.insert(record.id.clone(), record);
         }
+        let mut accounts = BTreeMap::new();
+        for path in state::json_files(&records_dir.join(UNITY))? {
+            let account: UnityAccount = serde_json::from_value(state::read_json(&path)?)?;
+            ensure!(
+                path.file_stem().and_then(|s| s.to_str()) == Some(account.id.as_str())
+                    && valid_id(&account.id),
+                "Invalid credential record"
+            );
+            accounts.insert(account.id.clone(), account);
+        }
         Ok(Self {
             root: records_dir,
             binaries: Arc::new(binaries),
             records: Arc::new(Mutex::new(records)),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            unity: Arc::new(Mutex::new(accounts)),
+            unity_login: unity::Client::from_env(),
         })
+    }
+    /// Use another Unity login endpoint (tests, or a configured stand-in).
+    pub fn with_unity_login(mut self, client: unity::Client) -> Self {
+        self.unity_login = client;
+        self
     }
     fn home(&self, id: &str) -> Result<PathBuf> {
         ensure!(valid_id(id), "Invalid credential");
@@ -221,6 +334,18 @@ impl Credentials {
             .filter(|c| c.org_id == org)
             .map(|c| c.public(self.has_key(&c.id)))
             .collect();
+        drop(records);
+        let rows = rows
+            .into_iter()
+            .chain(
+                self.unity
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|a| a.org_id == org)
+                    .map(UnityAccount::public),
+            )
+            .collect::<Vec<_>>();
         json!({"credentials": rows})
     }
     /// `POST /v1/credentials`: create a record in the acting org.
@@ -238,6 +363,10 @@ impl Credentials {
             &["provider", "kind", "label"],
         )?;
         ensure!(pools::valid_org(org), "Invalid org");
+        ensure!(
+            body["provider"] != UNITY,
+            "A Unity account is saved with its username and password"
+        );
         let provider = enginebox_agents::provider(crate::string(body, "provider")?)?.to_owned();
         let kind: Kind = serde_json::from_value(body["kind"].clone())
             .context("kind must be personal, team or api_key")?;
@@ -324,6 +453,15 @@ impl Credentials {
     }
     /// `POST /v1/credentials/{id}/delete`: the record, its home and its key.
     pub fn delete(&self, org: &str, id: &str) -> Result<Value> {
+        {
+            let mut accounts = self.unity.lock().unwrap();
+            if accounts.get(id).is_some_and(|a| a.org_id == org) {
+                remove_if_present(&self.key_path(id))?;
+                std::fs::remove_file(self.unity_path(id))?;
+                accounts.remove(id);
+                return Ok(json!({"deleted": true}));
+            }
+        }
         let mut records = self.records.lock().unwrap();
         ensure!(
             records.get(id).is_some_and(|c| c.org_id == org),
@@ -490,6 +628,224 @@ impl Credentials {
         Ok(s.public.clone())
     }
 
+    fn unity_path(&self, id: &str) -> PathBuf {
+        self.root.join(UNITY).join(format!("{id}.json"))
+    }
+    /// The org's Unity account with this ID.
+    pub fn unity_get(&self, org: &str, id: &str) -> Option<UnityAccount> {
+        self.unity
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|a| a.org_id == org)
+            .cloned()
+    }
+    /// The username and password of a save or update request, checked.
+    fn unity_fields<'a>(body: &'a Value, current: Option<&'a str>) -> Result<(&'a str, &'a str)> {
+        let username = match (body.get("username"), current) {
+            (Some(v), _) => v.as_str().context("username must be a string")?.trim(),
+            (None, Some(current)) => current,
+            (None, None) => return Err(refuse(400, "username is required")),
+        };
+        if !valid_username(username) {
+            return Err(refuse(
+                400,
+                "username must be your Unity ID email (3-254 characters, no spaces)",
+            ));
+        }
+        let password = body
+            .get("password")
+            .map(|v| v.as_str().context("password must be a string"))
+            .transpose()?
+            .ok_or_else(|| refuse(400, "password is required"))?;
+        if !valid_password(password) {
+            return Err(refuse(
+                400,
+                "password must be 1-1024 characters without control characters",
+            ));
+        }
+        Ok((username, password))
+    }
+    /// Ask Unity whether the username and password work: `Ok(None)` when it
+    /// accepted them, `Ok(Some(reason))` when it could not be asked, a
+    /// [`Refusal`] when it rejected them or wants a second factor.
+    fn unity_check(&self, username: &str, password: &str) -> Result<Option<&'static str>> {
+        match self.unity_login.login(username, password) {
+            unity::Login::Token(_) => Ok(None),
+            unity::Login::Invalid => Err(refuse(400, UNITY_INVALID)),
+            unity::Login::TwoFactor => Err(refuse(400, UNITY_TWO_FACTOR)),
+            unity::Login::Unknown(reason) => Ok(Some(reason)),
+        }
+    }
+    fn unity_store(&self, account: &UnityAccount, password: &str) -> Result<()> {
+        crate::jobs::write_private(&self.key_path(&account.id), &json!({"password": password}))?;
+        state::write_json(
+            &self.unity_path(&account.id),
+            &serde_json::to_value(account)?,
+        )
+    }
+    /// `POST /v1/credentials {provider: "unity", kind: "personal",
+    /// owner_user_id, username, password}`: save a member's Unity account
+    /// after asking Unity whether it works. Blocking (one Unity sign-in).
+    ///
+    /// One per member per org: a second save is a 409 (update the first). A
+    /// rejected password or a two-factor account is refused (400) and nothing
+    /// is stored; when Unity cannot be asked the account is saved `unverified`.
+    /// `actor` is the member the dashboard names; a member saves only their own.
+    pub fn unity_create(&self, org: &str, actor: &str, body: &Value) -> Result<Value> {
+        crate::keys(
+            body,
+            &[
+                "provider",
+                "kind",
+                "owner_user_id",
+                "username",
+                "password",
+                "share_with_org_pools",
+                "key",
+            ],
+            &["provider", "kind", "owner_user_id", "password"],
+        )?;
+        ensure!(pools::valid_org(org), "Invalid org");
+        ensure!(body["provider"] == UNITY, "provider must be unity");
+        if body["kind"] != "personal" {
+            return Err(refuse(
+                400,
+                "A Unity account is personal: each member saves their own, never a team account or key",
+            ));
+        }
+        if body.get("share_with_org_pools").is_some() || body.get("key").is_some() {
+            return Err(refuse(
+                400,
+                "A Unity account is used only by its owner; it is never shared and takes no key",
+            ));
+        }
+        let owner = body["owner_user_id"]
+            .as_str()
+            .filter(|o| valid_user(o))
+            .ok_or_else(|| refuse(400, "A Unity account needs its owner's user ID"))?;
+        if actor.starts_with("usr_") && actor != owner {
+            return Err(refuse(403, "Members save only their own Unity account."));
+        }
+        let (username, password) = Self::unity_fields(body, None)?;
+        let exists = |accounts: &BTreeMap<String, UnityAccount>| {
+            accounts
+                .values()
+                .any(|a| a.org_id == org && a.owner_user_id == owner)
+        };
+        let duplicate = || {
+            refuse(
+                409,
+                "You already have a Unity account in this organization. Update it instead.",
+            )
+        };
+        if exists(&self.unity.lock().unwrap()) {
+            return Err(duplicate());
+        }
+        let unverified = self.unity_check(username, password)?;
+        let at = now();
+        let account = UnityAccount {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            org_id: org.to_owned(),
+            owner_user_id: owner.to_owned(),
+            username: username.to_owned(),
+            status: if unverified.is_some() {
+                UnityStatus::Unverified
+            } else {
+                UnityStatus::Connected
+            },
+            last_error: unverified.map(str::to_owned),
+            created_at: at.clone(),
+            updated_at: at.clone(),
+            validated_at: unverified.is_none().then_some(at),
+        };
+        let total = self.records.lock().unwrap().len();
+        let mut accounts = self.unity.lock().unwrap();
+        // Two saves can race through Unity; the first one stored wins.
+        if exists(&accounts) {
+            return Err(duplicate());
+        }
+        ensure!(
+            total + accounts.len() < MAX_CREDENTIALS,
+            "Credential limit reached"
+        );
+        self.unity_store(&account, password)?;
+        let public = account.public();
+        accounts.insert(account.id.clone(), account);
+        Ok(json!({"credential": public}))
+    }
+    /// `POST /v1/credentials/{id}/update {username?, password}`: replace a
+    /// Unity account's username and password, checked with Unity the same way
+    /// as a save. A refused update leaves the saved account as it was.
+    pub fn unity_update(&self, org: &str, actor: &str, id: &str, body: &Value) -> Result<Value> {
+        crate::keys(body, &["username", "password"], &["password"])?;
+        let current = self
+            .unity_get(org, id)
+            .ok_or_else(|| refuse(404, "Unknown credential"))?;
+        if actor.starts_with("usr_") && actor != current.owner_user_id {
+            return Err(refuse(403, "Only its owner updates a Unity account."));
+        }
+        let (username, password) = Self::unity_fields(body, Some(&current.username))?;
+        let unverified = self.unity_check(username, password)?;
+        let mut accounts = self.unity.lock().unwrap();
+        let account = accounts
+            .get_mut(id)
+            .filter(|a| a.org_id == org)
+            .ok_or_else(|| refuse(404, "Unknown credential"))?;
+        let at = now();
+        let mut next = account.clone();
+        next.username = username.to_owned();
+        next.updated_at = at.clone();
+        next.status = if unverified.is_some() {
+            UnityStatus::Unverified
+        } else {
+            UnityStatus::Connected
+        };
+        next.last_error = unverified.map(str::to_owned);
+        next.validated_at = unverified.is_none().then_some(at);
+        self.unity_store(&next, password)?;
+        *account = next;
+        Ok(json!({"credential": account.public()}))
+    }
+    /// The Unity account a session started by `member` uses: only that
+    /// member's own in `org`. There is no fallback to a team account or to
+    /// another member's account.
+    pub fn unity_for(&self, org: &str, member: &str) -> Option<UnityAccount> {
+        self.unity
+            .lock()
+            .unwrap()
+            .values()
+            .find(|a| a.org_id == org && a.owner_user_id == member)
+            .cloned()
+    }
+    /// Sign `member`'s own Unity account in and return a short-lived access
+    /// token, for a node to run `Unity.Licensing.Client --activate-all
+    /// --accessToken <token> --include-personal`. The password stays on the
+    /// controller. Blocking (one Unity sign-in). Not called by sessions yet.
+    pub fn unity_access_token(&self, org: &str, member: &str) -> Result<String> {
+        let account = self.unity_for(org, member).ok_or_else(|| {
+            refuse(
+                404,
+                "Save your Unity account on the Agents page to use Unity in your sessions.",
+            )
+        })?;
+        let missing = "The saved Unity password is missing. Update your Unity account.";
+        let stored = state::read_json(&self.key_path(&account.id)).context(missing)?;
+        let password = stored["password"].as_str().context(missing)?;
+        match self.unity_login.login(&account.username, password) {
+            unity::Login::Token(token) => Ok(token),
+            unity::Login::Invalid => Err(refuse(
+                400,
+                "Unity no longer accepts your saved password. Update your Unity account.",
+            )),
+            unity::Login::TwoFactor => Err(refuse(400, UNITY_TWO_FACTOR)),
+            unity::Login::Unknown(_) => Err(refuse(
+                502,
+                "Unity sign-in is unavailable right now. Try again shortly.",
+            )),
+        }
+    }
+
     /// The selection interface for runs (not called yet). Eligible connected
     /// credentials of `org` for `provider`, in priority order: the requesting
     /// member's own personal credentials, then personal credentials their
@@ -522,6 +878,13 @@ impl Credentials {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         out.into_iter().map(|(_, c)| c).collect()
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -658,6 +1021,234 @@ mod tests {
         assert!(c.candidates(OTHER, "codex", Some(ALICE)).is_empty());
         // Sharing is personal-only.
         assert!(c.share(ORG, &team, &json!({"share":true})).is_err());
+    }
+
+    fn with_unity() -> (tempfile::TempDir, Credentials, Arc<Mutex<Vec<String>>>) {
+        let (temp, c) = open();
+        let (url, seen) = unity::fake::serve();
+        let c = c.with_unity_login(
+            unity::Client::new(&url).with_timeout(std::time::Duration::from_secs(1)),
+        );
+        (temp, c, seen)
+    }
+    fn unity_body(owner: &str, username: &str, password: &str) -> Value {
+        json!({"provider":"unity","kind":"personal","owner_user_id":owner,"username":username,"password":password})
+    }
+    fn refusal(error: anyhow::Error) -> (u16, String) {
+        let r = error.downcast_ref::<Refusal>().expect("a refusal");
+        (r.status, r.message.clone())
+    }
+
+    #[test]
+    fn unity_accounts_are_checked_with_unity_when_saved() {
+        let (temp, c, seen) = with_unity();
+        // Wrong password and two-factor accounts are refused and nothing is stored.
+        let (status, message) = refusal(
+            c.unity_create(
+                ORG,
+                ALICE,
+                &unity_body(ALICE, "a@example.com", "wrong-password"),
+            )
+            .unwrap_err(),
+        );
+        assert_eq!((status, message.as_str()), (400, UNITY_INVALID));
+        let (status, message) = refusal(
+            c.unity_create(
+                ORG,
+                ALICE,
+                &unity_body(ALICE, "a@example.com", "tfa-password"),
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(status, 400);
+        assert!(message.contains("Turn off two-factor sign-in"));
+        assert!(c.unity_for(ORG, ALICE).is_none());
+        // Unity unavailable: saved, but unverified with the reason.
+        let made = c
+            .unity_create(
+                ORG,
+                ALICE,
+                &unity_body(ALICE, "a@example.com", "down-password"),
+            )
+            .unwrap();
+        assert_eq!(made["credential"]["status"], "unverified");
+        assert_eq!(made["credential"]["last_error"], "service_error");
+        assert_eq!(made["credential"]["validated_at"], Value::Null);
+        let id = made["credential"]["id"].as_str().unwrap().to_owned();
+        // Updating re-checks: a good password connects it.
+        let updated = c
+            .unity_update(ORG, ALICE, &id, &json!({"password":"right-password"}))
+            .unwrap();
+        assert_eq!(updated["credential"]["status"], "connected");
+        assert_eq!(updated["credential"]["label"], "a@example.com");
+        assert_eq!(updated["credential"]["last_error"], Value::Null);
+        assert!(updated["credential"]["validated_at"].is_string());
+        // A refused update leaves the saved account as it was.
+        assert_eq!(
+            refusal(
+                c.unity_update(ORG, ALICE, &id, &json!({"password":"wrong-password"}))
+                    .unwrap_err()
+            )
+            .0,
+            400
+        );
+        assert_eq!(
+            c.unity_for(ORG, ALICE).unwrap().status,
+            UnityStatus::Connected
+        );
+        let timed_out = c
+            .unity_update(
+                ORG,
+                ALICE,
+                &id,
+                &json!({"username":"a2@example.com","password":"slow-password"}),
+            )
+            .unwrap();
+        assert_eq!(timed_out["credential"]["status"], "unverified");
+        assert_eq!(timed_out["credential"]["last_error"], "unreachable");
+        assert_eq!(timed_out["credential"]["username"], "a2@example.com");
+        // Unity was asked with exactly the saved password.
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.contains("right-password"))
+        );
+        // No password in any listing, record or reopened state; only in the 0600 key file.
+        for password in [
+            "right-password",
+            "slow-password",
+            "wrong-password",
+            "tfa-password",
+        ] {
+            assert!(!c.list(ORG).to_string().contains(password));
+        }
+        let record = std::fs::read_to_string(
+            temp.path()
+                .join(format!("agent-credentials/unity/{id}.json")),
+        )
+        .unwrap();
+        assert!(!record.contains("password"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(
+                temp.path()
+                    .join(format!("agent-credentials/keys/{id}.json")),
+            )
+            .unwrap()
+            .permissions()
+            .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+        let again =
+            Credentials::open(&temp.path().canonicalize().unwrap(), &BTreeMap::new()).unwrap();
+        assert_eq!(again.unity_for(ORG, ALICE).unwrap().id, id);
+        // Removal deletes the record and the password.
+        c.delete(ORG, &id).unwrap();
+        assert!(c.unity_for(ORG, ALICE).is_none());
+        assert!(
+            !temp
+                .path()
+                .join(format!("agent-credentials/keys/{id}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn unity_is_one_personal_account_per_member_used_only_by_its_owner() {
+        let (_temp, c, _) = with_unity();
+        let alice = c
+            .unity_create(
+                ORG,
+                ALICE,
+                &unity_body(ALICE, "a@example.com", "right-password"),
+            )
+            .unwrap()["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // A second save is a conflict; update the first instead.
+        assert_eq!(
+            refusal(
+                c.unity_create(
+                    ORG,
+                    ALICE,
+                    &unity_body(ALICE, "b@example.com", "camel-password")
+                )
+                .unwrap_err()
+            )
+            .0,
+            409
+        );
+        // The same member in another org has their own.
+        c.unity_create(
+            OTHER,
+            ALICE,
+            &unity_body(ALICE, "a@example.com", "right-password"),
+        )
+        .unwrap();
+        // Bob cannot save one for Alice or update hers.
+        assert_eq!(
+            refusal(
+                c.unity_create(
+                    ORG,
+                    BOB,
+                    &unity_body(ALICE, "b@example.com", "right-password")
+                )
+                .unwrap_err()
+            )
+            .0,
+            403
+        );
+        assert_eq!(
+            refusal(
+                c.unity_update(ORG, BOB, &alice, &json!({"password":"right-password"}))
+                    .unwrap_err()
+            )
+            .0,
+            403
+        );
+        assert_eq!(
+            refusal(
+                c.unity_update(OTHER, ALICE, &alice, &json!({"password":"right-password"}))
+                    .unwrap_err()
+            )
+            .0,
+            404
+        );
+        // Unity is personal only, never shared, never a key; sign-in and sharing do not apply.
+        for bad in [
+            json!({"provider":"unity","kind":"team","owner_user_id":BOB,"username":"b@example.com","password":"right-password"}),
+            json!({"provider":"unity","kind":"api_key","owner_user_id":BOB,"username":"b@example.com","password":"right-password"}),
+            json!({"provider":"unity","kind":"personal","owner_user_id":BOB,"username":"b@example.com","password":"right-password","share_with_org_pools":true}),
+            json!({"provider":"unity","kind":"personal","owner_user_id":BOB,"username":"not-an-email","password":"right-password"}),
+            json!({"provider":"unity","kind":"personal","owner_user_id":BOB,"username":"b@example.com"}),
+        ] {
+            assert!(c.unity_create(ORG, BOB, &bad).is_err(), "{bad}");
+        }
+        assert!(
+            c.create(
+                ORG,
+                &json!({"provider":"unity","kind":"personal","label":"x","owner_user_id":BOB})
+            )
+            .is_err()
+        );
+        assert!(c.share(ORG, &alice, &json!({"share":true})).is_err());
+        assert!(c.start_login(ORG, &alice).is_err());
+        assert!(c.unity_for(ORG, BOB).is_none());
+        // Selection: only the member's own account, and agent candidates never include it.
+        assert_eq!(c.unity_for(ORG, ALICE).unwrap().id, alice);
+        assert!(c.candidates(ORG, UNITY, Some(ALICE)).is_empty());
+        assert_eq!(
+            c.unity_access_token(ORG, ALICE).unwrap(),
+            unity::fake::TOKEN
+        );
+        assert_eq!(refusal(c.unity_access_token(ORG, BOB).unwrap_err()).0, 404);
+        // An unverified save still never falls back to anyone else's.
+        c.unity_create(ORG, BOB, &unity_body(BOB, "b@example.com", "down-password"))
+            .unwrap();
+        assert_eq!(refusal(c.unity_access_token(ORG, BOB).unwrap_err()).0, 502);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
 pub mod tenancy;
+pub mod unity;
 mod workspaces;
 
 use anyhow::{Context, Result, ensure};
@@ -106,6 +107,8 @@ pub struct Controller {
     preview_api: Mutex<Option<(Arc<dyn previews::PreviewApi>, String)>>,
     /// Where usage events go (metering.rs); discarded unless a deployment sets one.
     usage_sink: Mutex<Arc<dyn metering::UsageSink>>,
+    /// Test harnesses stand in for Unity's login endpoint (unity.rs).
+    unity_login: Mutex<Option<String>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -142,6 +145,7 @@ impl Controller {
             repository_transport: Mutex::new(None),
             preview_api: Mutex::new(None),
             usage_sink: Mutex::new(metering::noop()),
+            unity_login: Mutex::new(None),
         }))
     }
     /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
@@ -226,10 +230,14 @@ impl Controller {
                 }),
             },
             tenancy: tenancy::Tenancy::open(&self.root)?,
-            credentials: credentials::Credentials::open(
-                &self.root,
-                &std::collections::BTreeMap::new(),
-            )?,
+            credentials: {
+                let store =
+                    credentials::Credentials::open(&self.root, &std::collections::BTreeMap::new())?;
+                match self.unity_login.lock().unwrap().clone() {
+                    Some(url) => store.with_unity_login(unity::Client::new(&url)),
+                    None => store,
+                }
+            },
             usage: self.usage_sink.lock().unwrap().clone(),
             repositories: match self.repository_transport.lock().unwrap().clone() {
                 Some(transport) => {
@@ -309,6 +317,11 @@ impl Controller {
     /// Stand in for the environment service. Takes effect at the next activation.
     pub fn set_preview_api(&self, api: Arc<dyn previews::PreviewApi>, host: &str) {
         *self.preview_api.lock().unwrap() = Some((api, host.to_owned()));
+    }
+    /// Stand in for Unity's login endpoint. Takes effect at the next activation.
+    #[doc(hidden)]
+    pub fn set_unity_login_url(&self, url: &str) {
+        *self.unity_login.lock().unwrap() = Some(url.to_owned());
     }
     #[doc(hidden)]
     pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
@@ -1541,6 +1554,61 @@ fn preview_write(
     (status, value)
 }
 
+/// `POST /v1/credentials {provider: "unity", …}` (save, `id` none) and
+/// `POST /v1/credentials/{id}/update` (docs/ORGS.md, "Unity accounts"): a
+/// member's Unity account, checked with Unity before it is stored. Audited as
+/// `credential.unity_save` / `credential.unity_update` with the outcome and a
+/// value-free reason; the username, password and token never appear.
+fn unity_write(
+    runtime: &Runtime,
+    org: &str,
+    actor: &str,
+    id: Option<&str>,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let result = match id {
+        None => runtime.credentials.unity_create(org, actor, body),
+        Some(id) => runtime.credentials.unity_update(org, actor, id, body),
+    };
+    let target = match (&result, id) {
+        (Ok(v), _) => v["credential"]["id"].as_str().unwrap_or("unity").to_owned(),
+        (Err(_), Some(id)) => id.to_owned(),
+        (Err(_), None) => "unity".to_owned(),
+    };
+    let detail = match &result {
+        Ok(v) => {
+            json!({"status": v["credential"]["status"], "last_error": v["credential"]["last_error"]})
+        }
+        Err(error) => json!({"reason": catalog::message(error)}),
+    };
+    runtime.catalog.audit.record(
+        org,
+        actor,
+        if id.is_some() {
+            "credential.unity_update"
+        } else {
+            "credential.unity_save"
+        },
+        &target,
+        result.is_ok(),
+        detail,
+    );
+    match result {
+        Ok(value) if id.is_none() => (StatusCode::CREATED, value),
+        Ok(value) => (StatusCode::OK, value),
+        Err(error) => match error.downcast_ref::<credentials::Refusal>() {
+            Some(refusal) => (
+                StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::BAD_REQUEST),
+                json!({"error": refusal.message}),
+            ),
+            None => (
+                StatusCode::BAD_REQUEST,
+                json!({"error": catalog::message(&error)}),
+            ),
+        },
+    }
+}
+
 fn actions_secret(runtime: &Runtime, org: &str, actor: &str, body: &Value) -> (StatusCode, Value) {
     let target = format!(
         "{}{}/{}",
@@ -1728,6 +1796,15 @@ async fn write(
             ))
         })
         .await;
+    }
+    if let Some(id) = match routed.as_slice() {
+        ["v1", "credentials"] if body["provider"] == credentials::UNITY => Some(None),
+        ["v1", "credentials", id, "update"] => Some(Some(id.to_string())),
+        _ => None,
+    } {
+        let runtime = c.runtime()?;
+        return blocking(move || Ok(unity_write(&runtime, &org, &actor, id.as_deref(), &body)))
+            .await;
     }
     if routed.as_slice() == ["v1", "actions-secrets"] {
         let runtime = c.runtime()?;
@@ -2062,7 +2139,19 @@ async fn write(
         ["v1", "credentials", id, "share"] => runtime.credentials.share(&org, id, &body)?,
         ["v1", "credentials", id, "delete"] => {
             empty(&body)?;
-            runtime.credentials.delete(&org, id)?
+            let unity = runtime.credentials.unity_get(&org, id).is_some();
+            let deleted = runtime.credentials.delete(&org, id)?;
+            if unity {
+                runtime.catalog.audit.record(
+                    &org,
+                    &actor,
+                    "credential.unity_delete",
+                    id,
+                    true,
+                    json!({}),
+                );
+            }
+            deleted
         }
         ["v1", "credentials", id, "login"] => {
             empty(&body)?;
@@ -5133,6 +5222,183 @@ mod tests {
         assert!(resolved.connections.is_empty());
         assert_eq!(resolved.block.mcp_servers.len(), 1);
         assert_eq!(resolved.block.env["MODE"], "x");
+    }
+
+    #[tokio::test]
+    async fn unity_accounts_are_per_member_checked_on_save_and_never_echoed() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        const BOB: &str = "usr_bbbbbbbbbbbbbbbbbbbbbbbb";
+        let (temp, c) = setup();
+        let (url, _) = unity::fake::serve();
+        c.set_unity_login_url(&url);
+        c.activate().unwrap();
+        let app = router(c.clone());
+        let as_member = |method: Method, path: &str, body: Value, actor: &str| {
+            let mut r = request(method, path, &body.to_string(), true);
+            r.headers_mut()
+                .insert(catalog::ACTOR_HEADER, actor.parse().unwrap());
+            r
+        };
+        let save = |owner: &str, password: &str| json!({"provider":"unity","kind":"personal","owner_user_id":owner,"username":"a@example.com","password":password});
+        // A wrong password is refused with its reason and nothing is stored.
+        let (status, refused) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                save(ALICE, "wrong-password"),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["error"], credentials::UNITY_INVALID);
+        let (status, refused) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                save(ALICE, "tfa-password"),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(refused["error"].as_str().unwrap().contains("two-factor"));
+        // Saved and connected.
+        let (status, made) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                save(ALICE, "right-password"),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        assert_eq!(made["credential"]["status"], "connected");
+        assert_eq!(made["credential"]["username"], "a@example.com");
+        let id = made["credential"]["id"].as_str().unwrap().to_owned();
+        // One per member: the second save conflicts.
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                save(ALICE, "camel-password"),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Bob cannot save Alice's or update hers.
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                save(ALICE, "right-password"),
+                BOB,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let update = format!("/v1/credentials/{id}/update");
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                &update,
+                json!({"password":"camel-password"}),
+                BOB,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Alice updates; Unity is down, so it is saved unverified.
+        let (status, updated) = call(
+            &app,
+            as_member(
+                Method::POST,
+                &update,
+                json!({"password":"down-password"}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["credential"]["status"], "unverified");
+        assert_eq!(updated["credential"]["last_error"], "service_error");
+        // Team or shared Unity accounts do not exist.
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                json!({"provider":"unity","kind":"team","owner_user_id":BOB,"username":"b@example.com","password":"right-password"}),
+                BOB,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                &format!("/v1/credentials/{id}/share"),
+                json!({"share":true}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Listed with metadata only.
+        let (_, listed) = call(&app, request(Method::GET, "/v1/credentials", "", true)).await;
+        assert_eq!(listed["credentials"][0]["provider"], "unity");
+        assert_eq!(listed["credentials"][0]["owner_user_id"], ALICE);
+        // Removal is audited too.
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                &format!("/v1/credentials/{id}/delete"),
+                json!({}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, audit) = call(&app, request(Method::GET, "/v1/audit", "", true)).await;
+        let actions: Vec<_> = audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["action"].as_str().unwrap(),
+                    e["outcome"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(actions.contains(&("credential.unity_save", "applied")));
+        assert!(actions.contains(&("credential.unity_save", "refused")));
+        assert!(actions.contains(&("credential.unity_update", "applied")));
+        assert!(actions.contains(&("credential.unity_delete", "applied")));
+        for secret in [
+            "right-password",
+            "wrong-password",
+            "tfa-password",
+            "camel-password",
+            "down-password",
+            unity::fake::TOKEN,
+        ] {
+            for reply in [&refused, &made, &updated, &listed, &audit] {
+                assert!(!reply.to_string().contains(secret));
+            }
+            // After removal no state file holds any of them.
+            assert!(files_contain(&temp.path().join("state"), secret).is_empty());
+        }
     }
 
     #[tokio::test]

@@ -62,17 +62,39 @@ The dashboard holds the owner token. For orgs other than the platform org it sen
 
 ## Agent credentials
 
-Each org keeps its own agent accounts (`GET/POST /v1/credentials`, acting org from `X-EngineBox-Org`; dashboard **Agents → Your and your team's agent accounts**):
+Each org keeps its own agent accounts (`GET/POST /v1/credentials`, acting org from `X-EngineBox-Org`; dashboard **Agents → Your and your team's agent accounts**, with a **Unity account** card for your own Unity license):
 
 | Kind | Who adds it | Connect | Sharing |
 | --- | --- | --- | --- |
 | `personal` | any member, under their own identity | the provider's native sign-in (the same flow as controller accounts) into a private home of its own; only its owner can sign it in | the owner alone decides **Share into org pools** |
 | `team` | org admins | native sign-in by an admin | org-owned |
 | `api_key` | org admins | the key is sent once, stored in a 0600 file and never returned or logged | org-owned |
+| `personal`, provider `unity` | each member, for themselves only | a Unity ID email and password, checked with Unity when saved (see [Unity accounts](#unity-accounts)) | never shared: used only by sessions its owner starts |
 
 Members see team accounts, keys (metadata only), their own personal accounts and others' shared ones; admins see all metadata and can remove any credential. The controller-scope accounts (`GET /v1/agents`) remain the platform org's team accounts.
 
 Runs do not select from these yet. `credentials::Credentials::candidates(org, provider, member)` is the selection interface the credential-pool work will call: connected credentials of the org for the provider, in order: the requesting member's own personal accounts, then personal accounts their owners shared, then team accounts, then API keys. An org pool run without a member skips unshared personal accounts. Usage events already carry `credential_id`.
+
+### Unity accounts
+
+A member's Unity license comes from their own Unity ID: **Agents → Unity account** takes an email and password. Rules:
+
+- **One per member per org.** `POST /v1/credentials {provider: "unity", kind: "personal", username, password}` saves it (the dashboard fills `owner_user_id` from the session; the label is the username). A second save answers **409**: change the saved one with `POST /v1/credentials/{id}/update {username?, password}` instead. Remove it with `POST /v1/credentials/{id}/delete`.
+- **Owner only.** Only the member saves or updates their own; admins may remove any (as for other personal credentials). There are no team, shared or API key Unity accounts, and sign-in and sharing do not apply. The dashboard names the member in `X-EngineBox-Actor`, and the controller refuses a save or update for anyone else (403).
+- **Checked when saved.** The controller signs in once (`POST https://core.cloud.unity3d.com/api/login`, `grant_type: password`; 10 s timeout, no redirects; `ENGINEBOX_UNITY_LOGIN_URL` overrides the endpoint):
+
+  | Unity answers | Result |
+  | --- | --- |
+  | an access token | saved, `status: connected`, `validated_at` set |
+  | 401 / `143.002` "Invalid Credential" | refused (400), nothing stored; an update leaves the saved account unchanged |
+  | a two-factor or verification step | refused (400): turn off two-factor sign-in for that Unity account, because a password sign-in cannot answer it |
+  | no answer, 5xx, 429 or an unrecognized reply | saved, `status: unverified`, `last_error` `unreachable`, `service_error` or `unexpected_response` |
+
+  So a saved account always worked when it was saved, unless Unity could not be asked.
+- **Write-only.** The password is stored in a 0600 file and never returned, logged or audited. Listings show `username`, `status`, `validated_at` and `last_error`. Saves, updates and removals are audited as `credential.unity_save`, `credential.unity_update` and `credential.unity_delete` with the outcome and a value-free reason.
+- **Your sessions use yours.** `Credentials::unity_for(org, member)` returns only that member's own account, with no fallback to anyone else's. `Credentials::unity_access_token(org, member)` signs it in and returns a short-lived access token for a node to run `Unity.Licensing.Client --activate-all --accessToken <token> --include-personal`; the password never leaves the controller. Engine sessions will call it; nothing does yet.
+
+Unity licensing is not a [connection](CONNECTIONS.md): connections are org-wide and shared by profiles, while a Unity license belongs to one person.
 
 ## Connections
 
