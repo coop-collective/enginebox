@@ -2,6 +2,24 @@
 
 Status: design, October 31, 2026. Nothing here is implemented yet.
 
+## Owner decisions (November 1, 2026)
+
+- **Isolation: one VM per session.** Each session runs in its own Hyper-V VM with a GPU partition (GPU-P), not a
+  container sharing a kernel. The container spec below becomes the in-VM process spec; the WSL container results
+  remain the fallback evidence. Guest OS is being qualified (Windows Server guest is the standard GPU-P path; Windows
+  client guests are generally not licensed for third-party hosting). Sessions start from golden images via
+  differencing disks and a warm VM pool.
+- **Licensing: each org brings its own Unity credentials** as its own `secret_source` connection; activation is per
+  (node, org) inside that org's VMs.
+- **Saves: LayerFS workspaces.** The session's project is a LayerFS workspace exported into the VM.
+- **Capacity is measured, not configured.** No fixed `sessions_per_gpu`. A calibration run profiles each
+  (project, engine version, mode): peak VRAM, mean/p95 GPU and encoder utilisation, frame time at the target
+  resolution, first-import time. Admission requires the GPU's remaining VRAM, 3D headroom and free NVENC sessions
+  (GeForce drivers cap concurrent encodes per GPU) to cover the profile plus a margin; the VM's GPU-P VRAM share is
+  sized from it. Live per-VM telemetry (frame time over budget, encoder queue) tightens later admissions. Viewers and
+  WebGL players cost no node GPU (MoQ relay fan-out, client-side play); only Editor sessions and cloud-rendered play
+  are admitted against GPU capacity.
+
 An engine session is one tenant's game engine (Unity first; the API is engine-agnostic) running a given
 repository and ref in its own container on a GPU node, streamed to the requesting app over MoQ. Gamejam is the first
 client: its dev server, and later its Cloudflare deployment, starts sessions as an OAuth client of this controller.
