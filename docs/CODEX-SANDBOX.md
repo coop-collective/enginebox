@@ -70,3 +70,15 @@ workspaces without restarting them or changing their authentication. These
 checks verify sandbox startup and the tested boundaries; they do not establish
 provider entitlement, successful post-repair inference, or every possible
 sandbox escape boundary. No reboot test was performed during this repair.
+
+## Package-manager caches
+
+The workspace-write sandbox leaves the guest user's home read-only, so corepack,
+pnpm, npm, bun and cargo would fail to write their caches before a project's
+tests run (`ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK`, `EROFS` under
+`~/.cache/node/corepack`). Before each Codex run Engine Box creates
+`~/.cache`, `~/.npm`, `~/.local/share/pnpm`, `~/.bun/install/cache`,
+`~/.cargo/registry` and `~/.cargo/git` and passes them as
+`sandbox_workspace_write.writable_roots` (in a profile's generated config, or as
+a `-c` override). The rest of the home stays read-only; symlinked cache paths
+are never offered. The caches persist on the workspace between runs.

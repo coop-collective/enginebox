@@ -528,7 +528,11 @@ fn no_profile_ever_yields_a_bypass_flag() {
             );
         }
     }
-    let codex = profile::codex_config(&block(json!({"permission_profile":"edit"})).unwrap(), true);
+    let codex = profile::codex_config(
+        &block(json!({"permission_profile":"edit"})).unwrap(),
+        true,
+        &[],
+    );
     assert!(!codex.contains("danger-full-access") && !codex.contains("dangerously"));
 }
 
@@ -538,7 +542,7 @@ fn codex_config_carries_sandbox_mcp_and_disables_bundled_skills() {
         {"name":"docs","url":"https://docs.example.com/mcp","headers_from_env":{"Authorization":"DOCS_TOKEN"}},
         {"name":"local","command":"node","args":["s.js","--port","9\"0"],"env_vars":["LOCAL_KEY"]}]}))
     .unwrap();
-    let text = profile::codex_config(&b, false);
+    let text = profile::codex_config(&b, false, &[]);
     let config: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(config["approval_policy"].as_str(), Some("never"));
     assert_eq!(config["sandbox_mode"].as_str(), Some("read-only"));
@@ -558,7 +562,7 @@ fn codex_config_carries_sandbox_mcp_and_disables_bundled_skills() {
     assert_eq!(servers["local"]["args"][2].as_str(), Some("9\"0"));
     assert_eq!(servers["local"]["env_vars"][0].as_str(), Some("LOCAL_KEY"));
     assert!(!text.contains("enginebox-browser"));
-    let with_browser: toml::Value = toml::from_str(&profile::codex_config(&b, true)).unwrap();
+    let with_browser: toml::Value = toml::from_str(&profile::codex_config(&b, true, &[])).unwrap();
     assert!(
         with_browser["mcp_servers"]
             .get("enginebox-browser")
@@ -567,15 +571,46 @@ fn codex_config_carries_sandbox_mcp_and_disables_bundled_skills() {
 }
 
 #[test]
+fn codex_package_caches_are_writable_roots_for_edit_runs_only() {
+    let roots = vec![
+        "/home/agent/.npm".to_owned(),
+        "/home/agent/.local/share/pnpm".to_owned(),
+    ];
+    let edit: toml::Value = toml::from_str(&profile::codex_config(
+        &block(json!({"permission_profile":"edit"})).unwrap(),
+        false,
+        &roots,
+    ))
+    .unwrap();
+    assert_eq!(
+        edit["sandbox_workspace_write"]["writable_roots"],
+        toml::Value::try_from(&roots).unwrap()
+    );
+    assert!(
+        edit["sandbox_workspace_write"]
+            .get("network_access")
+            .is_none()
+    );
+    let read_only: toml::Value = toml::from_str(&profile::codex_config(
+        &block(json!({"permission_profile":"read_only"})).unwrap(),
+        false,
+        &roots,
+    ))
+    .unwrap();
+    assert!(read_only.get("sandbox_workspace_write").is_none());
+}
+
+#[test]
 fn codex_network_access_is_opt_in_and_edit_only() {
     let off: toml::Value = toml::from_str(&profile::codex_config(
         &block(json!({"permission_profile":"edit"})).unwrap(),
         false,
+        &[],
     ))
     .unwrap();
     assert!(off.get("sandbox_workspace_write").is_none());
     let b = block(json!({"permission_profile":"edit","network_access":true})).unwrap();
-    let on: toml::Value = toml::from_str(&profile::codex_config(&b, false)).unwrap();
+    let on: toml::Value = toml::from_str(&profile::codex_config(&b, false, &[])).unwrap();
     assert_eq!(on["sandbox_mode"].as_str(), Some("workspace-write"));
     assert_eq!(
         on["sandbox_workspace_write"]["network_access"].as_bool(),
