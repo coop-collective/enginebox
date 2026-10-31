@@ -866,10 +866,14 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             response
         }
         Ok((code, v)) => reply(code, v),
-        Err(_) => error(
-            StatusCode::BAD_REQUEST,
-            "Request could not be admitted. Check its fields, workspace state and configured capacity.",
-        ),
+        // A validation rule names the rule, never a value: the caller sees it.
+        Err(e) => match e.downcast_ref::<enginebox_agents::Rule>() {
+            Some(rule) => error(StatusCode::BAD_REQUEST, &rule.0),
+            None => error(
+                StatusCode::BAD_REQUEST,
+                "Request could not be admitted. Check its fields, workspace state and configured capacity.",
+            ),
+        },
     }
 }
 
@@ -3309,6 +3313,33 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} -> {body}");
         }
+        // A validation rule is shown to the caller; it names the rule, never a value.
+        let rule = json!({"name":"x","providers":{"codex":{"permission_profile":"read_only","network_access":true}}});
+        let (status, body) = call(
+            &app,
+            request(Method::POST, "/v1/profiles", &rule.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "network_access needs the edit permission profile."
+        );
+        // A body that does not parse stays behind the generic reply (serde quotes input).
+        let unparsed = json!({"name":"x","providers":{"claude":{"max_turns":"secret-ish-value"}}});
+        let (status, body) = call(
+            &app,
+            request(Method::POST, "/v1/profiles", &unparsed.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.to_string().contains("secret-ish-value"), "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Request could not be admitted")
+        );
         // Grants must name existing profiles.
         let token = |profiles: Value| {
             json!({"label":"runner","scopes":[{"host_id":"worker","name":"ebox-a"}],

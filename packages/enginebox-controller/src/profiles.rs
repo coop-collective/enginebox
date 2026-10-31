@@ -66,19 +66,19 @@ impl Profiles {
     /// Store one uploaded file (`{"content_base64": "..."}`) under its digest.
     pub fn upload(&self, body: &Value) -> Result<Value> {
         let object = body.as_object().context("Expected object")?;
-        ensure!(
+        enginebox_agents::require(
             object.len() == 1 && object.contains_key("content_base64"),
-            "Upload accepts only content_base64"
-        );
+            "Upload accepts only content_base64",
+        )?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(
             body["content_base64"]
                 .as_str()
                 .context("content_base64 must be a string")?,
         )?;
-        ensure!(
+        enginebox_agents::require(
             !bytes.is_empty() && bytes.len() <= profile::MAX_FILE_BYTES,
-            "A profile file must contain 1 byte to 1 MiB"
-        );
+            "A profile file must contain 1 byte to 1 MiB",
+        )?;
         let sha = profile::sha256_hex(&bytes);
         if !self.has_file(&sha) {
             ensure!(
@@ -93,20 +93,22 @@ impl Profiles {
     /// here; the body may not supply them.
     pub fn put(&self, body: Value) -> Result<Value> {
         let object = body.as_object().context("Expected object")?;
-        ensure!(
-            object.keys().all(|k| [
-                "name",
-                "org_id",
-                "description",
-                "template",
-                "providers",
-                "callback_secret",
-                "connections",
-                "connection_policy"
-            ]
-            .contains(&k.as_str())),
-            "Unsupported profile fields"
-        );
+        enginebox_agents::require(
+            object.keys().all(|k| {
+                [
+                    "name",
+                    "org_id",
+                    "description",
+                    "template",
+                    "providers",
+                    "callback_secret",
+                    "connections",
+                    "connection_policy",
+                ]
+                .contains(&k.as_str())
+            }),
+            "Unsupported profile fields",
+        )?;
         let named_org = object.contains_key("org_id");
         let mut profile: Profile = serde_json::from_value(body)?;
         let mut profiles = self.profiles.lock().unwrap();
@@ -121,14 +123,16 @@ impl Profiles {
                 profile.created_at = existing.created_at.clone();
             }
             None => {
-                ensure!(profiles.len() < MAX_PROFILES, "Profile limit reached");
+                enginebox_agents::require(profiles.len() < MAX_PROFILES, "Profile limit reached")?;
                 profile.revision = 1;
                 profile.created_at = now.clone();
             }
         }
         profile.owner = profile::OWNER.into();
         profile.updated_at = now;
-        profile.validate(&|sha| self.has_file(sha))?;
+        profile
+            .validate(&|sha| self.has_file(sha))
+            .map_err(enginebox_agents::rule)?;
         state::write_json(
             &self.records.join(format!("{}.json", profile.name)),
             &serde_json::to_value(&profile)?,
