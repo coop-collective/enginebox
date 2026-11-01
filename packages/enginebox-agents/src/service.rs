@@ -346,13 +346,27 @@ impl AgentService {
             let Some(id) = filename.strip_suffix(".json") else {
                 continue;
             };
-            native::validate_run_id(id)?;
-            let raw = security::read_bytes(&queue_root, &filename, QUEUE_ENTRY_LIMIT, true)?
-                .ok_or_else(|| anyhow::anyhow!("Queue entry vanished."))?;
-            let entry: Entry = serde_json::from_slice(&raw)?;
-            ensure!(entry.id == id, "Invalid queue entry.");
-            entry.validate()?;
-            entries.insert(id.to_owned(), entry);
+            // An entry this release cannot read is set aside, never a reason to refuse activation.
+            let loaded = (|| -> Result<Entry> {
+                native::validate_run_id(id)?;
+                let raw = security::read_bytes(&queue_root, &filename, QUEUE_ENTRY_LIMIT, true)?
+                    .ok_or_else(|| anyhow::anyhow!("Queue entry vanished."))?;
+                let entry: Entry = serde_json::from_slice(&raw)?;
+                ensure!(entry.id == id, "Invalid queue entry.");
+                entry.validate()?;
+                Ok(entry)
+            })();
+            match loaded {
+                Ok(entry) => {
+                    entries.insert(id.to_owned(), entry);
+                }
+                Err(error) => quarantine(
+                    &queue_root,
+                    &controller_root.join("agent-run-queue-quarantine"),
+                    &filename,
+                    &error,
+                ),
+            }
         }
         let root = controller_root.join("agents");
         security::private_dir(&root)?;
@@ -478,14 +492,51 @@ impl AgentService {
             keep
         });
         let mut details = BTreeMap::new();
+        let mut unreadable = Vec::new();
         for id in records.keys().chain(entries.keys()) {
-            if let Some(raw) =
-                security::read_bytes(&details_root, &format!("{id}.json"), security::LIMIT, true)?
-            {
+            let filename = format!("{id}.json");
+            // A detail another release wrote (an unknown failure reason or stage,
+            // say) sets its run aside instead of refusing activation.
+            let loaded = (|| -> Result<Option<Value>> {
+                let Some(raw) =
+                    security::read_bytes(&details_root, &filename, security::LIMIT, true)?
+                else {
+                    return Ok(None);
+                };
                 let detail: Value = serde_json::from_slice(&raw)?;
                 run_details::validate(&detail)?;
-                details.insert(id.clone(), detail);
+                Ok(Some(detail))
+            })();
+            match loaded {
+                Ok(Some(detail)) => {
+                    details.insert(id.clone(), detail);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("Run detail {filename} set aside: {error:#}");
+                    let _ = security::private_dir(&quarantine_root);
+                    let _ = std::fs::rename(
+                        details_root.join(&filename),
+                        quarantine_root.join(format!("details-{filename}")),
+                    );
+                    unreadable.push(id.clone());
+                }
             }
+        }
+        for id in unreadable {
+            if records.remove(&id).is_some() {
+                let filename = format!("{id}.json");
+                quarantine(
+                    &runs_root,
+                    &quarantine_root,
+                    &filename,
+                    &anyhow::anyhow!("its run detail was set aside"),
+                );
+            }
+            entries.remove(&id);
+            callbacks.remove(&id);
+            owed.retain(|o| o != &id);
+            adoptable.retain(|a| a != &id);
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -3936,6 +3987,9 @@ impl AgentService {
             )?)?)
         };
         let cancel = |id: &str| {
+            if !self.owns_fleet() {
+                return;
+            }
             if let Ok(command) = guest_command(
                 host,
                 name,
@@ -3967,6 +4021,11 @@ impl AgentService {
     /// Adopt the detached runs found running at startup: hold their
     /// workspace, poll each to its end and finish it once. Never re-runs.
     pub fn adopt_detached(&self) {
+        // Only the fleet owner adopts: a draining or standby controller leaves
+        // the runs (and their spools) to whoever owns the fleet.
+        if !self.owns_fleet() {
+            return;
+        }
         let ids = std::mem::take(&mut *self.inner.adoptable.lock().unwrap());
         for id in ids {
             let Some(record) = self.inner.records.lock().unwrap().get(&id).cloned() else {
@@ -4012,6 +4071,9 @@ impl AgentService {
                         )?)?)
                     };
                     let cancel = |id: &str| {
+                        if !this.owns_fleet() {
+                            return;
+                        }
                         if let Ok(command) = guest_command(
                             &host,
                             &name,
@@ -5399,5 +5461,85 @@ mod handoff_tests {
         )
         .unwrap_err();
         assert!(yielded.is::<HandedOff>());
+    }
+
+    #[test]
+    fn an_unknown_failure_reason_or_stage_sets_the_run_aside_instead_of_refusing_activation() {
+        // Production: 0.3.1-live.15 drained because activation refused a failure
+        // reason it did not know. Such a run is quarantined; activation proceeds.
+        let (_t, root, fleet) = state();
+        let reason = "11111111111111111111111111111111";
+        let stage = "22222222222222222222222222222222";
+        let fine = "33333333333333333333333333333333";
+        for (id, failure) in [
+            (
+                reason,
+                json!({"stage":"start","reason":"a_reason_from_the_future"}),
+            ),
+            (
+                stage,
+                json!({"stage":"a_stage_from_the_future","reason":"admission_error"}),
+            ),
+        ] {
+            write(&root, "agent-runs", id, &record(id, "failed"));
+            write(
+                &root,
+                "agent-run-details",
+                id,
+                &json!({"schema":1,"task":"fixture","started_at":null,"cancel_requested":false,"cancelled":false,"failure":failure}),
+            );
+        }
+        write(&root, "agent-runs", fine, &record(fine, "succeeded"));
+        let service = AgentService::new(&root, fleet).unwrap();
+        let records = service.inner.records.lock().unwrap();
+        assert!(records.contains_key(fine));
+        for id in [reason, stage] {
+            assert!(!records.contains_key(id), "{id} loaded");
+            let q = root.join("agent-runs-quarantine");
+            assert!(q.join(format!("{id}.json")).is_file());
+            assert!(q.join(format!("details-{id}.json")).is_file());
+        }
+    }
+
+    #[test]
+    fn an_unreadable_queue_entry_is_set_aside() {
+        let (_t, root, fleet) = state();
+        let id = "44444444444444444444444444444444";
+        write(
+            &root,
+            "agent-run-queue",
+            id,
+            &json!({"schema":1,"id":id,"future":"field"}),
+        );
+        let service = AgentService::new(&root, fleet).unwrap();
+        assert!(!service.inner.sched.lock().unwrap().entries.contains_key(id));
+        assert!(
+            root.join("agent-run-queue-quarantine")
+                .join(format!("{id}.json"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_controller_that_does_not_own_the_fleet_adopts_nothing() {
+        let (_t, root, fleet) = state();
+        let id = "55555555555555555555555555555555";
+        write(&root, "agent-runs", id, &record(id, "running"));
+        write(
+            &root,
+            DETACHED_DIR,
+            id,
+            &json!({"schema":1,"id":id,"deadline":u64::MAX / 2}),
+        );
+        let service = AgentService::new(&root, fleet).unwrap();
+        service.pause_admission();
+        service.adopt_detached();
+        // Nothing taken: no lease, no queue slot, still waiting for the owner.
+        assert!(service.inner.leases.lock().unwrap().is_empty());
+        assert!(service.inner.sched.lock().unwrap().running.is_empty());
+        assert_eq!(
+            service.inner.adoptable.lock().unwrap().as_slice(),
+            [id.to_owned()]
+        );
     }
 }
