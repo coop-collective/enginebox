@@ -422,6 +422,8 @@ async fn mock_server(state: Mock) -> (String, tokio::task::JoinHandle<()>) {
             .route("/v1/agents", get(mock_observation))
             .route("/v1/node/heartbeat", post(mock_node_heartbeat))
             .route("/v1/node/result", post(mock_node_result))
+            .route("/v1/node/engine-poll", post(mock_node_heartbeat))
+            .route("/v1/node/engine-report", post(mock_node_heartbeat))
             .with_state(state),
     )
     .await
@@ -991,7 +993,7 @@ async fn scoped_node_results_pass_drain_gate_without_authorizing_operator_writes
     })
     .await
     .unwrap();
-    for action in ["heartbeat", "result"] {
+    for action in ["heartbeat", "result", "engine-report"] {
         let response = client
             .post(format!("{}/v1/node/{action}", f.url))
             .bearer_auth("fixture-node-token")
@@ -1004,6 +1006,32 @@ async fn scoped_node_results_pass_drain_gate_without_authorizing_operator_writes
     }
     upgrade.await.unwrap().unwrap();
     assert_eq!(f.supervisor.current_version().await, Version::new(0, 4, 0));
+}
+
+#[tokio::test]
+async fn engine_session_node_actions_reach_the_controller_with_node_auth() {
+    // Without these in the node list the supervisor demanded owner auth, so
+    // engine machines never received their sessions.
+    let f = fixture().await;
+    let client = reqwest::Client::new();
+    for action in ["engine-poll", "engine-report"] {
+        let response = client
+            .post(format!("{}/v1/node/{action}", f.url))
+            .bearer_auth("fixture-node-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{action}");
+        assert_eq!(response.text().await.unwrap(), "0.3.0");
+        let forged = client
+            .post(format!("{}/v1/node/{action}", f.url))
+            .bearer_auth("invalid-node-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED, "{action}");
+        assert_eq!(forged.text().await.unwrap(), "node auth", "{action}");
+    }
 }
 
 fn controller_state_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
