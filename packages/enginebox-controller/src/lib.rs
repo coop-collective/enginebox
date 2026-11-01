@@ -297,8 +297,7 @@ impl Controller {
         self.fleet.set_refill_guard(Arc::new(move |host| {
             owner_refill
                 .upgrade()
-                .and_then(|owner| owner.runtime().ok())
-                .is_none_or(|runtime| !runtime.agents.pool_demand_on(host))
+                .is_some_and(|owner| owner.refill_allowed(host))
         }));
         let owner_attach = Arc::downgrade(self);
         self.fleet.set_post_start(Arc::new(move |host, name| {
@@ -351,6 +350,16 @@ impl Controller {
         );
         g.requests += 1;
         Ok(Admission(self.clone()))
+    }
+    /// Whether warm refill may take one of `host`'s last instance slots: only
+    /// while this controller is the active owner (a draining, drained or
+    /// standby one mutates no VMs) and no queued pool run needs the slot.
+    fn refill_allowed(&self, host: &str) -> bool {
+        let g = self.gate.lock().unwrap();
+        g.mode == Mode::Active
+            && g.runtime
+                .as_ref()
+                .is_some_and(|r| !r.agents.pool_demand_on(host))
     }
     pub fn drain(&self) -> Value {
         let mut g = self.gate.lock().unwrap();
@@ -2745,6 +2754,20 @@ mod tests {
             call(&app, request(Method::GET, route, "", true)).await.1["allowed"],
             false
         );
+    }
+    #[tokio::test]
+    async fn only_the_active_owner_allows_warm_refill_into_the_last_slot() {
+        let (_temp, c) = setup();
+        // Standby: not the owner.
+        assert!(!c.refill_allowed("worker"));
+        c.activate().unwrap();
+        assert!(c.refill_allowed("worker"));
+        let in_flight = c.admit().unwrap();
+        assert_eq!(c.drain()["mode"], "draining");
+        assert!(!c.refill_allowed("worker"));
+        drop(in_flight);
+        assert_eq!(c.drain()["drained"], true);
+        assert!(!c.refill_allowed("worker"));
     }
     #[tokio::test]
     async fn auth_and_origin_are_checked_before_body_or_state() {

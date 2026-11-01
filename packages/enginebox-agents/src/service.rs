@@ -1,7 +1,7 @@
 use crate::{
     auth, delegation,
     launch_events::{self, LaunchEvent, LaunchEvents, LaunchFailure, Stage},
-    lifecycle::{self, IdleAction, IdlePolicy, MemberView, Reclaim, StartPath, VmState},
+    lifecycle::{self, Hold, IdleAction, IdlePolicy, MemberView, Reclaim, StartPath, VmState},
     native, pools, process, profile,
     queue::{self, Entry, EntryState, HostLoad, Placement, QueueLimits, StoredCallback, Target},
     repository, run_details, security, usage,
@@ -1319,6 +1319,7 @@ impl AgentService {
             .map(|(h, n, _)| (h.clone(), n.clone()))
             .collect();
         let interval = Duration::from_secs(self.limits().uncertain_probe_seconds);
+        let owner = self.owns_fleet();
         let mut reasons = BTreeMap::new();
         let mut due = Vec::new();
         {
@@ -1331,7 +1332,9 @@ impl AgentService {
                     reason: "execution uncertain; checking its native session lease".into(),
                 });
                 // A workspace running a new run is busy anyway; probe later.
+                // Only the owner probes: clearing a fence is a state change.
                 if !probe.in_flight
+                    && owner
                     && !held.contains(&key)
                     && probe.last.is_none_or(|at| at.elapsed() >= interval)
                 {
@@ -1347,6 +1350,10 @@ impl AgentService {
                 let key = (host_id.clone(), name.clone());
                 let mut reason = None;
                 for (id, provider) in runs {
+                    // A drain that began after the probe was due: the new owner probes.
+                    if !this.owns_fleet() {
+                        break;
+                    }
                     let started = Instant::now();
                     let result = this.probe_lease(&host_id, &name, &provider);
                     let (outcome, why) = match &result {
@@ -2325,10 +2332,22 @@ impl AgentService {
                 });
             }
         }
-        for (pool, host) in plan.create {
-            *sched.creating.entry(pool.clone()).or_default() += 1;
-            self.spawn_create(pool, host);
+        // Only the owner grows pools (the plan creates nothing while
+        // admission is paused; this holds even if it did).
+        if self.owns_fleet() {
+            for (pool, host) in plan.create {
+                *sched.creating.entry(pool.clone()).or_default() += 1;
+                self.spawn_create(pool, host);
+            }
         }
+    }
+    /// Whether this service owns the fleet and admits work. A draining or
+    /// drained controller keeps its scheduler thread but must not freeze,
+    /// stop or resume members: it does not know the new owner's runs and its
+    /// idle clocks are stale (a drained controller froze a member under the
+    /// new owner's run once).
+    fn owns_fleet(&self) -> bool {
+        self.inner.admitting.load(Ordering::SeqCst) && !self.inner.closed.load(Ordering::SeqCst)
     }
     /// Start a lifecycle pass when one is due and none is running. Passes
     /// read host inventories and change VMs, so they run off the scheduler
@@ -2337,6 +2356,7 @@ impl AgentService {
         {
             let mut sched = self.inner.sched.lock().unwrap();
             if sched.lifecycle_running
+                || !self.owns_fleet()
                 || sched
                     .lifecycle_at
                     .is_some_and(|at| at.elapsed() < LIFECYCLE_EVERY)
@@ -2406,9 +2426,43 @@ impl AgentService {
             }
         }
         let now = Instant::now();
+        let mut resumes: Vec<(String, Placement)> = Vec::new();
         let actions: Vec<(String, Placement, IdleAction, Duration)> = {
             let mut sched = self.inner.sched.lock().unwrap();
-            let busy = self.busy_members(&sched);
+            // Re-checked under the lock that every placement takes: a drain
+            // that began after the pass started stops it here.
+            if !self.owns_fleet() {
+                return;
+            }
+            // Every busy source, kept apart: a run or lease on a frozen member
+            // must be resumed, an action in flight must not be.
+            let leases: BTreeSet<(String, String)> = self
+                .inner
+                .leases
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(h, n, _)| (h.clone(), n.clone()))
+                .collect();
+            let runs: BTreeSet<(String, String)> = sched
+                .running
+                .values()
+                .map(|p| (p.host_id.clone(), p.name.clone()))
+                .collect();
+            let uncertain: BTreeSet<(String, String)> = self
+                .inner
+                .records
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|v| v["execution_uncertain"] == true)
+                .map(|v| {
+                    (
+                        v["host_id"].as_str().unwrap_or("").to_owned(),
+                        v["name"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect();
             // Queued runs a pool's free members could take, and runs pinned
             // to one member: those members stay up.
             let mut demand: BTreeSet<String> = BTreeSet::new();
@@ -2451,19 +2505,30 @@ impl AgentService {
                         .get(&m.name)
                         .map_or(VmState::Other, |s| VmState::from_status(s));
                     sched.vm_states.insert(key.clone(), state);
-                    if busy.contains(&key) {
-                        if sched.idle_since.remove(&key).is_some() {
-                            sched.idle_dirty = true;
-                        }
-                        continue;
-                    }
-                    if !sched.idle_since.contains_key(&key) {
+                    let hold = Hold {
+                        run: runs.contains(&key),
+                        lease: leases.contains(&key),
+                        uncertain: uncertain.contains(&key),
+                        action: sched.holding.contains(&key),
+                    };
+                    let wanted = demand.contains(&def.name) || pinned.contains(&key);
+                    let before = sched.idle_since.get(&key).copied();
+                    let d = lifecycle::decide(true, state, hold, wanted, before, policy, now);
+                    if d.idle_since != before {
+                        match d.idle_since {
+                            Some(at) => sched.idle_since.insert(key.clone(), at),
+                            None => sched.idle_since.remove(&key),
+                        };
                         sched.idle_dirty = true;
                     }
-                    let since = *sched.idle_since.entry(key.clone()).or_insert(now);
-                    let idle = now.saturating_duration_since(since);
-                    let wanted = demand.contains(&def.name) || pinned.contains(&key);
-                    if let Some(action) = lifecycle::idle_action(state, idle, policy, wanted) {
+                    if d.resume {
+                        sched.holding.insert(key.clone());
+                        resumes.push((def.name.clone(), m.clone()));
+                    }
+                    if let Some(action) = d.action {
+                        let idle = d
+                            .idle_since
+                            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
                         sched.holding.insert(key);
                         out.push((def.name.clone(), m, action, idle));
                     }
@@ -2471,7 +2536,34 @@ impl AgentService {
             }
             out
         };
+        for (pool, m) in resumes {
+            let result = self.inner.fleet.wake(&m.host_id, &m.name);
+            self.lifecycle_event(
+                &pool,
+                &m,
+                "workspace_resumed_busy",
+                "busy_member_frozen",
+                result.as_ref().err(),
+            );
+            let mut sched = self.inner.sched.lock().unwrap();
+            let key = (m.host_id.clone(), m.name.clone());
+            sched.holding.remove(&key);
+            if result.is_ok() {
+                sched.vm_states.insert(key, VmState::Running);
+            }
+            sched.dirty = true;
+        }
         for (pool, m, action, idle) in actions {
+            // A drain may have begun since the decision: the new owner decides.
+            if !self.owns_fleet() {
+                self.inner
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .holding
+                    .remove(&(m.host_id.clone(), m.name.clone()));
+                continue;
+            }
             let op = match action {
                 IdleAction::Freeze => "pause",
                 IdleAction::Stop => "stop",
@@ -2569,6 +2661,9 @@ impl AgentService {
     /// `fits` says the pending start fits. Returns how many were stopped.
     fn relieve_memory(&self, host: &str, fits: &dyn Fn() -> bool) -> usize {
         let mut stopped = 0;
+        if !self.owns_fleet() {
+            return stopped;
+        }
         for m in lifecycle::memory_victims(&self.member_views(host), host) {
             if fits() {
                 break;
@@ -2576,6 +2671,9 @@ impl AgentService {
             let key = (m.host_id.clone(), m.name.clone());
             {
                 let mut sched = self.inner.sched.lock().unwrap();
+                if !self.owns_fleet() {
+                    break;
+                }
                 if self.busy_members(&sched).contains(&key) {
                     continue;
                 }
@@ -2605,6 +2703,9 @@ impl AgentService {
     /// Delete one thing disk reclamation allows on `host`; true when
     /// something was deleted.
     fn reclaim_disk(&self, host: &str) -> bool {
+        if !self.owns_fleet() {
+            return false;
+        }
         let bases = self.inner.fleet.stale_bases(host).unwrap_or_default();
         let views = self.member_views(host);
         let pools = self.inner.pools.all();
@@ -2623,6 +2724,9 @@ impl AgentService {
         for victim in lifecycle::delete_victims(host, &bases, &views, &minimum, &created) {
             match victim {
                 Reclaim::Base { host_id, name } => {
+                    if !self.owns_fleet() {
+                        return false;
+                    }
                     let result = self
                         .inner
                         .fleet
@@ -2643,6 +2747,9 @@ impl AgentService {
                     let key = (placement.host_id.clone(), placement.name.clone());
                     {
                         let mut sched = self.inner.sched.lock().unwrap();
+                        if !self.owns_fleet() {
+                            return false;
+                        }
                         if self.busy_members(&sched).contains(&key) {
                             continue;
                         }
@@ -2947,6 +3054,15 @@ impl AgentService {
         );
         self.inner.leases.lock().unwrap().insert(lease.clone());
         sched.running.insert(id.to_owned(), placement.clone());
+        // The member is reserved from here: its idle clock restarts when this
+        // run ends, never from a time before the run.
+        if sched
+            .idle_since
+            .remove(&(placement.host_id.clone(), placement.name.clone()))
+            .is_some()
+        {
+            sched.idle_dirty = true;
+        }
         sched
             .admitted_since
             .entry(placement.host_id.clone())
@@ -3478,6 +3594,15 @@ impl AgentService {
     fn spawn_create(&self, pool: String, host: String) {
         let this = self.clone();
         thread::spawn(move || {
+            // A drain that began after the plan: give the slot back, create nothing.
+            if !this.owns_fleet() {
+                let mut sched = this.inner.sched.lock().unwrap();
+                if let Some(n) = sched.creating.get_mut(&pool) {
+                    *n = n.saturating_sub(1);
+                }
+                sched.dirty = true;
+                return;
+            }
             let started = Instant::now();
             let mut event = LaunchEvent {
                 kind: "pool_member_created".into(),
@@ -4386,6 +4511,129 @@ mod run_control_tests {
             "cancelled"
         );
         assert_eq!(restarted.list_runs()["runs"][0]["task"], "fixture task");
+    }
+
+    /// A pool with one member on the fixture host, frozen and idle for an
+    /// hour: every reclaimer and the lifecycle would act on it as the owner.
+    fn idle_frozen_member(service: &AgentService) -> Placement {
+        let m = Placement {
+            host_id: "test-node".into(),
+            name: "ebox-idle".into(),
+        };
+        service
+            .inner
+            .pools
+            .put(
+                json!({"name":"p","workspaces":[{"host_id":"test-node","name":"ebox-idle"}]}),
+                &|h| h == "test-node",
+            )
+            .unwrap();
+        let mut sched = service.inner.sched.lock().unwrap();
+        let key = (m.host_id.clone(), m.name.clone());
+        sched.vm_states.insert(key.clone(), VmState::Frozen);
+        sched
+            .idle_since
+            // checked_sub: Windows' monotonic clock starts near boot.
+            .insert(
+                key,
+                Instant::now()
+                    .checked_sub(Duration::from_secs(3600))
+                    .unwrap_or_else(Instant::now),
+            );
+        m
+    }
+    fn lifecycle_events(service: &AgentService) -> usize {
+        service.launch_events(&launch_events::Filter::default())["events"]
+            .as_array()
+            .map_or(0, |e| e.len())
+    }
+
+    #[test]
+    fn a_non_owner_starts_no_lifecycle_pass() {
+        let (_t, service, _host) = fixture();
+        idle_frozen_member(&service);
+        service.pause_admission();
+        service.maybe_lifecycle();
+        assert!(service.inner.sched.lock().unwrap().lifecycle_at.is_none());
+        service.resume_admission();
+        service.maybe_lifecycle();
+        assert!(service.inner.sched.lock().unwrap().lifecycle_at.is_some());
+    }
+
+    #[test]
+    fn a_non_owner_stops_nothing_for_memory_or_slots() {
+        let (_t, service, _host) = fixture();
+        idle_frozen_member(&service);
+        service.pause_admission();
+        assert_eq!(service.relieve_memory("test-node", &|| false), 0);
+        let refused =
+            anyhow::anyhow!("Insufficient capacity (no instance slots (max_instances 16))");
+        assert!(!service.relieve_for_create("test-node", &refused));
+        assert_eq!(lifecycle_events(&service), 0);
+        assert!(service.inner.sched.lock().unwrap().holding.is_empty());
+    }
+
+    #[test]
+    fn a_non_owner_deletes_nothing_for_disk() {
+        let (_t, service, _host) = fixture();
+        idle_frozen_member(&service);
+        service
+            .inner
+            .sched
+            .lock()
+            .unwrap()
+            .vm_states
+            .insert(("test-node".into(), "ebox-idle".into()), VmState::Stopped);
+        service.pause_admission();
+        assert!(!service.reclaim_disk("test-node"));
+        assert_eq!(lifecycle_events(&service), 0);
+    }
+
+    #[test]
+    fn a_non_owner_creates_no_pool_member() {
+        let (_t, service, _host) = fixture();
+        service
+            .inner
+            .sched
+            .lock()
+            .unwrap()
+            .creating
+            .insert("p".into(), 1);
+        service.pause_admission();
+        service.spawn_create("p".into(), "test-node".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while service.inner.sched.lock().unwrap().creating.get("p") != Some(&0) {
+            assert!(
+                Instant::now() < deadline,
+                "the creation slot was not given back"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(lifecycle_events(&service), 0);
+        assert!(service.inner.pools.get("p").is_none());
+    }
+
+    #[test]
+    fn a_non_owner_probes_no_uncertain_lease() {
+        let (_t, service, _host) = fixture();
+        let id = "33333333333333333333333333333333";
+        insert(&service, id, json!({}));
+        service.inner.records.lock().unwrap().get_mut(id).unwrap()["execution_uncertain"] =
+            json!(true);
+        service.pause_admission();
+        let reasons = service.probe_uncertain();
+        assert_eq!(reasons.len(), 1, "the fence is still reported");
+        assert!(
+            service
+                .inner
+                .probes
+                .lock()
+                .unwrap()
+                .values()
+                .all(|p| !p.in_flight),
+            "no probe started"
+        );
+        assert_eq!(lifecycle_events(&service), 0);
     }
 
     fn fixture() -> (tempfile::TempDir, AgentService, Host) {
