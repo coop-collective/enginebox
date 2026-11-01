@@ -1,11 +1,9 @@
 import { test, expect, type Page } from "@playwright/test";
-import { createHmac, randomBytes } from "node:crypto";
+import { signedInCookie } from "./session";
 import { dashboardOrigin, fixtureOrigin } from "./urls";
 import type { Workspace } from "../../lib/workspaces";
 async function signIn(page: Page, path = "/?panel=workspaces") {
-  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3600000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
-  const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
-  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto(path);
 }
 function workspace(id: string): Workspace {

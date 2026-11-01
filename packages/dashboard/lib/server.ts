@@ -1,14 +1,9 @@
-import {
-  createHash,
-  createHmac,
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { HttpError } from "./http-error";
 import {
   DEFAULT_ORG,
   digest,
-  identityEnabled,
+  identityDir,
   membership,
   orgOf,
   readIdentity,
@@ -25,19 +20,24 @@ const cookieName = "enginebox_session";
 export const sessionSeconds = 8 * 60 * 60;
 
 export function config() {
-  const password = process.env.ENGINEBOX_DASHBOARD_PASSWORD ?? "";
   const secret = process.env.ENGINEBOX_SESSION_SECRET ?? "";
   const apiToken = process.env.ENGINEBOX_API_TOKEN ?? "";
-  if (password.length < 16 || secret.length < 32 || apiToken.length < 32) {
+  if (secret.length < 32 || apiToken.length < 32) {
     throw new HttpError(
       503,
       "Dashboard credentials are not configured. Check the server environment.",
     );
   }
-  if (password === apiToken)
+  if (secret === apiToken)
     throw new HttpError(
       503,
       "Use separate dashboard and fleet API credentials.",
+    );
+  // Email sign-in is the only way in, so the identity store is required.
+  if (!identityDir())
+    throw new HttpError(
+      503,
+      "Email sign-in is not configured. Set ENGINEBOX_IDENTITY_STATE_DIR.",
     );
   const origin =
     process.env.ENGINEBOX_DASHBOARD_ORIGIN ??
@@ -75,7 +75,6 @@ export function config() {
       "ENGINEBOX_DASHBOARD_ORIGIN must be an exact origin without a path or trailing slash.",
     );
   return {
-    password,
     secret,
     apiToken,
     origin,
@@ -117,15 +116,6 @@ function equal(a: string, b: string) {
   );
 }
 
-/** Operator (break-glass) sessions: signed with the secret and the operator password, so rotating either ends them. */
-function sign(payload: string) {
-  const { secret, password } = config();
-  return createHmac("sha256", secret)
-    .update(password)
-    .update("\0")
-    .update(payload)
-    .digest("base64url");
-}
 /** Member sessions: signed with the secret only (domain-separated); each is also a revocable server-side record. */
 function signMember(payload: string) {
   const { secret } = config();
@@ -133,18 +123,6 @@ function signMember(payload: string) {
     .update("enginebox-member-session\0")
     .update(payload)
     .digest("base64url");
-}
-
-/** A break-glass operator session cookie (the existing password sign-in). */
-export function sessionCookie(now = Date.now()) {
-  const payload = Buffer.from(
-    JSON.stringify({
-      kind: "operator",
-      expires: now + sessionSeconds * 1000,
-      nonce: randomBytes(24).toString("hex"),
-    }),
-  ).toString("base64url");
-  return cookie(`${payload}.${sign(payload)}`, sessionSeconds);
 }
 
 /** A member session cookie carrying the session ID whose digest the identity store keeps. */
@@ -162,9 +140,7 @@ export function cookie(value: string, maxAge: number) {
   return `${cookieName}=${value}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${maxAge}${config().origin.startsWith("https:") ? "; Secure" : ""}`;
 }
 
-export type SessionToken =
-  | { kind: "operator"; expires: number }
-  | { kind: "member"; sid: string; expires: number };
+export type SessionToken = { kind: "member"; sid: string; expires: number };
 
 /** The verified session cookie, or null. Does not consult the identity store. */
 export function readSession(request: Request, now = Date.now()): SessionToken | null {
@@ -190,59 +166,37 @@ export function readSession(request: Request, now = Date.now()): SessionToken | 
     session.expires > now + sessionSeconds * 1000
   )
     return null;
-  if (session.kind === "member") {
-    if (!equal(signMember(payload), signature)) return null;
-    if (typeof session.sid !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(session.sid)) return null;
-    return { kind: "member", sid: session.sid, expires: session.expires };
-  }
-  // Operator sessions, including cookies issued before orgs (no `kind`).
-  if (session.kind !== undefined && session.kind !== "operator") return null;
-  if (!equal(sign(payload), signature)) return null;
-  return { kind: "operator", expires: session.expires };
+  // Only member sessions exist; operator cookies from the retired password sign-in are rejected.
+  if (session.kind !== "member") return null;
+  if (!equal(signMember(payload), signature)) return null;
+  if (typeof session.sid !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(session.sid)) return null;
+  return { kind: "member", sid: session.sid, expires: session.expires };
 }
 
-/** Who is acting: a signed-in user in one of their orgs, or the host operator's break-glass session. */
+/** Who is acting: a signed-in user in one of their orgs. */
 export type Principal = {
-  kind: "operator" | "member";
+  kind: "member";
   /** The org this session acts in. */
   org_id: string;
   org_kind: OrgKind;
-  /** Null for the operator. */
-  user_id: string | null;
-  member_id: string | null;
+  user_id: string;
+  member_id: string;
   role: Role;
-  /** Operator of the install (the break-glass session, or the instance-owner user). */
+  /** Operator of the install (the user named by ENGINEBOX_OWNER_EMAIL). */
   instance_owner: boolean;
-  email: string | null;
-  /** Owner of OAuth grants this principal approves: the user ID, or "owner" for the operator (and pre-org grants). */
+  email: string;
+  /** Owner of OAuth grants this principal approves: the user ID. */
   grant_owner: string;
   label: string;
 };
 
-export const OPERATOR_LABEL = "Host operator (break-glass)";
-export const operatorPrincipal = (): Principal => ({
-  kind: "operator",
-  org_id: DEFAULT_ORG,
-  org_kind: "platform",
-  user_id: null,
-  member_id: null,
-  role: "owner",
-  instance_owner: true,
-  email: null,
-  grant_owner: "owner",
-  label: OPERATOR_LABEL,
-});
-
 /**
- * The request's principal, or null. The break-glass operator acts as the
- * platform org's owner. A member session is valid only while its server-side
- * record is live and the user still belongs to the session's org.
+ * The request's principal, or null. A session is valid only while its
+ * server-side record is live and the user still belongs to the session's org.
  */
 export function principal(request: Request, now = Date.now()): Principal | null {
   const session = readSession(request, now);
   if (!session) return null;
-  if (session.kind === "operator") return operatorPrincipal();
-  if (!identityEnabled()) return null;
   const state = readIdentity();
   const record = state.sessions.find(
     (s) => s.id_hash === digest("session", session.sid),
@@ -309,30 +263,6 @@ export async function bodyJson(request: Request, maxBytes = 8192) {
   } catch {
     throw new HttpError(400, "Request body must be valid JSON.");
   }
-}
-
-// A small global limit suits this single-operator service without trusting
-// user-controlled proxy address headers. Restarting the process resets it.
-let attempts: number[] = [];
-/** Counts one sign-in attempt against the shared limit, then checks the password. */
-export function verifyOperatorPassword(password: unknown) {
-  const now = Date.now();
-  attempts = attempts.filter((time) => time > now - 5 * 60 * 1000);
-  if (attempts.length >= 20)
-    throw new HttpError(
-      429,
-      "Too many sign-in attempts. Try again in five minutes.",
-    );
-  attempts.push(now);
-  if (typeof password !== "string" || !equal(password, config().password)) {
-    throw new HttpError(401, "That operator password was not accepted.");
-  }
-}
-export async function login(request: Request) {
-  requireOrigin(request);
-  const body = await bodyJson(request);
-  verifyOperatorPassword(body?.password);
-  return json({ authenticated: true }, 200, { "Set-Cookie": sessionCookie() });
 }
 
 /**

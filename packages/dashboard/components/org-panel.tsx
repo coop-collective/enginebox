@@ -9,10 +9,9 @@ type OrgSummary = { id: string; name: string; kind: "platform" | "personal" | "t
 type View = {
   enabled: boolean;
   mode: "self_hosted" | "managed";
-  me: { kind: "operator" | "member"; role: Role; email: string | null; label: string; org_id: string; org_kind?: string; instance_owner: boolean };
+  me: { kind: "member"; role: Role; email: string | null; label: string; org_id: string; org_kind?: string; instance_owner: boolean };
   org?: { id: string; name: string; kind: OrgSummary["kind"] };
   orgs?: OrgSummary[];
-  needs_instance_owner?: boolean;
   email_transport?: "gateway" | "file" | "none";
   members?: Member[];
   invites?: Invite[];
@@ -21,7 +20,7 @@ type View = {
 const kindLabel = (kind: string) => (kind === "platform" ? "platform" : kind === "personal" ? "personal workspace" : "team");
 const post = (path: string, body: unknown) => api(path, { method: "POST", body: JSON.stringify(body) });
 
-/** Organization: switch orgs, manage members and invites, and (operator) name the instance owner. */
+/** Organization: switch orgs, manage members and invites. */
 export function OrgPanel({ onSwitched }: { onSwitched: () => void }) {
   const [view, setView] = useState<View | null>(null);
   const [error, setError] = useState("");
@@ -31,8 +30,6 @@ export function OrgPanel({ onSwitched }: { onSwitched: () => void }) {
   const [inviteRole, setInviteRole] = useState<Role>("member");
   const [importText, setImportText] = useState("");
   const [teamName, setTeamName] = useState("");
-  const [claimEmail, setClaimEmail] = useState("");
-  const [claim, setClaim] = useState<{ challenge: string; code: string } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -66,7 +63,7 @@ export function OrgPanel({ onSwitched }: { onSwitched: () => void }) {
     return (
       <section className="contributor-panel" aria-label="Organization">
         <h2>Organization</h2>
-        <p>Organizations and email sign-in are not enabled on this Engine Box. The host operator signs in with the dashboard password. See docs/SELF-HOSTING-ORGS.md to turn on orgs.</p>
+        <p>Email sign-in is not configured on this Engine Box. Set ENGINEBOX_IDENTITY_STATE_DIR and ENGINEBOX_OWNER_EMAIL; see docs/SELF-HOSTING-ORGS.md.</p>
       </section>
     );
   const admin = view.me.role === "owner" || view.me.role === "admin";
@@ -79,7 +76,7 @@ export function OrgPanel({ onSwitched }: { onSwitched: () => void }) {
           <h2>{view.org?.name}</h2>
           <p>
             {kindLabel(view.org?.kind ?? "team")} · you are <strong>{view.me.role}</strong>
-            {view.me.kind === "operator" ? " (host operator, break-glass session)" : view.me.instance_owner ? " · instance owner" : ""}
+            {view.me.instance_owner ? " · instance owner" : ""}
             {view.mode === "managed" ? " · managed install" : ""}
           </p>
         </div>
@@ -103,24 +100,6 @@ export function OrgPanel({ onSwitched }: { onSwitched: () => void }) {
       {error && <div role="alert" className="alert">{error}</div>}
       {notice && <div role="status" className="notice">{notice}</div>}
       {view.email_transport === "none" && <div className="alert">Email sending is not configured: sign-in codes and invites cannot be delivered. See docs/SELF-HOSTING-ORGS.md.</div>}
-
-      {view.me.kind === "operator" && view.needs_instance_owner && (
-        <div className="host-card">
-          <h3>Name the instance owner</h3>
-          <p>You are signed in with the break-glass operator password. Verify the owner's email to create their account; they own the platform org and sign in by email from then on.</p>
-          {!claim ? (
-            <form onSubmit={(e: FormEvent) => { e.preventDefault(); void act("claim", async () => { const r = await api<{ challenge: string }>("/api/org/claim", { method: "POST", body: JSON.stringify({ email: claimEmail }) }); setClaim({ challenge: r.challenge, code: "" }); }); }}>
-              <input type="email" value={claimEmail} onChange={(e) => setClaimEmail(e.target.value)} required placeholder="owner@example.com" aria-label="Owner email" />
-              <button className="button small" disabled={busy === "claim"} type="submit">Send code</button>
-            </form>
-          ) : (
-            <form onSubmit={(e: FormEvent) => { e.preventDefault(); void act("claim", () => post("/api/auth/email/verify", claim).then(onSwitched), "You are now signed in as the instance owner."); }}>
-              <input inputMode="numeric" maxLength={6} value={claim.code} onChange={(e) => setClaim({ ...claim, code: e.target.value.replace(/\D/g, "") })} required placeholder="123456" aria-label="Verification code" />
-              <button className="button small" disabled={claim.code.length !== 6 || busy === "claim"} type="submit">Verify</button>
-            </form>
-          )}
-        </div>
-      )}
 
       <div className="host-card">
         <h3>Members</h3>

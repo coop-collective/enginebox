@@ -2,13 +2,13 @@
 
 Engine Box can serve a team: each person signs in with their email, works in one or more organizations, and the install's own machines stay under the operator's control. This page describes the model, sign-in, tenancy and where a managed (hosted) offering plugs in. Setup steps are in [Self-hosting orgs](SELF-HOSTING-ORGS.md).
 
-Orgs are **off** unless `ENGINEBOX_IDENTITY_STATE_DIR` is set. Off, the dashboard behaves exactly as before: one operator password, every record in the platform org.
+Email sign-in is the only way into the dashboard, so `ENGINEBOX_IDENTITY_STATE_DIR` is required; the dashboard refuses to start without it. There is no password sign-in.
 
 ## Model
 
 | Concept | What it is |
 | --- | --- |
-| **Instance owner** | The operator of the install. The break-glass operator session, plus the user named by `ENGINEBOX_OWNER_EMAIL` (or claimed by the operator in **Organization**). Owns the platform org. |
+| **Instance owner** | The operator of the install: the user named by `ENGINEBOX_OWNER_EMAIL` when the identity state has no instance owner yet. Owns the platform org. |
 | **Platform org** (`default`) | Shown as **Default Org** on a self-hosted install (`ENGINEBOX_ORG_NAME` overrides). Owns the install's nodes, pools, profiles and repositories. Everything created before orgs belongs to it. |
 | **User** | One per email address. Every user gets a **personal org** (their personal workspace) when the account is created. |
 | **Team org** | Created by any signed-in user (**Organization → New team organization**). People join by invite. |
@@ -131,14 +131,11 @@ Admins invite by email (`POST /api/org/invites {email, role}`). The invite is si
 
 ### Sessions
 
-The existing `enginebox_session` cookie (HttpOnly, SameSite=Strict, Secure on HTTPS, eight hours) carries one of:
+The `enginebox_session` cookie (HttpOnly, SameSite=Strict, Secure on HTTPS, eight hours) carries a **member** session: `{kind: "member", sid, expires}`, signed with the session secret alone, plus a server-side record (`sid` digest, user, active org, expiry, revocation). It is valid only while the record is live and the user still belongs to the org. Sign-out revokes the record; removing a member revokes their sessions in that org; `POST /api/org/switch {org_id}` moves the session to another of the user's orgs.
 
-- an **operator** session: signed with the session secret and the operator password, stateless, as before (cookies issued before orgs keep working until they expire);
-- a **member** session: `{kind: "member", sid, expires}`, signed with the session secret alone, plus a server-side record (`sid` digest, user, active org, expiry, revocation). It is valid only while the record is live and the user still belongs to the org. Sign-out revokes the record; removing a member revokes their sessions in that org; `POST /api/org/switch {org_id}` moves the session to another of the user's orgs.
+### The first owner and recovery
 
-### Break-glass operator password
-
-`ENGINEBOX_DASHBOARD_PASSWORD` stays as the host operator's emergency login, labelled as such on the sign-in page and on the OAuth consent page. It acts as the platform org's owner and the instance owner. It is how the first owner is named when `ENGINEBOX_OWNER_EMAIL` is not set: **Organization → Name the instance owner** sends a code to that address, and verifying it in the operator session creates the owner and switches the browser to that member session.
+The instance owner is created from `ENGINEBOX_OWNER_EMAIL` the first time the identity state is read, and only while it has no instance owner. Set it before the first start. Changing it later does nothing once an owner exists. If the owner loses access to that mailbox, another owner of the platform org can still sign in and manage members; with no other owner, start over with a new, empty `ENGINEBOX_IDENTITY_STATE_DIR` and the right `ENGINEBOX_OWNER_EMAIL` (members, invites and sessions in the old state are not carried over). Releases before this one also had an operator password; it is gone, and its cookies are rejected.
 
 ## Email sending
 
@@ -156,8 +153,9 @@ Development and tests use `ENGINEBOX_EMAIL_TRANSPORT=file`, which appends messag
 
 | Variable | Purpose |
 | --- | --- |
-| `ENGINEBOX_IDENTITY_STATE_DIR` | Absolute private directory for `identity.json`. Enables orgs. Production: `<controller state>/identity`. |
-| `ENGINEBOX_OWNER_EMAIL` | The instance owner's email (bootstrap). |
+| `ENGINEBOX_IDENTITY_STATE_DIR` | Required. Absolute private directory for `identity.json`. Production: `<controller state>/identity`. |
+| `ENGINEBOX_OWNER_EMAIL` | The instance owner's email, used once when the state has no instance owner. |
+| `ENGINEBOX_EMAIL_TRANSPORT` | `file`: write messages to `<identity dir>/outbox/outbox.jsonl` instead of sending. Local development and tests only. |
 | `ENGINEBOX_ORG_NAME` | Platform org display name (default "Default Org", "Platform" in managed mode). |
 | `ENGINEBOX_EMAIL_ENDPOINT` | `https://<site>/_email/send`. |
 | `ENGINEBOX_EMAIL_SECRET` | Shared HMAC secret (≥ 32 characters), the gateway's `EMAIL_GATEWAY_SECRET`. |
@@ -180,4 +178,4 @@ The core (controller, guest, node agent and dashboard with orgs) is complete and
 
 - Enabling orgs creates `identity.json` with the platform org and, when `ENGINEBOX_OWNER_EMAIL` is set, the instance owner and their personal org. No controller record is rewritten: platform-org records never gain an `org_id` field, `tenancy.json` is created only on the first assignment or grant, and every existing OAuth grant and service token remains the platform org's.
 - Rolling back the release is safe while only platform-org records exist. Records stamped with another org's `org_id` (pools, profiles, repositories, service tokens) are refused by releases before orgs, which reject unknown fields; remove or reassign them before rolling back.
-- Turning orgs off again (unsetting `ENGINEBOX_IDENTITY_STATE_DIR`) ends member sessions; the operator password keeps working.
+- The dashboard no longer starts without `ENGINEBOX_IDENTITY_STATE_DIR`. Rolling back to a release with the operator password needs `ENGINEBOX_DASHBOARD_PASSWORD` in `environment.json` again; the supervisor still accepts that key for retained prior releases.

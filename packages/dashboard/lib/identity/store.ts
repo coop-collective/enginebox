@@ -7,16 +7,16 @@ import { PrivateStateFile } from "../state-file";
  * Users, organizations, memberships, invites, email sign-in challenges and
  * member sessions. One private file, `identity.json`, in
  * ENGINEBOX_IDENTITY_STATE_DIR (production: `<controller state>/identity`, next
- * to the OAuth state). Unset, the dashboard keeps its single-operator
- * behaviour and every org route answers 404.
+ * to the OAuth state). It is required: email sign-in is the only way into the
+ * dashboard.
  *
  * Tenancy (docs/ORGS.md):
  * - The **platform org** (`default`, shown as "Default Org" on a self-hosted
  *   install) owns the install's nodes and pools. Everything that existed before
  *   orgs belongs to it.
- * - The **instance owner** operates the install: the break-glass operator
- *   session, and the user named by ENGINEBOX_OWNER_EMAIL (or claimed by the
- *   operator). On a self-hosted install the instance owner owns the platform org.
+ * - The **instance owner** operates the install: the user named by
+ *   ENGINEBOX_OWNER_EMAIL when the identity state has no instance owner yet.
+ *   On a self-hosted install the instance owner owns the platform org.
  * - Every user gets a **personal org** when their account is created, and joins
  *   other orgs by invite. The platform org never sees a personal org's resources.
  * - `mode` (ENGINEBOX_TENANCY_MODE): `self_hosted` (default) or `managed`. In
@@ -80,7 +80,8 @@ export type Challenge = {
   /**
    * `sign_in`: an existing user. `sign_up`: open sign-up (managed mode, or
    * ENGINEBOX_OPEN_SIGNUP) creates the user and their personal org on success.
-   * `claim_owner`: the break-glass operator proving the instance owner's email.
+   * `claim_owner`: retired (the removed password sign-in's owner claim). Old
+   * records may remain in a state file until pruned; they never verify.
    */
   purpose: "sign_in" | "sign_up" | "claim_owner";
   code_hash: string;

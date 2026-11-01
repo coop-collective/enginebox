@@ -1,12 +1,10 @@
 import { test, expect } from '@playwright/test';
-import { createHmac, randomBytes } from 'node:crypto';
+import { signedInCookie } from "./session";
 import { dashboardOrigin, fixtureOrigin } from './urls';
 
 test('persistent service status and authenticated HTTP/UDP route management use the protected dashboard API', async ({ page, request }) => {
   await request.post(`${fixtureOrigin}/__test/reset`);
-  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3600000, nonce: randomBytes(24).toString('hex') })).toString('base64url');
-  const signature = createHmac('sha256', 'fixture-session-secret-at-least-32-characters').update('fixture-dashboard-password').update('\0').update(payload).digest('base64url');
-  await page.context().addCookies([{ name: 'enginebox_session', value: `${payload}.${signature}`, url: dashboardOrigin, httpOnly: true, sameSite: 'Strict' }]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto('/');
   await page.getByRole('navigation', { name: 'Control plane' }).getByRole('button', { name: 'Environments', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Live environments', exact: true })).toBeVisible();

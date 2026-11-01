@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { flowCookie, validFlow, connectGitHub, githubCallback } from "../lib/github-server";
-process.env.ENGINEBOX_DASHBOARD_PASSWORD = "fixture-dashboard-password";
+import { useIdentityDir } from "./session-fixture";
+useIdentityDir();
 process.env.ENGINEBOX_SESSION_SECRET = "fixture-session-secret-at-least-32-characters";
 process.env.ENGINEBOX_API_TOKEN = "fixture-api-token-at-least-32-characters";
 process.env.ENGINEBOX_DASHBOARD_ORIGIN = "https://example.invalid";

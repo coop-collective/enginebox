@@ -1,5 +1,9 @@
-import { fixtureOrigin, dashboardOrigin, dashboardPort } from "./tests/browser/urls";
+import { rmSync } from "node:fs";
+import { fixtureOrigin, dashboardOrigin, dashboardPort, dashboardEnv, identityDir } from "./tests/browser/urls";
 import { defineConfig } from "@playwright/test";
+
+// Each run starts from an empty identity state (the owner is bootstrapped from ENGINEBOX_OWNER_EMAIL).
+if (!process.env.TEST_WORKER_INDEX) rmSync(identityDir, { recursive: true, force: true });
 
 export default defineConfig({
   testDir: "./tests/browser",
@@ -31,12 +35,7 @@ export default defineConfig({
         ENGINEBOX_LINUX_NODE_INSTALLER_URL: "https://github.com/coop-collective/enginebox/releases/download/linux-node-preview-fixture/install-linux-node.sh",
         ENGINEBOX_LINUX_NODE_INSTALLER_SHA256: "d".repeat(64),
         PORT: dashboardPort,
-        ENGINEBOX_DASHBOARD_ORIGIN: dashboardOrigin,
-        ENGINEBOX_DASHBOARD_PASSWORD: "fixture-dashboard-password",
-        ENGINEBOX_SESSION_SECRET:
-          "fixture-session-secret-at-least-32-characters",
-        ENGINEBOX_API_URL: fixtureOrigin,
-        ENGINEBOX_API_TOKEN: "fixture-api-token-server-only-12345",
+        ...dashboardEnv,
         ENGINEBOX_ENVIRONMENTS_URL: fixtureOrigin,
         ENGINEBOX_ENVIRONMENTS_TOKEN: "fixture-api-token-server-only-12345",
       },

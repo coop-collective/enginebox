@@ -343,7 +343,7 @@ function ControllerAgents() {
   );
 }
 
-export function AgentsPanel({ close }: { close: () => void }) {
+export function AgentsPanel() {
   return (
     <section className="agents-panel" aria-labelledby="agents-title">
       <div className="section-title">
@@ -353,9 +353,6 @@ export function AgentsPanel({ close }: { close: () => void }) {
             Connect once. Available to your private workspaces across the fleet.
           </p>
         </div>
-        <button className="button small" onClick={close}>
-          Close agents
-        </button>
       </div>
       <ControllerAgents />
       <p className="workspace-hint">

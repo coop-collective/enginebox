@@ -1,14 +1,11 @@
 import { fixtureOrigin } from "./urls";
+import { openSignedIn } from "./session";
 import { test, expect, type Page } from "@playwright/test";
 
 const fixture = `${fixtureOrigin}`;
 async function signIn(page: Page) {
-  await page.goto("/");
-  await page.getByLabel("Operator password").fill("fixture-dashboard-password");
-  await page.getByRole("button", { name: "Open dashboard" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Compute." }),
-  ).toBeVisible();
+  await openSignedIn(page);
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
 }
 const provider = (page: Page, name: string) =>
   page.getByRole("article", { name, exact: true });
@@ -19,7 +16,7 @@ test.beforeEach(async ({ request }) => {
 test("Agents distinguishes live allowance, provider credits, reset dates and unknown billing", async ({ page, request }) => {
   await request.post(`${fixture}/__test/mode`, { data: { mode: "usage-current" } });
   await signIn(page);
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   const codex = provider(page, "Codex (ChatGPT)");
   await expect(codex.getByText("75% left", { exact: true })).toBeVisible();
   await expect(codex.getByText("7-day allowance", { exact: true })).toBeVisible();
@@ -51,6 +48,7 @@ test("Agents shows native sign-in links, reconnect, Claude codes and cancellatio
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await signIn(page);
+  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Virtual machines", exact: true }).click();
   await page
     .getByRole("row")
     .filter({ hasText: "ebox-editor" })
@@ -142,6 +140,7 @@ test("global agent connections need no host or running workspace and never resum
   page.on("request", (req) => {
     if (req.method() === "POST") mutations.push(req.url());
   });
+  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Virtual machines", exact: true }).click();
   await page
     .getByRole("row")
     .filter({ hasText: "ebox-review" })
@@ -153,13 +152,13 @@ test("global agent connections need no host or running workspace and never resum
     page.getByRole("button", { name: "Resume workspace" }),
   ).toHaveCount(0);
   expect(mutations).toEqual([]);
-  await page.getByRole("button", { name: "Close agents" }).click();
+  await page.getByRole("button", { name: "Machines", exact: true }).click();
   await request.post(`${fixture}/__test/mode`, { data: { mode: "empty" } });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(
     page.getByText("No machines connected yet", { exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   await expect(provider(page, "Codex (ChatGPT)")).toBeVisible();
 });
 
@@ -171,7 +170,7 @@ test("global sessions recover after reload and closing or logout stops every pro
     data: { mode: "accounts-delayed" },
   });
   await signIn(page);
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   await provider(page, "Codex (ChatGPT)")
     .getByRole("button", { name: "Connect", exact: true })
     .click();
@@ -199,18 +198,18 @@ test("global sessions recover after reload and closing or logout stops every pro
     (req) =>
       req.method() === "GET" && req.url().includes("/agents/codex/sessions/"),
   );
-  await page.getByRole("button", { name: "Close agents" }).click();
+  await page.getByRole("button", { name: "Overview", exact: true }).click();
   const closedCount = polls.length;
   await page.waitForTimeout(1300);
   expect(polls).toHaveLength(closedCount);
   await expect(page.getByText("ABCD-EFGH", { exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
   await page.reload();
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   await expect(page.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Sign out" }).click();
-  await expect(page.getByLabel("Operator password")).toBeVisible();
+  await expect(page.getByLabel("Email")).toBeVisible();
   const loggedOutCount = polls.length;
   await page.waitForTimeout(1300);
   expect(polls).toHaveLength(loggedOutCount);
@@ -229,7 +228,7 @@ test("account endpoints require dashboard auth and status failures remain visibl
     data: { mode: "accounts-unavailable" },
   });
   await signIn(page);
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   await expect(
     provider(page, "Cursor").getByText("Unavailable", { exact: true }),
   ).toBeVisible();
@@ -257,7 +256,7 @@ test("signed-in providers report unsupported or expired delegation without claim
     data: { mode: "accounts-unsupported" },
   });
   await signIn(page);
-  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Accounts", exact: true }).click();
   const cursor = provider(page, "Cursor");
   await expect(cursor.getByText("Signed in", { exact: true })).toBeVisible();
   await expect(

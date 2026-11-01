@@ -6,14 +6,15 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { contributors, installCommand, nodeProxy } from '../lib/contributors';
-import { sessionCookie, HttpError } from '../lib/server';
+import { HttpError } from '../lib/server';
+import { memberCookie, useIdentityDir } from './session-fixture';
 const origin='https://enginebox.example';
 const owner='test-owner-credential-32-characters';
 const code=`${'a'.repeat(32)}.${'b'.repeat(64)}`;
 const budget={cpu:2,memory_gib:4,disk_gib:20};
 beforeEach(()=>{
   process.env.ENGINEBOX_DASHBOARD_ORIGIN=origin;
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD='test-dashboard-password';
+  useIdentityDir();
   process.env.ENGINEBOX_SESSION_SECRET='test-session-secret-32-characters';
   process.env.ENGINEBOX_API_TOKEN=owner;
   process.env.ENGINEBOX_API_URL='http://127.0.0.1:8765';
@@ -25,7 +26,7 @@ beforeEach(()=>{
   process.env.ENGINEBOX_ENGINE_NODE_INSTALLER_SHA256='e'.repeat(64);
   delete process.env.ENGINEBOX_NODE_PUBLIC_ORIGIN;
 });
-function ownerRequest(body:unknown, auth=true) {return new Request(`${origin}/api/contributors/enrollments`,{method:'POST',headers:{origin,'Content-Type':'application/json',...(auth?{cookie:sessionCookie().split(';')[0]}:{})},body:JSON.stringify(body)});}
+function ownerRequest(body:unknown, auth=true) {return new Request(`${origin}/api/contributors/enrollments`,{method:'POST',headers:{origin,'Content-Type':'application/json',...(auth?{cookie:memberCookie()}:{})},body:JSON.stringify(body)});}
 test('one-copy installer pins release, checksum, host without imposing local resources without owner credentials',async t=>{
   t.mock.method(globalThis,'fetch',async (_url:string,options:RequestInit)=>{
     if (_url.endsWith('/__enginebox/status')) return Response.json({node_protocol:1});
@@ -198,7 +199,7 @@ test('renewing an engine registration keeps the engine installer',async t=>{
     if (url.endsWith('/v1/contributors')) return Response.json({nodes:[{id,kind:'workspace',enrolled:false,revoked:false,workloads:{ci:false,agents:false,engine:true}}]});
     return Response.json({id,code:`${id}.${'b'.repeat(64)}`,expires:Math.floor(Date.now()/1000)+600});
   });
-  const request=new Request(`${origin}/api/contributors/${id}/renew-enrollment`,{method:'POST',headers:{origin,'Content-Type':'application/json',cookie:sessionCookie().split(';')[0]},body:'{}'});
+  const request=new Request(`${origin}/api/contributors/${id}/renew-enrollment`,{method:'POST',headers:{origin,'Content-Type':'application/json',cookie:memberCookie()},body:'{}'});
   const value=await (await contributors(request,[id,'renew-enrollment'])).json();
   assert.ok(value.command.includes('native-node-test/install.ps1'));assert.match(value.command,/-Workload 'engine'/);
 });

@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, type TestContext } from "node:test";
-import { sessionCookie } from "../lib/server";
+import { memberCookie, useIdentityDir } from "./session-fixture";
 import {
   authorize,
   authorizePost,
@@ -16,21 +16,22 @@ import {
 } from "../lib/oauth/server";
 
 export const origin = "https://enginebox.example";
-export const password = "test-only-dashboard-password";
 export const ownerToken = "test-only-owner-token-never-leaves-server";
 export let dir = "";
+let identityDir = "";
 
 beforeEach(() => {
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = password;
   process.env.ENGINEBOX_SESSION_SECRET = "test-only-session-signing-secret-123456789";
   process.env.ENGINEBOX_API_TOKEN = ownerToken;
   process.env.ENGINEBOX_DASHBOARD_ORIGIN = origin;
   process.env.ENGINEBOX_API_URL = "http://127.0.0.1:8765";
   dir = mkdtempSync(join(tmpdir(), "enginebox-oauth-"));
   process.env.ENGINEBOX_OAUTH_STATE_DIR = dir;
+  identityDir = useIdentityDir("enginebox-oauth-identity-");
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(identityDir, { recursive: true, force: true });
 });
 
 // ------------------------------------------------------------ fake controller
@@ -161,7 +162,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
 
 // ------------------------------------------------------------ helpers
 
-export const cookie = () => sessionCookie().split(";")[0];
+export const cookie = () => memberCookie();
 export const b64 = (bytes: Buffer) => bytes.toString("base64url");
 export function pkce() {
   const verifier = b64(randomBytes(32));
@@ -209,7 +210,9 @@ export function consentPost(fields: [string, string][], headers: Record<string, 
     }),
   );
 }
-export const requestId = (html: string) => /name="request" value="([^"]+)"/.exec(html)![1];
+/** The pending request ID: the consent form's hidden field, or the sign-in page's Continue link. */
+export const requestId = (html: string) =>
+  /name="request" value="([^"]+)"/.exec(html)?.[1] ?? decodeURIComponent(/[?&]request=([^"&]+)/.exec(html)![1]);
 
 /** Run sign-in and consent; returns the redirect Location. */
 export async function approve(

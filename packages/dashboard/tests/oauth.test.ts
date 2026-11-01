@@ -27,7 +27,6 @@ import {
   newClient,
   origin,
   ownerToken,
-  password,
   pkce,
   refreshWith,
   registerClient,
@@ -159,14 +158,17 @@ test("consent needs sign-in, a same-origin form and a real workspace; profiles a
   const resume = /url=([^"]+)"/.exec(interstitial)![1].replace(/&amp;/g, "&");
   const signIn = await authorize(new Request(`${origin}${resume}`));
   const signInHtml = await signIn.text();
-  assert.match(signInHtml, /Operator password/);
+  // Email sign-in happens on the dashboard; the consent page collects no credentials.
+  assert.match(signInHtml, /Sign in with your email on the Engine Box dashboard/);
+  assert.ok(!/<input[^>]+type="password"/.test(signInHtml) && !signInHtml.includes('name="action" value="sign_in"'));
   const id = requestId(signInHtml);
   const unsigned = await consentPost([["request", id], ["action", "approve"], ["workspace", "worker/ebox-a"]], { origin });
   assert.match(await unsigned.text(), /Sign in again/);
-  const badPassword = await consentPost([["request", id], ["action", "sign_in"], ["password", "wrong-password-value"]], { origin });
-  assert.match(await badPassword.text(), /not accepted/);
-  const signedIn = await consentPost([["request", id], ["action", "sign_in"], ["password", password]], { origin });
-  assert.ok(signedIn.headers.get("set-cookie")?.includes("enginebox_session="));
+  const formSignIn = await consentPost([["request", id], ["action", "sign_in"], ["password", "any-password-value"]], { origin });
+  const formSignInHtml = await formSignIn.text();
+  assert.match(formSignInHtml, /Sign in with your email/);
+  assert.equal(formSignIn.headers.get("set-cookie"), null);
+  const signedIn = await authorize(new Request(`${origin}${resume}`, { headers: { cookie: cookie() } }));
   const consent = await signedIn.text();
   assert.match(consent, /alpha/);
   assert.ok(!consent.includes("ebox-pool") && !consent.includes("worker/base"), "reserves and unmanaged bases are not offered");
@@ -333,7 +335,7 @@ test("no token, code or secret reaches the logs, even when controller revocation
   // The edge refuses the token at once even though the controller has not confirmed revocation.
   assert.equal((await call("v1/agent-runs", rotated.access_token)).status, 401);
   assert.ok(readFileSync(join(dir, "oauth.json"), "utf8").includes("pending_revocations"));
-  const secrets = [client.client_secret!, code, verifier, issued.access_token, issued.refresh_token, rotated.access_token, rotated.refresh_token, ownerToken, password];
+  const secrets = [client.client_secret!, code, verifier, issued.access_token, issued.refresh_token, rotated.access_token, rotated.refresh_token, ownerToken];
   for (const minted of controller.tokens.values()) secrets.push(minted.secret, minted.secret.split(".")[1]);
   const text = lines.join("\n");
   for (const secret of secrets) assert.ok(!text.includes(secret), "a credential appeared in logs");

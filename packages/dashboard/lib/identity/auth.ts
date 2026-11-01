@@ -152,7 +152,6 @@ function consume(
   challengeId: string,
   check: (c: Challenge) => boolean,
   failure: string,
-  operatorRequired = false,
 ): Consumed {
   const client = clientKey(request);
   return withIdentity((state, now) => {
@@ -165,15 +164,8 @@ function consume(
       if (c.attempts >= MAX_CODE_ATTEMPTS) c.used_at = now;
       return { ok: false, error: failure };
     }
-    if (c.purpose === "claim_owner") {
-      // Only the break-glass operator who started the claim can finish it, and only while there is no instance owner.
-      if (!operatorRequired) return { ok: false, error: failure };
-      c.used_at = now;
-      if (state.users.some((u) => u.instance_owner)) return { ok: false, error: "This Engine Box already has an instance owner." };
-      const user = userByEmail(state, c.email) ?? createUser(state, c.email, "operator", now);
-      makeInstanceOwner(state, user, "operator", now);
-      return { ok: true, setCookie: openSession(state, user, now, DEFAULT_ORG) };
-    }
+    // Retired owner-claim challenges (from releases with a password sign-in) never sign anyone in.
+    if (c.purpose !== "sign_in" && c.purpose !== "sign_up") return { ok: false, error: failure };
     c.used_at = now;
     let user = userByEmail(state, c.email);
     // Sign-up: every new account gets its personal org.
@@ -191,8 +183,7 @@ export async function verifyEmailCode(request: Request) {
   const challenge = typeof body?.challenge === "string" && /^[A-Za-z0-9_-]{32}$/.test(body.challenge) ? body.challenge : null;
   const code = typeof body?.code === "string" ? body.code.replace(/\s+/g, "") : "";
   if (!challenge || !/^\d{6}$/.test(code)) throw new HttpError(400, BAD_CODE);
-  const operator = readSession(request)?.kind === "operator";
-  const result = consume(request, challenge, (c) => same(c.code_hash, digest("code", `${challenge}\0${code}`)), BAD_CODE, operator);
+  const result = consume(request, challenge, (c) => same(c.code_hash, digest("code", `${challenge}\0${code}`)), BAD_CODE);
   if (!result.ok) throw new HttpError(401, result.error);
   return json({ authenticated: true }, 200, { "Set-Cookie": result.setCookie });
 }
@@ -253,34 +244,6 @@ export async function magicLinkConsume(request: Request) {
   }
 }
 
-/**
- * POST /api/org/claim {email}: the break-glass operator names the instance
- * owner (owner of the platform org) when ENGINEBOX_OWNER_EMAIL was not set. A
- * code goes to that address; verifying it (POST /api/auth/email/verify, still
- * in the operator session) creates the account, with its personal org, and
- * switches the browser to that member session.
- */
-export async function claimOwnerStart(request: Request) {
-  requireOrigin(request);
-  requireIdentity();
-  const who = requireSession(request);
-  if (who.kind !== "operator") throw new HttpError(403, "Only the host operator's break-glass session can claim ownership.");
-  const body = await bodyJson(request);
-  const email = normalizeEmail(body?.email);
-  if (!email) throw new HttpError(400, "Enter a valid email address.");
-  const client = clientKey(request);
-  const result = withIdentity((state, now) => {
-    if (state.users.some((u) => u.instance_owner)) throw new HttpError(409, "This Engine Box already has an instance owner.");
-    hit(state, now, `start:${client}`, LIMITS.startPerClient.limit, LIMITS.startPerClient.window, TOO_MANY);
-    hit(state, now, `start:email:${email}`, LIMITS.startPerEmail.limit, LIMITS.startPerEmail.window, TOO_MANY);
-    const { id, code } = newChallenge(state, email, "claim_owner", now);
-    return { id, code, org: orgOf(state, DEFAULT_ORG)?.name ?? "Engine Box" };
-  });
-  const sent = await send({ template: "claim_owner", to: email, code: result.code, link: config().origin, org_name: result.org, expires_minutes: CHALLENGE_MINUTES });
-  if (!sent) throw new HttpError(503, "The verification email could not be sent. Check the email gateway configuration.");
-  return json({ sent: true, challenge: result.id, expires_minutes: CHALLENGE_MINUTES });
-}
-
 // ---------------------------------------------------------------- invites
 
 /** GET /api/auth/invite?token=: shows the invite and an accept button (GET never consumes). */
@@ -336,11 +299,11 @@ export async function acceptInvite(request: Request) {
   }
 }
 
-/** DELETE /api/session: clears the cookie and, for a member, revokes the server-side session. */
+/** DELETE /api/session: clears the cookie and revokes the server-side session. */
 export function signOut(request: Request) {
   requireOrigin(request);
   const session = readSession(request);
-  if (session?.kind === "member" && readIdentityEnabled())
+  if (session && readIdentityEnabled())
     withIdentity((state, now) => {
       const record = state.sessions.find((s) => s.id_hash === digest("session", session.sid));
       if (record && record.revoked_at === null) record.revoked_at = now;

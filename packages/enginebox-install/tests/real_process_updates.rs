@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::time::{Instant, sleep};
 const TOKEN: &str = "local-qualification-api-token-32-characters-only";
-const PASSWORD: &str = "local-qualification-password-only";
+const OWNER_EMAIL: &str = "owner@qualification.invalid";
 const OLD: &str = "0.3.0";
 const NEW: &str = "0.3.1-test.1";
 const JOB: &str = "1234567890abcdef1234567890abcdef";
@@ -412,9 +412,17 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
     let url = format!("http://127.0.0.1:{api_port}");
     let ui = format!("http://127.0.0.1:{ui_port}");
     let environment = root.join("environment.json");
+    // Email sign-in is the dashboard's only sign-in; the file transport keeps codes in a private local outbox.
+    let identity = root.join("identity");
+    fs::create_dir_all(&identity)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o700))?;
+    }
     atomic_json(
         &environment,
-        &json!({"ENGINEBOX_DASHBOARD_PASSWORD":PASSWORD,"ENGINEBOX_SESSION_SECRET":"local-qualification-browser-session-secret-32-characters","ENGINEBOX_DASHBOARD_ORIGIN":ui,"PATH":path}),
+        &json!({"ENGINEBOX_SESSION_SECRET":"local-qualification-browser-session-secret-32-characters","ENGINEBOX_DASHBOARD_ORIGIN":ui,"ENGINEBOX_IDENTITY_STATE_DIR":identity,"ENGINEBOX_OWNER_EMAIL":OWNER_EMAIL,"ENGINEBOX_EMAIL_TRANSPORT":"file","PATH":path}),
     )?;
     let config = root.join("supervisor.json");
     let mut value = json!({"prefix":install.root,"state_dir":state,"fleet_config":fleet,"token_file":token,"environment_file":environment,"listen":format!("127.0.0.1:{api_port}"),"drain_timeout_seconds":10});
@@ -451,10 +459,43 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
         .error_for_status()?;
     let mut mcp = McpSession::start(&repo, &url, &token).await?;
     let cookie = if with_ui {
-        let response = client
-            .post(format!("{ui}/api/session"))
+        let started: Value = client
+            .post(format!("{ui}/api/auth/email"))
             .header("origin", &ui)
-            .json(&json!({"password":PASSWORD}))
+            .json(&json!({"email":OWNER_EMAIL}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let challenge = started["challenge"]
+            .as_str()
+            .context("missing sign-in challenge")?
+            .to_owned();
+        // Delivery is fire-and-forget after the response; wait for the outbox entry.
+        let outbox = identity.join("outbox/outbox.jsonl");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            let last = fs::read_to_string(&outbox)
+                .ok()
+                .and_then(|text| text.lines().last().map(str::to_owned));
+            if let Some(line) = last {
+                let message: Value = serde_json::from_str(&line)?;
+                break message["code"]
+                    .as_str()
+                    .context("missing sign-in code")?
+                    .to_owned();
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "sign-in email was not delivered to the outbox"
+            );
+            sleep(Duration::from_millis(100)).await;
+        };
+        let response = client
+            .post(format!("{ui}/api/auth/email/verify"))
+            .header("origin", &ui)
+            .json(&json!({"challenge":challenge,"code":code}))
             .send()
             .await?
             .error_for_status()?;

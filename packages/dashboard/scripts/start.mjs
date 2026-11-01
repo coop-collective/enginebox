@@ -1,5 +1,6 @@
 import { startProdServer } from "vinext/server/prod-server";
 import { createConnection, isIP } from "node:net";
+import { isAbsolute } from "node:path";
 
 const host = process.env.HOST ?? "127.0.0.1";
 const port = Number(process.env.PORT ?? 3000);
@@ -14,12 +15,12 @@ if (
   );
 }
 if (
-  (process.env.ENGINEBOX_DASHBOARD_PASSWORD?.length ?? 0) < 16 ||
   (process.env.ENGINEBOX_SESSION_SECRET?.length ?? 0) < 32 ||
-  (process.env.ENGINEBOX_API_TOKEN?.length ?? 0) < 32
+  (process.env.ENGINEBOX_API_TOKEN?.length ?? 0) < 32 ||
+  !isAbsolute(process.env.ENGINEBOX_IDENTITY_STATE_DIR ?? "")
 ) {
   throw new Error(
-    "Set ENGINEBOX_DASHBOARD_PASSWORD (16+ characters), ENGINEBOX_SESSION_SECRET (32+ characters), and ENGINEBOX_API_TOKEN (32+ characters).",
+    "Set ENGINEBOX_SESSION_SECRET (32+ characters), ENGINEBOX_API_TOKEN (32+ characters) and ENGINEBOX_IDENTITY_STATE_DIR (an absolute path). People sign in with an emailed code; set ENGINEBOX_OWNER_EMAIL before the first start.",
   );
 }
 // A supervisor crash must not leave a detached dashboard occupying a release

@@ -1,5 +1,5 @@
 import { atLeast, bodyJson, config, HttpError, json, readSession, requireOrigin, requireSession, type Principal } from "../server";
-import { claimOwnerStart, revokeOrgSessions } from "./auth";
+import { revokeOrgSessions } from "./auth";
 import { send, transport } from "./mail";
 import {
   addMember,
@@ -86,7 +86,6 @@ export function orgView(request: Request) {
     me: me(who),
     org: { id: who.org_id, name: orgOf(state, who.org_id)?.name ?? who.org_id, kind: who.org_kind },
     orgs,
-    needs_instance_owner: !state.users.some((u) => u.instance_owner),
     email_transport: transport(),
     members: members.map((m) => memberView(state, m)),
     invites: atLeast(who, "admin")
@@ -270,11 +269,10 @@ async function createOrg(request: Request, who: Principal) {
 
 /** POST /api/org/switch {org_id}: move this session to another org the user belongs to. */
 async function switchOrg(request: Request, who: Principal) {
-  if (!who.user_id) throw new HttpError(403, "The break-glass session acts only in the platform organization.");
   const target = (await bodyJson(request))?.org_id;
   if (typeof target !== "string" || !ORG_ID.test(target)) throw new HttpError(400, "Choose one of your organizations.");
   const token = readSession(request);
-  if (token?.kind !== "member") throw new HttpError(401, "Sign in again.");
+  if (!token) throw new HttpError(401, "Sign in again.");
   withIdentity((state) => {
     if (!state.members.some((m) => m.org_id === target && m.user_id === who.user_id && m.removed_at === null))
       throw new HttpError(403, "You are not a member of that organization.");
@@ -285,12 +283,11 @@ async function switchOrg(request: Request, who: Principal) {
   return json({ org_id: target });
 }
 
-/** POST /api/org/{...}: invites, import, roles, removal, naming, team orgs, switching and the instance-owner claim. */
+/** POST /api/org/{...}: invites, import, roles, removal, naming, team orgs, and switching. */
 export async function orgAction(request: Request, segments: string[]) {
   requireOrigin(request);
   if (!identityEnabled()) throw new HttpError(404, "Organizations are not enabled on this Engine Box.");
   const path = segments.join("/");
-  if (path === "claim") return claimOwnerStart(request);
   const who = requireSession(request);
   let match: RegExpMatchArray | null;
   if (path === "invites") return createInvite(request, who);

@@ -1,15 +1,7 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import type {
-  Allocation,
-  ComputeNode,
-  Fleet,
-  Host,
-  Instance,
-  Job,
-  Resources,
-} from "@/lib/types";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { Allocation, ComputeNode, Fleet, Job } from "@/lib/types";
 import { api, errorMessage, RequestError } from "@/lib/client";
 import { usePageVisible, useVisibleInterval } from "@/lib/visible-interval";
 import { TemplateCatalog } from "@/components/template-catalog";
@@ -19,704 +11,73 @@ import { ComputePanel, type Contributor } from "@/components/compute-panel";
 import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
 import { WorkspacesPanel } from "@/components/workspaces-panel";
+import { GitHubPanel } from "@/components/github-panel";
 import { EmailSignIn } from "@/components/email-sign-in";
 import { OrgPanel } from "@/components/org-panel";
 import { CredentialsPanel } from "@/components/credentials-panel";
 import { ConnectionsPanel } from "@/components/connections-panel";
 import { ProfilesPanel } from "@/components/profiles-panel";
-import { coldSlots, matchingPools, validResources } from "@/lib/resources";
+import { Overview } from "@/components/overview";
+import { CommandMenu, type Command } from "@/components/command-menu";
+import { Icon, PageHeader } from "@/components/ui";
+import {
+  activeJob,
+  bytes,
+  CreateWorkspace,
+  HostCard,
+  hostAdmitting,
+  poolReserve,
+  title,
+  WorkspaceRow,
+} from "@/components/fleet";
 
-const GiB = 1024 ** 3;
-const active = (job: Job) =>
-  job.status === "queued" || job.status === "running";
-const poolReserve = (instance: Instance) =>
-  !!instance.warm_pool_state && instance.warm_pool_state !== "claimed";
-const bytes = (value?: number) =>
-  typeof value === "number" && Number.isFinite(value)
-    ? `${(value / GiB).toLocaleString(undefined, { maximumFractionDigits: 1 })} GiB`
-    : "—";
-const title = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
-const sections = {
-  workspaces: { title: "Workspaces", description: "Project sources, environments, agent activity and measured preparation.", icon: "box" },
-  github: { title: "Workspaces", description: "Project sources, environments, agent activity and measured preparation.", icon: "box" },
-  environments: {
-    title: "Environments",
-    description: "Run persistent development services and manage their endpoints.",
-    icon: "server",
-  },
-  fleet: {
-    title: "Compute",
-    description: "Manage your servers, workstations and workspace capacity in one place.",
-    icon: "server",
-  },
-  agents: {
-    title: "Agents",
-    description: "Manage native agent connections for your entire fleet.",
-    icon: "terminal",
-  },
-  templates: {
-    title: "Templates",
-    description: "Prepare reusable environments and keep your nodes in sync.",
-    icon: "box",
-  },
-  storage: {
-    title: "Workspaces",
-    description: "Project source, storage, environments and measured preparation.",
-    icon: "server",
-  },
-  repositories: {
-    title: "Workspaces",
-    description: "Project sources, environments, agent activity and measured preparation.",
-    icon: "box",
-  },
-  profiles: { title: "Profiles", description: "How agents run: template, tools, skills and the connections each kind of run gets.", icon: "box" },
-  connections: { title: "Connections", description: "MCP servers and secret sources your profiles share.", icon: "link" },
-  mcp: { title: "MCP", description: "Connect a client, control workspaces and review app access.", icon: "terminal" },
-  org: { title: "Organization", description: "Members, invites and the organization you are working in.", icon: "lock" },
-  apps: {
-    title: "MCP",
-    description: "Connect a client, control workspaces and review app access.",
-    icon: "terminal",
-  },
+/**
+ * Information architecture. Grouped the way an operator thinks about the
+ * install: what is being built (Source), who builds it (Agents), how it is
+ * checked (CI), what it runs on (Compute), and the settings that every part
+ * shares (Settings), where all stored secrets and access live together.
+ */
+type View = {
+  id: string;
+  label: string;
+  group: string;
+  icon: string;
+  title: string;
+  description: string;
+  keywords?: string;
 };
-type DashboardSection = keyof typeof sections;
+const VIEWS: View[] = [
+  { id: "overview", label: "Overview", group: "Home", icon: "overview", title: "Overview", description: "What your machines, agents and CI are doing, and what needs you." },
+  { id: "workspaces", label: "Workspaces", group: "Source", icon: "folder", title: "Workspaces", description: "Project sources, agent runs, LayerFS checkouts and measured preparation.", keywords: "projects layerfs storage checkouts runs" },
+  { id: "github", label: "Repositories", group: "Source", icon: "branch", title: "Repositories", description: "Connect GitHub, choose repositories and sync accepted main revisions back.", keywords: "github import export sync" },
+  { id: "environments", label: "Environments", group: "Source", icon: "globe", title: "Environments", description: "Persistent development services and the routes that reach them.", keywords: "routes dns services dev" },
+  { id: "agents", label: "Accounts", group: "Agents", icon: "agent", title: "Agent accounts", description: "Native Codex, Claude and Cursor sign-ins your workspaces use, and their usage.", keywords: "codex claude cursor providers usage credentials" },
+  { id: "profiles", label: "Profiles", group: "Agents", icon: "profile", title: "Profiles", description: "How each kind of run works: template, tools, skills and connections.", keywords: "run kinds policy skills" },
+  { id: "runners", label: "Actions runners", group: "CI", icon: "checks", title: "Actions runners", description: "Run GitHub Actions on your machines with prepared LayerFS checkouts.", keywords: "github ci jobs pools drain" },
+  { id: "toolchains", label: "Toolchains", group: "CI", icon: "template", title: "CI toolchains", description: "Versioned build toolchains installed and verified on CI workers.", keywords: "ci templates recipes" },
+  { id: "compute", label: "Machines", group: "Compute", icon: "server", title: "Machines", description: "Servers and workstations connected to this controller, and their capacity.", keywords: "fleet hosts nodes workers enroll" },
+  { id: "instances", label: "Virtual machines", group: "Compute", icon: "vm", title: "Virtual machines", description: "VM workspaces, warm reserves and their lifecycle.", keywords: "vm instances pause hibernate stop allocate" },
+  { id: "templates", label: "Templates", group: "Compute", icon: "box", title: "Templates", description: "Credential-free workspace bases, synchronized to every node.", keywords: "images catalog sync" },
+  { id: "connections", label: "Connections & secrets", group: "Settings", icon: "key", title: "Connections & secrets", description: "MCP servers and secret sources that profiles reference. Values are write-only.", keywords: "mcp secrets env tokens" },
+  { id: "apps", label: "MCP & apps", group: "Settings", icon: "plug", title: "MCP & apps", description: "Connect MCP clients, review OAuth app access and revoke grants.", keywords: "oauth grants clients tokens" },
+  { id: "org", label: "Organization", group: "Settings", icon: "team", title: "Organization", description: "Members, invites and the organization you are working in.", keywords: "members invites roles team" },
+];
+const GROUPS = ["Home", "Source", "Agents", "CI", "Compute", "Settings"];
+/** Older links and redirects (`?panel=`) that now live elsewhere. */
+const LEGACY: Record<string, string> = { fleet: "compute", repositories: "workspaces", storage: "workspaces", mcp: "apps", ci: "toolchains" };
+const viewOf = (id: string | null) => {
+  if (!id) return "overview";
+  const mapped = LEGACY[id] ?? id;
+  return VIEWS.some((v) => v.id === mapped) ? mapped : "overview";
+};
 
-function Icon({ name = "box", size = 20 }: { name?: string; size?: number }) {
-  const paths: Record<string, React.ReactNode> = {
-    box: (
-      <>
-        <path d="m12 3 9 5v8l-9 5-9-5V8l9-5Z" />
-        <path d="m3 8 9 5 9-5M12 13v8M7.5 5.5l9 5" />
-      </>
-    ),
-    server: (
-      <>
-        <rect x="3" y="3" width="18" height="7" rx="2" />
-        <rect x="3" y="14" width="18" height="7" rx="2" />
-        <path d="M7 6.5h.01M7 17.5h.01M12 6.5h5M12 17.5h5" />
-      </>
-    ),
-    arrow: <path d="M5 12h14m-5-5 5 5-5 5" />,
-    link: (
-      <>
-        <path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" />
-        <path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" />
-      </>
-    ),
-    plus: <path d="M12 5v14M5 12h14" />,
-    refresh: (
-      <>
-        <path d="M20 7v5h-5M4 17v-5h5" />
-        <path d="M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1" />
-      </>
-    ),
-    cpu: (
-      <>
-        <rect x="6" y="6" width="12" height="12" rx="2" />
-        <path d="M10 1v5m4-5v5m-4 12v5m4-5v5M1 10h5m-5 4h5m12-4h5m-5 4h5M10 10h4v4h-4z" />
-      </>
-    ),
-    memory: (
-      <>
-        <rect x="3" y="6" width="18" height="11" rx="2" />
-        <path d="M7 10v3m5-3v3m5-3v3M7 17v3m5-3v3m5-3v3" />
-      </>
-    ),
-    lock: (
-      <>
-        <rect x="5" y="10" width="14" height="11" rx="2" />
-        <path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" />
-      </>
-    ),
-    close: <path d="m6 6 12 12M6 18 18 6" />,
-    check: <path d="m5 12 4 4L19 6" />,
-    terminal: (
-      <>
-        <rect x="3" y="4" width="18" height="16" rx="3" />
-        <path d="m7 9 3 3-3 3m6 0h4" />
-      </>
-    ),
-    logout: <path d="M10 4H4v16h6m4-12 4 4-4 4m-6-4h12" />,
-  };
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.65"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      {paths[name] ?? paths.box}
-    </svg>
-  );
-}
-
-function Status({ status, stateful }: { status: string; stateful?: boolean }) {
-  const label =
-    status === "Stopped" && stateful
-      ? "Hibernated"
-      : status === "Frozen"
-        ? "Paused"
-        : status;
-  return (
-    <span className={`status status-${status.toLowerCase()}`}>
-      <i />
-      {label}
-    </span>
-  );
-}
-
-function Meter({ used, total }: { used: number; total: number }) {
-  const percentage = Math.min(
-    100,
-    Math.max(0, total ? (used / total) * 100 : 0),
-  );
-  return (
-    <div
-      className="meter"
-      aria-label={`${Math.round(percentage)} percent allocated`}
-    >
-      <span style={{ width: `${percentage}%` }} />
-    </div>
-  );
-}
-
-function HostCard({ host }: { host: Host }) {
-  const c = host.capacity;
-  return (
-    <article className={`host-card ${!host.online ? "offline" : ""}`}>
-      <div className="host-heading">
-        <div className="host-symbol">
-          <Icon name="server" />
-        </div>
-        <div>
-          <h3>Host resources</h3>
-          <span className="mono subtle">{host.id}</span>
-        </div>
-        <span className="subtle">{host.online ? "Inventory available" : "Inventory unavailable"}</span>
-      </div>
-      {!host.online || !c ? (
-        <p className="host-error" role="status">
-          {host.error ??
-            "This host is not reachable. Check the connection and refresh."}
-        </p>
-      ) : (
-        <>
-          <div className="resource-line">
-            <span>CPU allocated</span>
-            <strong>
-              {c.allocated_cpu} <small>/ {c.cpu_total} cores</small>
-            </strong>
-          </div>
-          <Meter used={c.allocated_cpu} total={c.cpu_total} />
-          <div className="resource-line">
-            <span>Memory allocated</span>
-            <strong>
-              {bytes(c.allocated_memory_bytes)}{" "}
-              <small>/ {bytes(c.memory_total_bytes)}</small>
-            </strong>
-          </div>
-          <Meter used={c.allocated_memory_bytes} total={c.memory_total_bytes} />
-          <div className="host-details">
-            <span>
-              Available memory<strong>{bytes(c.memory_available_bytes)}</strong>
-            </span>
-            <span>
-              Free disk<strong>{bytes(c.disk_free_bytes)}</strong>
-            </span>
-            {typeof c.disk_budget_available_bytes === "number" && (
-              <span>
-                Workspace disk budget
-                <strong>{bytes(c.disk_budget_available_bytes)}</strong>
-              </span>
-            )}
-            {typeof c.contribution_cpu === "number" && (
-              <span>
-                Fleet CPU limit
-                <strong>{c.contribution_allocated_cpu ?? 0} / {c.contribution_cpu} cores</strong>
-              </span>
-            )}
-            {typeof c.contribution_memory_bytes === "number" && (
-              <span>
-                Fleet memory limit
-                <strong>{bytes(c.contribution_allocated_memory_bytes)} / {bytes(c.contribution_memory_bytes)}</strong>
-              </span>
-            )}
-          </div>
-          <div className="host-foot">
-            <span>
-              {c.reserve_cpu} cores · {bytes(c.reserve_memory_bytes)} reserved
-            </span>
-            <span className="capacity-badge">
-              {c.max_additional.standard ?? 0} standard cold slots
-            </span>
-          </div>
-          {!!host.warm_pools?.length && (
-            <div
-              className="pool-summary"
-              aria-label="Prepared workspace reserve"
-            >
-              <h4>Prepared reserve</h4>
-              {host.warm_pools.map((pool) => (
-                <div
-                  className="pool-summary-item"
-                  key={`${pool.template}/${pool.size}`}
-                >
-                  <strong>
-                    {pool.template} · {title(pool.size)}
-                  </strong>
-                  {pool.resources && (
-                    <span>
-                      {pool.resources.cpu} vCPU · {pool.resources.memory_gib}{" "}
-                      GiB RAM · {pool.resources.disk_gib} GiB disk
-                    </span>
-                  )}
-                  <span>
-                    {pool.ready} ready · {pool.preparing} preparing · target{" "}
-                    {pool.target}
-                  </span>
-                  {pool.error && <p className="pool-error">{pool.error}</p>}
-                </div>
-              ))}
-              <p>Ready workspaces are paused and keep memory allocated.</p>
-            </div>
-          )}
-        </>
-      )}
-    </article>
-  );
-}
-
-function WorkspaceRow({
-  host,
-  instance,
-  busy,
-  action,
-  connect,
-}: {
-  host: Host;
-  instance: Instance;
-  busy: boolean;
-  action: (host: string, name: string, action: string) => void;
-  connect: () => void;
-}) {
-  const running = instance.status === "Running";
-  const resumable = ["Stopped", "Frozen"].includes(instance.status);
-  const reserved = poolReserve(instance);
-  return (
-    <tr className={reserved ? "pool-reserve-row" : undefined}>
-      <td>
-        <div className="workspace-name">
-          <span className="workspace-icon">
-            <Icon name="terminal" size={18} />
-          </span>
-          <div>
-            <strong>{instance.workspace_name || instance.name}</strong>
-            {instance.workspace_name &&
-              instance.workspace_name !== instance.name && (
-                <span className="instance-id">VM: {instance.name}</span>
-              )}
-            <span>{instance.ipv4?.join(", ") || "No address reported"}</span>
-          </div>
-        </div>
-      </td>
-      <td>
-        <span className="host-name">{host.label}</span>
-      </td>
-      <td>
-        <Status status={instance.status} stateful={instance.stateful} />
-        {reserved && (
-          <span className={`pool-state pool-state-${instance.warm_pool_state}`}>
-            Pool reserve · {title(instance.warm_pool_state!)}
-          </span>
-        )}
-      </td>
-      <td>
-        <strong className="allocation">
-          {instance.cpu ?? "—"} vCPU · {bytes(instance.memory_bytes)}
-        </strong>
-        <span className="table-detail">
-          {typeof instance.memory_usage_bytes === "number"
-            ? `${bytes(instance.memory_usage_bytes)} memory used`
-            : "Usage unavailable"}
-        </span>
-      </td>
-      <td className="actions">
-        <div className="action-buttons">
-          {reserved ? (
-            <span
-              className="subtle"
-              title="Prepared reserve is managed by the warm pool. Allocate a new workspace to claim a ready instance."
-            >
-              Reserved for allocation
-            </span>
-          ) : !instance.managed ? (
-            <span
-              className="subtle"
-              title="This instance is not managed by Engine Box. Lifecycle controls are disabled."
-            >
-              Read only
-            </span>
-          ) : busy ? (
-            <span className="working">
-              <span className="spinner" />
-              Working
-            </span>
-          ) : (
-            <>
-              <button className="button small" onClick={connect}>
-                Manage agents
-              </button>
-              {resumable && (
-                <button
-                  className="button small"
-                  disabled={!host.online}
-                  onClick={() => action(host.id, instance.name, "resume")}
-                >
-                  Resume
-                </button>
-              )}
-              {running && (
-                <>
-                  <button
-                    className="button small"
-                    disabled={!host.online}
-                    onClick={() => action(host.id, instance.name, "pause")}
-                  >
-                    Pause
-                  </button>
-                  <button
-                    className="button small"
-                    disabled={!host.online}
-                    onClick={() => action(host.id, instance.name, "hibernate")}
-                  >
-                    Hibernate
-                  </button>
-                  <button
-                    className="button small danger-text"
-                    disabled={!host.online}
-                    onClick={() => {
-                      if (
-                        window.confirm(
-                          `Stop ${instance.name}? Running processes will end. Use Hibernate to preserve memory.`,
-                        )
-                      )
-                        action(host.id, instance.name, "stop");
-                    }}
-                  >
-                    Stop
-                  </button>
-                </>
-              )}
-              {!running && !resumable && (
-                <span className="subtle">No actions available</span>
-              )}
-            </>
-          )}
-        </div>
-      </td>
-    </tr>
-  );
-}
-
-function hostAdmitting(fleet: Fleet, host: Host) {
-  const machine = fleet.compute_nodes?.find(node => node.backend === "incus" && node.source_id === host.id);
-  return host.online && (machine?.registration.method !== "enrollment" ||
-    (machine.online && ["ready", "capacity_limited"].includes(machine.runtime.state)));
-}
-
-function CreateWorkspace({
-  fleet,
-  busy,
-  close,
-  create,
-}: {
-  fleet: Fleet;
-  busy: boolean;
-  close: () => void;
-  create: (host: string, request: Allocation) => Promise<void>;
-}) {
-  const [host, setHost] = useState(
-    fleet.hosts.find((item) => hostAdmitting(fleet, item))?.id ?? "",
-  );
-  const available = fleet.templates.filter(
-    (item) => !item.host_ids || item.host_ids.includes(host),
-  );
-  const [template, setTemplate] = useState(available[0]?.id ?? "");
-  const selectedTemplate = available.find((item) => item.id === template);
-  const requirements =
-    selectedTemplate?.host_resources?.[host] ?? selectedTemplate;
-  const [size, setSize] = useState(
-    requirements?.recommended
-      ? "recommended"
-      : fleet.sizes.standard
-        ? "standard"
-        : (Object.keys(fleet.sizes)[0] ?? ""),
-  );
-  const [custom, setCustom] = useState({
-    cpu: "4",
-    memory_gib: "4",
-    disk_gib: "40",
-  });
-  const [name, setName] = useState("");
-  const selectedHost = fleet.hosts.find((item) => item.id === host);
-  useEffect(() => {
-    if (!available.some((item) => item.id === template))
-      setTemplate(available[0]?.id ?? "");
-  }, [host, template, fleet.templates]);
-  useEffect(() => {
-    const recommended = requirements?.recommended;
-    setSize(
-      recommended
-        ? "recommended"
-        : fleet.sizes.standard
-          ? "standard"
-          : (Object.keys(fleet.sizes)[0] ?? ""),
-    );
-    if (recommended)
-      setCustom({
-        cpu: String(recommended.cpu),
-        memory_gib: String(recommended.memory_gib),
-        disk_gib: String(recommended.disk_gib),
-      });
-  }, [template, host]);
-  const minimum = requirements?.minimum;
-  const resources: Resources | undefined =
-    size === "custom"
-      ? {
-          cpu: Number(custom.cpu),
-          memory_gib: Number(custom.memory_gib),
-          disk_gib: Number(custom.disk_gib),
-        }
-      : size === "minimum"
-        ? minimum
-        : size === "recommended"
-          ? requirements?.recommended
-          : undefined;
-  const resourceValid =
-    !resources ||
-    validResources(
-      resources,
-      minimum ?? { cpu: 1, memory_gib: 1, disk_gib: 1 },
-    );
-  const slots = resources
-    ? coldSlots(selectedHost, resources)
-    : (selectedHost?.capacity?.max_additional[size] ?? 0);
-  const pools = matchingPools(selectedHost, template, size, resources);
-  const ready = pools.reduce((sum, pool) => sum + pool.ready, 0);
-  const preparing = pools.reduce((sum, pool) => sum + pool.preparing, 0);
-  const valid =
-    !!selectedHost && hostAdmitting(fleet, selectedHost) &&
-    !!selectedTemplate &&
-    !!size &&
-    resourceValid &&
-    (ready > 0 || slots > 0);
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (!valid || busy) return;
-    await create(
-      host,
-      size === "custom" && resources
-        ? { name, template, resources }
-        : { name, template, size },
-    );
-  }
-  return (
-    <section className="create-panel" aria-labelledby="create-title">
-      <div className="section-title">
-        <div>
-          <h2 id="create-title">Create a workspace</h2>
-          <p>A private workspace from a prepared, credential-free template.</p>
-        </div>
-        <button
-          className="icon-button"
-          onClick={close}
-          aria-label="Close workspace form"
-        >
-          <Icon name="close" />
-        </button>
-      </div>
-      <form onSubmit={submit}>
-        <div className="create-grid">
-          <label>
-            Workspace name
-            <input
-              required
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="ebox-my-project"
-              pattern={"ebox-[a-z0-9][a-z0-9\\-]{0,48}"}
-              title="Start with ebox-, then use lowercase letters, digits or hyphens."
-              maxLength={54}
-              autoFocus
-            />
-          </label>
-          <label>
-            Host
-            <select
-              value={host}
-              onChange={(event) => setHost(event.target.value)}
-              required
-            >
-              <option value="" disabled>
-                Select a host
-              </option>
-              {fleet.hosts.map((item) => (
-                <option key={item.id} value={item.id} disabled={!hostAdmitting(fleet, item)}>
-                  {item.label}
-                  {!hostAdmitting(fleet, item) ? " (unavailable)" : ""}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Prepared template
-            <select
-              value={template}
-              onChange={(event) => setTemplate(event.target.value)}
-              required
-            >
-              <option value="" disabled>
-                No installed templates
-              </option>
-              {available.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Size
-            <select
-              value={size}
-              onChange={(event) => setSize(event.target.value)}
-              required
-            >
-              {minimum && requirements?.recommended ? (
-                <>
-                  <option value="minimum">
-                    Minimum · {minimum.cpu} vCPU / {minimum.memory_gib} GiB /{" "}
-                    {minimum.disk_gib} GiB disk
-                  </option>
-                  <option value="recommended">
-                    Recommended · {requirements.recommended.cpu} vCPU /{" "}
-                    {requirements.recommended.memory_gib} GiB /{" "}
-                    {requirements.recommended.disk_gib} GiB disk
-                  </option>
-                  <option value="custom">Custom</option>
-                </>
-              ) : (
-                Object.entries(fleet.sizes).map(([id, value]) => (
-                  <option key={id} value={id}>
-                    {title(id)} · {value.cpu} vCPU / {value.memory_gib} GiB
-                  </option>
-                ))
-              )}
-            </select>
-          </label>
-        </div>
-        {size === "custom" && minimum && (
-          <div className="custom-resources">
-            {(
-              [
-                ["cpu", "CPU cores"],
-                ["memory_gib", "Memory (GiB)"],
-                ["disk_gib", "Disk (GiB)"],
-              ] as const
-            ).map(([key, label]) => (
-              <label key={key}>
-                {label}
-                <input
-                  type="number"
-                  min={minimum[key]}
-                  step="1"
-                  required
-                  value={custom[key]}
-                  onChange={(event) =>
-                    setCustom((current) => ({
-                      ...current,
-                      [key]: event.target.value,
-                    }))
-                  }
-                />
-                <span>Minimum {minimum[key]}</span>
-              </label>
-            ))}
-          </div>
-        )}
-        {resources && resourceValid && (
-          <p className="resource-preview">
-            {resources.cpu} vCPU · {resources.memory_gib} GiB RAM ·{" "}
-            {resources.disk_gib} GiB disk
-          </p>
-        )}
-        <div className="create-footer">
-          <div className="allocation-hint" aria-live="polite">
-            <p>
-              {!available.length
-                ? "Install a template on this host from the template catalog first."
-                : !selectedHost?.online
-                  ? "Choose an online host."
-                  : !resourceValid
-                    ? "Custom resources must be whole numbers at or above the template minimum."
-                    : ready > 0
-                      ? `${ready} ready paused workspace${ready === 1 ? " matches" : "s match"} this template and resource allocation. A ready workspace will be claimed if still available.`
-                      : slots > 0
-                        ? `Cold start: no matching workspace is ready. Capacity is available for ${slots} more workspace${slots === 1 ? "" : "s"} with these resources.`
-                        : "No ready workspace or cold-start capacity is available for this selection."}
-            </p>
-            {ready > 0 && (
-              <p>
-                {slots > 0
-                  ? "If the reserve is claimed first, the request may use a cold start."
-                  : "No cold-start capacity remains; another request may claim the reserve first."}
-              </p>
-            )}
-            {preparing > 0 && (
-              <p>
-                {preparing} matching workspace
-                {preparing === 1 ? " is" : "s are"} preparing. Availability
-                refreshes automatically.
-              </p>
-            )}
-            {pools
-              .filter((pool) => pool.error)
-              .map((pool) => (
-                <p className="pool-error" key={`${pool.template}/${pool.size}`}>
-                  {pool.error}
-                </p>
-              ))}
-          </div>
-          <button
-            className="button primary"
-            disabled={!valid || busy}
-            type="submit"
-          >
-            {busy ? (
-              <span className="spinner" />
-            ) : (
-              <Icon name="plus" size={16} />
-            )}
-            Create workspace
-          </button>
-        </div>
-      </form>
-    </section>
-  );
-}
+type Me = { role: string; email: string | null; label: string; org_id: string };
 
 export default function Dashboard() {
-  const [session, setSession] = useState<"loading" | "login" | "ready">(
-    "loading",
-  );
-  const [password, setPassword] = useState("");
-  // Email sign-in is offered when orgs are enabled; the password is then the host operator's break-glass.
-  const [emailSignIn, setEmailSignIn] = useState(false);
+  const [session, setSession] = useState<"loading" | "login" | "ready">("loading");
+  const [me, setMe] = useState<Me | null>(null);
+  const [orgName, setOrgName] = useState("");
+  const [emailDelivery, setEmailDelivery] = useState(true);
   const [fleet, setFleet] = useState<Fleet | null>(null);
   const [workers, setWorkers] = useState<Contributor[]>([]);
   const [workerNodes, setWorkerNodes] = useState<ComputeNode[]>([]);
@@ -728,23 +89,56 @@ export default function Dashboard() {
   const [submitting, setSubmitting] = useState(false);
   const [pendingInstances, setPendingInstances] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
-  const [section, setSection] = useState<DashboardSection>("fleet");
+  const [view, setView] = useState("overview");
+  const [storageFirst, setStorageFirst] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [navOpen, setNavOpen] = useState(false);
   const loading = useRef(false);
-  useEffect(() => {
-    const panel = new URLSearchParams(window.location.search).get("panel");
-    if (panel && Object.hasOwn(sections, panel)) setSection(panel as DashboardSection);
-    api<{ authenticated: boolean; email_sign_in?: boolean }>("/api/session")
+
+  const readSession = useCallback(() => {
+    api<{ authenticated: boolean; email_delivery?: boolean; me?: Me | null }>("/api/session")
       .then((data) => {
-        setEmailSignIn(!!data.email_sign_in);
+        setEmailDelivery(data.email_delivery !== false);
+        setMe(data.me ?? null);
         setSession(data.authenticated ? "ready" : "login");
       })
       .catch((err) => {
-        setError(err.message);
+        setError(errorMessage(err));
         setSession("login");
       });
   }, []);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const panel = params.get("panel");
+    setView(viewOf(panel));
+    setStorageFirst(panel === "storage" || params.get("storage") === "1");
+    readSession();
+    const onPop = () => setView(viewOf(new URLSearchParams(window.location.search).get("panel")));
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [readSession]);
+  useEffect(() => {
+    if (session !== "ready") return;
+    api<{ org?: { name: string } }>("/api/org")
+      .then((data) => setOrgName(data.org?.name ?? ""))
+      .catch(() => setOrgName(""));
+  }, [session]);
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      const typing = !!target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+      if ((event.key === "k" && (event.metaKey || event.ctrlKey)) || (event.key === "/" && !typing)) {
+        if (session !== "ready") return;
+        event.preventDefault();
+        setMenuOpen((open) => !open);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [session]);
+
   const refreshWorkers = useCallback(async () => {
     const request = ++workerRequest.current;
     try {
@@ -793,58 +187,34 @@ export default function Dashboard() {
   }, [session, refresh]);
   useVisibleInterval(refresh, session === "ready" ? 10_000 : null);
   useEffect(() => {
-    if (session !== "ready" || !visible || !jobs.some(active)) return;
+    if (session !== "ready" || !visible || !jobs.some(activeJob)) return;
     let cancelled = false;
     const timer = setTimeout(async () => {
       const updates = await Promise.all(
-        jobs.filter(active).map(async (job) => {
+        jobs.filter(activeJob).map(async (job) => {
           try {
-            const result = await api<{ job: Job }>(
-              `/api/control/v1/jobs/${encodeURIComponent(job.id)}`,
-            );
+            const result = await api<{ job: Job }>(`/api/control/v1/jobs/${encodeURIComponent(job.id)}`);
             return { ...job, ...result.job, error: result.job.error };
           } catch (err) {
-            return {
-              ...job,
-              error: `Status unavailable: ${errorMessage(err)}`,
-            };
+            return { ...job, error: `Status unavailable: ${errorMessage(err)}` };
           }
         }),
       );
       if (cancelled) return;
-      setJobs((current) =>
-        current.map(
-          (job) => updates.find((update) => update.id === job.id) ?? job,
-        ),
-      );
-      if (updates.some((job) => !active(job))) void refresh();
+      setJobs((current) => current.map((job) => updates.find((update) => update.id === job.id) ?? job));
+      if (updates.some((job) => !activeJob(job))) void refresh();
     }, 1500);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
   }, [jobs, session, visible, refresh]);
-  async function signIn(event: FormEvent) {
-    event.preventDefault();
-    setSubmitting(true);
-    setError("");
-    try {
-      await api("/api/session", {
-        method: "POST",
-        body: JSON.stringify({ password }),
-      });
-      setPassword("");
-      setSession("ready");
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSubmitting(false);
-    }
-  }
+
   async function signOut() {
     try {
       await api("/api/session", { method: "DELETE" });
       setSession("login");
+      setMe(null);
       setFleet(null);
       ++workerRequest.current;
       setWorkers([]);
@@ -853,31 +223,19 @@ export default function Dashboard() {
       setWorkersError("");
       setJobs([]);
       setPendingInstances([]);
-      setSection("fleet");
       setError("");
+      go("overview");
     } catch (err) {
       setError(errorMessage(err));
     }
   }
-  async function queue(
-    path: string,
-    body: object,
-    label: string,
-    host: string,
-    instance: string,
-    kind: Job["kind"] = "workspace",
-  ) {
+  async function queue(path: string, body: object, label: string, host: string, instance: string, kind: Job["kind"] = "workspace") {
     const target = `${host}/${instance}`;
     setPendingInstances((current) => [...current, target]);
     setError("");
     try {
-      const { job } = await api<{ job: Job }>(`/api/control/${path}`, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
-      setJobs((current) =>
-        [{ ...job, label, host, instance, kind }, ...current].slice(0, 20),
-      );
+      const { job } = await api<{ job: Job }>(`/api/control/${path}`, { method: "POST", body: JSON.stringify(body) });
+      setJobs((current) => [{ ...job, label, host, instance, kind }, ...current].slice(0, 20));
       return true;
     } catch (err) {
       setError(errorMessage(err));
@@ -888,16 +246,7 @@ export default function Dashboard() {
   }
   async function create(host: string, request: Allocation) {
     setSubmitting(true);
-    if (
-      await queue(
-        `v1/hosts/${encodeURIComponent(host)}/allocations`,
-        request,
-        `Create ${request.name}`,
-        host,
-        request.name,
-      )
-    )
-      setCreating(false);
+    if (await queue(`v1/hosts/${encodeURIComponent(host)}/allocations`, request, `Create ${request.name}`, host, request.name)) setCreating(false);
     setSubmitting(false);
   }
   function action(host: string, name: string, operation: string) {
@@ -909,26 +258,30 @@ export default function Dashboard() {
       name,
     );
   }
-  function navigate(next: DashboardSection) {
-    setSection(next);
+  function go(next: string) {
+    const id = viewOf(next);
+    setView(id);
+    setStorageFirst(false);
+    setNavOpen(false);
+    const url = new URL(window.location.href);
+    url.search = id === "overview" ? "" : `panel=${id}`;
+    window.history.pushState(null, "", url);
     window.scrollTo({ top: 0 });
   }
-  const online = fleet?.hosts.filter((host) => host.online) ?? [];
-  const admittingHosts = fleet ? fleet.hosts.filter(host => hostAdmitting(fleet, host)) : [];
-  const computeMachines = [...(fleet?.compute_nodes ?? []), ...workerNodes].filter(node => node.registered);
-  const onlineMachines = computeMachines.filter(node => node.online).length;
-  const machineCount = computeMachines.length;
-  const instances =
-    fleet?.hosts.flatMap((host) =>
-      host.instances.map((instance) => ({ host, instance })),
-    ) ?? [];
-  const assigned = instances.filter(
-    ({ instance }) => instance.managed && !poolReserve(instance),
+
+  const current = VIEWS.find((v) => v.id === view) ?? VIEWS[0];
+  const commands: Command[] = useMemo(
+    () => VIEWS.map((v) => ({ id: v.id, label: v.title, group: v.group, icon: v.icon, keywords: v.keywords })),
+    [],
   );
+  const online = fleet?.hosts.filter((host) => host.online) ?? [];
+  const admittingHosts = fleet ? fleet.hosts.filter((host) => hostAdmitting(fleet, host)) : [];
+  const computeMachines = [...(fleet?.compute_nodes ?? []), ...workerNodes].filter((node) => node.registered);
+  const onlineMachines = computeMachines.filter((node) => node.online).length;
+  const instances = fleet?.hosts.flatMap((host) => host.instances.map((instance) => ({ host, instance }))) ?? [];
+  const assigned = instances.filter(({ instance }) => instance.managed && !poolReserve(instance));
   const readyReserve = online.reduce(
-    (total, host) =>
-      total +
-      (host.warm_pools ?? []).reduce((count, pool) => count + pool.ready, 0),
+    (total, host) => total + (host.warm_pools ?? []).reduce((count, pool) => count + pool.ready, 0),
     0,
   );
   const sum = (key: "cpu_total" | "allocated_cpu" | "memory_total_bytes") =>
@@ -941,426 +294,320 @@ export default function Dashboard() {
     return (
       total +
       (capacity
-        ? Math.max(
-            0,
-            Math.min(
-              capacity.memory_total_bytes,
-              capacity.memory_total_bytes - capacity.memory_available_bytes,
-            ),
-          )
+        ? Math.max(0, Math.min(capacity.memory_total_bytes, capacity.memory_total_bytes - capacity.memory_available_bytes))
         : 0)
     );
   }, 0);
   const percent = (used: number, total: number) =>
-    total > 0
-      ? `${Math.min(100, Math.max(0, (used / total) * 100)).toFixed(1)}%`
-      : "—";
-  const passwordForm = (
-    <form onSubmit={signIn}>
-      <label>
-        {emailSignIn ? "Operator password (break-glass)" : "Operator password"}
-        <input
-          type="password"
-          autoComplete="current-password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          required
-          autoFocus={!emailSignIn}
-          placeholder="Enter your dashboard password"
-        />
-      </label>
-      <button
-        className="button primary"
-        disabled={submitting}
-        type="submit"
-      >
-        {submitting ? (
-          <span className="spinner" />
-        ) : (
-          <>
-            Open dashboard
-            <Icon name="arrow" size={17} />
-          </>
-        )}
-      </button>
-    </form>
-  );
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <a href="/" className="brand">
-          <span className="brand-mark">
-            <Icon size={25} />
-          </span>
-          <span>
-            engine<span className="brand-light">box</span>
-            <small>WORKSPACE INFRASTRUCTURE</small>
-          </span>
-        </a>
-        <div className="nav-label">CONTROL PLANE</div>
-        <nav aria-label="Control plane">
-          {(["fleet", "workspaces", "agents", "profiles", "connections", "templates", "environments", "mcp", "org"] as const)
-            .filter((item) => session === "ready" || item === "fleet")
-            .map((item) => (
-              <button
-                key={item}
-                type="button"
-                className={`nav-item${section === item || (item === "workspaces" && ["github", "repositories", "storage"].includes(section)) || (item === "mcp" && section === "apps") ? " active" : ""}`}
-                aria-current={section === item || (item === "workspaces" && ["github", "repositories", "storage"].includes(section)) || (item === "mcp" && section === "apps") ? "page" : undefined}
-                onClick={() => navigate(item)}
-              >
-                <Icon name={sections[item].icon} />
-                {sections[item].title}
-                {section === item && <span className="nav-dot" />}
-              </button>
-            ))}
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="native-note">
-            <Icon name="terminal" size={20} />
-            <strong>Your tools. Your machines.</strong>
-            <p>Native agents, prepared workspaces, and compute you control.</p>
-            <div className="harnesses">
-              <span>Codex</span>
-              <span>Claude</span>
-              <span>Cursor</span>
-            </div>
+    total > 0 ? `${Math.min(100, Math.max(0, (used / total) * 100)).toFixed(1)}%` : "—";
+  const attentionCount = computeMachines.filter((m) => !m.online).length + workers.filter((w) => w.blocked || (!w.enrolled && !w.revoked)).length;
+
+  if (session !== "ready")
+    return (
+      <div className="signin-shell">
+        <main className="signin-card">
+          <div className="brand brand-center">
+            <span className="brand-mark">
+              <Icon name="box" size={22} />
+            </span>
+            <span className="brand-word">Engine Box</span>
           </div>
-          <div className="self-hosted">
-            <span />
-            Self-hosted · Engine Box
+          <h1>Sign in</h1>
+          <p className="muted">We email you a one-time code. No password to remember or leak.</p>
+          {error && (
+            <div role="alert" className="alert">
+              {error}
+            </div>
+          )}
+          {session === "loading" ? (
+            <div className="loading">
+              <span className="spinner" />
+              Checking your session…
+            </div>
+          ) : (
+            <>
+              {!emailDelivery && (
+                <div className="alert" role="status">
+                  Email delivery is not configured on this server, so sign-in codes cannot be sent. Configure the email gateway; see docs/SELF-HOSTING-ORGS.md.
+                </div>
+              )}
+              <EmailSignIn onSignedIn={readSession} />
+            </>
+          )}
+          <p className="signin-foot muted">
+            <Icon name="lock" size={13} /> Private control plane. Your session stays in this browser for eight hours.
+          </p>
+        </main>
+      </div>
+    );
+
+  return (
+    <div className={`app-shell${navOpen ? " nav-open" : ""}`}>
+      <aside className="sidebar">
+        <div className="sidebar-top">
+          <a href="/" className="brand" onClick={(e) => { e.preventDefault(); go("overview"); }}>
+            <span className="brand-mark">
+              <Icon name="box" size={18} />
+            </span>
+            <span className="brand-word">Engine Box</span>
+          </a>
+          <button type="button" className="icon-button nav-toggle" aria-label={navOpen ? "Close navigation" : "Open navigation"} aria-expanded={navOpen} onClick={() => setNavOpen((o) => !o)}>
+            <Icon name={navOpen ? "close" : "menu"} />
+          </button>
+        </div>
+        <button type="button" className="org-switch" onClick={() => go("org")} title="Organization settings">
+          <span className="org-avatar" aria-hidden="true">{(orgName || "E").slice(0, 1).toUpperCase()}</span>
+          <span>
+            <strong>{orgName || "Organization"}</strong>
+            <small>{me?.role ?? "member"}</small>
+          </span>
+        </button>
+        <button type="button" className="jump" onClick={() => setMenuOpen(true)}>
+          <Icon name="search" size={15} />
+          <span>Jump to…</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <nav aria-label="Control plane" className="nav">
+          {GROUPS.map((group) => (
+            <div className="nav-group" key={group}>
+              {group !== "Home" && <div className="nav-label">{group}</div>}
+              {VIEWS.filter((v) => v.group === group).map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`nav-item${view === item.id ? " active" : ""}`}
+                  aria-current={view === item.id ? "page" : undefined}
+                  onClick={() => go(item.id)}
+                  aria-describedby={item.id === "compute" && attentionCount > 0 ? "compute-attention" : undefined}
+                >
+                  <Icon name={item.icon} size={16} />
+                  <span>{item.label}</span>
+                  {item.id === "compute" && attentionCount > 0 && (
+                    <span className="nav-badge" aria-hidden="true">
+                      {attentionCount}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
+        {attentionCount > 0 && (
+          <span id="compute-attention" hidden>
+            {attentionCount} machine{attentionCount === 1 ? "" : "s"} need attention
+          </span>
+        )}
+        <div className="sidebar-bottom">
+          <div className="me">
+            <span className="me-avatar" aria-hidden="true">{(me?.email ?? "?").slice(0, 1).toUpperCase()}</span>
+            <span className="me-text">
+              <strong title={me?.email ?? undefined}>{me?.label || me?.email || "Signed in"}</strong>
+              <small>{me?.label && me.label !== me.email ? me.email : "Signed in with email"}</small>
+            </span>
+            <button className="icon-button" onClick={signOut} aria-label="Sign out" title="Sign out">
+              <Icon name="logout" size={16} />
+            </button>
           </div>
         </div>
       </aside>
       <div className="main-shell">
         <header className="topbar">
-          <div>
-            <span className="breadcrumb">Infrastructure</span>
-            <span className="slash">/</span>
-            {sections[section].title}
-          </div>
+          <nav aria-label="Breadcrumb" className="crumbs">
+            <span>{current.group}</span>
+            <span className="slash" aria-hidden="true">/</span>
+            <strong>{current.title}</strong>
+          </nav>
           <div className="topbar-right">
-            <span className="private-label">
-              <Icon name="lock" size={13} />
-              Private control plane
+            <span className="update-label">
+              <span className={`live-dot${error ? " stale" : ""}`} />
+              {updated ? `Updated ${updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "Connecting"}
             </span>
-            {session === "ready" && (
-              <button
-                className="icon-button"
-                onClick={signOut}
-                aria-label="Sign out"
-              >
-                <Icon name="logout" size={18} />
-              </button>
-            )}
+            <button className="button small" onClick={refresh} disabled={refreshing}>
+              <Icon name="refresh" size={14} />
+              {refreshing ? "Refreshing" : "Refresh"}
+            </button>
           </div>
         </header>
-        <main>
-          {session !== "ready" ? (
-            <section className="login-panel">
-              <span className="login-symbol">
-                <Icon name="lock" size={28} />
-              </span>
-              <span className="eyebrow">WELCOME TO ENGINE BOX</span>
-              <h1>Your fleet, under control.</h1>
-              <p>Sign in to manage your hosts and workspaces.</p>
-              {error && (
-                <div role="alert" className="alert">
-                  {error}
-                </div>
-              )}
-              {session === "loading" ? (
-                <div className="loading">
-                  <span className="spinner" />
-                  Checking your session…
-                </div>
-              ) : (
-                emailSignIn ? (
-                  <>
-                    <EmailSignIn onSignedIn={() => setSession("ready")} />
-                    <details className="break-glass">
-                      <summary>Host operator? Sign in with the break-glass password</summary>
-                      {passwordForm}
-                    </details>
-                  </>
-                ) : (
-                  passwordForm
-                )
-              )}
-              <span className="login-foot">
-                Your session stays in this browser.
-              </span>
-            </section>
-          ) : (
+        <main className="content">
+          <PageHeader
+            title={current.title}
+            description={current.description}
+            actions={
+              view === "instances" ? (
+                <button className="button primary" onClick={() => setCreating((value) => !value)} disabled={!fleet || !admittingHosts.length}>
+                  <Icon name="plus" size={15} />
+                  New workspace
+                </button>
+              ) : undefined
+            }
+          />
+          {error && (
+            <div className="alert" role="alert">
+              {error}
+              <button className="text-button" onClick={refresh}>
+                Try again
+              </button>
+            </div>
+          )}
+          {view === "overview" && <Overview fleet={fleet} machines={computeMachines} workers={workers} jobs={jobs} go={go} />}
+          {view === "workspaces" && <WorkspacesPanel fleet={fleet} initialStorage={storageFirst} refreshToken={updated?.getTime() ?? 0} />}
+          {view === "github" && <GitHubPanel show="repositories" />}
+          {view === "environments" && <EnvironmentsPanel />}
+          {view === "agents" && (
             <>
-              <div className="page-heading">
-                <div>
-                  <span className="eyebrow">YOUR COMPUTE, CONNECTED</span>
-                  <h1>
-                    {sections[section].title}
-                    <span className="title-dot">.</span>
-                  </h1>
-                  <p>{sections[section].description}</p>
-                </div>
-                <div className="heading-actions">
-                  <button
-                    className="button"
-                    onClick={refresh}
-                    disabled={refreshing}
-                  >
-                    <Icon name="refresh" size={16} />
-                    {refreshing ? "Refreshing" : "Refresh"}
-                  </button>
-                  {section === "fleet" && (
-                    <button
-                      className="button primary"
-                      onClick={() => setCreating((value) => !value)}
-                      disabled={!fleet || !admittingHosts.length}
-                    >
-                      <Icon name="plus" size={17} />
-                      New workspace
-                    </button>
+              <AgentsPanel />
+              <CredentialsPanel />
+            </>
+          )}
+          {view === "profiles" && <ProfilesPanel />}
+          {view === "runners" && <GitHubPanel show="runners" />}
+          {view === "toolchains" && <CiTemplates />}
+          {view === "templates" && <TemplateCatalog refreshToken={updated?.getTime() ?? 0} registered={refresh} />}
+          {view === "connections" && <ConnectionsPanel />}
+          {view === "apps" && <ConnectedAppsPanel />}
+          {view === "org" && <OrgPanel onSwitched={() => window.location.reload()} />}
+          {view === "compute" && (
+            <>
+              <div className="stat-grid">
+                {[
+                  {
+                    label: "Online machines",
+                    value: fleet && workersLoaded ? `${onlineMachines}` : "—",
+                    note: fleet && workersLoaded ? `${computeMachines.length} registered · ${workersError || error ? "refresh needed" : "servers and workstations"}` : "Loading machine inventories",
+                    icon: "server",
+                  },
+                  {
+                    label: "VM CPU allocated",
+                    value: fleet ? `${cpuAllocated} / ${cpuTotal}` : "—",
+                    note: `${percent(cpuAllocated, cpuTotal)} allocated · VM hosts`,
+                    icon: "cpu",
+                  },
+                  {
+                    label: "VM host memory used",
+                    value: fleet ? `${bytes(memoryUsed)} / ${bytes(memoryTotal)}` : "—",
+                    note: `${percent(memoryUsed, memoryTotal)} used · online VM hosts`,
+                    icon: "memory",
+                  },
+                  {
+                    label: "VM workspaces",
+                    value: fleet ? `${assigned.length}` : "—",
+                    note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
+                    icon: "vm",
+                  },
+                ].map((stat) => (
+                  <article className="stat-card" key={stat.label}>
+                    <div>
+                      <span>{stat.label}</span>
+                      <Icon name={stat.icon} size={16} />
+                    </div>
+                    <strong>{stat.value}</strong>
+                    <small>{stat.note}</small>
+                  </article>
+                ))}
+              </div>
+              <ComputePanel
+                hosts={fleet?.hosts ?? []}
+                hostsLoaded={fleet !== null}
+                nodes={workers}
+                machines={computeMachines}
+                loaded={workersLoaded}
+                loadError={workersError}
+                refresh={refresh}
+                hostDetails={(host) => <HostCard host={host} />}
+              />
+            </>
+          )}
+          {view === "instances" && (
+            <>
+              {creating && fleet && <CreateWorkspace fleet={fleet} busy={submitting} close={() => setCreating(false)} create={create} />}
+              <section className="panel workspaces-section">
+                <header className="panel-head">
+                  <h2>VM instance inventory</h2>
+                  <span className="count">{instances.length}</span>
+                  <span className="section-caption">Assigned workspaces · Prepared reserves · Bases</span>
+                </header>
+                <div className="table-container">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Workspace</th>
+                        <th>Host</th>
+                        <th>Status</th>
+                        <th>Resources</th>
+                        <th className="actions">Controls</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {instances.map(({ host, instance }) => (
+                        <WorkspaceRow
+                          key={`${host.id}/${instance.name}`}
+                          host={host}
+                          instance={instance}
+                          busy={
+                            pendingInstances.includes(`${host.id}/${instance.name}`) ||
+                            jobs.some(
+                              (job) =>
+                                activeJob(job) &&
+                                job.host === host.id &&
+                                (job.instance === instance.name || (!!instance.workspace_name && job.instance === instance.workspace_name)),
+                            )
+                          }
+                          action={action}
+                          connect={() => go("agents")}
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                  {!instances.length && (
+                    <div className="empty-state compact">
+                      <Icon name="vm" size={26} />
+                      <h3>{fleet ? "No workspaces yet" : "Waiting for workspace inventory"}</h3>
+                      <p>{fleet ? "Create a workspace from a prepared template to start building." : "Workspaces appear when the fleet service responds."}</p>
+                    </div>
                   )}
                 </div>
-              </div>
-              {error && (
-                <div className="alert" role="alert">
-                  {error}
-                  <button className="text-button" onClick={refresh}>
-                    Try again
-                  </button>
-                </div>
-              )}
-              {["workspaces", "github", "repositories", "storage"].includes(section) && <WorkspacesPanel key={section} fleet={fleet} initialConnections={section === "github"} initialStorage={section === "storage"} refreshToken={updated?.getTime() ?? 0} />}
-              {section === "agents" && (
-                <AgentsPanel close={() => navigate("fleet")} />
-              )}
-              {section === "agents" && emailSignIn && (
-                <CredentialsPanel />
-              )}
-              {section === "templates" && (
-                <>
-                <TemplateCatalog
-                  refreshToken={updated?.getTime() ?? 0}
-                  registered={refresh}
-                  close={() => navigate("fleet")}
-                />
-                <CiTemplates />
-                </>
-              )}
-              {section === "environments" && <EnvironmentsPanel />}
-              {section === "profiles" && <ProfilesPanel />}
-              {section === "connections" && <ConnectionsPanel />}
-              {["mcp", "apps"].includes(section) && <ConnectedAppsPanel />}
-              {section === "org" && <OrgPanel onSwitched={() => window.location.reload()} />}
-              {section === "fleet" && (
-                <>
-                  <div className="stat-grid">
-                    {[
-                      {
-                        label: "Online machines",
-                        value: fleet && workersLoaded ? `${onlineMachines}` : "—",
-                        note: fleet && workersLoaded
-                          ? `${machineCount} registered · ${workersError || error ? "refresh needed" : "servers and workstations"}`
-                          : "Loading machine inventories",
-                        icon: "server",
-                      },
-                      {
-                        label: "VM CPU allocated",
-                        value: fleet ? (
-                          <>
-                            {cpuAllocated}{" "}
-                            <span className="stat-total">/ {cpuTotal}</span>
-                          </>
-                        ) : (
-                          "—"
-                        ),
-                        note: `${percent(cpuAllocated, cpuTotal)} allocated · VM hosts`,
-                        icon: "cpu",
-                      },
-                      {
-                        label: "VM host memory used",
-                        value: fleet ? (
-                          <>
-                            {bytes(memoryUsed)}{" "}
-                            <span className="stat-total">
-                              / {bytes(memoryTotal)}
-                            </span>
-                          </>
-                        ) : (
-                          "—"
-                        ),
-                        note: `${percent(memoryUsed, memoryTotal)} used · online VM hosts`,
-                        icon: "memory",
-                      },
-                      {
-                        label: "VM workspaces",
-                        value: fleet ? `${assigned.length}` : "—",
-                        note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
-                        icon: "box",
-                      },
-                    ].map((stat) => (
-                      <article className="stat-card" key={stat.label}>
+                <p className="workspace-hint">Pause keeps memory allocated. Hibernate saves memory to disk. Stop ends running processes.</p>
+              </section>
+              {!!jobs.length && (
+                <section className="panel jobs-section" aria-live="polite">
+                  <header className="panel-head">
+                    <h2>Recent operations</h2>
+                    <span className="section-caption">This browser session</span>
+                  </header>
+                  <div className="job-list">
+                    {jobs.map((job) => (
+                      <article className="job" key={job.id}>
+                        <span className={`job-icon ${job.status}`}>
+                          {activeJob(job) ? <span className="spinner" /> : <Icon name={job.status === "succeeded" ? "check" : "close"} size={16} />}
+                        </span>
                         <div>
-                          <span>{stat.label}</span>
-                          <Icon name={stat.icon} size={19} />
+                          <strong>{job.label ?? job.id}</strong>
+                          {job.error && <p className="job-error">{job.error}</p>}
+                          {job.status === "succeeded" && job.result?.startup && (
+                            <p className="job-detail">
+                              {job.result.startup === "warm" ? "Warm allocation" : "Cold start"}
+                              {typeof job.result.ready_seconds === "number" &&
+                                Number.isFinite(job.result.ready_seconds) &&
+                                ` · ready in ${job.result.ready_seconds.toFixed(2)} s`}
+                              {job.result.name && <span className="mono">VM: {job.result.name}</span>}
+                            </p>
+                          )}
+                          <small className="mono">{job.id}</small>
                         </div>
-                        <strong>{stat.value}</strong>
-                        <small>{stat.note}</small>
+                        <span className={`tag status status-${job.status}`} data-tone={activeJob(job) ? "agent" : job.status === "succeeded" ? "ok" : "danger"}>
+                          <i className="tag-dot" aria-hidden="true" />
+                          {title(job.status)}
+                        </span>
                       </article>
                     ))}
                   </div>
-                  {creating && fleet && (
-                    <CreateWorkspace
-                      fleet={fleet}
-                      busy={submitting}
-                      close={() => setCreating(false)}
-                      create={create}
-                    />
-                  )}
-                  <ComputePanel
-                    hosts={fleet?.hosts ?? []}
-                    hostsLoaded={fleet !== null}
-                    nodes={workers}
-                    machines={computeMachines}
-                    loaded={workersLoaded}
-                    loadError={workersError}
-                    refresh={refresh}
-                    hostDetails={(host) => <HostCard host={host} />}
-                  />
-                  <section className="workspaces-section">
-                    <div className="section-title">
-                      <div className="section-heading">
-                        <h2>VM instance inventory</h2>
-                        <span className="count">{instances.length}</span>
-                      </div>
-                      <span className="section-caption">
-                        Assigned workspaces · Prepared reserves · Bases
-                      </span>
-                    </div>
-                    <div className="table-container">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Workspace</th>
-                            <th>Host</th>
-                            <th>Status</th>
-                            <th>Resources</th>
-                            <th className="actions">Controls</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {instances.map(({ host, instance }) => (
-                            <WorkspaceRow
-                              key={`${host.id}/${instance.name}`}
-                              host={host}
-                              instance={instance}
-                              busy={
-                                pendingInstances.includes(
-                                  `${host.id}/${instance.name}`,
-                                ) ||
-                                jobs.some(
-                                  (job) =>
-                                    active(job) &&
-                                    job.host === host.id &&
-                                    (job.instance === instance.name ||
-                                      (!!instance.workspace_name &&
-                                        job.instance === instance.workspace_name)),
-                                )
-                              }
-                              action={action}
-                              connect={() => navigate("agents")}
-                            />
-                          ))}
-                        </tbody>
-                      </table>
-                      {!instances.length && (
-                        <div className="empty-state compact">
-                          <Icon size={28} />
-                          <h3>
-                            {fleet
-                              ? "No workspaces yet"
-                              : "Waiting for workspace inventory"}
-                          </h3>
-                          <p>
-                            {fleet
-                              ? "Create a workspace from a prepared template to start building."
-                              : "Workspaces appear when the fleet service responds."}
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                    <p className="workspace-hint">
-                      Pause keeps memory allocated. Hibernate saves memory to disk.
-                      Stop ends running processes.
-                    </p>
-                  </section>
-                  {!!jobs.length && (
-                    <section className="jobs-section" aria-live="polite">
-                      <div className="section-title">
-                        <h2>Recent operations</h2>
-                        <span className="section-caption">
-                          This browser session
-                        </span>
-                      </div>
-                      <div className="job-list">
-                        {jobs.map((job) => (
-                          <article className="job" key={job.id}>
-                            <span className={`job-icon ${job.status}`}>
-                              {active(job) ? (
-                                <span className="spinner" />
-                              ) : (
-                                <Icon
-                                  name={
-                                    job.status === "succeeded" ? "check" : "close"
-                                  }
-                                  size={18}
-                                />
-                              )}
-                            </span>
-                            <div>
-                              <strong>{job.label ?? job.id}</strong>
-                              {job.error && (
-                                <p className="job-error">{job.error}</p>
-                              )}
-                              {job.status === "succeeded" &&
-                                job.result?.startup && (
-                                  <p className="job-detail">
-                                    {job.result.startup === "warm"
-                                      ? "Warm allocation"
-                                      : "Cold start"}
-                                    {typeof job.result.ready_seconds === "number" &&
-                                      Number.isFinite(job.result.ready_seconds) &&
-                                      ` · ready in ${job.result.ready_seconds.toFixed(2)} s`}
-                                    {job.result.name && (
-                                      <span className="mono">
-                                        VM: {job.result.name}
-                                      </span>
-                                    )}
-                                  </p>
-                                )}
-                              <small className="mono">{job.id}</small>
-                            </div>
-                            <span className={`status status-${job.status}`}>
-                              {title(job.status)}
-                            </span>
-                          </article>
-                        ))}
-                      </div>
-                    </section>
-                  )}
-                </>
+                </section>
               )}
-              <footer className="page-footer">
-                <span>Engine Box</span>
-                <span>
-                  Prepared environments. Native harnesses. Your infrastructure.
-                </span>
-              </footer>
             </>
           )}
         </main>
       </div>
+      <CommandMenu open={menuOpen} commands={commands} close={() => setMenuOpen(false)} run={go} />
     </div>
   );
 }

@@ -60,6 +60,9 @@ fn main() -> Result<()> {
         for (key, value) in values {
             ensure!(
                 [
+                    // Retired: dashboards now sign in only by email. Still accepted so existing
+                    // environment.json files and retained prior releases keep starting; current
+                    // dashboards ignore it.
                     "ENGINEBOX_DASHBOARD_PASSWORD",
                     "ENGINEBOX_SESSION_SECRET",
                     "ENGINEBOX_DASHBOARD_ORIGIN",
@@ -76,6 +79,8 @@ fn main() -> Result<()> {
                     "ENGINEBOX_ORG_NAME",
                     "ENGINEBOX_EMAIL_ENDPOINT",
                     "ENGINEBOX_EMAIL_SECRET",
+                    // `file`: a private sign-in outbox for local qualification, never production.
+                    "ENGINEBOX_EMAIL_TRANSPORT",
                     "ENGINEBOX_CLIENT_IP_HEADER",
                     "ENGINEBOX_TENANCY_MODE",
                     "ENGINEBOX_OPEN_SIGNUP",

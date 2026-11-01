@@ -1,27 +1,30 @@
 import assert from "node:assert/strict";
-import { test, beforeEach } from "node:test";
+import { createHmac, randomBytes } from "node:crypto";
+import { rmSync } from "node:fs";
+import { test, beforeEach, afterEach } from "node:test";
+import * as sessionRoute from "../app/api/session/route";
 import {
   authenticated,
   config,
   cookie,
   HttpError,
-  login,
   proxy,
   requireOrigin,
-  sessionCookie,
 } from "../lib/server";
+import { memberCookie, memberSessionHeader, useIdentityDir } from "./session-fixture";
 
 const origin = "http://127.0.0.1:3000";
-const password = "test-only-dashboard-password";
 const token = "test-only-backend-token-never-in-browser";
+let identityDir = "";
 beforeEach(() => {
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = password;
+  identityDir = useIdentityDir();
   process.env.ENGINEBOX_SESSION_SECRET =
     "test-only-session-signing-secret-123456789";
   process.env.ENGINEBOX_API_TOKEN = token;
   process.env.ENGINEBOX_DASHBOARD_ORIGIN = origin;
   process.env.ENGINEBOX_API_URL = "http://127.0.0.1:8765";
 });
+afterEach(() => rmSync(identityDir, { recursive: true, force: true }));
 
 function request(
   path = "/api/control/v1/fleet",
@@ -34,7 +37,7 @@ function request(
     headers: {
       origin,
       "content-type": "application/json",
-      ...(authenticatedCookie ? { cookie: sessionCookie().split(";")[0] } : {}),
+      ...(authenticatedCookie ? { cookie: memberCookie() } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -42,7 +45,7 @@ function request(
 
 test("session is signed, expires and never contains the backend token", () => {
   const now = Date.now();
-  const header = sessionCookie(now);
+  const header = memberSessionHeader(undefined, now);
   assert.match(header, /HttpOnly; Path=\/; SameSite=Strict; Max-Age=28800/);
   assert.ok(!header.includes(token));
   const req = new Request(origin, {
@@ -56,15 +59,32 @@ test("session is signed, expires and never contains the backend token", () => {
   );
 });
 
-test("rotating the password invalidates an existing session", () => {
+test("rotating the session secret invalidates an existing session", () => {
   const req = request();
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = "a-different-dashboard-password";
+  assert.equal(authenticated(req), true);
+  process.env.ENGINEBOX_SESSION_SECRET = "a-different-session-signing-secret-12345678";
   assert.equal(authenticated(req), false);
+});
+
+test("operator cookies from the retired password sign-in are rejected", () => {
+  const secret = process.env.ENGINEBOX_SESSION_SECRET!;
+  for (const fields of [{}, { kind: "operator" }]) {
+    const payload = Buffer.from(JSON.stringify({ ...fields, expires: Date.now() + 3_600_000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
+    const legacy = createHmac("sha256", secret).update("old-operator-password").update("\0").update(payload).digest("base64url");
+    const member = createHmac("sha256", secret).update("enginebox-member-session\0").update(payload).digest("base64url");
+    for (const signature of [legacy, member])
+      assert.equal(authenticated(new Request(origin, { headers: { cookie: `enginebox_session=${payload}.${signature}` } })), false);
+  }
+});
+
+test("email sign-in is required: no identity state directory, no dashboard", () => {
+  delete process.env.ENGINEBOX_IDENTITY_STATE_DIR;
+  assert.throws(config, (error: unknown) => error instanceof HttpError && error.status === 503 && /ENGINEBOX_IDENTITY_STATE_DIR/.test(error.message));
 });
 
 test("HTTPS cookies use Secure and logout expires the session", () => {
   process.env.ENGINEBOX_DASHBOARD_ORIGIN = "https://enginebox.example";
-  assert.match(sessionCookie(), /; Secure$/);
+  assert.match(memberSessionHeader(), /; Secure$/);
   assert.match(cookie("", 0), /Max-Age=0; Secure$/);
 });
 
@@ -86,17 +106,12 @@ test("missing, cross-site and prefix origins are rejected", () => {
   requireOrigin(new Request(origin, { headers: { origin } }));
 });
 
-test("login issues a session only with the separate operator password", async () => {
-  await assert.rejects(
-    login(request("/api/session", "POST", { password: token }, false)),
-    (error: unknown) => error instanceof HttpError && error.status === 401,
-  );
-  const response = await login(
-    request("/api/session", "POST", { password }, false),
-  );
-  assert.equal(response.status, 200);
-  assert.ok(response.headers.get("set-cookie"));
-  assert.deepEqual(await response.json(), { authenticated: true });
+test("the session route offers no password sign-in", async () => {
+  assert.equal("POST" in sessionRoute, false);
+  delete process.env.ENGINEBOX_EMAIL_TRANSPORT;
+  delete process.env.ENGINEBOX_EMAIL_ENDPOINT;
+  const response = await sessionRoute.GET(new Request(origin));
+  assert.deepEqual(await response.json(), { authenticated: false, me: null, email_delivery: false });
 });
 
 test("unauthenticated proxy requests never reach the backend", async (t) => {
@@ -188,11 +203,11 @@ test("backend auth errors are useful without returning backend response contents
   );
 });
 
-test("plain HTTP remote URLs and shared operator/API credentials are refused", () => {
+test("plain HTTP remote URLs and a session secret shared with the API token are refused", () => {
   process.env.ENGINEBOX_API_URL = "http://remote.example:8765";
   assert.throws(config, /HTTPS/);
   process.env.ENGINEBOX_API_URL = "http://127.0.0.1:8765";
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = token;
+  process.env.ENGINEBOX_SESSION_SECRET = token;
   assert.throws(config, /separate/);
 });
 
