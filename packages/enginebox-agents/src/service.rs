@@ -4533,7 +4533,13 @@ mod run_control_tests {
         sched.vm_states.insert(key.clone(), VmState::Frozen);
         sched
             .idle_since
-            .insert(key, Instant::now() - Duration::from_secs(3600));
+            // checked_sub: Windows' monotonic clock starts near boot.
+            .insert(
+                key,
+                Instant::now()
+                    .checked_sub(Duration::from_secs(3600))
+                    .unwrap_or_else(Instant::now),
+            );
         m
     }
     fn lifecycle_events(service: &AgentService) -> usize {
