@@ -1,41 +1,62 @@
-import { fixtureOrigin, dashboardOrigin } from "./urls";
+import { fixtureOrigin, dashboardOrigin, identityDir, ownerEmail } from "./urls";
+import { openSignedIn } from "./session";
+import { join } from "node:path";
 import { test, expect, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 
 const origin = `${dashboardOrigin}`;
-async function signIn(page: Page) {
-  await page.goto("/");
-  await page.getByLabel("Operator password").fill("fixture-dashboard-password");
-  await page.getByRole("button", { name: "Open dashboard" }).click();
-  await expect(
-    page.getByRole("heading", { name: "Compute." }),
-  ).toBeVisible();
+/** A real member session, then the Virtual machines page (or `view`) from the sidebar. */
+async function signIn(page: Page, view = "Virtual machines") {
+  await openSignedIn(page);
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
+  await go(page, view);
+}
+async function go(page: Page, view: string) {
+  const toggle = page.getByRole("button", { name: "Open navigation" });
+  if (await toggle.isVisible()) await toggle.click();
+  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: view, exact: true }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(view);
+}
+async function latestCode() {
+  // Delivery is fire-and-forget after the response, so wait for the outbox line.
+  const file = join(identityDir, "outbox", "outbox.jsonl");
+  await expect.poll(async () => (await readFile(file, "utf8").catch(() => "")).includes(ownerEmail)).toBe(true);
+  const lines = (await readFile(file, "utf8")).trim().split("\n");
+  const message = JSON.parse(lines[lines.length - 1]);
+  expect(message.template).toBe("sign_in");
+  expect(message.to).toBe(ownerEmail);
+  return message.code as string;
 }
 test.beforeEach(async ({ request }) => {
   await request.post(`${fixtureOrigin}/__test/reset`);
 });
 
-test("login protects fleet data, rejects wrong passwords and keeps API token server-side", async ({
+test("email sign-in protects fleet data, rejects wrong codes and keeps API token server-side", async ({
   page,
   request,
   context,
 }) => {
   const response = await request.get("/api/control/v1/fleet");
   expect(response.status()).toBe(401);
-  await page.goto("/");
-  await page.getByLabel("Operator password").fill("wrong-password");
-  await page.getByRole("button", { name: "Open dashboard" }).click();
-  await expect(page.getByRole("alert")).toContainText("not accepted");
+  expect((await request.post("/api/session", { headers: { origin }, data: { password: "anything" } })).status()).toBe(405);
   const browserRequests: string[] = [];
   page.on("request", (req) =>
     browserRequests.push(
       `${req.url()} ${JSON.stringify(req.headers())} ${req.postData() ?? ""}`,
     ),
   );
-  await signIn(page);
-  await expect(
-    page.getByText("Build machine", { exact: true }).first(),
-  ).toBeVisible();
+  await page.goto("/");
+  await expect(page.getByLabel(/password/i)).toHaveCount(0);
+  await page.getByLabel("Email").fill(ownerEmail);
+  await page.getByRole("button", { name: "Email me a sign-in code" }).click();
+  const code = await latestCode();
+  await page.getByLabel("Sign-in code").fill(code === "000000" ? "111111" : "000000");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("not valid");
+  await page.getByLabel("Sign-in code").fill(code);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
+  await expect(page.getByText(ownerEmail).first()).toBeVisible();
   expect(browserRequests.join("\n")).not.toContain(
     "fixture-api-token-server-only-12345",
   );
@@ -45,7 +66,8 @@ test("login protects fleet data, rejects wrong passwords and keeps API token ser
   expect(cookie?.httpOnly).toBe(true);
   expect(cookie?.sameSite).toBe("Strict");
   await page.getByRole("button", { name: "Sign out" }).click();
-  await expect(page.getByLabel("Operator password")).toBeVisible();
+  await expect(page.getByLabel("Email")).toBeVisible();
+  expect((await page.request.get("/api/control/v1/fleet")).status()).toBe(401);
 });
 
 test("live inventory, template creation and all lifecycle actions follow asynchronous jobs", async ({
@@ -53,8 +75,9 @@ test("live inventory, template creation and all lifecycle actions follow asynchr
 }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await signIn(page);
+  await signIn(page, "Machines");
   await expect(page.getByText("SSH connection timed out.").first()).toBeVisible();
+  await go(page, "Virtual machines");
   const base = page.getByRole("row").filter({ hasText: "ebox-native-base" });
   await expect(base.getByText("Read only")).toBeVisible();
   await expect(base.getByRole("button")).toHaveCount(0);
@@ -106,6 +129,7 @@ test("failed jobs, empty fleet and API errors are visible", async ({
   await expect(
     page.getByText("The selected host does not have enough free storage."),
   ).toBeVisible();
+  await go(page, "Machines");
   await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "empty" },
   });
@@ -164,7 +188,7 @@ test("pending lifecycle operations only change controls on their target workspac
 test("top resource cards distinguish CPU allocation from actual host memory usage", async ({
   page,
 }) => {
-  await signIn(page);
+  await signIn(page, "Machines");
   const cpu = page.locator(".stat-card").filter({ hasText: "CPU allocated" });
   await expect(cpu.locator("strong")).toHaveText("12 / 32");
   await expect(cpu.locator("small")).toHaveText(
@@ -209,7 +233,7 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   await request.post(`${fixtureOrigin}/__test/mode`, {
     data: { mode: "warm" },
   });
-  await signIn(page);
+  await signIn(page, "Machines");
   const assigned = page
     .locator(".stat-card")
     .filter({ hasText: "VM workspaces" });
@@ -219,6 +243,7 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   await expect(
     page.getByText("1 ready · 1 preparing · target 2"),
   ).toBeVisible();
+  await go(page, "Virtual machines");
   for (const state of ["ready", "preparing", "quarantined"]) {
     const row = page.getByRole("row").filter({ hasText: `ebox-pool-${state}` });
     await expect(row.getByText("Reserved for allocation")).toBeVisible();
@@ -256,7 +281,9 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   await expect(
     page.getByText("Warm allocation · ready in 0.15 s", { exact: false }),
   ).toBeVisible();
+  await go(page, "Machines");
   await expect(assigned.locator("strong")).toHaveText("3");
+  await go(page, "Virtual machines");
   const action = page.waitForRequest(
     (req) => req.method() === "POST" && req.url().endsWith("/actions"),
   );

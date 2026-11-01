@@ -4,8 +4,15 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 
 ## What is implemented
 
-- Sidebar navigation for Compute, Workspaces, Agents, Profiles, Connections, Templates, Environments and MCP. Workspaces consolidates hosted/GitHub sources and source/storage controls with project activity and measured preparation. MCP teaches local stdio setup and retains OAuth app grant management. Each opens its own view; the navigation becomes a compact row on mobile. Switching views keeps recent operations in memory and continues polling active infrastructure jobs.
-- **Compute** combines configured VM hosts and enrolled Windows workers in one machine list. Pending and revoked registrations stay collapsed. Add machine issues the Windows installer command; CPU/memory/disk allowances are selected on that PC. The online count includes both inventories; VM resource cards and VM allocation controls use only VM hosts. Worker allowances are not physical host utilization or additional VM capacity. Either inventory remains visible if the other fails, with a visible error.
+- Navigation grouped by job, styled in Kitbash's Styrene language (light and dark follow the OS):
+  - **Overview** (the landing view): machines online, agent accounts connected, workspaces and CI runner pools, a **Needs attention** list (offline or unregistered machines, providers that need sign-in, failed template or toolchain installs, drained runners, failed CI jobs and operations), and compact machine, agent-account and CI summaries. Every item links to the page that fixes it; the Overview never mutates state. Sources it cannot read are listed, not hidden.
+  - **Source**: Workspaces (hosted/GitHub sources, source and storage controls, project activity and measured preparation), Repositories (GitHub connection and repository selection) and Environments.
+  - **Agents**: Accounts (controller connections and the org's agent accounts, with usage) and Profiles.
+  - **CI**: Actions runners (pools, permissions, prepared workflow fragments, drain, job receipts) and Toolchains.
+  - **Compute**: Machines, Virtual machines (VM inventory, allocation, lifecycle and recent operations) and Templates.
+  - **Settings**: Connections & secrets, MCP & apps, and Organization. Stored secret values and credential grants are managed only here and under Agents, Accounts.
+- Views have URLs (`/?panel=<view>`) and browser history. Older links keep working: `fleet` opens Machines, `repositories` and `storage` open Workspaces, `mcp` opens MCP & apps. **Jump to** (⌘K, Ctrl+K or `/`) opens any view by name. Switching views keeps recent operations in memory and continues polling active infrastructure jobs. On narrow screens the sidebar collapses behind a menu button.
+- **Machines** combines configured VM hosts and enrolled Windows workers in one machine list. Pending and revoked registrations stay collapsed. Add machine issues the Windows installer command; CPU/memory/disk allowances are selected on that PC. The online count includes both inventories; VM resource cards and VM allocation controls use only VM hosts. Worker allowances are not physical host utilization or additional VM capacity. Either inventory remains visible if the other fails, with a visible error.
 - Live fleet inventory, online/offline hosts, reserved and allocated CPU/memory, free disk, available memory, and capacity by workspace size. The top CPU card shows allocated cores and percentage, not CPU utilization. Host memory usage is total minus available memory, clamped to the reported total.
 - Workspace names, host, state, IP addresses, allocated resources, and current memory usage when the host reports it.
 - Allocating a workspace from a matching ready, paused reserve, with an explicit cold-start fallback. Completed operations show the actual startup mode and ready time reported by the API. Availability is advisory; another request can claim a ready instance before submission.
@@ -15,10 +22,10 @@ The optional dashboard is a Vinext App Router application targeting Node.js. It 
 - An Agents panel for connecting Codex (ChatGPT), Claude and Cursor once through controller-level native sign-in sessions, with separate workspace-delegation readiness. It displays status, official provider links, device codes, Claude authorization-code entry and cancellation.
 - Usage cards separate provider allowance windows, quota resets, optional credits and billing renewal. Codex uses its native read-only quota interface; Claude/Cursor and unreported billing dates display explicit unavailable states with provider links.
 - Asynchronous operation status, error messages, loading states, empty fleet instructions and responsive mobile layouts.
-- A separate operator sign-in, an eight-hour signed HttpOnly session, and exact Origin checks for login, logout and mutations.
-- With [organizations](ORGS.md) enabled (`ENGINEBOX_IDENTITY_STATE_DIR`): email sign-in with a 6-digit code or magic link, an **Organization** view (switch org, members and roles, invites, carrying members over by email, team orgs, naming the instance owner), role checks on every route, and each org seeing only its own machines, pools and repositories. The operator password becomes the host operator's labelled break-glass login.
+- Email sign-in only: a 6-digit code or magic link sent to the address, an eight-hour HttpOnly session backed by a revocable server-side record, and exact Origin checks for sign-in, sign-out and mutations. There is no password sign-in.
+- [Organizations](ORGS.md): an **Organization** view (switch org, members and roles, invites, carrying members over by email, team orgs), role checks on every route, and each org seeing only its own machines, pools and repositories.
 
-The page reads `/v1/fleet` and `/v1/contributors` every ten seconds while signed in and visible. Refresh updates both inventories. Registration changes refresh the worker list immediately. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. Infrastructure jobs cannot be cancelled through the dashboard. Without orgs there is one operator; with orgs, see [Organizations](ORGS.md).
+The page reads `/v1/fleet` and `/v1/contributors` every ten seconds while signed in and visible. Refresh updates both inventories. Registration changes refresh the worker list immediately. Pending jobs are polled every 1.5 seconds; completed jobs trigger a fresh inventory read. Recent operations are kept in the current page's memory and are cleared on reload or sign-out. Infrastructure jobs cannot be cancelled through the dashboard. Who can do what is described in [Organizations](ORGS.md).
 
 The assigned-workspace count excludes unmanaged bases and pool reserves. The instance inventory still shows all of them, with reserve state clearly marked. Claimed reserves keep their Incus VM ID; the requested workspace name appears above that ID, and lifecycle requests always use the actual VM ID. Each VM host’s **Details** shows its configured reserve's ready/preparing/target counts and refill errors. Paused reserves retain their memory allocation.
 
@@ -58,7 +65,7 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-Create `packages/dashboard/.env.local` with these values. It is ignored by Git. Keep permissions restricted to the service owner (`chmod 600 .env.local`). Use distinct random values for the password, session secret and fleet API token.
+Create `packages/dashboard/.env.local` with these values. It is ignored by Git. Keep permissions restricted to the service owner (`chmod 600 .env.local`). Use distinct random values for the session secret and fleet API token.
 
 ```dotenv
 HOST=127.0.0.1
@@ -66,11 +73,15 @@ PORT=3000
 ENGINEBOX_DASHBOARD_ORIGIN=http://127.0.0.1:3000
 ENGINEBOX_API_URL=http://127.0.0.1:8765
 ENGINEBOX_API_TOKEN=<the fleet service's existing bearer token, at least 32 characters>
-ENGINEBOX_DASHBOARD_PASSWORD=<a separate random operator password, at least 16 characters>
 ENGINEBOX_SESSION_SECRET=<a separate random signing secret, at least 32 characters>
+ENGINEBOX_IDENTITY_STATE_DIR=<an absolute private directory, for example /home/you/.enginebox/identity>
+ENGINEBOX_OWNER_EMAIL=<your email: the instance owner, created on first start>
+ENGINEBOX_EMAIL_TRANSPORT=file
 ```
 
-To let other apps connect over OAuth, also set `ENGINEBOX_OAUTH_STATE_DIR` to an absolute private directory (see [OAuth](OAUTH.md)); without it the OAuth endpoints answer 404. The placeholders above must be replaced; they are not usable credentials. `openssl rand -hex 32` generates a suitable random value. The API token must match the configured fleet service. The operator types only `ENGINEBOX_DASHBOARD_PASSWORD` into the login page; the browser never receives the API token or signing secret.
+Email sign-in is required: without `ENGINEBOX_IDENTITY_STATE_DIR` the dashboard refuses to start. `ENGINEBOX_EMAIL_TRANSPORT=file` is for local development only: sign-in codes are written to `<identity dir>/outbox/outbox.jsonl` (0600) instead of being emailed. A shared or production dashboard sends through the email gateway instead (`ENGINEBOX_EMAIL_ENDPOINT` and `ENGINEBOX_EMAIL_SECRET`, see [Self-hosting orgs](SELF-HOSTING-ORGS.md)).
+
+To let other apps connect over OAuth, also set `ENGINEBOX_OAUTH_STATE_DIR` to an absolute private directory (see [OAuth](OAUTH.md)); without it the OAuth endpoints answer 404. The placeholders above must be replaced; they are not usable credentials. `openssl rand -hex 32` generates a suitable random value. The API token must match the configured fleet service. People type only their email and the emailed code; the browser never receives the API token or signing secret.
 
 ```sh
 pnpm start
@@ -88,7 +99,7 @@ Build output is in `packages/dashboard/dist/`; `pnpm start` runs the tested Vine
 
 ## Managed service and updates
 
-Use the native [installer](INSTALL.md) and [supervisor](UPDATES.md). The supervisor keeps stable loopback API/dashboard addresses, stages a candidate controller in standby, drains admitted work and transfers exclusive state ownership before switching traffic. Keep the dashboard password and session secret stable across releases to preserve existing sessions. The first move from Python v0.2 requires a short control-plane interruption; VM workloads continue independently.
+Use the native [installer](INSTALL.md) and [supervisor](UPDATES.md). The supervisor keeps stable loopback API/dashboard addresses, stages a candidate controller in standby, drains admitted work and transfers exclusive state ownership before switching traffic. Keep the session secret and identity state directory stable across releases to preserve existing sessions. The first move from Python v0.2 requires a short control-plane interruption; VM workloads continue independently.
 
 The installer provides service plans for systemd, launchd and Windows Task Scheduler. A native package does not qualify that platform for Incus compute or native provider authentication. Private configuration/state stays outside immutable release directories. Production services need the built dashboard and Node 22.12 or newer; building from source uses the pinned root pnpm workspace.
 
@@ -96,7 +107,7 @@ The installer provides service plans for systemd, launchd and Windows Task Sched
 
 `ENGINEBOX_DASHBOARD_ORIGIN` must be an exact origin with no path or trailing slash. The proxy does not trust forwarded host/protocol headers to decide which origins to permit. All state-changing requests require a matching `Origin` header, including login and logout.
 
-Cookies use `HttpOnly`, `SameSite=Strict`, an eight-hour expiry and `Secure` when the configured origin uses HTTPS. Operator (break-glass) sessions are signed with the session secret and the operator password, so rotating either invalidates them; logout clears the cookie, and an individual stolen operator cookie cannot be revoked without rotating credentials. Member sessions (with orgs) are also server-side records: sign-out and member removal revoke them, and rotating the session secret ends them all. A process-local limit allows at most twenty password attempts per five minutes; email sign-in has its own per-email, per-client and global limits ([details](ORGS.md#sign-in)).
+Cookies use `HttpOnly`, `SameSite=Strict`, an eight-hour expiry and `Secure` when the configured origin uses HTTPS. Every session is also a server-side record: sign-out and member removal revoke it, and rotating the session secret ends them all. Cookies from the retired operator password sign-in are rejected. Email sign-in has per-email, per-client and global limits ([details](ORGS.md#sign-in)).
 
 For access through a TLS reverse proxy, set an HTTPS dashboard origin. The start script refuses non-loopback binding unless that HTTPS origin is set. TLS must be provided by the reverse proxy, and direct access to the plain HTTP upstream must be restricted by the operator. The dashboard does not enable TLS itself. Plain HTTP fleet API URLs are accepted only for loopback; remote API connections require HTTPS.
 

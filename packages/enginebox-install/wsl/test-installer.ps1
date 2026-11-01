@@ -364,7 +364,7 @@ try {
   if (-not $f.enrolled -or $f.code -ne $f.secret -or $f.pendingId -ne ('a'*32) -or $f.downloads -ne $beforeDownloads -or ($f.calls | Where-Object { $_ -like '--install*' -or $_ -like '--unregister*' })) { throw 'Registration retry must retain the installed runtime and saved identity' }
   if (@($f.calls | Where-Object { $_ -like '* configure' }).Count -ne 1) { throw 'Registration retry repeated runtime configuration' }
   $f.retryChoice='n'; $f.recoverEnrollmentOnRetry=$false; $f.enrollmentError=$null
-  # Pasting a dashboard password is rejected locally, then the user can paste
+  # Pasting something other than a registration code is rejected locally, then the user can paste
   # the raw registration code into the same prompt without reinstalling.
   $f.enrolled=$false; $f.pendingId=$null; $f.secret=$code; $f.calls=@()
   & $flowScript -InstallDirectory $errorsRoot -Resume -EnrollmentCode 'fixture-dashboard-password'

@@ -173,11 +173,9 @@ function TemplateEntry({
 export function TemplateCatalog({
   refreshToken,
   registered,
-  close,
 }: {
   refreshToken: number;
   registered: () => void;
-  close: () => void;
 }) {
   const [records, setRecords] = useState<TemplateRecord[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -265,9 +263,6 @@ export function TemplateCatalog({
             node, including nodes added later.
           </p>
         </div>
-        <button className="button small" type="button" onClick={close}>
-          Close catalog
-        </button>
       </div>
       {error && (
         <div className="alert" role="alert">

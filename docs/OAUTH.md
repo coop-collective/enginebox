@@ -192,12 +192,11 @@ keep strict one-time refresh tokens.
 - **Sign-in** goes through a `UserAuthenticator` interface
   (`packages/dashboard/lib/oauth/identity.ts`) and shares the dashboard's session
   cookie. With [orgs](ORGS.md) enabled, members sign in with their email on the
-  dashboard in the same browser and choose **Continue**; the form on the consent
-  page is only the host operator's break-glass password. Without orgs it is the
-  operator password, as before.
+  dashboard in the same browser and choose **Continue**. The consent page
+  collects no credentials.
 - **Who approves.** Approving needs the `admin` or `owner` role in the approver's
   active org. The grant records the approver (`user_id`: their user ID, or `owner`
-  for the break-glass operator and every grant made before orgs) and the org
+  on grants made before orgs) and the org
   (`org_id`, absent for the platform org). The approver manages it under **MCP**;
   so do that org's admins and owners. Consent offers only the org's own pools,
   platform pools shared with it by a [capacity grant](ORGS.md#capacity-grants), and

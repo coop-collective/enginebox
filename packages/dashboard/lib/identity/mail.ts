@@ -24,7 +24,7 @@ import { requireIdentity } from "./store";
  * over "v1\nPOST\n/send\n<timestamp>\n<nonce>\n<hex sha256(body)>".
  */
 export type Message =
-  | { template: "sign_in" | "claim_owner"; to: string; code: string; link: string; org_name: string; expires_minutes: number }
+  | { template: "sign_in"; to: string; code: string; link: string; org_name: string; expires_minutes: number }
   | { template: "invite"; to: string; link: string; org_name: string; role: string; expires_days: number };
 
 export type Transport = "gateway" | "file" | "none";

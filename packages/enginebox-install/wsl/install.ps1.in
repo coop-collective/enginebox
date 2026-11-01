@@ -68,7 +68,7 @@ function Read-EnrollmentCode([string]$Value) {
     if ($Value) {
       $Value=$Value.Trim()
       if ($Value -cmatch '^[a-f0-9]{32}\.[a-f0-9]{64}$') { return $Value }
-      Write-Host 'That is not a machine registration code. Paste only the dashboard Registration code field, not the dashboard password or the full install command. Installed components are retained.'
+      Write-Host 'That is not a machine registration code. Paste only the dashboard Registration code field, not an email sign-in code or the full install command. Installed components are retained.'
     }
     $secret=Read-Host 'One-time registration code' -AsSecureString
     $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)

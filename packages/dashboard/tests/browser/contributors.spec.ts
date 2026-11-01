@@ -1,12 +1,18 @@
 import { test, expect, type Page } from '@playwright/test';
-import { createHmac, randomBytes } from 'node:crypto';
+import { signedInCookie } from "./session";
 import { dashboardOrigin, fixtureOrigin } from './urls';
 async function openMachines(page: Page) {
-  const payload=Buffer.from(JSON.stringify({expires:Date.now()+3600000,nonce:randomBytes(24).toString('hex')})).toString('base64url');
-  const signature=createHmac('sha256','fixture-session-secret-at-least-32-characters').update('fixture-dashboard-password').update('\0').update(payload).digest('base64url');
-  await page.context().addCookies([{name:'enginebox_session',value:`${payload}.${signature}`,url:dashboardOrigin,httpOnly:true,sameSite:'Strict'}]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto('/');
-  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Compute',exact:true}).click();
+  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Machines',exact:true}).click();
+}
+/** VM allocation lives on the Virtual machines page: check it there, then return to Machines. */
+async function expectAllocation(page: Page, enabled: boolean) {
+  const nav = page.getByRole('navigation',{name:'Control plane'});
+  await nav.getByRole('button',{name:'Virtual machines',exact:true}).click();
+  const button = page.getByRole('button',{name:'New workspace',exact:true});
+  if (enabled) await expect(button).toBeEnabled(); else await expect(button).toBeDisabled();
+  await nav.getByRole('button',{name:'Machines',exact:true}).click();
 }
 test('copies the installer and raw code separately, renews the same identity, and moves a registered machine into the list',async ({page,request})=>{
   await request.post(`${fixtureOrigin}/__test/reset`);
@@ -96,7 +102,12 @@ for (const inventory of ['hosts', 'workers'] as const) {
     const machines = page.getByRole('region', {name:'Registered machines',exact:true});
     await expect(machines.getByRole('listitem', {name:inventory === 'hosts' ? 'Machine Render RTX' : 'Machine Build machine',exact:true})).toBeVisible();
     await expect(machines.getByRole('listitem')).toHaveCount(2);
-    if (inventory === 'hosts') await expect(page.getByRole('button', {name:'New workspace',exact:true})).toBeDisabled();
+    if (inventory === 'hosts') {
+      const nav = page.getByRole('navigation',{name:'Control plane'});
+      await nav.getByRole('button',{name:'Virtual machines',exact:true}).click();
+      await expect(page.getByRole('button', {name:'New workspace',exact:true})).toBeDisabled();
+      await nav.getByRole('button',{name:'Machines',exact:true}).click();
+    }
     await page.unroute(route);
     await page.getByRole('button', {name:'Refresh',exact:true}).click();
     await expect(page.getByRole('alert')).toHaveCount(0);
@@ -114,9 +125,10 @@ test('shows workers when there are no VM hosts without offering an incompatible 
   await request.post(`${fixtureOrigin}/__test/mode`,{data:{mode:'empty'}});
   await openMachines(page);
   await expect(page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem')).toHaveCount(2);
-  await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeDisabled();
   await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('1');
   await expect(page.locator('.stat-card').filter({hasText:'VM CPU allocated'}).locator('strong')).toHaveText('0 / 0');
+  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Virtual machines',exact:true}).click();
+  await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeDisabled();
 });
 
 test('uses controller registration and allowances for both runtimes with the same details flow', async ({page, request}) => {
@@ -159,7 +171,7 @@ test('Linux uses the shared installer flow, renews the matching code and stays o
   const server=machines.getByRole('listitem',{name:'Machine Build machine',exact:true});
   await expect(machines.getByRole('listitem')).toHaveCount(2);
   await expect(server).toContainText('Registration required');
-  await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeDisabled();
+  await expectAllocation(page, false);
   await page.getByRole('button',{name:'Add machine',exact:true}).click();
   await page.getByRole('combobox',{name:'Operating system',exact:true}).selectOption('linux');
   await expect(page.getByLabel('Machine name',{exact:true})).toHaveCount(0);
@@ -181,7 +193,7 @@ test('Linux uses the shared installer flow, renews the matching code and stays o
   await expect(machines.getByRole('listitem')).toHaveCount(2);
   await expect(server).toContainText('Registered · Linux · Incus');
   await expect(server).toContainText('Online');
-  await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeEnabled();
+  await expectAllocation(page, true);
   await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('1');
   await server.locator('summary').filter({hasText:'Details'}).click();
   await expect(server).toContainText('host:metal-01');

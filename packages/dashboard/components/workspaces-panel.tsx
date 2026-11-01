@@ -4,7 +4,6 @@ import { api, errorMessage } from "@/lib/client";
 import { useVisibleInterval } from "@/lib/visible-interval";
 import type { Fleet } from "@/lib/types";
 import { StoragePanel } from "@/components/storage-panel";
-import { GitHubPanel } from "@/components/github-panel";
 import { duration, sourceBytes, mergeWorkspaces, type WorkspaceCatalog, type Workspace, type EnvironmentCatalog, type Metrics } from "@/lib/workspaces";
 
 const base = "/api/control/v1";
@@ -19,13 +18,12 @@ function Timings({ metrics }: { metrics?: Metrics }) {
     <small>Revision {receipt.revision.slice(0, 12)}</small>
   </article>)}</div>;
 }
-export function WorkspacesPanel({ fleet, initialConnections = false, initialStorage = false, refreshToken = 0 }: { fleet: Fleet | null; initialConnections?: boolean; initialStorage?: boolean; refreshToken?: number }) {
+export function WorkspacesPanel({ fleet, initialStorage = false, refreshToken = 0 }: { fleet: Fleet | null; initialStorage?: boolean; refreshToken?: number }) {
   const [catalog, setCatalog] = useState<WorkspaceCatalog | null>(null);
   const [environments, setEnvironments] = useState<EnvironmentCatalog | null>(null);
   const [github, setGithub] = useState<GitHub>({});
   const [hosted, setHosted] = useState(false);
   const [selected, setSelected] = useState("");
-  const [connections, setConnections] = useState(initialConnections);
   const [creating, setCreating] = useState(false);
   const [storageOpen, setStorageOpen] = useState(initialStorage);
   const [error, setError] = useState("");
@@ -82,9 +80,8 @@ export function WorkspacesPanel({ fleet, initialConnections = false, initialStor
   const activeMembers = knownMembers.filter(m => m.instance?.status.toLowerCase() === "running").length;
   function state(w: Workspace) { return environments?.projects?.some(p => p.project === w.id && p.healthy) || environments?.environments.some(e => e.source.project === w.id && e.healthy) ? "Development serving" : w.source_observations.length || w.checkouts.length ? "LayerFS source observed" : w.repositories.length ? "Source connected · preparation needed" : "Environment or storage registered"; }
   return <section aria-label="Workspaces" className="contributor-panel workspaces-panel">
-    <div className="contributor-heading"><div><h2>{workspace ? workspace.id : "Workspaces"}</h2><p>Project source, agent environments, and measured preparation in one place.</p></div><div className="github-actions"><button className="button small" onClick={() => void refresh()}>Refresh workspaces</button><button className="button small" aria-expanded={connections} onClick={() => { setConnections(!connections); if (connections) void refresh(); }}>GitHub connection</button><button className="button small" onClick={() => setStorageOpen(!storageOpen)}>{storageOpen ? "Close source and storage" : "Source and storage"}</button><button className="button primary" onClick={() => { open(""); setProject(""); setCreating(true); }}>New workspace</button></div></div>
+    <div className="contributor-heading"><div><h2>{workspace ? workspace.id : "Workspaces"}</h2><p>Project source, agent environments, and measured preparation in one place.</p></div><div className="github-actions"><button className="button small" onClick={() => void refresh()}>Refresh workspaces</button><a className="button small" href="/?panel=github">GitHub repositories</a><button className="button small" onClick={() => setStorageOpen(!storageOpen)}>{storageOpen ? "Close source and storage" : "Source and storage"}</button><button className="button primary" onClick={() => { open(""); setProject(""); setCreating(true); }}>New workspace</button></div></div>
     {error && <p className="alert" role="alert">{error}</p>}{environmentError && <p role="status">{environmentError}</p>}{sourceError && <p role="status">{sourceError}</p>}{notice && <p role="status">{notice}</p>}
-    {connections && <GitHubPanel />}
     {(workspace || creating) && <button className="text-button" onClick={() => open("")}>← All workspaces</button>}
     {selected && catalog && !workspace && <p role="status">Workspace {selected} was not found in the available observations.</p>}
     {!workspace && !creating && <div className="host-grid">{all.map(w => <article className="host-card" key={w.id}><h3><button className="text-button" onClick={() => open(w.id)}>{w.id}</button></h3><p>{state(w)}</p><p>{w.repositories.length} sources · {w.pools.length} agent pools · {w.runs.filter(r => ["running", "queued"].includes(r.status)).length} active runs</p><p>{w.repositories.map(r => r.backend === "github" ? "GitHub" : "Hosted Git").join(" · ") || "LayerFS / environment"}</p><button className="button small" onClick={() => open(w.id)}>Open workspace {w.id}</button></article>)}{catalog && !all.length && <p>No workspaces yet. Create a hosted source or link a selected GitHub repository.</p>}{!catalog && !error && <p>Loading workspaces…</p>}</div>}

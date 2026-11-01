@@ -1,11 +1,9 @@
 import { test, expect, type Page } from "@playwright/test";
-import { createHmac, randomBytes } from "node:crypto";
+import { signedInCookie } from "./session";
 import { dashboardOrigin } from "./urls";
 
 async function open(page: Page, path: string) {
-  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3600000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
-  const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
-  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto(path);
 }
 
@@ -50,7 +48,7 @@ test("Connections lists, tests and creates connections with write-only secret in
   await fixture.install();
   await open(page, "/?panel=connections");
   const nav = page.getByRole("navigation", { name: "Control plane" });
-  await expect(nav.getByRole("button", { name: "Connections", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(nav.getByRole("button", { name: "Connections & secrets", exact: true })).toHaveAttribute("aria-current", "page");
   const panel = page.getByRole("region", { name: "Connections" });
   await expect(panel.getByRole("cell", { name: "https://kitbash.example.com/mcp" })).toBeVisible();
   await expect(panel.getByText("Authorization: Bearer secret KITBASH_TOKEN")).toBeVisible();

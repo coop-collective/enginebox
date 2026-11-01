@@ -1,14 +1,12 @@
 import { fixtureOrigin, dashboardOrigin } from "./urls";
 import { test, expect, type Page } from "@playwright/test";
-import { createHmac, randomBytes } from "node:crypto";
+import { signedInCookie } from "./session";
 
 async function openStorage(page: Page) {
   // Login itself is exercised by fleet/account tests. Use a signed fixture
   // session here so additional feature tests do not consume the production
   // twenty-attempt login budget or require weakening that protection.
-  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3_600_000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
-  const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
-  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: `${dashboardOrigin}`, httpOnly: true, sameSite: "Strict" }]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/?panel=storage");
   await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Storage", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Shared checkout storage" })).toBeVisible();

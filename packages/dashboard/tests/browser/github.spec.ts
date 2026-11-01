@@ -1,14 +1,13 @@
 import { test, expect, type Page } from "@playwright/test";
 import { dashboardOrigin, fixtureOrigin } from "./urls";
-import { createHmac, randomBytes } from "node:crypto";
+import { signedInCookie } from "./session";
 
 async function signIn(page: Page) {
   // Login is covered elsewhere; feature tests must not consume its rate budget.
-  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3_600_000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
-  const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
-  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/?panel=github");
 }
+const nav = (page: Page, name: string) => page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name, exact: true }).click();
 test("GitHub selects private repositories, links LayerFS sync and drains without granting runner permissions implicitly", async ({ page, request }) => {
   await request.post(`${fixtureOrigin}/__test/reset`);
   const repo = { id: 12, installation_id: 4, full_name: "fixture/private", private: true, branch: "main", default_branch: "main", permissions: { push: true } };
@@ -28,7 +27,6 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
     await route.fulfill({ json: value });
   });
   await signIn(page);
-  await expect(page.getByText("LayerFS preparation required")).toBeVisible();
   await expect(page.getByText("Connected as fixture")).toBeVisible();
   await page.getByRole("button", { name: "Choose repositories" }).click();
   await page.getByLabel("GitHub installation").selectOption("4");
@@ -37,6 +35,8 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
   await page.getByRole("button", { name: "Add repository" }).click();
   await expect(page.getByText("fixture/private", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "Prepare source and sync" })).toHaveAttribute("href", "/?panel=workspaces&storage=1&github_repository=12");
+  await nav(page, "Actions runners");
+  await expect(page.getByText("LayerFS preparation required")).toBeVisible();
   await page.getByLabel("Prepared runner profile").selectOption("linux");
   await page.getByLabel("Runner group name").fill("fixture-prepared");
   await page.getByLabel("Enginebox action at commit SHA").fill(`fixture/enginebox/packages/enginebox-actions@${"a".repeat(40)}`);
@@ -49,6 +49,7 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
   await expect(page.getByRole("button", { name: "Resume runner provisioning" })).toBeVisible();
   expect(writes.some(w => w.path.includes("connect"))).toBe(false);
   expect(writes.find(w => w.path.endsWith("/select"))?.body.repository_id).toBe(12);
+  await nav(page, "Repositories");
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.getByRole("link", { name: "Prepare source and sync" }).click();
@@ -83,19 +84,22 @@ test("one App shares the connection and reviews permissions without another OAut
   await signIn(page);
   await expect(page.getByRole("heading", {name:"GitHub connection",exact:true})).toBeVisible();
   await expect(page.getByRole("button", {name:"Reconnect GitHub",exact:true})).toBeVisible();
-  await expect(page.getByRole("button", {name:"Connect runner administration"})).toHaveCount(0);
   await page.getByRole("button", {name:"Choose repositories"}).click();
   await expect(page.getByText("fixture: Repository sync approved", {exact:true})).toBeVisible();
+  await nav(page, "Actions runners");
+  await expect(page.getByRole("button", {name:"Connect runner administration"})).toHaveCount(0);
   await page.getByRole("button", {name:"Review runner permissions"}).click();
   await expect(page.getByText("fixture: Organization approval required", {exact:true})).toBeVisible();
   await expect(page.getByRole("link", {name:"Approve permissions for the connected App on GitHub"})).toHaveAttribute("href","https://github.com/apps/fixture-shared/installations/new");
   permissions.organization_self_hosted_runners="write";
   await page.getByRole("button", {name:"Review runner permissions"}).click();
   await expect(page.getByText("fixture: Runner administration approved", {exact:true})).toBeVisible();
+  await nav(page, "Repositories");
   await page.getByRole("button", {name:"Disconnect GitHub",exact:true}).click();
-  await expect(page.getByRole("button", {name:"Review runner permissions"})).toBeDisabled();
   await expect(page.getByRole("button", {name:"Choose repositories"})).toBeDisabled();
   await expect(page.getByText("No repositories selected.", {exact:true})).toBeVisible();
+  await nav(page, "Actions runners");
+  await expect(page.getByRole("button", {name:"Review runner permissions"})).toBeDisabled();
   await expect(page.getByText("fixture: Runner administration approved", {exact:true})).toHaveCount(0);
   expect(disconnected).toBe(true);
 });

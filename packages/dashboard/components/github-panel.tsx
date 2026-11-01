@@ -7,7 +7,8 @@ type Repository = { id: number; installation_id: number; full_name: string; priv
 type Installation = { id: number; account: string; permissions: Record<string, string>; suspended: boolean };
 type Status = { configured: boolean; shared_app?: boolean; runner_app_configured: boolean; accounts: { kind: string; login: string }[]; repositories: Repository[]; draining: boolean; pools: { id: string; organization: string; labels: string[]; runner_group_id: number; max_runners: number; preparation?: { repository_id: number; workflows: string[] } | null }[]; jobs: { id: number; repository: string; status: string; github_status: string; error?: string }[] };
 const base = "/api/control/v1/github";
-export function GitHubPanel() {
+/** `show` picks one half: repository sync (Source) or Actions runners (CI). */
+export function GitHubPanel({ show = "all" }: { show?: "all" | "repositories" | "runners" } = {}) {
   const [status, setStatus] = useState<Status>();
   const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
   const [installations, setInstallations] = useState<Installation[]>([]);
@@ -33,6 +34,7 @@ export function GitHubPanel() {
   return <section className="github-panel" aria-label="GitHub">
     {error && <p className="alert" role="alert">{error}</p>}
     {!status ? <p>Loading GitHub connections…</p> : !status.configured ? <article className="github-card"><h2>Connect GitHub</h2><p>Configure your GitHub App on your controller to connect an account and select private repositories.</p></article> : <>
+      {show !== "runners" && <>
       <article className="github-card"><h2>{status.shared_app ? "GitHub connection" : "Repository connection"}</h2>{status.shared_app && <p>One App installation and account connection support repository sync and Actions runners.</p>}<p>Choose repositories to import into LayerFS and sync accepted main revisions back to GitHub.</p>
         <div className="github-actions"><button className="button primary" disabled={busy} onClick={() => void work(() => connect("repos"))}>{status.accounts.some(a => a.kind === accountKind) ? "Reconnect GitHub" : "Connect GitHub account"}</button>
         {status.accounts.filter(a => a.kind === accountKind).map(a => <span key={a.kind}>Connected as {a.login}</span>)}
@@ -48,7 +50,8 @@ export function GitHubPanel() {
         {status.repositories.map(repo => <div className="github-repo" key={repo.id}><div><strong>{repo.full_name}</strong><p>{repo.private ? "Private" : "Public"} · {repo.branch}</p></div><div className="github-actions"><a className="button" href={`/?panel=workspaces&storage=1&github_repository=${repo.id}`}>Prepare source and sync</a><button className="button" disabled={busy} onClick={() => void work(async () => { await post("remove", { repository_id: repo.id }); })}>Remove selection</button></div></div>)}
         <p>LayerFS owns project files and accepted main revisions. Open workspace source and storage controls to review imports, publish accepted changes, and resolve sync conflicts. Removing a selection retains project files.</p>
       </article>
-      <article className="github-card"><h2>GitHub Actions runners</h2><p>{status.shared_app ? "Your connected GitHub App also manages runners once the organization approves Self-hosted runners read/write and Actions read." : "The configured runner App requests organization runner administration."} Workflows opt in with the pool label and runner group. Existing runners remain available during migration.</p>
+      </>}
+      {show !== "repositories" && <article className="github-card"><h2>GitHub Actions runners</h2>{!status.accounts.some(a => a.kind === runnerAccountKind) && status.shared_app && <p className="catalog-notice">Connect a GitHub account under <a href="/?panel=github">Source, Repositories</a> first; the same App manages runners.</p>}<p>{status.shared_app ? "Your connected GitHub App also manages runners once the organization approves Self-hosted runners read/write and Actions read." : "The configured runner App requests organization runner administration."} Workflows opt in with the pool label and runner group. Existing runners remain available during migration.</p>
         {!status.runner_app_configured ? <p>Configure runner access and a disposable CI worker to enable Actions.</p> : <div className="github-actions">{!status.shared_app && <button className="button primary" disabled={busy} onClick={() => void work(() => connect("runners"))}>Connect runner administration</button>}<button className="button" disabled={busy || !status.accounts.some(a => a.kind === runnerAccountKind)} onClick={() => void work(() => loadInstallations("runners"))}>Review runner permissions</button></div>}
         {runnerInstallUrl && <p><a href={runnerInstallUrl} target="_blank" rel="noreferrer">{status.shared_app ? "Approve permissions for the connected App on GitHub" : "Install runner App or approve organization permissions"}</a></p>}
         {runnerInstallations.map(i => <p key={i.id}>{i.account}: {i.permissions.organization_self_hosted_runners === "write" && ["read", "write"].includes(i.permissions.actions) && !i.suspended ? "Runner administration approved" : "Organization approval required"}</p>)}
@@ -64,7 +67,7 @@ export function GitHubPanel() {
         <div className="github-actions"><button className="button" disabled={busy} onClick={() => void work(async () => { await post("drain", { draining: !status.draining }); })}>{status.draining ? "Resume runner provisioning" : "Drain runners"}</button><button className="button" disabled={busy} onClick={() => void work(refresh)}>Refresh GitHub status</button></div>
         <p>{status.draining ? "Provisioning paused; active runners finish their jobs." : status.pools.length ? "Provisioning enabled for configured pools." : "Configure a runner pool to start running jobs."}</p>
         {status.jobs.map(j => <div className="github-repo" key={j.id}><strong>{j.repository} · job {j.id}</strong><p>{j.status} · GitHub: {j.github_status}</p>{j.error && <p role="alert">{j.error}</p>}</div>)}
-      </article>
+      </article>}
     </>}
   </section>;
 }

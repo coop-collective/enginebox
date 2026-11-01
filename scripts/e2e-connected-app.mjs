@@ -12,14 +12,14 @@
 //     target/debug/examples/dev_fake_executor --config dev-fleet.toml --state-dir $DIR/state --listen 127.0.0.1:18765
 //   (dashboard) ENGINEBOX_API_URL=http://127.0.0.1:18765 ENGINEBOX_OAUTH_STATE_DIR=$DIR/oauth \
 //     ENGINEBOX_DASHBOARD_ORIGIN=http://127.0.0.1:13000 ... vite --port 13000
-//   cd packages/dashboard && EB_BASE=http://127.0.0.1:13000 EB_PASSWORD=... \
+//   cd packages/dashboard && EB_BASE=http://127.0.0.1:13000 EB_SESSION_COOKIE=... \
 //     EB_API=http://127.0.0.1:18765 EB_OWNER_TOKEN=$OWNER EB_CREATE_POOL=1 \
 //     EB_CALLBACK_URL=https://callbacks.example.com/enginebox \
 //     EB_CLIENT_MODULE=/path/to/your-app/enginebox-client.ts \
 //     node --import tsx ../../scripts/e2e-connected-app.mjs
 //
 // Against a real Engine Box: EB_BASE=https://<dashboard origin>, EB_POOL=<an
-// existing pool>. Without EB_PASSWORD the script prints the authorization URL;
+// existing pool>. Without EB_SESSION_COOKIE the script prints the authorization URL;
 // open it in a browser on this computer, sign in and consent, and the loopback
 // redirect completes the flow. EB_CALLBACK_URL must then be a public HTTPS URL
 // you can watch (the script cannot receive it); leave it unset to skip that step.
@@ -27,7 +27,8 @@
 // Environment:
 //   EB_BASE            dashboard origin (the OAuth issuer and protected resource)   required
 //   EB_POOL            pool to grant and run on (default "e2e")
-//   EB_PASSWORD        operator password: simulate the owner's sign-in and consent
+//   EB_SESSION_COOKIE  the dashboard's enginebox_session cookie value after email sign-in
+//                      in a browser: simulate the owner's consent with that session
 //   EB_API, EB_OWNER_TOKEN, EB_CREATE_POOL=1, EB_POOL_HOST, EB_POOL_WORKSPACE
 //                      create the pool on the controller first (dev only)
 //   EB_CALLBACK_URL    callback URL put on one run; EB_SINK_PORT (default 18790) is the
@@ -171,25 +172,25 @@ try {
   for (const [k, v] of Object.entries({ response_type: "code", client_id: clientId, redirect_uri: REDIRECT_URI, scope: "agent-runs", state, code_challenge: challenge, code_challenge_method: "S256", resource: BASE }))
     authUrl.searchParams.set(k, v);
   let redirect;
-  if (env.EB_PASSWORD) {
-    // Simulate the owner's browser: interstitial, sign-in, consent.
+  if (env.EB_SESSION_COOKIE) {
+    // Simulate the owner's browser: interstitial, then consent in an email-signed-in session.
     const first = await getJson(authUrl.href);
     const pendingPath = /url=([^"]+)"/.exec(first.text)?.[1]?.replace(/&amp;/g, "&");
     must("authorize starts with a same-origin hop that hides any existing session", first.res.status === 200 && !!pendingPath);
     const signInPage = await getJson(`${issuerUrl.origin}${pendingPath}`);
-    const requestId = /name="request" value="([^"]+)"/.exec(signInPage.text)?.[1];
-    must("the owner is asked to sign in", /Operator password|Sign in/.test(signInPage.text) && !!requestId);
-    const formPost = (fields, cookie) =>
+    must("without a session the owner is asked to sign in by email", /Sign in with your email/.test(signInPage.text));
+    const cookie = `enginebox_session=${env.EB_SESSION_COOKIE.replace(/^enginebox_session=/, "")}`;
+    const formPost = (fields, sessionCookie) =>
       fetch(meta.authorization_endpoint, {
         method: "POST",
         redirect: "manual",
-        headers: { "content-type": "application/x-www-form-urlencoded", origin: issuerUrl.origin, ...(cookie ? { cookie } : {}) },
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: issuerUrl.origin, ...(sessionCookie ? { cookie: sessionCookie } : {}) },
         body: new URLSearchParams(fields).toString(),
       });
-    const signedIn = await formPost([["request", requestId], ["action", "sign_in"], ["password", env.EB_PASSWORD]]);
-    const cookie = (signedIn.headers.get("set-cookie") ?? "").split(";")[0];
-    const consent = await signedIn.text();
-    must("sign-in sets a session and shows the consent screen", !!cookie && /Connect “Example Connected App”/.test(consent));
+    const consentPage = await getJson(`${issuerUrl.origin}${pendingPath}`, { headers: { cookie } });
+    const consent = consentPage.text;
+    const requestId = /name="request" value="([^"]+)"/.exec(consent)?.[1];
+    must("the signed-in session sees the consent screen", !!requestId && /Connect “Example Connected App”/.test(consent));
     step("consent offers the pool", consent.includes(`name="pool" value="${POOL}"`), POOL);
     const approved = await formPost([["request", requestId], ["action", "approve"], ["pool", POOL]], cookie);
     must("approving redirects to the registered URI", approved.status === 303 && (approved.headers.get("location") ?? "").startsWith(REDIRECT_URI));

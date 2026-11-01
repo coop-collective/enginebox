@@ -1,6 +1,6 @@
 import { fixtureOrigin, dashboardOrigin } from "./urls";
 import { test, expect } from "@playwright/test";
-import { createHmac, randomBytes } from "node:crypto";
+import { signedInCookie } from "./session";
 
 test.beforeEach(async ({ request }) => { await request.post(`${fixtureOrigin}/__test/reset`); });
 
@@ -8,11 +8,9 @@ test("CI templates enable, show failed verification, retry to readiness and disa
   expect((await request.get("/api/control/v1/ci/templates")).status()).toBe(401);
   // Reuse the signed-fixture session pattern from storage tests; login behavior
   // has its own coverage and this feature must not exhaust its attempt budget.
-  const payload = Buffer.from(JSON.stringify({ expires: Date.now() + 3_600_000, nonce: randomBytes(24).toString("hex") })).toString("base64url");
-  const signature = createHmac("sha256", "fixture-session-secret-at-least-32-characters").update("fixture-dashboard-password").update("\0").update(payload).digest("base64url");
-  await page.context().addCookies([{ name: "enginebox_session", value: `${payload}.${signature}`, url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
+  await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/");
-  await page.getByRole("button", { name: "Templates", exact: true }).click();
+  await page.getByRole("button", { name: "Toolchains", exact: true }).click();
   const panel = page.getByRole("region", { name: "CI toolchain templates" });
   await expect(panel.getByText("No CI templates registered.")).toBeVisible();
   await panel.getByLabel("CI recipe JSON").fill("invalid");

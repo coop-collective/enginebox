@@ -12,7 +12,6 @@ import { HttpError } from "../lib/server";
 const origin = "https://enginebox.example";
 let dir = "";
 beforeEach(() => {
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = "test-only-dashboard-password";
   process.env.ENGINEBOX_SESSION_SECRET = "test-only-session-signing-secret-123456789";
   process.env.ENGINEBOX_API_TOKEN = "test-only-backend-token-never-in-browser";
   process.env.ENGINEBOX_DASHBOARD_ORIGIN = origin;

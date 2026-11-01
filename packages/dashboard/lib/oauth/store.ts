@@ -75,7 +75,7 @@ export type Code = {
 /** One client's consented access for one user: a refresh-token family. */
 export type Grant = {
   id: string;
-  /** The approver: a user ID, or "owner" (break-glass operator, and every grant made before orgs). */
+  /** The approver: a user ID, or "owner" (every grant made before orgs). */
   user_id: string;
   /** The org the grant belongs to (absent: the platform org, `default`). Admins of that org manage it. */
   org_id?: string;

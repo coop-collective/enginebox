@@ -66,7 +66,7 @@ The sender defaults to `login@<domain>` (`--from` overrides). Domain registratio
 - [ ] **7. Restart the supervisor** (or run the normal update). Sign in at the dashboard with your email. The **Organization** view should show *Default Org*, you as owner and instance owner, and no "Email sending is not configured" warning.
 - [ ] **8. Invite or carry over your team.** **Organization → Invite someone**, or **Carry members over** with one email per line (for example your Ideator members, matched by email).
 
-If you did not set `ENGINEBOX_OWNER_EMAIL`, sign in with the operator password (the labelled break-glass login), open **Organization → Name the instance owner** and verify the owner's email with the code it receives.
+Set `ENGINEBOX_OWNER_EMAIL` before the first start: it is the only way the first owner is created, and there is no password sign-in. If the identity state already exists without an owner, see [the first owner and recovery](ORGS.md#the-first-owner-and-recovery).
 
 ## Managed mode
 

@@ -6,7 +6,6 @@ import { afterEach, beforeEach, test } from "node:test";
 import {
   acceptInvite,
   CHALLENGE_MINUTES,
-  claimOwnerStart,
   invitePage,
   LIMITS,
   magicLinkConsume,
@@ -19,14 +18,13 @@ import {
 import { orgAction, orgView } from "../lib/identity/org";
 import { DEFAULT_ORG, readIdentity, withIdentity } from "../lib/identity/store";
 import { forgetTenancy } from "../lib/tenancy";
-import { HttpError, principal, proxy, scopeToOrg, sessionCookie } from "../lib/server";
+import { config, HttpError, principal, proxy, scopeToOrg } from "../lib/server";
 
 const origin = "https://enginebox.example";
 let dir = "";
 const OWNER = "owner@example.com";
 
 beforeEach(() => {
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = "test-only-dashboard-password";
   process.env.ENGINEBOX_SESSION_SECRET = "test-only-session-signing-secret-123456789";
   process.env.ENGINEBOX_API_TOKEN = "test-only-backend-token-never-in-browser";
   process.env.ENGINEBOX_DASHBOARD_ORIGIN = origin;
@@ -273,21 +271,24 @@ test("import carries members over by email without sending mail; an existing acc
   for (const u of readIdentity().users) assert.ok(readIdentity().orgs.some((o) => o.id === u.personal_org_id && o.kind === "personal"));
 });
 
-test("break-glass operator: owner of the platform org; claims the instance owner when none is configured", async () => {
+test("without ENGINEBOX_OWNER_EMAIL nobody becomes instance owner, and no sign-in can claim it", async () => {
   delete process.env.ENGINEBOX_OWNER_EMAIL;
-  const operator = sessionCookie().split(";")[0];
-  const p = who(operator)!;
-  assert.deepEqual([p.kind, p.org_id, p.role, p.instance_owner], ["operator", DEFAULT_ORG, "owner", true]);
-  assert.equal((await (await orgView(get("/api/org", operator))).json()).needs_instance_owner, true);
-  const started = await (await claimOwnerStart(post("/api/org/claim", { email: "ops@example.com" }, { cookie: operator }))).json();
-  const code = outbox().at(-1)!.code!;
-  // Finishing needs the operator session.
-  await assert.rejects(verifyEmailCode(post("/api/auth/email/verify", { challenge: started.challenge, code })), (e: unknown) => e instanceof HttpError && e.status === 401);
-  const again = await (await claimOwnerStart(post("/api/org/claim", { email: "ops@example.com" }, { cookie: operator }))).json();
-  const verified = await verifyEmailCode(post("/api/auth/email/verify", { challenge: again.challenge, code: outbox().at(-1)!.code }, { cookie: operator }));
-  const owner = who(cookieOf(verified))!;
-  assert.deepEqual([owner.kind, owner.org_id, owner.role, owner.instance_owner], ["member", DEFAULT_ORG, "owner", true]);
-  await assert.rejects(claimOwnerStart(post("/api/org/claim", { email: "other@example.com" }, { cookie: operator })), (e: unknown) => e instanceof HttpError && e.status === 409);
+  // Unknown addresses get a decoy challenge and no mail (self-hosted, no open sign-up).
+  const started = await (await startEmailSignIn(post("/api/auth/email", { email: "ops@example.com" }))).json();
+  assert.equal(typeof started.challenge, "string");
+  assert.equal(outbox().length, 0);
+  assert.equal(readIdentity().users.some((u) => u.instance_owner), false);
+  // A retired owner-claim challenge left in old state never signs anyone in.
+  const { createHmac } = await import("node:crypto");
+  const secret = process.env.ENGINEBOX_SESSION_SECRET!;
+  const digestOf = (purpose: string, value: string) => createHmac("sha256", secret).update(`enginebox-identity/${purpose}\0`).update(value).digest("hex");
+  const id = "c".repeat(32), code = "123456";
+  withIdentity((state, now) => {
+    state.challenges.push({ id_hash: digestOf("challenge", id), email: "ops@example.com", purpose: "claim_owner", code_hash: digestOf("code", `${id}\0${code}`), link_hash: "x", attempts: 0, created_at: now, expires_at: now + 600_000, used_at: null });
+  });
+  await assert.rejects(verifyEmailCode(post("/api/auth/email/verify", { challenge: id, code })), (e: unknown) => e instanceof HttpError && e.status === 401);
+  assert.equal(readIdentity().users.length, 0);
+  await assert.rejects(orgAction(post("/api/org/claim", { email: "ops@example.com" }), ["claim"]), (e: unknown) => e instanceof HttpError && (e.status === 401 || e.status === 404));
 });
 
 test("managed mode: open sign-up creates a personal org; tenants cannot add people to the platform org", async () => {
@@ -361,12 +362,10 @@ test("listings: an org sees only its own pools, repositories and hosts, plus pla
   assert.deepEqual(forPlatform.hosts.map((h) => h.id), ["worker"]);
 });
 
-test("without ENGINEBOX_IDENTITY_STATE_DIR the dashboard keeps operator-only behaviour", async () => {
+test("without ENGINEBOX_IDENTITY_STATE_DIR the dashboard refuses to run: email sign-in is required", async () => {
   delete process.env.ENGINEBOX_IDENTITY_STATE_DIR;
-  await assert.rejects(startEmailSignIn(post("/api/auth/email", { email: OWNER })), (e: unknown) => e instanceof HttpError && e.status === 404);
-  const operator = sessionCookie().split(";")[0];
-  assert.equal(who(operator)?.kind, "operator");
-  assert.equal((await (await orgView(get("/api/org", operator))).json()).enabled, false);
+  await assert.rejects(startEmailSignIn(post("/api/auth/email", { email: OWNER })), (e: unknown) => e instanceof HttpError && e.status === 503);
+  assert.throws(config, (e: unknown) => e instanceof HttpError && e.status === 503);
 });
 
 test("OAuth consent: org admins approve and own grants in their org; members cannot approve", async () => {
@@ -379,9 +378,9 @@ test("OAuth consent: org admins approve and own grants in their org; members can
   assert.deepEqual([asOwner.org_id, asOwner.may_approve], [DEFAULT_ORG, true]);
   assert.match(asOwner.id, /^usr_/);
   assert.deepEqual([asMember.org_id, asMember.may_approve], [DEFAULT_ORG, false]);
-  // The break-glass operator keeps the pre-org grant owner id, so existing grants stay manageable.
-  assert.equal(ownerAuthenticator.current(get("/", sessionCookie().split(";")[0]))?.id, "owner");
-  assert.match(ownerAuthenticator.signInFields[0].label, /break-glass/);
+  // The consent page collects no credentials: people sign in by email on the dashboard.
+  assert.deepEqual(ownerAuthenticator.signInFields, []);
+  assert.throws(() => ownerAuthenticator.signIn(new URLSearchParams({ password: "anything" })), (e: unknown) => e instanceof HttpError && /email/.test(e.message));
 });
 
 test("a single record of another org reads as not found", () => {
