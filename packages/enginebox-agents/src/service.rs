@@ -335,7 +335,10 @@ impl AgentService {
         security::private_dir(&queue_root)?;
         // In-flight detached runs, outside the run records so a previous
         // release (which validates records strictly) still reads the state.
-        let detached_root = controller_root.join(DETACHED_DIR);
+        // Under the agents root (inner.root), where run_detached writes and adopt_detached reads; creating it under
+        // the controller root left production writing into a missing directory (2026-11-01, 0.3.1-live.21).
+        security::private_dir(&controller_root.join("agents"))?;
+        let detached_root = controller_root.join("agents").join(DETACHED_DIR);
         security::private_dir(&detached_root)?;
         let quarantine_root = controller_root.join("agent-runs-quarantine");
         let pools = pools::Pools::open(&controller_root)?;
@@ -5339,6 +5342,16 @@ mod handoff_tests {
     }
 
     #[test]
+    fn a_fresh_controller_creates_the_detached_index_where_runs_write_it() {
+        // 0.3.1-live.21 created the index under the controller root while run_detached wrote under the agents root,
+        // so every detached run failed with ENOENT. The directory must exist at inner.root.join(DETACHED_DIR).
+        let (_t, root, fleet) = state();
+        let service = AgentService::new(&root, fleet).unwrap();
+        assert!(service.inner.root.join(DETACHED_DIR).is_dir());
+        assert_eq!(service.inner.root, root.join("agents"));
+    }
+
+    #[test]
     fn records_this_release_writes_stay_readable_by_the_previous_release() {
         // Round trip: the in-flight index lives outside the records, so a
         // rollback reads every record this release writes.
@@ -5347,7 +5360,7 @@ mod handoff_tests {
         write(&root, "agent-runs", id, &record(id, "running"));
         write(
             &root,
-            DETACHED_DIR,
+            &format!("agents/{DETACHED_DIR}"),
             id,
             &json!({"schema":1,"id":id,"deadline":u64::MAX / 2}),
         );
@@ -5383,7 +5396,7 @@ mod handoff_tests {
         write(&root, "agent-runs", id, &record(id, "running"));
         write(
             &root,
-            DETACHED_DIR,
+            &format!("agents/{DETACHED_DIR}"),
             id,
             &json!({"schema":1,"id":id,"deadline":u64::MAX / 2}),
         );
@@ -5394,7 +5407,12 @@ mod handoff_tests {
             .unwrap()
             .unwrap();
         assert_eq!(on_disk["status"], "running");
-        assert!(root.join(DETACHED_DIR).join(format!("{id}.json")).is_file());
+        assert!(
+            root.join("agents")
+                .join(DETACHED_DIR)
+                .join(format!("{id}.json"))
+                .is_file()
+        );
     }
 
     #[test]
@@ -5527,7 +5545,7 @@ mod handoff_tests {
         write(&root, "agent-runs", id, &record(id, "running"));
         write(
             &root,
-            DETACHED_DIR,
+            &format!("agents/{DETACHED_DIR}"),
             id,
             &json!({"schema":1,"id":id,"deadline":u64::MAX / 2}),
         );
