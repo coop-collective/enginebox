@@ -90,6 +90,8 @@ pub const REASONS: &[&str] = &[
     "lease_inactive",
     "lease_active",
     "lease_probe_failed",
+    // Waking a frozen or stopped pool member failed (lifecycle, #93). Written by placement; activation must read it.
+    "workspace_wake_failed",
 ];
 pub fn valid_reason(reason: &str) -> bool {
     REASONS.contains(&reason)
@@ -406,5 +408,36 @@ mod tests {
             reopened.list(&Filter::default())["events"][0]["reason"],
             "admission_error"
         );
+    }
+}
+
+#[cfg(test)]
+mod reason_guard {
+    /// Every reason the scheduler writes into a run's failure must be one activation accepts: an unknown reason in a
+    /// persisted run record refuses every later activation ("Invalid native run failure"), leaving production drained.
+    #[test]
+    fn every_written_failure_reason_is_accepted_on_activation() {
+        let source = include_str!("service.rs");
+        let mut checked = 0;
+        let calls = source
+            .match_indices("LaunchFailure::from_error(")
+            .chain(source.match_indices("LaunchFailure::new("));
+        for (i, _) in calls {
+            let call = &source[i..source.len().min(i + 200)];
+            if let Some(start) = call.find('"') {
+                let rest = &call[start + 1..];
+                let reason = &rest[..rest.find('"').unwrap()];
+                assert!(
+                    super::valid_reason(reason),
+                    "service.rs writes failure reason {reason:?}, which REASONS rejects"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no LaunchFailure::from_error calls found; update this guard"
+        );
+        assert!(super::valid_reason("workspace_wake_failed"));
     }
 }
