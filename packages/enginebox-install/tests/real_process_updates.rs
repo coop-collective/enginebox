@@ -486,7 +486,10 @@ async fn real_versioned_controller_updates_and_rollback() -> Result<()> {
                     .context("missing sign-in code")?
                     .to_owned();
             }
-            ensure!(Instant::now() < deadline, "sign-in email was not delivered to the outbox");
+            ensure!(
+                Instant::now() < deadline,
+                "sign-in email was not delivered to the outbox"
+            );
             sleep(Duration::from_millis(100)).await;
         };
         let response = client
