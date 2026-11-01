@@ -6,13 +6,12 @@ import { afterEach, beforeEach, test, type TestContext } from "node:test";
 import { startEmailSignIn, verifyEmailCode } from "../lib/identity/auth";
 import { engineSessions } from "../lib/engine-sessions";
 import { contributors, nodeProxy } from "../lib/contributors";
-import { HttpError, sessionCookie } from "../lib/server";
+import { HttpError } from "../lib/server";
 
 const origin = "https://enginebox.example";
 const nodeToken = `${"a".repeat(32)}.${"b".repeat(64)}`;
 let dir = "";
 beforeEach(() => {
-  process.env.ENGINEBOX_DASHBOARD_PASSWORD = "test-only-dashboard-password";
   process.env.ENGINEBOX_SESSION_SECRET = "test-only-session-signing-secret-123456789";
   process.env.ENGINEBOX_API_TOKEN = "test-only-backend-token-never-in-browser";
   process.env.ENGINEBOX_DASHBOARD_ORIGIN = origin;
@@ -101,8 +100,8 @@ test("an admin claims an engine machine as their own; the member is never taken 
   assert.equal(claim.url, `http://127.0.0.1:8765/v1/contributors/${id}/engine-owner`);
   assert.match((claim.body as { member: string }).member, /^usr_[a-f0-9]{24}$/);
   await assert.rejects(contributors(req(`/api/contributors/${id}/engine-owner`, "POST", owner, { member: "usr_bbbbbbbbbbbbbbbbbbbbbbbb" }), [id, "engine-owner"]), (e: unknown) => e instanceof HttpError && e.status === 400);
-  // The single-password operator has no member identity to own a machine.
-  await assert.rejects(contributors(req(`/api/contributors/${id}/engine-owner`, "POST", sessionCookie().split(";")[0], {}), [id, "engine-owner"]), (e: unknown) => e instanceof HttpError && (e.status === 403 || e.status === 401));
+  // A request without a member session cannot claim a machine.
+  await assert.rejects(contributors(req(`/api/contributors/${id}/engine-owner`, "POST", "", {}), [id, "engine-owner"]), (e: unknown) => e instanceof HttpError && e.status === 401);
 });
 
 test("the node proxy allows the engine channel and nothing else new", async (t) => {
