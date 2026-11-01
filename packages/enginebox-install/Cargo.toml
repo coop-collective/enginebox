@@ -10,6 +10,7 @@ enginebox-node-protocol = { path = "../enginebox-node-protocol" }
 enginebox-ci = { path = "../enginebox-ci" }
 enginebox-agents = { path = "../enginebox-agents" }
 anyhow = "1"
+base64 = "0.22"
 chrono = "0.4"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }

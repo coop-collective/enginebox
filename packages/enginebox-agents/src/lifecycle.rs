@@ -13,7 +13,7 @@
 //! - Disk pressure deletes stale bases first, then stopped created members
 //!   beyond the pool's `min_workspaces`, longest idle first.
 use crate::queue::Placement;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A member's Incus state as the scheduler last saw it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -85,6 +85,74 @@ pub fn idle_action(
         }
         VmState::Frozen if stop => Some(IdleAction::Stop),
         _ => None,
+    }
+}
+
+/// Why a member must stay as it is: any of these keeps it from being frozen,
+/// stopped or reclaimed, and clears its idle clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hold {
+    /// A run is placed on it (from admission, which reserves the member, to
+    /// the run's end, including the wake/start before the run).
+    pub run: bool,
+    /// A writer lease (a run's provider lease, or an owner's attach).
+    pub lease: bool,
+    /// An unresolved (execution-uncertain) lease.
+    pub uncertain: bool,
+    /// A lifecycle action on it is in flight.
+    pub action: bool,
+}
+impl Hold {
+    pub fn busy(self) -> bool {
+        self.run || self.lease || self.uncertain || self.action
+    }
+}
+
+/// One member's lifecycle step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    /// Freeze or stop it.
+    pub action: Option<IdleAction>,
+    /// It is busy but frozen (a run would hang): resume it now.
+    pub resume: bool,
+    /// Its idle clock after this pass (`None` while busy).
+    pub idle_since: Option<Instant>,
+}
+
+/// Decide one member's step. Only the controller that owns the fleet and is
+/// admitting work (`active`) acts: a draining or drained controller does not
+/// know the new owner's runs and its idle clocks are stale. A busy member
+/// never gets an idle action and its idle clock restarts when it is free
+/// again, so a member woken for a run waits a full policy period after that
+/// run before it is frozen or stopped. `wanted`: queued runs could take it.
+pub fn decide(
+    active: bool,
+    state: VmState,
+    hold: Hold,
+    wanted: bool,
+    idle_since: Option<Instant>,
+    policy: IdlePolicy,
+    now: Instant,
+) -> Decision {
+    if !active {
+        return Decision {
+            action: None,
+            resume: false,
+            idle_since,
+        };
+    }
+    if hold.busy() {
+        return Decision {
+            action: None,
+            resume: state == VmState::Frozen && (hold.run || hold.lease) && !hold.action,
+            idle_since: None,
+        };
+    }
+    let since = idle_since.unwrap_or(now);
+    Decision {
+        action: idle_action(state, now.saturating_duration_since(since), policy, wanted),
+        resume: false,
+        idle_since: Some(since),
     }
 }
 
@@ -224,6 +292,162 @@ mod tests {
             session_age: session.map(|m| MIN * m as u32),
             created: true,
         }
+    }
+
+    fn run() -> Hold {
+        Hold {
+            run: true,
+            ..Hold::default()
+        }
+    }
+
+    #[test]
+    fn a_member_being_placed_is_never_frozen_even_when_its_idle_clock_elapsed() {
+        // Admission reserves the member (a run is placed on it) before its
+        // wake and launch; a long-elapsed idle clock must not freeze it.
+        let t0 = Instant::now();
+        let d = decide(
+            true,
+            VmState::Running,
+            run(),
+            false,
+            Some(t0),
+            policy(),
+            t0 + 90 * MIN,
+        );
+        assert_eq!(
+            d,
+            Decision {
+                action: None,
+                resume: false,
+                idle_since: None
+            }
+        );
+        for hold in [
+            Hold {
+                lease: true,
+                ..Hold::default()
+            },
+            Hold {
+                uncertain: true,
+                ..Hold::default()
+            },
+            Hold {
+                action: true,
+                ..Hold::default()
+            },
+        ] {
+            let d = decide(
+                true,
+                VmState::Running,
+                hold,
+                false,
+                Some(t0),
+                policy(),
+                t0 + 90 * MIN,
+            );
+            assert_eq!(d.action, None, "{hold:?}");
+            assert_eq!(d.idle_since, None);
+        }
+    }
+
+    #[test]
+    fn only_an_admitting_controller_acts() {
+        // A drained or restored controller keeps its scheduler thread but
+        // does not know the new owner's runs: it must not freeze or stop.
+        let t0 = Instant::now();
+        let d = decide(
+            false,
+            VmState::Running,
+            Hold::default(),
+            false,
+            Some(t0),
+            policy(),
+            t0 + 90 * MIN,
+        );
+        assert_eq!(
+            d,
+            Decision {
+                action: None,
+                resume: false,
+                idle_since: Some(t0)
+            }
+        );
+        let d = decide(false, VmState::Frozen, run(), false, Some(t0), policy(), t0);
+        assert!(!d.resume);
+    }
+
+    #[test]
+    fn stop_counts_from_the_end_of_the_run_not_a_stale_idle_clock() {
+        // ebox-ideator-95: idle since yesterday, woken for a run, stopped three
+        // seconds after the run ended. The stale clock is dropped while busy
+        // and a fresh one starts when the run ends.
+        let stale = Instant::now();
+        let woke = stale + 600 * MIN;
+        let busy = decide(
+            true,
+            VmState::Running,
+            run(),
+            false,
+            Some(stale),
+            policy(),
+            woke,
+        );
+        assert_eq!(busy.idle_since, None);
+        let ended = woke + 5 * MIN;
+        let free = decide(
+            true,
+            VmState::Running,
+            Hold::default(),
+            false,
+            busy.idle_since,
+            policy(),
+            ended,
+        );
+        assert_eq!(
+            free,
+            Decision {
+                action: None,
+                resume: false,
+                idle_since: Some(ended)
+            }
+        );
+        let later = |m: u32, state| {
+            decide(
+                true,
+                state,
+                Hold::default(),
+                false,
+                Some(ended),
+                policy(),
+                ended + MIN * m,
+            )
+        };
+        assert_eq!(later(1, VmState::Running).action, None);
+        assert_eq!(later(2, VmState::Running).action, Some(IdleAction::Freeze));
+        assert_eq!(later(59, VmState::Frozen).action, None);
+        assert_eq!(later(60, VmState::Frozen).action, Some(IdleAction::Stop));
+    }
+
+    #[test]
+    fn a_busy_frozen_member_is_resumed() {
+        // After a restart or a stray freeze, a member whose run is still
+        // going must not stay frozen. A lifecycle action in flight is left
+        // alone (it will settle the state itself).
+        let t0 = Instant::now();
+        assert!(decide(true, VmState::Frozen, run(), false, None, policy(), t0).resume);
+        let lease = Hold {
+            lease: true,
+            ..Hold::default()
+        };
+        assert!(decide(true, VmState::Frozen, lease, false, None, policy(), t0).resume);
+        let acting = Hold {
+            run: true,
+            action: true,
+            ..Hold::default()
+        };
+        assert!(!decide(true, VmState::Frozen, acting, false, None, policy(), t0).resume);
+        assert!(!decide(true, VmState::Running, run(), false, None, policy(), t0).resume);
     }
 
     #[test]

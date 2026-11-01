@@ -54,6 +54,25 @@ enum Action {
     },
     #[command(hide = true)]
     ExecuteWorker,
+    /// Validate an engine machine's engine.json and list its Unity versions.
+    EngineCheck {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run an engine session's steps up to Unity activation, without a
+    /// controller or any credential (docs/ENGINE-SESSIONS.md).
+    EngineRehearse {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        work: PathBuf,
+        /// A session spec JSON file (the controller's `spec` shape).
+        #[arg(long)]
+        spec: PathBuf,
+        /// The repository remote, e.g. a file:// URL of a local clone.
+        #[arg(long)]
+        remote: String,
+    },
     Inspect {
         #[arg(long, value_enum)]
         profile: Profile,
@@ -137,6 +156,23 @@ async fn main() -> Result<()> {
             config,
             test_loopback_http,
         } => contributor::run(&config, test_loopback_http).await?,
+        Action::EngineCheck { config } => {
+            println!("{}", enginebox_install::engine::inventory(&config, 0))
+        }
+        Action::EngineRehearse {
+            config,
+            work,
+            spec,
+            remote,
+        } => {
+            let spec = serde_json::from_slice(&std::fs::read(spec)?)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &enginebox_install::engine::rehearse(&config, &work, spec, &remote).await?
+                )?
+            );
+        }
         Action::ExecuteWorker => {
             use tokio::io::AsyncReadExt;
             let mut input = Vec::new();

@@ -2,7 +2,8 @@ import { bodyJson, config, HttpError, json, requireOrigin, requireRole, requireS
 import { DEFAULT_ORG } from './identity/store';
 import { forgetTenancy, hostOrg, tenancy } from './tenancy';
 
-const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result']);
+// engine-poll and engine-report are the engine session channel, parallel to the job slot (docs/ENGINE-SESSIONS.md).
+const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result', 'engine-poll', 'engine-report']);
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
 type Platform = 'windows' | 'linux';
@@ -50,7 +51,7 @@ export async function contributors(request: Request, segments: string[]) {
   if (new URL(request.url).search) throw new HttpError(400, 'Query parameters are not supported.');
   const suffix = segments.join('/');
   const allowed = request.method === 'GET' ? suffix === '' : request.method === 'POST' &&
-    (suffix === 'enrollments' || /^[a-f0-9]{32}\/(renew-enrollment|revoke|reconcile|runs)$/.test(suffix));
+    (suffix === 'enrollments' || /^[a-f0-9]{32}\/(renew-enrollment|revoke|reconcile|runs|engine-owner)$/.test(suffix));
   if (!allowed) throw new HttpError(404, 'Unknown machine operation.');
   const body = request.method === 'POST' ? await bodyJson(request, 20000) : undefined;
   const enrollment = suffix === 'enrollments' || suffix.endsWith('/renew-enrollment');
@@ -101,6 +102,13 @@ export async function contributors(request: Request, segments: string[]) {
     if (supervisor.node_protocol !== 1) throw new HttpError(503, 'The controller supervisor needs the node protocol update before registration.');
   }
   if (request.method === 'POST' && !enrollment && !mine(segments[0])) throw new HttpError(404, 'Registration unavailable.');
+  if (suffix.endsWith('/engine-owner')) {
+    // A personal engine machine runs only its owner's sessions: the claiming admin
+    // becomes the owner. The member comes from the session, never the request.
+    if (!who.user_id) throw new HttpError(403, 'Sign in with your own account to claim an engine machine.');
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) throw new HttpError(400, 'Claiming accepts an empty object.');
+    forwardedBody = { member: who.user_id };
+  }
   const result = await forward(path, request.method, config().apiToken, forwardedBody);
   if (suffix === 'enrollments' && who.org_id !== DEFAULT_ORG && typeof result.id === 'string') {
     // A machine enrolled from an org belongs to it.
