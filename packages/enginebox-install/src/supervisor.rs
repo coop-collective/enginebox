@@ -513,12 +513,25 @@ async fn proxy(supervisor: Supervisor, request: Request, dashboard: bool) -> Res
     // as writes. Pure reads continue against the draining controller.
     // Scoped node authentication belongs to the active controller. Completion
     // traffic must pass the upgrade gate so a draining owner can finish its jobs.
+    // Keep both lists in step with the controller's node routes (engine-poll and
+    // engine-report are the engine session channel, docs/ENGINE-SESSIONS.md).
     let node_action = (request.method() == Method::POST && !dashboard)
         .then(|| path.strip_prefix("/v1/node/"))
         .flatten()
-        .filter(|action| ["enroll", "hello", "heartbeat", "poll", "result"].contains(action));
-    let finishing_node =
-        node_action.is_some_and(|action| ["heartbeat", "result"].contains(&action));
+        .filter(|action| {
+            [
+                "enroll",
+                "hello",
+                "heartbeat",
+                "poll",
+                "result",
+                "engine-poll",
+                "engine-report",
+            ]
+            .contains(action)
+        });
+    let finishing_node = node_action
+        .is_some_and(|action| ["heartbeat", "result", "engine-report"].contains(&action));
     let owned_request = !dashboard
         && !finishing_node
         && (!matches!(
