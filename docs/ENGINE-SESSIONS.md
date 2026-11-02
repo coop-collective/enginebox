@@ -121,7 +121,13 @@ reports in order. If the engine channel fails for a minute, it stops its session
    package whose editor script enters Play mode after import when Unity runs with `-enginebox-autoplay`; the bridge
    streams only in Play mode). The next session's `checkout -f` restores the manifest.
 3. `bridge.json {port, token, scene, width, height, playOnly:true}` and `bridge.token` are written to
-   `work\engine\sessions\<id>` (the node's owner-only directory).
+   `work\engine\sessions\<id>` (the node's owner-only directory). `port` is a free loopback port picked just before
+   (bind `127.0.0.1:0`). Another program can take it before Unity binds; the bridge then retries its start on every
+   Editor update and reads `bridge.json` again each time. So while the node waits for the bridge (step 5, and before
+   every stream host start in step 6), a port that stays held for three checks (about 6 s) by something that does not
+   answer the bridge's authenticated `/status` gets a new free port written into `bridge.json`, at most five times per
+   session ("could not keep a local port" after that; `bridge_port_moves` in the receipt). Unity's own
+   player-connection listener is left as it is.
 4. `<Editor>\Data\Resources\Licensing\Client\Unity.Licensing.Client.exe --activate-all --accessToken <token>
    --include-personal`. **This is the one place a secret is in argv**; the client has no other input. Its output is
    discarded.
@@ -130,7 +136,8 @@ reports in order. If the engine channel fails for a minute, it stops its session
    `/status` until `playing` and `view:"play"` (default limit one hour, `startup_timeout_seconds`).
 6. `enginebox-stream-host.exe --moq-session <session>\moq-session.json` with
    `{schema:1, token:<publish>, controlKey, session, namespace, tag, durationSeconds:600, width, height,
-   capture:{kind:"unity-editor", origin:"http://127.0.0.1:<port>", tokenFile, ffmpeg}}`. Its first
+   capture:{kind:"unity-editor", origin:"http://127.0.0.1:<port>", tokenFile, ffmpeg}}`, where `<port>` is always the
+   port the bridge is answering on at that start (the node waits up to two minutes for it). Its first
    `moq-source-running` line reports `ready`. The stream host's permit is fixed at 600 s and it also ends cleanly
    when no controlling client keeps it alive, so the node restarts it while the session runs (viewers reconnect);
    five quick non-zero exits in a row fail the session.
