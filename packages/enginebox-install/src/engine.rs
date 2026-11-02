@@ -63,6 +63,11 @@ pub struct EngineConfig {
     /// How long the Editor may take to import and enter Play mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_timeout_seconds: Option<u64>,
+    /// `global` keeps Unity's services on the global region. Unity's config CDN
+    /// answers by IP, and from mainland China or Hong Kong it hands out Unity
+    /// China, which does not know global Unity IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unity_region: Option<String>,
 }
 
 fn valid_version(v: &str) -> bool {
@@ -162,6 +167,10 @@ impl EngineConfig {
             self.startup_timeout_seconds
                 .is_none_or(|t| (60..=4 * 3600).contains(&t)),
             "startup_timeout_seconds must be 60-14400"
+        );
+        ensure!(
+            self.unity_region.as_deref().is_none_or(|r| r == "global"),
+            "unity_region must be global"
         );
         Ok(())
     }
@@ -394,9 +403,8 @@ pub fn scrub_licensing_logs(dir: &Path, token: &str) -> Result<usize> {
 }
 pub fn unity_argv(project: &Path, bridge_config: &Path, log: &Path) -> Vec<OsString> {
     vec![
-        // The member accepted Unity's Editor Software Terms with their Unity
-        // account; a session has no one at the dialog, which would otherwise
-        // block the Editor before it logs anything (as Unity's CLI does unattended).
+        // Newer Editors honour this for unattended opens, as Unity's CLI passes
+        // it; 6000.6 does not, so accept_unity_terms also records the acceptance.
         "-acceptSoftwareTermsForThisRunOnly".into(),
         "-projectPath".into(),
         project.as_os_str().to_owned(),
@@ -488,6 +496,169 @@ pub fn write_session_package(dir: &Path) -> Result<()> {
     )?;
     std::fs::write(editor.join("AutoPlay.cs"), AUTOPLAY)?;
     Ok(())
+}
+
+/// Copy the configured editor bridge into the node's own cache and return the
+/// copy. The configured package can be read-only for the engine account, and
+/// Unity writes `.meta` files into a `file:` package; a missing one in a
+/// read-only package keeps the Editor retrying forever at "Opening project".
+/// The copy is keyed by the source's content, so an updated bridge is copied
+/// again and older copies are removed.
+pub fn stage_bridge(source: &Path, cache: &Path) -> Result<PathBuf> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if kind.is_symlink() || name == ".git" || name == "node_modules" {
+                continue;
+            }
+            if kind.is_dir() {
+                walk(root, &path, out)?;
+            } else if kind.is_file() {
+                ensure!(
+                    out.len() < 2000,
+                    "The editor bridge package has too many files"
+                );
+                out.push((path.strip_prefix(root)?.to_owned(), std::fs::read(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(source, source, &mut files)?;
+    let mut digest = Sha256::new();
+    for (path, bytes) in &files {
+        digest.update(path.to_string_lossy().replace('\\', "/").as_bytes());
+        digest.update([0]);
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    let digest = hex::encode(digest.finalize());
+    let name = format!("editor-bridge-{}", &digest[..16]);
+    private_dir(cache)?;
+    let staged = cache.join(&name);
+    if staged.join(".enginebox-staged").is_file() {
+        return Ok(staged);
+    }
+    let pending = cache.join(format!(".{name}-{}", random_hex(4)));
+    for (path, bytes) in &files {
+        let target = pending.join(path);
+        std::fs::create_dir_all(target.parent().context("bridge file has no parent")?)?;
+        std::fs::write(&target, bytes)?;
+    }
+    std::fs::write(pending.join(".enginebox-staged"), &digest)?;
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)?;
+    }
+    std::fs::rename(&pending, &staged)?;
+    for entry in std::fs::read_dir(cache)?.flatten() {
+        let other = entry.file_name().to_string_lossy().to_string();
+        if other != name && other.starts_with("editor-bridge-") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    Ok(staged)
+}
+
+/// The EditorPrefs registry/plist name Unity stores for `key`: the key plus
+/// `_h` and its 32-bit djb2-xor hash.
+pub fn editor_prefs_name(key: &str) -> String {
+    let hash = key
+        .bytes()
+        .fold(5381u32, |h, b| h.wrapping_mul(33) ^ u32::from(b));
+    format!("{key}_h{hash}")
+}
+/// The `Terms-<hash>` EditorPrefs key an Editor build checks before it shows
+/// its one-time "Unity Editor Software Terms" dialog, read from its binaries.
+pub fn unity_terms_key(unity: &Path) -> Option<String> {
+    let editor = unity.parent()?;
+    let candidates = [editor.join("Unity.dll"), unity.to_owned()];
+    candidates.iter().find_map(|file| {
+        let bytes = std::fs::read(file).ok()?;
+        bytes.windows(38).find_map(|w| {
+            (w.starts_with(b"Terms-")
+                && w[6..]
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)))
+            .then(|| String::from_utf8_lossy(w).into_owned())
+        })
+    })
+}
+/// Record the member's acceptance of the Editor terms for the engine account,
+/// as the dialog's Accept does: nobody is at a session's locked console, and
+/// the Editor would wait at the dialog before writing its log. The member
+/// accepted Unity's terms with the Unity account the session uses.
+async fn accept_unity_terms(unity: &Path) -> Result<Option<String>> {
+    let Some(key) = unity_terms_key(unity) else {
+        return Ok(None);
+    };
+    if !cfg!(windows) {
+        return Ok(Some(key));
+    }
+    let name = editor_prefs_name(&key);
+    let status = Command::new("reg.exe")
+        .args([
+            "add",
+            r"HKCU\Software\Unity Technologies\Unity Editor 5.x",
+            "/v",
+            &name,
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "1",
+            "/f",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("Cannot run reg.exe")?;
+    ensure!(
+        status.success(),
+        "Could not record Unity's Editor terms for the engine account"
+    );
+    Ok(Some(key))
+}
+
+/// Unity's global services configuration, as its config CDN serves it outside
+/// China (`public-cdn.cloud.unity3d.com/config/production`).
+const UNITY_GLOBAL_CONFIG: &str = include_str!("unity-global-config.json");
+fn unity_config_file() -> Option<PathBuf> {
+    licensing_log_dir().map(|dir| dir.join("config").join("production.json"))
+}
+/// With `unity_region: global`, keep the licensing client's cached services
+/// configuration on the global region. The file is left read-only so the
+/// client cannot replace it with the regional copy it downloads.
+pub fn pin_unity_region(file: &Path) -> Result<bool> {
+    let global = |bytes: &[u8]| {
+        serde_json::from_slice::<Value>(bytes)
+            .is_ok_and(|v| v["license"] == "https://license.unity3d.com")
+    };
+    if std::fs::read(file).is_ok_and(|b| global(&b)) {
+        let mut permissions = std::fs::metadata(file)?.permissions();
+        if !permissions.readonly() {
+            permissions.set_readonly(true);
+            std::fs::set_permissions(file, permissions)?;
+        }
+        return Ok(false);
+    }
+    std::fs::create_dir_all(file.parent().context("config file has no parent")?)?;
+    if let Ok(meta) = std::fs::metadata(file) {
+        let mut permissions = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(file, permissions)?;
+    }
+    std::fs::write(file, UNITY_GLOBAL_CONFIG)
+        .context("Cannot pin Unity's services configuration to the global region")?;
+    let mut permissions = std::fs::metadata(file)?.permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(file, permissions)?;
+    Ok(true)
 }
 fn random_hex(bytes: usize) -> String {
     let mut out = String::new();
@@ -836,9 +1007,13 @@ pub fn prepare_project(
     );
     let package = session_dir.join("packages").join(SESSION_PACKAGE);
     write_session_package(&package)?;
+    let bridge = stage_bridge(
+        &ctx.config.editor_bridge,
+        &ctx.work.join("engine").join("packages"),
+    )?;
     add_packages(
         &project.join("Packages").join("manifest.json"),
-        &ctx.config.editor_bridge,
+        &bridge,
         &package,
     )?;
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
@@ -919,6 +1094,11 @@ pub async fn run_session(
         let bridge_token = std::fs::read_to_string(&token_file)?;
         let pids = PidRecord::new(ctx.private.join("engine-pids.json"));
         let mut g = Group::new()?;
+        if ctx.config.unity_region.as_deref() == Some("global") {
+            let file = unity_config_file().context("The engine account has no Unity config folder")?;
+            receipt["unity_region_pinned"] = json!(pin_unity_region(&file)?);
+        }
+        receipt["unity_terms_key"] = json!(accept_unity_terms(&unity).await?);
         // Activation: the access token is the licensing client's only input.
         let t = Instant::now();
         let mut activate = Command::new(licensing_client(&unity));
@@ -1317,6 +1497,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editor_prefs_names_match_unity() {
+        // Values Unity 6 wrote on a real Windows account.
+        assert_eq!(
+            editor_prefs_name("Terms-43dc734cac67bb5fb31d4692eb48c6b3"),
+            "Terms-43dc734cac67bb5fb31d4692eb48c6b3_h3816273780"
+        );
+        assert_eq!(
+            editor_prefs_name("UnityMcpServer.AutoStart"),
+            "UnityMcpServer.AutoStart_h4003269344"
+        );
+    }
+
+    #[test]
+    fn terms_key_comes_from_the_editor_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let unity = dir.path().join("Unity.exe");
+        std::fs::write(&unity, b"no terms here").unwrap();
+        assert_eq!(unity_terms_key(&unity), None);
+        let mut dll = b"\0\0SoftwareTermsWndProc\0Terms-".to_vec();
+        dll.extend_from_slice(b"a406f2015eeb4822cbb013b27860953b\0tail");
+        std::fs::write(dir.path().join("Unity.dll"), dll).unwrap();
+        assert_eq!(
+            unity_terms_key(&unity).as_deref(),
+            Some("Terms-a406f2015eeb4822cbb013b27860953b")
+        );
+    }
+
+    #[test]
+    fn bridge_is_staged_writable_and_restaged_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("bridge");
+        std::fs::create_dir_all(source.join("Editor")).unwrap();
+        std::fs::create_dir_all(source.join("node_modules/x")).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            r#"{"name":"dev.unityjam.editor-bridge"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("README.md"), "no meta").unwrap();
+        std::fs::write(source.join("Editor/Bridge.cs"), "class B {}").unwrap();
+        std::fs::write(source.join("node_modules/x/big.js"), "skip").unwrap();
+        let cache = root.join("cache");
+        let first = stage_bridge(&source, &cache).unwrap();
+        assert!(first.join("README.md").is_file() && first.join("Editor/Bridge.cs").is_file());
+        assert!(!first.join("node_modules").exists());
+        // Unity may write the missing meta into the copy; staging again keeps it.
+        std::fs::write(first.join("README.md.meta"), "guid").unwrap();
+        assert_eq!(stage_bridge(&source, &cache).unwrap(), first);
+        assert!(first.join("README.md.meta").is_file());
+        std::fs::write(source.join("Editor/Bridge.cs"), "class B { int x; }").unwrap();
+        let second = stage_bridge(&source, &cache).unwrap();
+        assert_ne!(second, first);
+        assert!(!first.exists(), "the old copy is removed");
+        assert_eq!(
+            std::fs::read_to_string(second.join("Editor/Bridge.cs")).unwrap(),
+            "class B { int x; }"
+        );
+    }
+
+    #[test]
+    fn unity_region_pin_replaces_a_regional_config() {
+        assert_eq!(
+            serde_json::from_str::<Value>(UNITY_GLOBAL_CONFIG).unwrap()["license"],
+            "https://license.unity3d.com"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config/production.json");
+        assert!(pin_unity_region(&file).unwrap());
+        std::fs::set_permissions(&file, {
+            let mut p = std::fs::metadata(&file).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            p
+        })
+        .unwrap();
+        std::fs::write(&file, r#"{"license":"https://license.unity.cn"}"#).unwrap();
+        assert!(pin_unity_region(&file).unwrap());
+        assert!(std::fs::metadata(&file).unwrap().permissions().readonly());
+        assert!(
+            !pin_unity_region(&file).unwrap(),
+            "an already global config is left alone"
+        );
+        let pinned: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(pinned["core"], "https://core.cloud.unity3d.com");
+    }
+
+    #[test]
     fn licensing_logs_lose_the_access_token() {
         let dir = tempfile::tempdir().unwrap();
         let token = "unity-access-token-0123456789";
@@ -1370,6 +1638,7 @@ mod tests {
             editor_bridge: bridge,
             git: None,
             startup_timeout_seconds: None,
+            unity_region: None,
         };
         (dir, config)
     }
@@ -1588,10 +1857,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(project.join("Packages/manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["dependencies"]["com.unity.inputsystem"], "1.20.0");
-        assert_eq!(
-            manifest["dependencies"][BRIDGE_PACKAGE],
-            file_url(&config.editor_bridge)
-        );
+        // The node's own copy of the bridge, never the configured (possibly read-only) one.
+        let staged = manifest["dependencies"][BRIDGE_PACKAGE].as_str().unwrap();
+        assert!(staged.starts_with(&file_url(&ctx.work.join("engine/packages/editor-bridge-"))));
+        assert_ne!(staged, file_url(&config.editor_bridge));
         assert!(
             manifest["dependencies"][SESSION_PACKAGE]
                 .as_str()
