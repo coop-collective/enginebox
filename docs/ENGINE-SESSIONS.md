@@ -119,7 +119,7 @@ reports in order. If the engine channel fails for a minute, it stops its session
 4. `<Editor>\Data\Resources\Licensing\Client\Unity.Licensing.Client.exe --activate-all --accessToken <token>
    --include-personal`. **This is the one place a secret is in argv**; the client has no other input. Its output is
    discarded.
-5. `Unity.exe -projectPath <project> -jam-editor-config <bridge.json> -enginebox-autoplay -logFile <session>\unity.log`
+5. `Unity.exe -acceptSoftwareTermsForThisRunOnly -projectPath <project> -jam-editor-config <bridge.json> -enginebox-autoplay -logFile <session>\unity.log`
    in the node's own interactive session (the `enginebox` account, session 1); then the node polls the bridge's
    `/status` until `playing` and `view:"play"` (default limit one hour, `startup_timeout_seconds`).
 6. `enginebox-stream-host.exe --moq-session <session>\moq-session.json` with
@@ -181,6 +181,19 @@ reports in order. If the engine channel fails for a minute, it stops its session
   relay, then stopped cleanly on `control-liveness-expired`.
 - Not yet run: Unity activation and the Editor (the owner's Unity account is not saved yet), a controller-driven
   session end to end, and a browser viewer.
+
+### Unity licensing notes
+
+- The licensing client writes its command line, access token included, to `%LOCALAPPDATA%\Unity\Unity.Licensing.Client.log`.
+  The node replaces the token with `<redacted>` in those logs right after activation, whether or not it succeeded
+  (`licensing_logs_scrubbed` in the receipt).
+- A new engine account has never accepted Unity's Editor Software Terms, and the Editor would wait at that dialog
+  before writing its log. The node passes `-acceptSoftwareTermsForThisRunOnly`, as Unity's CLI does for unattended
+  opens; the member accepted the terms with the Unity account the session uses.
+- Region: Unity's config CDN (`public-cdn.cloud.unity3d.com/config/production`) answers by IP. From mainland China
+  or Hong Kong it redirects to Unity China, whose license server does not know global Unity IDs (`Token not found in
+  cache`). The global license, activation and identity hosts work from those networks; pin the global config in the
+  engine account's `%LOCALAPPDATA%\Unity\config\production.json` (read-only for that account) on such machines.
 
 ### Known v1 limits
 
