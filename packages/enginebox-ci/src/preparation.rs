@@ -77,7 +77,7 @@ pub fn bootstrap(
         "recipe":{"schema":1,"recipe":"pnpm-installed-v1","namespace":format!("github-installation-{}",admission.installation_id),
         "repository":admission.repository_id.to_string(),"trust":"repository-read","image":profile.image,"pnpm":profile.pnpm,"scripts":profile.scripts}});
     let payload = json!({"policy":policy,"home":bx.guest.home,"uid":bx.guest.uid,"gid":bx.guest.gid,
-        "hook":include_str!("../../enginebox-actions/src/hook.mjs"),"broker":include_str!("../../enginebox-actions/src/broker.py"),"seconds":timeout_seconds+180});
+        "hook":include_str!("../../enginebox-actions/src/hook.mjs"),"broker":include_str!("../../enginebox-actions/src/broker.py"),"seconds":if timeout_seconds == 0 { 0 } else { timeout_seconds+180 }});
     // This runs only in the exact disposable VM after owned attachment, never on the physical host.
     let script = r#"import json,sys,os,pathlib,subprocess
 p=json.load(sys.stdin)
@@ -204,7 +204,12 @@ pub fn verify(
     repository: &str,
     admission: &Admission,
     stopped: &AtomicBool,
-) -> Result<Value> {
+    initial_wait_seconds: u64,
+) -> Result<Option<Value>> {
+    ensure!(
+        initial_wait_seconds <= 86400,
+        "Invalid initial assignment wait"
+    );
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -212,7 +217,18 @@ pub fn verify(
         .timeout(Duration::from_secs(10))
         .build()?;
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(120) && !stopped.load(Ordering::SeqCst) {
+    let mut identity_observed = None;
+    while !stopped.load(Ordering::SeqCst) {
+        let within_deadline = identity_observed.map_or_else(
+            || {
+                initial_wait_seconds == 0
+                    || started.elapsed() < Duration::from_secs(initial_wait_seconds)
+            },
+            |observed: Instant| observed.elapsed() < Duration::from_secs(120),
+        );
+        if !within_deadline {
+            break;
+        }
         let input = bx.execute(
             name,
             &[
@@ -224,6 +240,9 @@ pub fn verify(
             Duration::from_secs(5),
         );
         if let Ok(input) = input {
+            // Once a guest submits an identity it can never be classified as an
+            // unused standby, even if validation or the GitHub lookup fails.
+            let observed = *identity_observed.get_or_insert_with(Instant::now);
             ensure!(input.len() <= 16384, "Oversized assignment request");
             let identity: Value = serde_json::from_slice(&input)?;
             check_identity(&identity, admission, name, repository)?;
@@ -254,21 +273,33 @@ pub fn verify(
                     break;
                 }
                 ensure!(
-                    page < 100 && started.elapsed() < Duration::from_secs(110),
+                    page < 100 && observed.elapsed() < Duration::from_secs(110),
                     "Assignment inspection exceeded bounds"
                 );
             }
             if let Ok(assignment) = assigned_job(&jobs, &identity, admission, name) {
+                let mut assignment = assignment;
+                assignment["verified_at_ms"] = json!(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as u64
+                );
                 let script = "import sys,pathlib; p=pathlib.Path('/run/enginebox-ci/verified.tmp'); f=p.open('x'); f.write(sys.stdin.read()); f.close(); p.chmod(0o444); p.rename('/run/enginebox-ci/verified.json')";
                 bx.run_input(
                     &root_args(name, vec!["python3".into(), "-c".into(), script.into()]),
                     &serde_json::to_vec(&assignment)?,
                     Duration::from_secs(10),
                 )?;
-                return Ok(assignment);
+                return Ok(Some(assignment));
             }
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+    if identity_observed.is_none() && stopped.load(Ordering::SeqCst) {
+        // This is absence of guest assignment evidence, not proof of idleness.
+        // The controller must corroborate the exact org runner's busy state
+        // with its runner-administration credential before releasing capacity.
+        return Ok(None);
     }
     anyhow::bail!("Actual GitHub job was not verified before preparation deadline")
 }

@@ -100,6 +100,7 @@ pub struct Controller {
     root: PathBuf,
     token: String,
     gate: Mutex<Gate>,
+    github_dispatch: Arc<tokio::sync::Notify>,
     observations: Mutex<std::collections::BTreeMap<String, Value>>,
     // Last background reconcile failure (message, RFC 3339 time); cleared on success.
     reconcile_error: Mutex<Option<(String, String)>>,
@@ -142,6 +143,7 @@ impl Controller {
                 owner: None,
                 runtime: None,
             }),
+            github_dispatch: Arc::new(tokio::sync::Notify::new()),
             observations: Mutex::new(std::collections::BTreeMap::new()),
             reconcile_error: Mutex::new(None),
             repository_transport: Mutex::new(None),
@@ -162,8 +164,10 @@ impl Controller {
         }
         if gate.mode == Mode::Draining && gate.owner.is_some() {
             gate.mode = Mode::Active;
+            self.github_dispatch.notify_one();
             if let Some(runtime) = &gate.runtime {
                 runtime.agents.resume_admission();
+                runtime.github.resume_admission();
             }
             return Ok(json!({"active":true,"state_schema":STATE_SCHEMA}));
         }
@@ -312,10 +316,15 @@ impl Controller {
         runtime.agents.start_scheduler();
         // Runs a previous owner left detached in their guests continue here.
         runtime.agents.adopt_detached();
+        let github_dispatch = self.github_dispatch.clone();
+        runtime
+            .github
+            .set_dispatch_waker(Arc::new(move || github_dispatch.notify_one()));
         runtime.github.adopt_workers();
         gate.runtime = Some(runtime);
         gate.owner = Some(owner);
         gate.mode = Mode::Active;
+        self.github_dispatch.notify_one();
         Ok(json!({"active":true,"state_schema":STATE_SCHEMA}))
     }
     /// The agent service of an active controller, for development harnesses
@@ -375,6 +384,7 @@ impl Controller {
             // hold the drain.
             if let Some(runtime) = &g.runtime {
                 runtime.agents.pause_admission();
+                runtime.github.pause_admission();
             }
         }
         let pending = g
@@ -409,44 +419,73 @@ impl Controller {
     pub fn start_background(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(15)).await;
-                let runtime = {
-                    let mut g = this.gate.lock().unwrap();
-                    if g.mode != Mode::Active {
-                        continue;
-                    }
-                    g.background += 1;
-                    g.runtime.clone()
-                };
-                let controller = this.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut errors = Vec::new();
-                    if let Some(r) = &runtime
-                        && let Err(e) = r.github.tick()
-                    {
-                        errors.push(format!("github: {e:#}"));
-                    }
-                    if let Some(r) = &runtime
-                        && let Err(e) = r.ci.reconcile(&r.ci_jobs)
-                    {
-                        // Installers run in the CI pool; report queue/state failures.
-                        errors.push(format!("ci: {e:#}"));
-                    }
-                    if let Err(e) = controller.fleet.reconcile() {
-                        errors.push(format!("fleet: {e:#}"));
-                    }
-                    if let Some(r) = runtime
-                        && let Err(e) = r.agents.reconcile()
-                    {
-                        errors.push(format!("agents: {e:#}"));
-                    }
-                    controller.record_reconcile(errors);
-                })
-                .await;
-                this.gate.lock().unwrap().background -= 1;
-            }
+            // These futures share the owner gate, but slow fleet/API/VM work must
+            // never hold up demand notification. One consumer coalesces bursts.
+            tokio::join!(this.github_dispatch_loop(), this.reconcile_loop());
         })
+    }
+    async fn github_dispatch_loop(self: &Arc<Self>) {
+        loop {
+            self.github_dispatch.notified().await;
+            let runtime = {
+                let mut gate = self.gate.lock().unwrap();
+                if gate.mode != Mode::Active {
+                    continue;
+                }
+                gate.background += 1;
+                gate.runtime.clone()
+            };
+            let controller = self.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(runtime) = runtime
+                    && let Err(error) = runtime.github.dispatch()
+                {
+                    controller.record_reconcile(vec![format!("github dispatch: {error:#}")]);
+                }
+            })
+            .await;
+            self.gate.lock().unwrap().background -= 1;
+        }
+    }
+    async fn reconcile_loop(self: &Arc<Self>) {
+        let this = self;
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let runtime = {
+                let mut g = this.gate.lock().unwrap();
+                if g.mode != Mode::Active {
+                    continue;
+                }
+                g.background += 1;
+                g.runtime.clone()
+            };
+            let controller = this.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut errors = Vec::new();
+                if let Some(r) = &runtime
+                    && let Err(e) = r.github.tick()
+                {
+                    errors.push(format!("github: {e:#}"));
+                }
+                if let Some(r) = &runtime
+                    && let Err(e) = r.ci.reconcile(&r.ci_jobs)
+                {
+                    // Installers run in the CI pool; report queue/state failures.
+                    errors.push(format!("ci: {e:#}"));
+                }
+                if let Err(e) = controller.fleet.reconcile() {
+                    errors.push(format!("fleet: {e:#}"));
+                }
+                if let Some(r) = runtime
+                    && let Err(e) = r.agents.reconcile()
+                {
+                    errors.push(format!("agents: {e:#}"));
+                }
+                controller.record_reconcile(errors);
+            })
+            .await;
+            this.gate.lock().unwrap().background -= 1;
+        }
     }
     fn authorized(&self, request: &Request<Body>) -> bool {
         let expected = format!("Bearer {}", self.token);
@@ -2960,6 +2999,43 @@ mod tests {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {}", "x".repeat(32)));
         }
         builder.body(Body::from(body.to_owned())).unwrap()
+    }
+    #[tokio::test]
+    async fn signed_webhook_dispatches_without_waiting_for_periodic_reconciliation() {
+        let (_temp, c) = setup();
+        enginebox_core::state::write_json(&c.root.join("github.json"), &json!({"schema":1,"callback_url":"https://example.invalid/callback",
+            "app":{"client_id":"fixture","client_secret":"fixture","slug":"fixture","private_key":"fixture","webhook_secret":"fixture-webhook-secret-32-characters"},
+            "pools":[{"id":"linux","installation_id":2,"organization":"fixture","runner_group_id":1,"labels":["enginebox-linux"],"max_runners":1,"timeout_seconds":60,"worker":["/unused/fixture-worker"]}]})).unwrap();
+        enginebox_core::state::private_dir(&c.root.join("github")).unwrap();
+        enginebox_core::state::write_json(&c.root.join("github/state.json"), &json!({"repositories":{"5":{"id":5,"installation_id":2,"full_name":"fixture/private","private":true,"branch":"main"}}})).unwrap();
+        c.activate().unwrap();
+        let background = c.start_background();
+        let app = router(c.clone());
+        let webhook = Request::builder().method(Method::POST).uri("/v1/github/webhook/runners")
+            .header("x-github-event", "workflow_job")
+            .header("x-hub-signature-256", "sha256=ced0aeb552ce8c360b729f658b82d80e3f2e006b75f696198c1c4fe14810cf4a")
+            .body(Body::from(r#"{"action":"queued","installation":{"id":2},"repository":{"id":5,"full_name":"fixture/private","owner":{"login":"fixture"}},"workflow_job":{"id":99,"run_id":44,"labels":["enginebox-linux"]}}"#)).unwrap();
+        assert_eq!(call(&app, webhook).await.0, StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = c.runtime().unwrap().github.status();
+                let job = &status["jobs"][0];
+                // No account was configured: dispatch runs, then fails closed
+                // without a GitHub request or a worker launch.
+                if job["status"] == "uncertain" {
+                    assert!(
+                        job["timings"]["dispatch_started_at_ms"].as_u64().unwrap()
+                            >= job["timings"]["demand_received_at_ms"].as_u64().unwrap()
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("webhook waited for the 15-second recovery tick");
+        background.abort();
+        let _ = background.await;
     }
     #[tokio::test]
     async fn admission_observation_requires_owner_and_fails_closed_during_handoff() {

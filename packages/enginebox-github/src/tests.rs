@@ -317,6 +317,125 @@ fn webhook_duplicates_out_of_order_and_restart_do_not_replay_jobs() {
     assert!(reopened.disconnect("repos").is_err());
 }
 #[test]
+fn durable_demand_wakes_once_and_assignment_refills_only_its_reserve() {
+    let (_root, g) = service();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let observed = wakes.clone();
+    g.set_dispatch_waker(Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    }));
+    g.data.lock().unwrap().repositories.insert(
+        5,
+        Repository {
+            id: 5,
+            installation_id: 4,
+            full_name: "fixture/private".into(),
+            private: true,
+            branch: "main".into(),
+        },
+    );
+    let mut event = json!({"action":"queued","installation":{"id":2},"repository":{"id":5,"full_name":"fixture/private","owner":{"login":"fixture"}},"workflow_job":{"id":99,"run_id":44,"labels":["enginebox-linux"]}});
+    signed(&g, &event);
+    let received = g.data.lock().unwrap().jobs["2-99"]["timings"]["demand_received_at_ms"].clone();
+    signed(&g, &event);
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert!(received.as_u64().unwrap() > 0);
+    assert_eq!(
+        g.data.lock().unwrap().jobs["2-99"]["timings"]["demand_received_at_ms"],
+        received
+    );
+    g.data.lock().unwrap().jobs.insert("reserve-test".into(),json!({"id":0,"reserve":true,"pool":"linux","status":"running","runner_id":501,"runner_name":"ebox-ci-test"}));
+    event["action"] = json!("in_progress");
+    event["workflow_job"]["runner_id"] = json!(500);
+    signed(&g, &event);
+    assert!(g.data.lock().unwrap().jobs["reserve-test"]["assigned_job_id"].is_null());
+    event["workflow_job"]["runner_id"] = json!(501);
+    signed(&g, &event);
+    signed(&g, &event);
+    assert_eq!(
+        g.data.lock().unwrap().jobs["reserve-test"]["assigned_job_id"],
+        99
+    );
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        g.data.lock().unwrap().jobs["2-99"]["status"],
+        "claimed_elsewhere"
+    );
+}
+#[test]
+fn concurrent_dispatch_honors_capacity_drain_and_uncertainty() {
+    let (_root, mut g) = service();
+    g.config.as_mut().unwrap().pools[0].max_runners = 2;
+    for id in 1..=8 {
+        g.data.lock().unwrap().jobs.insert(
+            format!("2-{id}"),
+            json!({"id":id,"pool":"linux","status":"queued"}),
+        );
+    }
+    g.set_draining(true).unwrap();
+    g.dispatch().unwrap();
+    assert_eq!(g.pending(), 0);
+    assert!(
+        g.status()["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|j| j["status"] == "queued")
+    );
+    g.set_draining(false).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| g.dispatch().unwrap());
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while g.status()["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["status"] == "uncertain")
+        .count()
+        != 2
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let jobs = g.status()["jobs"].as_array().unwrap().clone();
+    assert_eq!(
+        jobs.iter().filter(|j| j["status"] == "uncertain").count(),
+        2
+    );
+    assert_eq!(jobs.iter().filter(|j| j["status"] == "queued").count(), 6);
+    g.hand_off();
+    g.dispatch().unwrap();
+    assert_eq!(g.status()["jobs"], json!(jobs));
+}
+#[test]
+fn an_idle_standby_holds_capacity_and_never_duplicates_queued_demand() {
+    let (_root, mut g) = service();
+    g.config.as_mut().unwrap().pools[0].standby = Some(ci::Standby {
+        minimum: 1,
+        repository_id: 5,
+        workflows: vec!["fixture/private/.github/workflows/ci.yml@refs/heads/main".into()],
+        idle_timeout_seconds: 600,
+    });
+    let mut data = g.data.lock().unwrap();
+    data.jobs.insert(
+        "reserve-test".into(),
+        json!({"id":0,"reserve":true,"pool":"linux","status":"running"}),
+    );
+    data.jobs.insert(
+        "2-99".into(),
+        json!({"id":99,"pool":"linux","status":"queued"}),
+    );
+    drop(data);
+    for _ in 0..5 {
+        g.dispatch().unwrap();
+    }
+    assert_eq!(g.status()["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(g.data.lock().unwrap().jobs["2-99"]["status"], "queued");
+}
+#[test]
 fn disabled_module_does_not_create_state_or_touch_credentials() {
     let root = tempfile::tempdir().unwrap();
     let g = GitHub::open(root.path()).unwrap();

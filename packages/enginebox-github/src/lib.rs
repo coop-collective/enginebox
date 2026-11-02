@@ -86,6 +86,7 @@ pub(crate) struct Data {
     #[serde(default)]
     pub draining: bool,
 }
+type DispatchWaker = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct GitHub {
     pub(crate) config: Option<Config>,
@@ -98,6 +99,9 @@ pub struct GitHub {
     pub(crate) handed_off: Arc<AtomicBool>,
     /// Jobs whose worker outlived the previous owner, adopted on activation.
     pub(crate) adoptable: Arc<Mutex<Vec<String>>>,
+    admission_paused: Arc<AtomicBool>,
+    retiring_reserves: Arc<AtomicBool>,
+    dispatch_waker: Arc<Mutex<Option<DispatchWaker>>>,
 }
 pub fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().context("Missing text field")
@@ -235,6 +239,9 @@ impl GitHub {
             pending: Arc::new(AtomicUsize::new(0)),
             handed_off: Arc::new(AtomicBool::new(false)),
             adoptable: Arc::new(Mutex::new(adoptable)),
+            admission_paused: Arc::new(AtomicBool::new(false)),
+            retiring_reserves: Arc::new(AtomicBool::new(false)),
+            dispatch_waker: Arc::new(Mutex::new(None)),
         };
         if service.config.is_some() {
             service.save(&service.data.lock().unwrap())?;
@@ -254,15 +261,39 @@ impl GitHub {
             .context("GitHub is not configured")?
             .account_kind(kind)
     }
+    /// The controller supplies a coalescing notification, never synchronous API work.
+    pub fn set_dispatch_waker(&self, wake: DispatchWaker) {
+        *self.dispatch_waker.lock().unwrap() = Some(wake);
+    }
+    fn wake_dispatch(&self) {
+        if let Some(wake) = self.dispatch_waker.lock().unwrap().clone() {
+            wake();
+        }
+    }
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
+            + usize::from(self.retiring_reserves.load(Ordering::SeqCst))
+            + self
+                .data
+                .lock()
+                .unwrap()
+                .jobs
+                .values()
+                .filter(|job| {
+                    job["reserve"] == true
+                        && (job["status"] == "uncertain"
+                            || (job["status"] == "running"
+                                && job["assigned_job_id"].is_null()
+                                && job["reserve_busy"] != true))
+                })
+                .count()
     }
     pub fn status(&self) -> Value {
         let data = self.data.lock().unwrap();
         json!({"configured": self.config.is_some(), "shared_app":self.config.as_ref().is_some_and(|c|c.app.is_some()), "runner_app_configured":self.app("runners").is_ok(),
             "accounts":data.accounts.iter().map(|(kind, a)|json!({"kind":kind,"login":a["login"]})).collect::<Vec<_>>(),
             "repositories":data.repositories.values().collect::<Vec<_>>(), "jobs":data.jobs.values().collect::<Vec<_>>(), "draining":data.draining,
-            "pools":self.config.as_ref().map(|c|c.pools.iter().map(|p|json!({"id":p.id,"organization":p.organization,"labels":p.labels,"runner_group_id":p.runner_group_id,"max_runners":p.max_runners,"preparation":p.preparation.as_ref().map(|v|json!({"repository_id":v.repository_id,"workflows":v.workflows}))})).collect::<Vec<_>>()).unwrap_or_default()})
+            "pools":self.config.as_ref().map(|c|c.pools.iter().map(|p|json!({"id":p.id,"organization":p.organization,"labels":p.labels,"runner_group_id":p.runner_group_id,"max_runners":p.max_runners,"standby":p.standby.as_ref().map(|s|json!({"minimum":s.minimum,"repository_id":s.repository_id,"workflows":s.workflows,"idle_timeout_seconds":s.idle_timeout_seconds})),"preparation":p.preparation.as_ref().map(|v|json!({"repository_id":v.repository_id,"workflows":v.workflows}))})).collect::<Vec<_>>()).unwrap_or_default()})
     }
     pub fn connect(&self, kind: &str) -> Result<Value> {
         let kind = self.account_kind(kind)?;
@@ -361,6 +392,7 @@ impl GitHub {
     pub fn repositories(&self, installation: u64) -> Result<Value> {
         let mut data = self.data.lock().unwrap();
         let token = self.user_token("repos", &mut data)?;
+        drop(data);
         let repos = self.api.pages(
             &format!("/user/installations/{installation}/repositories"),
             "repositories",

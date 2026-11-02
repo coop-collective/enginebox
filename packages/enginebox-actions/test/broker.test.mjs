@@ -26,10 +26,13 @@ test('root handoff protects approved bytes, refuses escaping/symlink targets and
   command(['mount', '--bind', join(root, 'prepared'), join(root, 'prepared')]);
   command(['mount', '-o', 'remount,bind,ro,nosuid,nodev', join(root, 'prepared')]);
   await assert.rejects(writeFile(join(root, 'prepared', key, 'node_modules/fixture'), 'tampered'), { code: 'EROFS' });
-  async function request(value, success) {
-    const child = spawn('python3', [resolve(import.meta.dirname, '../src/broker.py'), control, '5']);
+  async function request(value, success, lifetime = '5') {
+    const child = spawn('python3', [resolve(import.meta.dirname, '../src/broker.py'), control, lifetime]);
     const done = new Promise((accept, reject) => { child.once('error', reject); child.once('exit', code => code === 0 ? accept() : reject(new Error(`Broker exit ${code}`))); });
     t.after(() => { if (child.exitCode === null) child.kill(); });
+    // A preconnected standby's zero lifetime must survive beyond the former
+    // minimum one-second clamp while waiting for its single verified request.
+    if (lifetime === '0') await new Promise(resolve => setTimeout(resolve, 1200));
     if (success) await activatePreparedTree(value, control);
     else await assert.rejects(activatePreparedTree(value, control), /handoff failed/);
     await done;
@@ -44,7 +47,7 @@ test('root handoff protects approved bytes, refuses escaping/symlink targets and
   await request({ key, inputs, source }, false);
   await rm(join(source, 'node_modules'), { recursive: true });
   const before = await stat(join(root, 'prepared', key, 'node_modules/fixture'));
-  await request({ key, inputs, source }, true);
+  await request({ key, inputs, source }, true, '0');
   const after = await stat(join(source, 'node_modules/fixture'));
   assert.equal(after.ino, before.ino); assert.equal(after.dev, before.dev);
   assert.equal(await readFile(join(source, 'node_modules/fixture'), 'utf8'), 'approved');
