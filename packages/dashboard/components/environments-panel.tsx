@@ -30,7 +30,7 @@ export function EnvironmentsPanel() {
     void mutate({ id: routeId, environment, service, access, ...(['http', 'tls'].includes(selected?.protocol ?? '') ? { hostname } : {}), ...(selected?.protocol !== 'http' ? { entrypoint } : {}) });
   }
   return <section className="storage-panel environment-panel" aria-label="Environment services">
-    <div className="section-heading"><div><h2>Live environments</h2><p>Follow accepted code, preserve service data, and manage network routes.</p></div><button className="button small" onClick={() => void refresh()}>Refresh services</button></div>
+    <div className="section-heading"><div><h2>Previews and routes</h2><p>Every project's previews: they follow accepted code, keep service data, and reach the network through these routes.</p></div><button className="button small" onClick={() => void refresh()}>Refresh services</button></div>
     {error && <div role="alert" className="alert">{error}</div>}
     {catalog && <>
       {!!catalog.projects?.length && <div className="host-grid">{catalog.projects.map(project => <article key={project.id} className="host-card" aria-label={`Project dev ${project.project}`}>

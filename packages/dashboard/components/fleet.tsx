@@ -83,7 +83,7 @@ export function HostCard({ host }: { host: Host }) {
             </span>
             {typeof c.disk_budget_available_bytes === "number" && (
               <span>
-                Workspace disk budget
+                Sandbox disk budget
                 <strong>{bytes(c.disk_budget_available_bytes)}</strong>
               </span>
             )}
@@ -111,7 +111,7 @@ export function HostCard({ host }: { host: Host }) {
           {!!host.warm_pools?.length && (
             <div
               className="pool-summary"
-              aria-label="Prepared workspace reserve"
+              aria-label="Prepared sandbox reserve"
             >
               <h4>Prepared reserve</h4>
               {host.warm_pools.map((pool) => (
@@ -135,7 +135,7 @@ export function HostCard({ host }: { host: Host }) {
                   {pool.error && <p className="pool-error">{pool.error}</p>}
                 </div>
               ))}
-              <p>Ready workspaces are paused and keep memory allocated.</p>
+              <p>Ready sandboxes are paused and keep memory allocated.</p>
             </div>
           )}
         </>
@@ -203,7 +203,7 @@ export function WorkspaceRow({
           {reserved ? (
             <span
               className="subtle"
-              title="Prepared reserve is managed by the warm pool. Allocate a new workspace to claim a ready instance."
+              title="Prepared reserve is managed by the warm pool. Create a new sandbox to claim a ready instance."
             >
               Reserved for allocation
             </span>
@@ -382,13 +382,13 @@ export function CreateWorkspace({
     <section className="create-panel" aria-labelledby="create-title">
       <div className="section-title">
         <div>
-          <h2 id="create-title">Create a workspace</h2>
-          <p>A private workspace from a prepared, credential-free template.</p>
+          <h2 id="create-title">Create a sandbox</h2>
+          <p>A private agent VM from a prepared, credential-free template.</p>
         </div>
         <button
           className="icon-button"
           onClick={close}
-          aria-label="Close workspace form"
+          aria-label="Close sandbox form"
         >
           <Icon name="close" />
         </button>
@@ -396,7 +396,7 @@ export function CreateWorkspace({
       <form onSubmit={submit}>
         <div className="create-grid">
           <label>
-            Workspace name
+            Sandbox name
             <input
               required
               value={name}
@@ -518,10 +518,10 @@ export function CreateWorkspace({
                   : !resourceValid
                     ? "Custom resources must be whole numbers at or above the template minimum."
                     : ready > 0
-                      ? `${ready} ready paused workspace${ready === 1 ? " matches" : "s match"} this template and resource allocation. A ready workspace will be claimed if still available.`
+                      ? `${ready} ready paused sandbox${ready === 1 ? " matches" : "es match"} this template and resource allocation. A ready sandbox will be claimed if still available.`
                       : slots > 0
-                        ? `Cold start: no matching workspace is ready. Capacity is available for ${slots} more workspace${slots === 1 ? "" : "s"} with these resources.`
-                        : "No ready workspace or cold-start capacity is available for this selection."}
+                        ? `Cold start: no matching sandbox is ready. Capacity is available for ${slots} more sandbox${slots === 1 ? "" : "es"} with these resources.`
+                        : "No ready sandbox or cold-start capacity is available for this selection."}
             </p>
             {ready > 0 && (
               <p>
@@ -532,8 +532,8 @@ export function CreateWorkspace({
             )}
             {preparing > 0 && (
               <p>
-                {preparing} matching workspace
-                {preparing === 1 ? " is" : "s are"} preparing. Availability
+                {preparing} matching sandbox
+                {preparing === 1 ? " is" : "es are"} preparing. Availability
                 refreshes automatically.
               </p>
             )}
@@ -555,7 +555,7 @@ export function CreateWorkspace({
             ) : (
               <Icon name="plus" size={16} />
             )}
-            Create workspace
+            Create sandbox
           </button>
         </div>
       </form>

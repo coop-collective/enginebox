@@ -10,7 +10,8 @@ test("CI templates enable, show failed verification, retry to readiness and disa
   // has its own coverage and this feature must not exhaust its attempt budget.
   await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto("/");
-  await page.getByRole("button", { name: "Toolchains", exact: true }).click();
+  await page.getByRole("button", { name: "Templates", exact: true }).click();
+  await page.getByRole("tab", { name: "Build toolchains" }).click();
   const panel = page.getByRole("region", { name: "CI toolchain templates" });
   await expect(panel.getByText("No CI templates registered.")).toBeVisible();
   await panel.getByLabel("CI recipe JSON").fill("invalid");

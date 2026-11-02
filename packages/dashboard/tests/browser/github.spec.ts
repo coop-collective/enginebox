@@ -49,7 +49,7 @@ test("GitHub selects private repositories, links LayerFS sync and drains without
   await expect(page.getByRole("button", { name: "Resume runner provisioning" })).toBeVisible();
   expect(writes.some(w => w.path.includes("connect"))).toBe(false);
   expect(writes.find(w => w.path.endsWith("/select"))?.body.repository_id).toBe(12);
-  await nav(page, "Repositories");
+  await nav(page, "GitHub");
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.getByRole("link", { name: "Prepare source and sync" }).click();
@@ -94,7 +94,7 @@ test("one App shares the connection and reviews permissions without another OAut
   permissions.organization_self_hosted_runners="write";
   await page.getByRole("button", {name:"Review runner permissions"}).click();
   await expect(page.getByText("fixture: Runner administration approved", {exact:true})).toBeVisible();
-  await nav(page, "Repositories");
+  await nav(page, "GitHub");
   await page.getByRole("button", {name:"Disconnect GitHub",exact:true}).click();
   await expect(page.getByRole("button", {name:"Choose repositories"})).toBeDisabled();
   await expect(page.getByText("No repositories selected.", {exact:true})).toBeVisible();

@@ -8,9 +8,9 @@ import { TemplateCatalog } from "@/components/template-catalog";
 import { CiTemplates } from "@/components/ci-templates";
 import { AgentsPanel } from "@/components/agents-panel";
 import { ComputePanel, type Contributor } from "@/components/compute-panel";
-import { EnvironmentsPanel } from "@/components/environments-panel";
 import { ConnectedAppsPanel } from "@/components/connected-apps-panel";
-import { WorkspacesPanel } from "@/components/workspaces-panel";
+import { ProjectsPanel } from "@/components/projects-panel";
+import { PreviewRuntimes } from "@/components/preview-runtimes";
 import { GitHubPanel } from "@/components/github-panel";
 import { EmailSignIn } from "@/components/email-sign-in";
 import { OrgPanel } from "@/components/org-panel";
@@ -19,7 +19,7 @@ import { ConnectionsPanel } from "@/components/connections-panel";
 import { ProfilesPanel } from "@/components/profiles-panel";
 import { Overview } from "@/components/overview";
 import { CommandMenu, type Command } from "@/components/command-menu";
-import { Icon, PageHeader } from "@/components/ui";
+import { Icon, PageHeader, Tabs } from "@/components/ui";
 import {
   activeJob,
   bytes,
@@ -32,10 +32,11 @@ import {
 } from "@/components/fleet";
 
 /**
- * Information architecture. Grouped the way an operator thinks about the
- * install: what is being built (Source), who builds it (Agents), how it is
- * checked (CI), what it runs on (Compute), and the settings that every part
- * shares (Settings), where all stored secrets and access live together.
+ * Information architecture (docs/DASHBOARD-IA.md). Everything a person works
+ * on is a Project. Agents and CI are the jobs that run; Infrastructure is the
+ * capacity (machines and the sandboxes on them) and the templates they run;
+ * Settings holds what the repository must never contain: secrets, access and
+ * the GitHub connection.
  */
 type View = {
   id: string;
@@ -48,28 +49,41 @@ type View = {
 };
 const VIEWS: View[] = [
   { id: "overview", label: "Overview", group: "Home", icon: "overview", title: "Overview", description: "What your machines, agents and CI are doing, and what needs you." },
-  { id: "workspaces", label: "Workspaces", group: "Source", icon: "folder", title: "Workspaces", description: "Project sources, agent runs, LayerFS checkouts and measured preparation.", keywords: "projects layerfs storage checkouts runs" },
-  { id: "github", label: "Repositories", group: "Source", icon: "branch", title: "Repositories", description: "Connect GitHub, choose repositories and sync accepted main revisions back.", keywords: "github import export sync" },
-  { id: "environments", label: "Environments", group: "Source", icon: "globe", title: "Environments", description: "Persistent development services and the routes that reach them.", keywords: "routes dns services dev" },
-  { id: "agents", label: "Accounts", group: "Agents", icon: "agent", title: "Agent accounts", description: "Native Codex, Claude and Cursor sign-ins your workspaces use, and their usage.", keywords: "codex claude cursor providers usage credentials" },
-  { id: "profiles", label: "Profiles", group: "Agents", icon: "profile", title: "Profiles", description: "How each kind of run works: template, tools, skills and connections.", keywords: "run kinds policy skills" },
-  { id: "runners", label: "Actions runners", group: "CI", icon: "checks", title: "Actions runners", description: "Run GitHub Actions on your machines with prepared LayerFS checkouts.", keywords: "github ci jobs pools drain" },
-  { id: "toolchains", label: "Toolchains", group: "CI", icon: "template", title: "CI toolchains", description: "Versioned build toolchains installed and verified on CI workers.", keywords: "ci templates recipes" },
-  { id: "compute", label: "Machines", group: "Compute", icon: "server", title: "Machines", description: "Servers and workstations connected to this controller, and their capacity.", keywords: "fleet hosts nodes workers enroll" },
-  { id: "instances", label: "Virtual machines", group: "Compute", icon: "vm", title: "Virtual machines", description: "VM workspaces, warm reserves and their lifecycle.", keywords: "vm instances pause hibernate stop allocate" },
-  { id: "templates", label: "Templates", group: "Compute", icon: "box", title: "Templates", description: "Credential-free workspace bases, synchronized to every node.", keywords: "images catalog sync" },
+  { id: "projects", label: "Projects", group: "Home", icon: "folder", title: "Projects", description: "Each project's agents, code, previews and activity in one place.", keywords: "workspaces repositories source layerfs storage checkouts runs previews environments routes" },
+  { id: "profiles", label: "Profiles", group: "Agents", icon: "profile", title: "Profiles", description: "How and where an agent runs: template, tools, skills, connections and secrets.", keywords: "run kinds policy skills pools" },
+  { id: "agents", label: "Accounts", group: "Agents", icon: "agent", title: "Accounts", description: "Codex, Claude and Cursor sign-ins, shared with the organization or personal, and their usage.", keywords: "codex claude cursor providers usage credentials" },
+  { id: "runners", label: "Actions runners", group: "CI", icon: "checks", title: "Actions runners", description: "Run GitHub Actions jobs in disposable VMs on your machines.", keywords: "github ci jobs pools drain" },
+  { id: "compute", label: "Machines", group: "Infrastructure", icon: "server", title: "Machines", description: "Computers connected to this controller, their roles and capacity, and the sandboxes they host.", keywords: "fleet hosts nodes workers enroll sandboxes vm virtual machines instances" },
+  { id: "templates", label: "Templates", group: "Infrastructure", icon: "box", title: "Templates", description: "Credential-free images and how they run: agent sandboxes, build toolchains and preview runtimes.", keywords: "images catalog sync toolchains ci recipes runtimes" },
   { id: "connections", label: "Connections & secrets", group: "Settings", icon: "key", title: "Connections & secrets", description: "MCP servers and secret sources that profiles reference. Values are write-only.", keywords: "mcp secrets env tokens" },
+  { id: "github", label: "GitHub", group: "Settings", icon: "branch", title: "GitHub", description: "Connect GitHub and choose which repositories projects may import from and export to.", keywords: "github repositories import export sync" },
   { id: "apps", label: "MCP & apps", group: "Settings", icon: "plug", title: "MCP & apps", description: "Connect MCP clients, review OAuth app access and revoke grants.", keywords: "oauth grants clients tokens" },
   { id: "org", label: "Organization", group: "Settings", icon: "team", title: "Organization", description: "Members, invites and the organization you are working in.", keywords: "members invites roles team" },
 ];
-const GROUPS = ["Home", "Source", "Agents", "CI", "Compute", "Settings"];
-/** Older links and redirects (`?panel=`) that now live elsewhere. */
-const LEGACY: Record<string, string> = { fleet: "compute", repositories: "workspaces", storage: "workspaces", mcp: "apps", ci: "toolchains" };
-const viewOf = (id: string | null) => {
-  if (!id) return "overview";
-  const mapped = LEGACY[id] ?? id;
-  return VIEWS.some((v) => v.id === mapped) ? mapped : "overview";
+const GROUPS = ["Home", "Agents", "CI", "Infrastructure", "Settings"];
+/** Older links and redirects (`?panel=`) that now live elsewhere, with the tab they open. */
+const LEGACY: Record<string, [string, string?]> = {
+  fleet: ["compute"],
+  instances: ["compute"],
+  workspaces: ["projects"],
+  repositories: ["projects"],
+  storage: ["projects"],
+  environments: ["projects", "previews"],
+  mcp: ["apps"],
+  ci: ["templates", "toolchains"],
+  toolchains: ["templates", "toolchains"],
 };
+const TEMPLATE_TABS = [
+  { id: "sandboxes", label: "Sandbox images" },
+  { id: "toolchains", label: "Build toolchains" },
+  { id: "runtimes", label: "Preview runtimes" },
+];
+function resolve(id: string | null, tab: string | null): { view: string; tab: string } {
+  if (!id) return { view: "overview", tab: "" };
+  const [mapped, legacyTab] = LEGACY[id] ?? [id];
+  if (!VIEWS.some((v) => v.id === mapped)) return { view: "overview", tab: "" };
+  return { view: mapped, tab: legacyTab ?? tab ?? "" };
+}
 
 type Me = { role: string; email: string | null; label: string; org_id: string };
 
@@ -90,6 +104,7 @@ export default function Dashboard() {
   const [pendingInstances, setPendingInstances] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
   const [view, setView] = useState("overview");
+  const [tab, setTab] = useState("");
   const [storageFirst, setStorageFirst] = useState(false);
   const [updated, setUpdated] = useState<Date | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -112,10 +127,17 @@ export default function Dashboard() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const panel = params.get("panel");
-    setView(viewOf(panel));
+    const initial = resolve(panel, params.get("tab"));
+    setView(initial.view);
+    setTab(initial.tab);
     setStorageFirst(panel === "storage" || params.get("storage") === "1");
     readSession();
-    const onPop = () => setView(viewOf(new URLSearchParams(window.location.search).get("panel")));
+    const onPop = () => {
+      const next = new URLSearchParams(window.location.search);
+      const resolved = resolve(next.get("panel"), next.get("tab"));
+      setView(resolved.view);
+      setTab(resolved.tab);
+    };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, [readSession]);
@@ -258,20 +280,34 @@ export default function Dashboard() {
       name,
     );
   }
-  function go(next: string) {
-    const id = viewOf(next);
+  function go(next: string, nextTab = "") {
+    const resolved = resolve(next, nextTab || null);
+    const id = resolved.view;
     setView(id);
+    setTab(resolved.tab);
     setStorageFirst(false);
     setNavOpen(false);
+    setCreating(false);
     const url = new URL(window.location.href);
-    url.search = id === "overview" ? "" : `panel=${id}`;
+    url.search = id === "overview" ? "" : `panel=${id}${resolved.tab ? `&tab=${encodeURIComponent(resolved.tab)}` : ""}`;
     window.history.pushState(null, "", url);
     window.scrollTo({ top: 0 });
   }
+  function switchTab(next: string) {
+    setTab(next);
+    const url = new URL(window.location.href);
+    url.search = `panel=${view}&tab=${encodeURIComponent(next)}`;
+    window.history.replaceState(null, "", url);
+  }
+  const templateTab = TEMPLATE_TABS.some((t) => t.id === tab) ? tab : "sandboxes";
 
   const current = VIEWS.find((v) => v.id === view) ?? VIEWS[0];
   const commands: Command[] = useMemo(
-    () => VIEWS.map((v) => ({ id: v.id, label: v.title, group: v.group, icon: v.icon, keywords: v.keywords })),
+    () => [
+      ...VIEWS.map((v) => ({ id: v.id, label: v.title, group: v.group, icon: v.icon, keywords: v.keywords })),
+      { id: "templates:toolchains", label: "Build toolchains", group: "Infrastructure", icon: "template", keywords: "ci templates recipes" },
+      { id: "projects:previews", label: "Previews & routes", group: "Projects", icon: "globe", keywords: "environments routes dns services dev" },
+    ],
     [],
   );
   const online = fleet?.hosts.filter((host) => host.online) ?? [];
@@ -433,10 +469,10 @@ export default function Dashboard() {
             title={current.title}
             description={current.description}
             actions={
-              view === "instances" ? (
+              view === "compute" ? (
                 <button className="button primary" onClick={() => setCreating((value) => !value)} disabled={!fleet || !admittingHosts.length}>
                   <Icon name="plus" size={15} />
-                  New workspace
+                  New sandbox
                 </button>
               ) : undefined
             }
@@ -450,9 +486,8 @@ export default function Dashboard() {
             </div>
           )}
           {view === "overview" && <Overview fleet={fleet} machines={computeMachines} workers={workers} jobs={jobs} go={go} />}
-          {view === "workspaces" && <WorkspacesPanel fleet={fleet} initialStorage={storageFirst} refreshToken={updated?.getTime() ?? 0} />}
+          {view === "projects" && <ProjectsPanel fleet={fleet} initialStorage={storageFirst} initialTab={tab} refreshToken={updated?.getTime() ?? 0} />}
           {view === "github" && <GitHubPanel show="repositories" />}
-          {view === "environments" && <EnvironmentsPanel />}
           {view === "agents" && (
             <>
               <AgentsPanel />
@@ -461,8 +496,14 @@ export default function Dashboard() {
           )}
           {view === "profiles" && <ProfilesPanel />}
           {view === "runners" && <GitHubPanel show="runners" />}
-          {view === "toolchains" && <CiTemplates />}
-          {view === "templates" && <TemplateCatalog refreshToken={updated?.getTime() ?? 0} registered={refresh} />}
+          {view === "templates" && (
+            <>
+              <Tabs label="Template runtime" tabs={TEMPLATE_TABS} value={templateTab} onChange={switchTab} />
+              {templateTab === "sandboxes" && <TemplateCatalog refreshToken={updated?.getTime() ?? 0} registered={refresh} />}
+              {templateTab === "toolchains" && <CiTemplates />}
+              {templateTab === "runtimes" && <PreviewRuntimes />}
+            </>
+          )}
           {view === "connections" && <ConnectionsPanel />}
           {view === "apps" && <ConnectedAppsPanel />}
           {view === "org" && <OrgPanel onSwitched={() => window.location.reload()} />}
@@ -489,7 +530,7 @@ export default function Dashboard() {
                     icon: "memory",
                   },
                   {
-                    label: "VM workspaces",
+                    label: "Sandboxes",
                     value: fleet ? `${assigned.length}` : "—",
                     note: `${assigned.filter(({ instance }) => instance.status === "Running").length} running · ${readyReserve} ready in reserve`,
                     icon: "vm",
@@ -515,22 +556,18 @@ export default function Dashboard() {
                 refresh={refresh}
                 hostDetails={(host) => <HostCard host={host} />}
               />
-            </>
-          )}
-          {view === "instances" && (
-            <>
               {creating && fleet && <CreateWorkspace fleet={fleet} busy={submitting} close={() => setCreating(false)} create={create} />}
               <section className="panel workspaces-section">
                 <header className="panel-head">
-                  <h2>VM instance inventory</h2>
+                  <h2>Sandboxes</h2>
                   <span className="count">{instances.length}</span>
-                  <span className="section-caption">Assigned workspaces · Prepared reserves · Bases</span>
+                  <span className="section-caption">Agent VMs on these machines · Prepared reserves · Template bases</span>
                 </header>
                 <div className="table-container">
                   <table>
                     <thead>
                       <tr>
-                        <th>Workspace</th>
+                        <th>Sandbox</th>
                         <th>Host</th>
                         <th>Status</th>
                         <th>Resources</th>
@@ -561,8 +598,8 @@ export default function Dashboard() {
                   {!instances.length && (
                     <div className="empty-state compact">
                       <Icon name="vm" size={26} />
-                      <h3>{fleet ? "No workspaces yet" : "Waiting for workspace inventory"}</h3>
-                      <p>{fleet ? "Create a workspace from a prepared template to start building." : "Workspaces appear when the fleet service responds."}</p>
+                      <h3>{fleet ? "No sandboxes yet" : "Waiting for sandbox inventory"}</h3>
+                      <p>{fleet ? "Create a sandbox from a prepared template to start building." : "Sandboxes appear when the fleet service responds."}</p>
                     </div>
                   )}
                 </div>
@@ -607,7 +644,7 @@ export default function Dashboard() {
           )}
         </main>
       </div>
-      <CommandMenu open={menuOpen} commands={commands} close={() => setMenuOpen(false)} run={go} />
+      <CommandMenu open={menuOpen} commands={commands} close={() => setMenuOpen(false)} run={(id) => { const [next, nextTab] = id.split(":"); go(next, nextTab); }} />
     </div>
   );
 }

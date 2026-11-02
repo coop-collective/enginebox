@@ -2,7 +2,7 @@ import { test, expect, type Page } from "@playwright/test";
 import { signedInCookie } from "./session";
 import { dashboardOrigin, fixtureOrigin } from "./urls";
 import type { Workspace } from "../../lib/workspaces";
-async function signIn(page: Page, path = "/?panel=workspaces") {
+async function signIn(page: Page, path = "/?panel=projects") {
   await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto(path);
 }
@@ -38,38 +38,44 @@ test("one workspace source list creates hosted sources, links approved GitHub an
   });
   await signIn(page);
   await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "GitHub", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "Map fixture/private to workspace" }).click();
+  await page.getByRole("button", { name: "Link fixture/private to a project" }).click();
   await expect(page.getByLabel("Source type")).toHaveValue("github");
   await expect(page.getByLabel("Selected GitHub repository")).toHaveValue("fixture/private");
-  await page.getByRole("button", { name: "← All workspaces", exact: true }).click();
-  await page.getByRole("button", { name: "Open workspace app" }).click();
+  await page.getByRole("button", { name: "← All projects", exact: true }).click();
+  await page.getByRole("button", { name: "Open project app" }).click();
   await expect(page.getByText(/1 runtime states unknown/)).toBeVisible();
+  await page.getByRole("tab", { name: /Previews/ }).click();
+  await expect(page).toHaveURL(/tab=previews/);
   await expect(page.getByText(/Source copy 40 ms/)).toBeVisible();
+  await page.getByRole("tab", { name: "Activity" }).click();
   await expect(page.getByText(/Shared node cache pnpm-store/)).toContainText("Logical file size 1.00 MiB");
-  await expect(page.getByText(/Accepted main accepted-abc/)).toBeVisible();
   await expect(page.getByText(/test command · succeeded · 1.20 s/)).toBeVisible();
+  await page.getByRole("tab", { name: /Code/ }).click();
+  await expect(page.getByText(/Accepted main accepted-abc/)).toBeVisible();
   await expect(page.getByText(/Checkpoint checkpoint-abc/)).toBeVisible();
   await page.getByText("Add source", { exact: true }).click();
   await page.getByLabel("Source type").selectOption("github");
   await page.getByLabel("Selected GitHub repository").selectOption("fixture/private");
   await page.getByRole("button", { name: "Link GitHub source" }).click();
-  await expect(page.getByRole("link", { name: "Review and prepare source" })).toHaveAttribute("href", "/?panel=workspaces&storage=1&workspace=app&github_repository=7");
+  await expect(page.getByRole("link", { name: "Review and prepare source" })).toHaveAttribute("href", "/?panel=projects&storage=1&workspace=app&github_repository=7");
+  await page.getByRole("tab", { name: /Agents/ }).click();
   await page.getByLabel("Agent pool").selectOption("app-pool");
   await page.getByLabel("Repository access").selectOption("app/main");
   await page.getByLabel("Task", { exact: true }).fill("Inspect the code and propose a change");
   await page.getByRole("button", { name: "Submit agent run" }).click();
   await expect(page.getByText("codex · queued", { exact: true })).toBeVisible();
   expect(writes.at(-1)?.body).toEqual({ provider: "codex", prompt: "Inspect the code and propose a change", repository: "app/main" });
-  await page.getByRole("button", { name: "New workspace", exact: true }).click();
-  await page.getByLabel("Workspace ID").fill("fresh");
+  await page.getByRole("button", { name: "New project", exact: true }).click();
+  await page.getByLabel("Project ID").fill("fresh");
   await page.getByLabel("Source type").selectOption("hosted");
   await page.getByRole("button", { name: "Create hosted source" }).click();
   await expect(page.getByRole("heading", { name: "fresh", exact: true })).toBeVisible();
-  await expect(page.getByText(/Source connected · preparation needed/)).toBeVisible();
+  await expect(page.getByText(/Source connected · preparation needed/).first()).toBeVisible();
+  await expect(page.getByRole("tab", { name: /Code/ })).toHaveAttribute("aria-selected", "true");
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
-test("partial unavailable observations remain unknown and old repository URLs open Workspaces", async ({ page }) => {
+test("partial unavailable observations remain unknown and old repository URLs open Projects", async ({ page }) => {
   const app = workspace("app");
   await page.route("**/api/control/v1/workspaces", route => route.fulfill({ json: { workspaces: [app], coverage: {} } }));
   await page.route("**/api/control/v1/repository-backends", route => route.fulfill({ json: { backend: { configured: false } } }));
@@ -77,9 +83,11 @@ test("partial unavailable observations remain unknown and old repository URLs op
   await page.route("**/api/environments", route => route.fulfill({ json: { error: "Disconnected" }, status: 502 }));
   await signIn(page, "/?panel=repositories&workspace=app");
   await expect(page.getByRole("heading", { name: "app", exact: true })).toBeVisible();
-  await expect(page.getByText(/Development state unavailable/)).toBeVisible();
-  await expect(page.getByText(/No project-attributed storage operations measured yet/)).toBeVisible();
   await expect(page.getByText(/No agent pool is assigned/)).toBeVisible();
+  await page.getByRole("tab", { name: "Previews" }).click();
+  await expect(page.getByText(/Preview state unavailable/)).toBeVisible();
+  await page.getByRole("tab", { name: "Activity" }).click();
+  await expect(page.getByText(/No project-attributed storage operations measured yet/)).toBeVisible();
 });
 
 test("workspace storage controls cannot operate on another project's checkouts", async ({ page, request }) => {

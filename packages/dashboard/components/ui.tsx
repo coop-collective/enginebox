@@ -194,3 +194,28 @@ export function PageHeader({ title, description, actions }: { title: string; des
     </div>
   );
 }
+
+/**
+ * A row of tabs for one page. Each tab is a real tab (role="tab"), keyed by
+ * a URL-safe id so the caller can mirror the selection in the address bar.
+ */
+export function Tabs({ label, tabs, value, onChange }: { label: string; tabs: { id: string; label: string; count?: number }[]; value: string; onChange: (id: string) => void }) {
+  return (
+    <div className="tabs" role="tablist" aria-label={label}>
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          role="tab"
+          id={`tab-${tab.id}`}
+          aria-selected={value === tab.id}
+          className={`tab${value === tab.id ? " active" : ""}`}
+          onClick={() => onChange(tab.id)}
+        >
+          {tab.label}
+          {tab.count != null && <span className="count">{tab.count}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
