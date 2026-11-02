@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "pnpm build:rust && pnpm --filter enginebox-dashboard build && pnpm --filter enginebox-site build && pnpm build:fleet",
+    "build:pr": "cargo build --workspace --locked && pnpm --filter enginebox-dashboard build && pnpm --filter enginebox-site build && pnpm build:fleet",
     "build:rust": "cargo build --workspace --release --locked",
     "check": "cargo check --workspace --all-targets --locked && pnpm --filter enginebox-dashboard typecheck && pnpm --filter enginebox-site check && pnpm check:fleet && pnpm --filter @enginebox/preparation check && pnpm --filter @enginebox/actions check && pnpm --filter @enginebox/artifacts-gateway check && pnpm --filter @enginebox/email-gateway check",
     "test": "cargo test --workspace --no-fail-fast --locked && pnpm --filter enginebox-dashboard test && pnpm --filter enginebox-site test && pnpm --filter @enginebox/deploy test && pnpm test:fleet && pnpm --filter @enginebox/artifacts-gateway test && pnpm --filter @enginebox/email-gateway test && pnpm --filter @enginebox/environment-service test && pnpm test:preparation",
