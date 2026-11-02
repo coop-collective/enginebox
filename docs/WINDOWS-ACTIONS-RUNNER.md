@@ -33,7 +33,10 @@ that host for unattended CI. Shared capacity needs the reservations/isolation
 implementation described in CI.md before activation.
 
 Provision Git + git-lfs, PowerShell 7.3+, Node 24, MSVC C++ Build Tools/Windows SDK,
-and the root pnpm 12.15.0/Rust toolchain pins. Run the frozen install and complete
+OpenSSL for generated-key test fixtures (Git for Windows includes it under
+`usr/bin`), and the root pnpm 12.15.0/Rust toolchain pins. Put the actual native
+PowerShell executable on the build account PATH rather than relying on an App
+Execution Alias. Run the frozen install and complete
 check/test/lint/build suite under the actual dedicated build account. Record
 versions and results privately. Keep controller, provider and owner credentials
 outside that account and machine. Public-repository same-repo PRs still execute
