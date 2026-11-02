@@ -563,6 +563,81 @@ pub fn stage_bridge(source: &Path, cache: &Path) -> Result<PathBuf> {
     Ok(staged)
 }
 
+/// Remove the project's `Temp` folder before the Editor opens it. A session's
+/// Editor is always stopped by the node, which leaves crash scene backups there
+/// ("Scene Backup Detected") and a stale lock file; imports live in `Library`.
+pub fn clear_unity_temp(project: &Path) -> Result<()> {
+    let temp = project.join("Temp");
+    reject_symlink_components(&temp)?;
+    match std::fs::remove_dir_all(&temp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("Cannot clear {}", temp.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Dialogs that stop the Editor until someone answers them. Nobody is at a
+/// session's locked console, so the node fails the session with the title
+/// rather than waiting out the startup limit.
+pub const BLOCKING_DIALOGS: &[&str] = &[
+    "Scene Backup Detected",
+    "Unity Editor Software Terms",
+    "Enter Safe Mode?",
+    "Project Upgrade Required",
+    "Script Updating Consent",
+    "Opening Project in Non-Matching Editor Installation",
+    "Unity Package Manager Error",
+];
+pub fn blocking_dialog(titles: &[String]) -> Option<String> {
+    titles
+        .iter()
+        .find(|t| BLOCKING_DIALOGS.iter().any(|d| t.trim() == *d))
+        .cloned()
+}
+/// Titles of the visible top-level windows of process `pid`.
+#[cfg(windows)]
+pub fn window_titles(pid: u32) -> Vec<String> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+    struct Search {
+        pid: u32,
+        titles: Vec<String>,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> i32 {
+        // SAFETY: `data` is the `Search` passed to EnumWindows below, alive for the call.
+        let search = unsafe { &mut *(data as *mut Search) };
+        let mut owner = 0u32;
+        // SAFETY: plain Win32 queries on a window handle EnumWindows supplied.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut owner);
+            if owner == search.pid && IsWindowVisible(hwnd) != 0 && search.titles.len() < 64 {
+                let mut buffer = [0u16; 256];
+                let n = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+                if n > 0 {
+                    search
+                        .titles
+                        .push(String::from_utf16_lossy(&buffer[..n as usize]));
+                }
+            }
+        }
+        1
+    }
+    let mut search = Search {
+        pid,
+        titles: Vec::new(),
+    };
+    // SAFETY: the callback only touches `search`, which outlives the call.
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
+    search.titles
+}
+#[cfg(not(windows))]
+pub fn window_titles(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
 /// The EditorPrefs registry/plist name Unity stores for `key`: the key plus
 /// `_h` and its 32-bit djb2-xor hash.
 pub fn editor_prefs_name(key: &str) -> String {
@@ -1130,6 +1205,7 @@ pub async fn run_session(
         receipt["activation_seconds"] = json!(t.elapsed().as_secs());
 
         // The Editor, in this node's interactive session.
+        clear_unity_temp(&project)?;
         let log = session_dir.join("unity.log");
         let mut editor = Command::new(&unity);
         editor
@@ -1144,6 +1220,8 @@ pub async fn run_session(
         report("starting", None, json!({}));
         let t = Instant::now();
         let limit = Duration::from_secs(ctx.config.startup_timeout_seconds.unwrap_or(DEFAULT_STARTUP_SECONDS));
+        let editor_pid = g.child(editor_index).id().unwrap_or(0);
+        let mut dialog: Option<(String, Instant)> = None;
         loop {
             if let Some(status) = bridge_status(port, bridge_token.trim()).await
                 && status["playing"] == true
@@ -1155,6 +1233,20 @@ pub async fn run_session(
                 bail!("The Unity Editor exited during startup (exit {}); see unity.log on the engine machine", exit.code().unwrap_or(-1));
             }
             ensure!(t.elapsed() < limit, "The Unity Editor did not enter Play mode in time");
+            match blocking_dialog(&window_titles(editor_pid)) {
+                Some(title) => {
+                    let since = match &dialog {
+                        Some((seen, since)) if *seen == title => *since,
+                        _ => Instant::now(),
+                    };
+                    ensure!(
+                        since.elapsed() < Duration::from_secs(20),
+                        "The Unity Editor is waiting at the \"{title}\" dialog; nobody can answer it in a session. Open the project once in Unity on this machine, or start a new session."
+                    );
+                    dialog = Some((title, since));
+                }
+                None => dialog = None,
+            }
             tokio::select! {
                 _ = cancelled(&mut stop) => bail!("Stopped"),
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -1495,6 +1587,33 @@ pub fn report_body(session: &str, epoch: u64, r: &Report) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_blocking_dialogs_are_recognised() {
+        let titles = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            blocking_dialog(&titles(&["Opening project...", "Scene Backup Detected"])).as_deref(),
+            Some("Scene Backup Detected")
+        );
+        assert_eq!(
+            blocking_dialog(&titles(&["Opening project...", "Hold on..."])),
+            None
+        );
+        assert_eq!(blocking_dialog(&[]), None);
+    }
+
+    #[test]
+    fn unity_temp_is_cleared_before_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().canonicalize().unwrap().join("unity-project");
+        std::fs::create_dir_all(project.join("Temp/__Backupscenes")).unwrap();
+        std::fs::write(project.join("Temp/__Backupscenes/0.backup"), "scene").unwrap();
+        std::fs::create_dir_all(project.join("Library")).unwrap();
+        clear_unity_temp(&project).unwrap();
+        assert!(!project.join("Temp").exists());
+        assert!(project.join("Library").is_dir());
+        clear_unity_temp(&project).unwrap();
+    }
 
     #[test]
     fn editor_prefs_names_match_unity() {
