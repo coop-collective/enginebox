@@ -1,5 +1,8 @@
 # CI startup and pnpm comparison
 
+See [the measured ten-job results](RESULTS.md) for the qualified template run,
+including startup, dependency and complete-job timings and their limits.
+
 Standalone research tools; no product dependency or cache publication authority.
 Use a disposable repository and one exact commit, lockfile, Node/pnpm version,
 runner image, resource allocation and lifecycle policy across every sample.
@@ -71,6 +74,25 @@ completed workflow VM/branch: checkout credentials, runner registration and
 workflow writes are private. Use the dedicated clean preparation flow for
 LayerFS publication. Ordinary GitHub cache behavior is a distinct control and
 must not be reported as LayerFS acceleration.
+
+Qualify Docker access after boot with the exact runner identity. Incus execution
+with `--user 1001 --group 1001` does not initialize the account's supplementary
+Docker group. A temporary socket ACL also disappears when Docker recreates its
+socket. In a dedicated Docker-capable disposable runner image, configure
+`/etc/systemd/system/docker.socket.d/enginebox-agent.conf` with:
+
+```ini
+[Socket]
+SocketGroup=1001
+SocketMode=0660
+```
+
+Use the actual runner's primary GID. Apply this only inside its reviewed clean
+image, then reboot a fresh clone and verify `docker info`, seed readability,
+private cache writes and the full integration suite using the exact UID/GID
+without supplementary groups. Keep the builder credential-free and discard the
+qualification clone. This configuration grants the runner Docker control within
+its disposable VM; the protected installed-tree profile remains separate.
 
 Whole-job measurements include cache restore and upload overhead; a faster
 dependency command alone does not establish a faster job. These tools do not
