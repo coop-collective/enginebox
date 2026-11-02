@@ -349,8 +349,55 @@ pub fn licensing_argv(token: &str) -> Vec<String> {
         "--include-personal".into(),
     ]
 }
+/// Unity's licensing client writes its command line, access token included, to
+/// these logs. The node removes the token once activation has finished.
+pub fn licensing_log_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Unity"))
+    } else {
+        std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".config/unity3d/Unity"))
+    }
+}
+/// Replace every copy of `token` in the licensing client's logs under `dir`;
+/// returns how many files changed.
+pub fn scrub_licensing_logs(dir: &Path, token: &str) -> Result<usize> {
+    if token.len() < 16 || !dir.is_dir() {
+        return Ok(0);
+    }
+    let needle = token.as_bytes();
+    let mut changed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let named = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("Unity.Licensing.Client") && n.contains(".log"));
+        if !named || !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read(&path)?;
+        if !text.windows(needle.len()).any(|w| w == needle) {
+            continue;
+        }
+        let mut out = Vec::with_capacity(text.len());
+        let mut rest = &text[..];
+        while let Some(at) = rest.windows(needle.len()).position(|w| w == needle) {
+            out.extend_from_slice(&rest[..at]);
+            out.extend_from_slice(b"<redacted>");
+            rest = &rest[at + needle.len()..];
+        }
+        out.extend_from_slice(rest);
+        std::fs::write(&path, out)?;
+        changed += 1;
+    }
+    Ok(changed)
+}
 pub fn unity_argv(project: &Path, bridge_config: &Path, log: &Path) -> Vec<OsString> {
     vec![
+        // The member accepted Unity's Editor Software Terms with their Unity
+        // account; a session has no one at the dialog, which would otherwise
+        // block the Editor before it logs anything (as Unity's CLI does unattended).
+        "-acceptSoftwareTermsForThisRunOnly".into(),
         "-projectPath".into(),
         project.as_os_str().to_owned(),
         "-jam-editor-config".into(),
@@ -888,12 +935,20 @@ pub async fn run_session(
             s = tokio::time::timeout(Duration::from_secs(LICENSE_SECONDS), group.as_mut().unwrap().child(index).wait()) =>
                 s.context("Unity license activation timed out")??,
         };
+        // Whether or not activation worked, the token leaves the licensing client's logs.
+        receipt["licensing_logs_scrubbed"] =
+            match licensing_log_dir().map(|dir| scrub_licensing_logs(&dir, &secrets.unity.access_token)) {
+                Some(Ok(files)) => json!(files),
+                Some(Err(error)) => json!(format!("failed: {error:#}")),
+                None => json!(0),
+            };
         ensure!(
             status.success(),
             "Unity could not activate a license with your Unity account (licensing client exit {}). Check the account on the Agents page.",
             status.code().unwrap_or(-1)
         );
         receipt["activation_seconds"] = json!(t.elapsed().as_secs());
+
         // The Editor, in this node's interactive session.
         let log = session_dir.join("unity.log");
         let mut editor = Command::new(&unity);
@@ -1261,6 +1316,34 @@ pub fn report_body(session: &str, epoch: u64, r: &Report) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn licensing_logs_lose_the_access_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "unity-access-token-0123456789";
+        let log = dir.path().join("Unity.Licensing.Client.log");
+        std::fs::write(
+            &log,
+            format!(
+                "args: --activate-all --accessToken {token} --include-personal\nagain {token}\n"
+            ),
+        )
+        .unwrap();
+        let other = dir.path().join("Editor.log");
+        std::fs::write(&other, token).unwrap();
+        assert_eq!(scrub_licensing_logs(dir.path(), token).unwrap(), 1);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains(token));
+        assert_eq!(text.matches("<redacted>").count(), 2);
+        assert!(text.contains("--include-personal"));
+        // Only the licensing client's logs are touched; a clean log stays as it is.
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), token);
+        assert_eq!(scrub_licensing_logs(dir.path(), token).unwrap(), 0);
+        assert_eq!(
+            scrub_licensing_logs(&dir.path().join("missing"), token).unwrap(),
+            0
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, EngineConfig) {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
@@ -1420,6 +1503,7 @@ mod tests {
         assert_eq!(
             unity,
             [
+                "-acceptSoftwareTermsForThisRunOnly",
                 "-projectPath",
                 "/w/c/unity-project",
                 "-jam-editor-config",
