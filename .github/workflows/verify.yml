@@ -36,7 +36,12 @@ jobs:
       - name: Qualify pinned CI toolchain installation on the native worker
         run: pnpm test:ci-templates
       - run: pnpm lint:rust
-      - run: pnpm build
+      - name: Build workspace without a second release compilation
+        if: github.event_name == 'pull_request'
+        run: pnpm build:pr
+      - name: Build release workspace
+        if: github.event_name != 'pull_request'
+        run: pnpm build
       - if: runner.os == 'Linux'
         run: pnpm fleet:smoke
       - if: runner.os == 'Linux'
