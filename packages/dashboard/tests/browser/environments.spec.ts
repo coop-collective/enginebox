@@ -6,8 +6,10 @@ test('persistent service status and authenticated HTTP/UDP route management use 
   await request.post(`${fixtureOrigin}/__test/reset`);
   await page.context().addCookies([{ ...(await signedInCookie()), url: dashboardOrigin, httpOnly: true, sameSite: "Strict" }]);
   await page.goto('/');
-  await page.getByRole('navigation', { name: 'Control plane' }).getByRole('button', { name: 'Environments', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Live environments', exact: true })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Control plane' }).getByRole('button', { name: 'Projects', exact: true }).click();
+  await page.getByRole('tab', { name: 'Previews & routes' }).click();
+  await expect(page).toHaveURL(/panel=projects&tab=previews/);
+  await expect(page.getByRole('heading', { name: 'Previews and routes', exact: true })).toBeVisible();
   await expect(page.getByRole('article', { name: 'Environment main' })).toContainText('Serving');
   await expect(page.getByRole('article', { name: 'Project dev demo', exact: true })).toContainText('Serving');
   await expect(page.getByRole('link', { name: 'Open demo', exact: true })).toHaveAttribute('href', 'https://demo.dev.example.com');

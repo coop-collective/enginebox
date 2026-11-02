@@ -257,7 +257,7 @@ export function TemplateCatalog({
     <section className="catalog-panel" aria-labelledby="catalog-title">
       <div className="section-title">
         <div>
-          <h2 id="catalog-title">Template catalog</h2>
+          <h2 id="catalog-title">Sandbox images</h2>
           <p>
             Register once. Templates automatically sync to every registered
             node, including nodes added later.
@@ -325,7 +325,7 @@ export function TemplateCatalog({
       </form>
       <p className="workspace-hint">
         The controller keeps the canonical template. Each node prepares a
-        credential-free base; workspace creation becomes available only after
+        credential-free base; sandbox creation becomes available only after
         that node reports ready.
       </p>
       {records === null ? (

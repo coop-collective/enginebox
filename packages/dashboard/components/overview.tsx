@@ -107,12 +107,12 @@ export function Overview({
   for (const host of hosts)
     for (const pool of host.warm_pools ?? [])
       if (pool.error)
-        attention.push({ id: `p:${host.id}/${pool.template}/${pool.size}`, tone: "danger", title: `Warm pool ${pool.template} on ${host.label}`, detail: pool.error, view: "instances", action: "Open VMs" });
+        attention.push({ id: `p:${host.id}/${pool.template}/${pool.size}`, tone: "danger", title: `Warm pool ${pool.template} on ${host.label}`, detail: pool.error, view: "compute", action: "Open sandboxes" });
   for (const provider of providers)
     if (provider.installed && provider.status !== "connected" && provider.status !== "unavailable")
       attention.push({ id: `a:${provider.id}`, tone: "decal", title: `Connect ${providerLabels[provider.id]}`, detail: "Agents cannot use this provider until the controller signs in.", view: "agents", action: "Connect" });
     else if (provider.delegation_status === "reauth_required")
-      attention.push({ id: `a:${provider.id}`, tone: "decal", title: `Reconnect ${providerLabels[provider.id]}`, detail: "Workspace access needs a fresh sign-in.", view: "agents", action: "Reconnect" });
+      attention.push({ id: `a:${provider.id}`, tone: "decal", title: `Reconnect ${providerLabels[provider.id]}`, detail: "Sandbox access needs a fresh sign-in.", view: "agents", action: "Reconnect" });
   for (const template of templates)
     for (const node of template.sync?.nodes ?? [])
       if (node.status === "failed")
@@ -126,7 +126,7 @@ export function Overview({
   for (const job of ciJobs.filter((j) => j.error).slice(0, 3))
     attention.push({ id: `gj:${job.id}`, tone: "danger", title: `CI job ${job.id} on ${job.repository}`, detail: job.error!, view: "runners", action: "Open runners" });
   for (const job of jobs.filter((j) => j.status === "failed").slice(0, 3))
-    attention.push({ id: `j:${job.id}`, tone: "danger", title: job.label ?? `Operation ${job.id}`, detail: job.error ?? "The operation failed.", view: "instances", action: "Open VMs" });
+    attention.push({ id: `j:${job.id}`, tone: "danger", title: job.label ?? `Operation ${job.id}`, detail: job.error ?? "The operation failed.", view: "compute", action: "Open sandboxes" });
 
   const stats: { label: string; value: string; note: string; view: string; icon: string }[] = [
     {
@@ -144,10 +144,10 @@ export function Overview({
       icon: "agent",
     },
     {
-      label: "Workspaces",
+      label: "Projects",
       value: signals.workspaces ? `${workspaces.length}` : "—",
-      note: `${running} VM${running === 1 ? "" : "s"} running · ${assigned.length} assigned`,
-      view: "workspaces",
+      note: `${running} sandbox${running === 1 ? "" : "es"} running · ${assigned.length} assigned`,
+      view: "projects",
       icon: "folder",
     },
     {
@@ -282,7 +282,7 @@ export function Overview({
                   <Tag tone={p.status === "connected" ? (p.delegation_status === "reauth_required" ? "decal" : "ok") : p.status === "unavailable" ? "neutral" : "decal"}>
                     {p.status === "connected" ? (p.delegation_status === "reauth_required" ? "Reconnect" : "Connected") : p.status === "unavailable" ? "Unavailable" : "Not connected"}
                   </Tag>
-                  <span className="muted">{p.workspace_count != null ? `${p.workspace_count} workspaces` : ""}</span>
+                  <span className="muted">{p.workspace_count != null ? `${p.workspace_count} sandboxes` : ""}</span>
                 </li>
               ))}
             </ul>

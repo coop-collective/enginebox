@@ -2106,3 +2106,53 @@ pre {
     transition: none !important;
   }
 }
+
+/* ---------- Tabs: one page, several facets of the same object ---------- */
+.tabs {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--kb-line);
+  scrollbar-width: none;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--kb-ink-2);
+  font: inherit;
+  font-weight: 550;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.tab:hover {
+  color: var(--kb-ink);
+}
+.tab.active {
+  color: var(--kb-ink);
+  border-bottom-color: var(--kb-ink);
+}
+.tab:focus-visible {
+  outline: 2px solid var(--kb-ink);
+  outline-offset: -2px;
+}
+.tab .count {
+  font-size: 12px;
+  color: var(--kb-ink-3);
+}
+.role-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.back-link {
+  justify-self: start;
+  align-self: start;
+  width: auto;
+}

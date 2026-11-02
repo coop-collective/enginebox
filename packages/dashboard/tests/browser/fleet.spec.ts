@@ -5,8 +5,8 @@ import { test, expect, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 
 const origin = `${dashboardOrigin}`;
-/** A real member session, then the Virtual machines page (or `view`) from the sidebar. */
-async function signIn(page: Page, view = "Virtual machines") {
+/** A real member session, then the Machines page (or `view`) from the sidebar. */
+async function signIn(page: Page, view = "Machines") {
   await openSignedIn(page);
   await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
   await go(page, view);
@@ -77,17 +77,17 @@ test("live inventory, template creation and all lifecycle actions follow asynchr
   page.on("pageerror", (error) => errors.push(error.message));
   await signIn(page, "Machines");
   await expect(page.getByText("SSH connection timed out.").first()).toBeVisible();
-  await go(page, "Virtual machines");
+  await go(page, "Machines");
   const base = page.getByRole("row").filter({ hasText: "ebox-native-base" });
   await expect(base.getByText("Read only")).toBeVisible();
   await expect(base.getByRole("button")).toHaveCount(0);
-  await page.getByRole("button", { name: "New workspace" }).click();
-  await page.getByLabel("Workspace name").fill("ebox-new-project");
+  await page.getByRole("button", { name: "New sandbox" }).click();
+  await page.getByLabel("Sandbox name").fill("ebox-new-project");
   await page
     .getByRole("combobox", { name: "Size", exact: true })
     .selectOption("small");
   await page
-    .getByRole("button", { name: "Create workspace", exact: true })
+    .getByRole("button", { name: "Create sandbox", exact: true })
     .click();
   await expect(
     page.getByText("Create ebox-new-project", { exact: true }),
@@ -121,10 +121,10 @@ test("failed jobs, empty fleet and API errors are visible", async ({
   request,
 }) => {
   await signIn(page);
-  await page.getByRole("button", { name: "New workspace" }).click();
-  await page.getByLabel("Workspace name").fill("ebox-fail");
+  await page.getByRole("button", { name: "New sandbox" }).click();
+  await page.getByLabel("Sandbox name").fill("ebox-fail");
   await page
-    .getByRole("button", { name: "Create workspace", exact: true })
+    .getByRole("button", { name: "Create sandbox", exact: true })
     .click();
   await expect(
     page.getByText("The selected host does not have enough free storage."),
@@ -236,21 +236,21 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   await signIn(page, "Machines");
   const assigned = page
     .locator(".stat-card")
-    .filter({ hasText: "VM workspaces" });
+    .filter({ hasText: "Sandboxes" });
   await expect(assigned.locator("strong")).toHaveText("2");
   await expect(assigned).toContainText("1 ready in reserve");
   await page.getByRole("listitem", { name: "Machine Build machine", exact: true }).locator("summary").filter({ hasText: "Details" }).click();
   await expect(
     page.getByText("1 ready · 1 preparing · target 2"),
   ).toBeVisible();
-  await go(page, "Virtual machines");
+  await go(page, "Machines");
   for (const state of ["ready", "preparing", "quarantined"]) {
     const row = page.getByRole("row").filter({ hasText: `ebox-pool-${state}` });
     await expect(row.getByText("Reserved for allocation")).toBeVisible();
     await expect(row.getByRole("button")).toHaveCount(0);
   }
-  await page.getByRole("button", { name: "New workspace" }).click();
-  await page.getByLabel("Workspace name").fill("ebox-my-project");
+  await page.getByRole("button", { name: "New sandbox" }).click();
+  await page.getByLabel("Sandbox name").fill("ebox-my-project");
   await page
     .getByRole("combobox", { name: "Size", exact: true })
     .selectOption("custom");
@@ -260,7 +260,7 @@ test("warm reserve is separate inventory and custom resources can claim it with 
     ),
   ).toBeVisible();
   const button = page.getByRole("button", {
-    name: "Create workspace",
+    name: "Create sandbox",
     exact: true,
   });
   await expect(button).toBeEnabled();
@@ -283,7 +283,7 @@ test("warm reserve is separate inventory and custom resources can claim it with 
   ).toBeVisible();
   await go(page, "Machines");
   await expect(assigned.locator("strong")).toHaveText("3");
-  await go(page, "Virtual machines");
+  await go(page, "Machines");
   const action = page.waitForRequest(
     (req) => req.method() === "POST" && req.url().endsWith("/actions"),
   );
@@ -292,13 +292,13 @@ test("warm reserve is separate inventory and custom resources can claim it with 
     "/api/control/v1/hosts/metal-01/instances/ebox-pool-ready/actions",
   );
   await expect(claimed.getByText("Paused", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "New workspace" }).click();
+  await page.getByRole("button", { name: "New sandbox" }).click();
   await expect(
-    page.getByRole("button", { name: "Create workspace", exact: true }),
+    page.getByRole("button", { name: "Create sandbox", exact: true }),
   ).toBeDisabled();
   await expect(
     page.getByText(
-      "1 matching workspace is preparing. Availability refreshes automatically.",
+      "1 matching sandbox is preparing. Availability refreshes automatically.",
     ),
   ).toBeVisible();
   await page.screenshot({
@@ -325,8 +325,8 @@ test("template minimum and custom resources validate before a cold allocation", 
     data: { mode: "typed" },
   });
   await signIn(page);
-  await page.getByRole("button", { name: "New workspace" }).click();
-  await page.getByLabel("Workspace name").fill("ebox-sized-project");
+  await page.getByRole("button", { name: "New sandbox" }).click();
+  await page.getByLabel("Sandbox name").fill("ebox-sized-project");
   const size = page.getByRole("combobox", { name: "Size", exact: true });
   await expect(size).toHaveValue("recommended");
   await expect(size.locator('option[value="minimum"]')).toHaveText(
@@ -352,7 +352,7 @@ test("template minimum and custom resources validate before a cold allocation", 
   await size.selectOption("custom");
   await page.getByLabel("CPU cores").fill("1");
   const button = page.getByRole("button", {
-    name: "Create workspace",
+    name: "Create sandbox",
     exact: true,
   });
   await expect(button).toBeDisabled();
@@ -387,17 +387,17 @@ test("preparing reserves remain unavailable and refill errors are visible", asyn
     data: { mode: "pool-preparing" },
   });
   await signIn(page);
-  await page.getByRole("button", { name: "New workspace" }).click();
+  await page.getByRole("button", { name: "New sandbox" }).click();
   await expect(
-    page.getByRole("button", { name: "Create workspace", exact: true }),
+    page.getByRole("button", { name: "Create sandbox", exact: true }),
   ).toBeDisabled();
   await expect(
     page.getByText(
-      "2 matching workspaces are preparing. Availability refreshes automatically.",
+      "2 matching sandboxes are preparing. Availability refreshes automatically.",
     ),
   ).toBeVisible();
   await expect(
-    page.getByText("Refill is waiting for host capacity.").first(),
+    page.getByRole("region", { name: "Create a sandbox" }).getByText("Refill is waiting for host capacity."),
   ).toBeVisible();
 });
 
@@ -411,7 +411,7 @@ test("canonical templates import once and automatically sync revisions and futur
   await signIn(page);
   await page.getByRole("button", { name: "Templates", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "Template catalog" }),
+    page.getByRole("heading", { name: "Sandbox images", exact: true }),
   ).toBeVisible();
   await page.getByLabel("Import from").selectOption("json");
   await page.getByLabel("Template JSON").fill("{invalid");
@@ -595,8 +595,8 @@ test("mobile layout has no page overflow and remains operable", async ({
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
-  await page.getByRole("button", { name: "New workspace" }).click();
-  await expect(page.getByLabel("Workspace name")).toBeVisible();
+  await page.getByRole("button", { name: "New sandbox" }).click();
+  await expect(page.getByLabel("Sandbox name")).toBeVisible();
   await page.screenshot({
     path: "test-results/fleet-mobile.png",
     fullPage: true,

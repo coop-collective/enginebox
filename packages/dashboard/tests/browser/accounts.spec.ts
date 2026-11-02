@@ -48,7 +48,7 @@ test("Agents shows native sign-in links, reconnect, Claude codes and cancellatio
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await signIn(page);
-  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Virtual machines", exact: true }).click();
+  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Machines", exact: true }).click();
   await page
     .getByRole("row")
     .filter({ hasText: "ebox-editor" })
@@ -140,7 +140,7 @@ test("global agent connections need no host or running workspace and never resum
   page.on("request", (req) => {
     if (req.method() === "POST") mutations.push(req.url());
   });
-  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Virtual machines", exact: true }).click();
+  await page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "Machines", exact: true }).click();
   await page
     .getByRole("row")
     .filter({ hasText: "ebox-review" })

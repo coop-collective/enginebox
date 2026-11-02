@@ -6,11 +6,11 @@ async function openMachines(page: Page) {
   await page.goto('/');
   await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Machines',exact:true}).click();
 }
-/** VM allocation lives on the Virtual machines page: check it there, then return to Machines. */
+/** Sandbox allocation lives on the Machines page. */
 async function expectAllocation(page: Page, enabled: boolean) {
   const nav = page.getByRole('navigation',{name:'Control plane'});
-  await nav.getByRole('button',{name:'Virtual machines',exact:true}).click();
-  const button = page.getByRole('button',{name:'New workspace',exact:true});
+  await nav.getByRole('button',{name:'Machines',exact:true}).click();
+  const button = page.getByRole('button',{name:'New sandbox',exact:true});
   if (enabled) await expect(button).toBeEnabled(); else await expect(button).toBeDisabled();
   await nav.getByRole('button',{name:'Machines',exact:true}).click();
 }
@@ -104,8 +104,8 @@ for (const inventory of ['hosts', 'workers'] as const) {
     await expect(machines.getByRole('listitem')).toHaveCount(2);
     if (inventory === 'hosts') {
       const nav = page.getByRole('navigation',{name:'Control plane'});
-      await nav.getByRole('button',{name:'Virtual machines',exact:true}).click();
-      await expect(page.getByRole('button', {name:'New workspace',exact:true})).toBeDisabled();
+      await nav.getByRole('button',{name:'Machines',exact:true}).click();
+      await expect(page.getByRole('button', {name:'New sandbox',exact:true})).toBeDisabled();
       await nav.getByRole('button',{name:'Machines',exact:true}).click();
     }
     await page.unroute(route);
@@ -127,8 +127,8 @@ test('shows workers when there are no VM hosts without offering an incompatible 
   await expect(page.getByRole('region',{name:'Registered machines',exact:true}).getByRole('listitem')).toHaveCount(2);
   await expect(page.locator('.stat-card').filter({hasText:'Online machines'}).locator('strong')).toHaveText('1');
   await expect(page.locator('.stat-card').filter({hasText:'VM CPU allocated'}).locator('strong')).toHaveText('0 / 0');
-  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Virtual machines',exact:true}).click();
-  await expect(page.getByRole('button',{name:'New workspace',exact:true})).toBeDisabled();
+  await page.getByRole('navigation',{name:'Control plane'}).getByRole('button',{name:'Machines',exact:true}).click();
+  await expect(page.getByRole('button',{name:'New sandbox',exact:true})).toBeDisabled();
 });
 
 test('uses controller registration and allowances for both runtimes with the same details flow', async ({page, request}) => {
