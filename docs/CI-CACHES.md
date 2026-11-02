@@ -5,7 +5,10 @@ using setup-node's lockfile-keyed cache. The second setup-node invocation is
 intentional: the first selects Node 24, then pnpm is available for store discovery.
 `pnpm install --frozen-lockfile` always runs; installed `node_modules` is not cached.
 
-Pinned `Swatinem/rust-cache` v2.9.3 restores Cargo registry/git downloads and
+After the frozen install selects the pinned Rust toolchain,
+`Swatinem/rust-cache` v2.9.3 uses `cmd-format: "pnpm exec {0}"` to inspect the
+actual workspace compiler instead of downloading/inspecting a host-default
+toolchain. It restores Cargo registry/git downloads and
 compatible target dependency artifacts. Its keys include compiler identity,
 Cargo inputs and the explicit OS/architecture namespace. Default cleanup removes
 workspace-crate artifacts and incremental state; this does not promise zero
