@@ -1,9 +1,11 @@
 import { config, HttpError } from "../server";
 import type { Fleet } from "../types";
-import type { PoolGrant, RepositoryGrant, WorkspaceGrant } from "./store";
+import type { EngineSessionsGrant, PoolGrant, RepositoryGrant, WorkspaceGrant } from "./store";
 
 /** Every agent-run operation; the `agent-runs` scope grants exactly these. */
 export const AGENT_RUN_OPERATIONS = ["agent_runs.start", "agent_runs.get", "agent_runs.list", "agent_runs.cancel"];
+/** Every engine-session operation; the `engine-sessions` scope grants exactly these, on the consented projects. */
+export const ENGINE_SESSION_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end"];
 
 async function call(path: string, init: { method: string; body?: unknown }) {
   const { apiUrl, apiToken } = config();
@@ -35,6 +37,10 @@ export type TokenGrant = {
   project?: string | null;
   /** The grant's org; sent only when it is not the platform org, so older controllers keep accepting default-org grants. */
   org_id?: string | null;
+  /** Engine-session projects; the token acts as `member` there. */
+  engine_sessions?: EngineSessionsGrant[];
+  /** The consenting member (`usr_…`); required with `engine_sessions`. */
+  member?: string;
 };
 
 /**
@@ -45,20 +51,25 @@ export type TokenGrant = {
 export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSeconds: number): Promise<Minted> {
   const profiles = [...new Set(grant.workspaces.flatMap((w) => w.profiles))].sort();
   const repositories = grant.repositories ?? [];
+  const engine = grant.engine_sessions ?? [];
+  if (engine.length && !grant.member) throw new GrantRefused("Engine sessions need the member who consented.");
+  // An engine-session-only grant holds no agent-run operation; every other grant keeps them all, as before.
+  const agentRuns = !engine.length || grant.workspaces.length > 0 || grant.pools.length > 0 || repositories.length > 0;
   const response = await call("v1/service-tokens", {
     method: "POST",
     body: {
       label: `oauth grant ${grantId}`,
       scopes: grant.workspaces.map((w) => ({ host_id: w.host, name: w.instance })),
-      operations: AGENT_RUN_OPERATIONS,
+      operations: [...(agentRuns ? AGENT_RUN_OPERATIONS : []), ...(engine.length ? ENGINE_SESSION_OPERATIONS : [])],
       expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
       // Optional fields only when used, so older controllers keep accepting workspace-only grants.
       ...(profiles.length ? { profiles } : {}),
       ...(grant.pools.length ? { pools: grant.pools.map((p) => p.pool) } : {}),
       ...(repositories.length ? { repositories: repositories.map((r) => ({ project: r.project, access: r.access })) } : {}),
+      ...(engine.length ? { engine_sessions: engine.map((e) => ({ project: e.project })), member: grant.member } : {}),
       ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
-      // Restricts the pool and repository grants to one project; the controller re-checks it on every request.
-      ...(grant.project && (grant.pools.length || repositories.length) ? { project: grant.project } : {}),
+      // Restricts the pool, repository and engine-session grants to one project; the controller re-checks it on every request.
+      ...(grant.project && (grant.pools.length || repositories.length || engine.length) ? { project: grant.project } : {}),
       ...(grant.org_id && grant.org_id !== "default" ? { org_id: grant.org_id } : {}),
     },
   });
@@ -67,7 +78,7 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
     secret?: unknown;
   } | null;
   // 400: the controller validated the request and refused it, so this grant cannot be honoured any more.
-  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools, repositories or profiles are no longer available.");
+  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools, repositories, engine sessions or profiles are no longer available.");
   const id = body?.token?.id, secret = body?.secret, expires = Date.parse(String(body?.token?.expires_at));
   if (response.status !== 201 || typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id) || typeof secret !== "string" || !secret.startsWith(`ebst_${id}.`) || !Number.isFinite(expires))
     throw new HttpError(503, "The fleet service could not issue an access token.");

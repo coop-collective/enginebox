@@ -5,7 +5,9 @@ Engine Box's dashboard is an OAuth 2.1 authorization server that follows the
 Any app can register itself, send the owner to a consent screen, and receive a
 token that starts, reads, lists and cancels agent runs on the workspaces and
 [pools](QUEUE.md#pools) the owner picked, and uses the [hosted repositories](REPOSITORIES.md)
-of the projects the owner picked, and nothing else. No app gets special treatment: there is no client-specific
+of the projects the owner picked, and, with the `engine-sessions` scope, runs the
+approving member's own [engine sessions](ENGINE-SESSIONS.md) in the projects they
+picked, and nothing else. No app gets special treatment: there is no client-specific
 code or configuration.
 
 Everything runs in the dashboard process on its public origin (for the hosted
@@ -39,10 +41,14 @@ read-modify-write with an atomic rename, and no network call happens under the l
    ones). A confidential client receives `client_secret` once.
 3. **Authorization.** The app sends the browser to `/oauth/authorize` with
    `response_type=code`, `client_id`, `redirect_uri`, `code_challenge` +
-   `code_challenge_method=S256`, `resource=<origin>`, optional `scope=agent-runs`
-   and `state`, and optional `project=<id>` to ask for one project only:
-   consent then offers only that project's pools and repositories, and the grant
-   (and every access token minted for it) is restricted to that project.
+   `code_challenge_method=S256`, `resource=<origin>`, optional `scope` and
+   `state`, and optional `project=<id>` to ask for one project only:
+   consent then offers only that project's pools, repositories and engine
+   sessions, and the grant (and every access token minted for it) is restricted to
+   that project. `scope` is space-separated: `agent-runs` (the default when
+   omitted: workspaces, pools and repositories), `engine-sessions` (below), or
+   `agent-runs engine-sessions`; any other value is `invalid_scope`. Clients that
+   send `scope=agent-runs`, or none, see exactly what they saw before.
 4. **Sign-in and consent.** The owner signs in (if needed) and sees the app's
    self-chosen name, its redirect host and client ID, then ticks the pools and the
    workspaces (host/instance) it may use and, optionally, profile names per
@@ -51,7 +57,10 @@ read-modify-write with an atomic rename, and no network call happens under the l
    the controller. If one list cannot be read (for example, a host's inventory is
    unreachable), the other is still offered. Below the pools, "Manage repositories
    in project X" offers no access, read or write for each project that has a pool or
-   a repository (see [repository grants](REPOSITORIES.md#grants)).
+   a repository (see [repository grants](REPOSITORIES.md#grants)). With the
+   `engine-sessions` scope, "Run live engine sessions in project X" is a checkbox
+   per project (the same projects, or only the requested `project`), offered only
+   to a signed-in member (a `usr_…` user).
 5. **Code.** Engine Box redirects to the exact registered URI with `code`, the
    original `state` and `iss`. Denial returns `error=access_denied`.
 6. **Token.** `POST /oauth/token` with `grant_type=authorization_code`, `code`,
@@ -67,7 +76,8 @@ read-modify-write with an atomic rename, and no network call happens under the l
   "enginebox_grants": [
     { "kind": "workspace", "host": "primary", "instance": "ebox-work", "profiles": ["review"] },
     { "kind": "pool", "pool": "workers", "project": "default", "profile": "coder", "profiles": ["coder"] },
-    { "kind": "repositories", "project": "default", "access": "write" }
+    { "kind": "repositories", "project": "default", "access": "write" },
+    { "kind": "engine_sessions", "project": "qoh", "member": "usr_0123456789abcdef01234567" }
   ],
   "enginebox_callback_secret": "<43 characters>"
 }
@@ -82,7 +92,9 @@ projects, or against a controller that does not report them). A `repositories`
 entry grants one project's hosted repositories: `write` creates, lists, reads,
 mints read or write tokens and names a repository on runs; `read` lists, reads
 and mints read tokens. The access token carries it as the controller's
-`repositories` grant.
+`repositories` grant. An `engine_sessions` entry grants one project's
+[engine sessions](#engine-sessions) acting as `member`, the user who consented.
+`scope` is what was granted: `agent-runs`, `engine-sessions`, or both.
 `enginebox_callback_secret` is returned only by the code exchange: it is the HMAC
 key the controller signs this connection's run [callbacks](FLEET.md#agent-runs-v2)
 with, and it stays the same across refreshes. A refresh response repeats
@@ -91,6 +103,28 @@ with, and it stays the same across refreshes. A refresh response repeats
 7. **Use.** Call the agent-run routes on the public origin with
    `Authorization: Bearer <access_token>`. Refresh with
    `grant_type=refresh_token` before `expires_in` runs out.
+
+### Engine sessions
+
+An app such as Gamejam's hosted room asks for `scope=engine-sessions` (optionally
+with `project=<id>`). Any member of the org may approve an engine-sessions-only
+request, because the grant acts only as them; workspaces, pools and repositories
+still need an admin or owner, and a member's consent page does not offer them. The
+grant records the consenting member (`user_id`) and org, and every access token
+carries the controller grant `engine_sessions: [{project}]`, `member: <user id>`,
+the grant's org, and the operations `engine_sessions.start|get|renew|end` (an
+engine-sessions-only token holds no agent-run operation).
+
+The token acts as that member on the controller: a start is that member's session,
+placed only on their own engine machine with their own Unity account; reads list
+only their sessions; `GET …/{id}` carries the `stream` block (relay URL, audience
+token, control key and token) because the token's member is the starter; renew and
+end reach only their sessions. Another member's session is `404`. The member is
+taken from the token, never from a header the app sends, and the public proxy
+forwards no actor or org header. The owner-wide `/v1/engine-sessions` routes are
+never forwarded. When the member leaves the org, the next refresh answers
+`invalid_grant` and ends the connection. The request and response bodies are those
+of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllersrcengine_sessionsrs).
 
 ## Endpoints
 
@@ -114,11 +148,16 @@ with, and it stays the same across refreshes. A refresh response repeats
 | `POST /v1/projects/{project}/repositories` | Create one (`write` grant; idempotent on name) |
 | `GET /v1/projects/{project}/repositories/{name}` | Read one |
 | `POST /v1/projects/{project}/repositories/{name}/tokens` | Mint a short-lived repository token (`read` grants: read tokens only) |
+| `GET /v1/projects/{project}/engine-sessions` | The consenting member's sessions in a granted project (`engine-sessions`) |
+| `POST /v1/projects/{project}/engine-sessions` | Start one as that member (`202`; idempotent on `request_id`) |
+| `GET /v1/projects/{project}/engine-sessions/{id}` | Read one; `stream` when ready |
+| `POST /v1/projects/{project}/engine-sessions/{id}/renew` | `{lease, ttl_seconds}` |
+| `POST /v1/projects/{project}/engine-sessions/{id}/end` | `{}` or `{lease}` |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 
 The dashboard's **MCP** section includes Connected apps and grants: every live
-connection (app name, redirect hosts, workspaces, pools, repository grants,
-profiles, last renewal) retains a Disconnect button. The former `?panel=apps`
+connection (app name, redirect hosts, workspaces, pools, repository and
+engine-session grants, profiles, last renewal) retains a Disconnect button. The former `?panel=apps`
 URL remains supported.
 
 The MCP setup instructions describe the local `enginebox-fleet-mcp` stdio binary.
@@ -133,7 +172,7 @@ local configuration. Operator credentials stay outside project environments.
 |---|---|
 | Pending authorization request | 10 minutes; consumed by approve or deny |
 | Authorization code | 60 seconds, single use. Any presentation burns it (a wrong verifier cannot be retried); a replay revokes the connection it produced |
-| Access token | 1 hour. A scoped controller service token (`agent_runs.start/get/list/cancel` on exactly the consented workspaces and `pools`, with the named workspace profiles as its `profiles` grant and the connection's `callback_secret`), labelled `oauth grant <id>` |
+| Access token | 1 hour. A scoped controller service token (`agent_runs.start/get/list/cancel` on exactly the consented workspaces and `pools`, with the named workspace profiles as its `profiles` grant and the connection's `callback_secret`; plus `engine_sessions.start/get/renew/end` with its `engine_sessions` projects and `member` for an engine-session grant), labelled `oauth grant <id>` |
 | Callback key | The life of the connection; generated at the code exchange and passed to every access token minted for it |
 | Refresh token | 30 days, sliding: each refresh issues a new one and resets the 30 days. Rotated tokens are remembered; presenting one again revokes the whole connection, except within the grace window below |
 | Refresh grace window | 30 seconds (`ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS`, 0 to 300; 0 turns it off). Presenting the immediately-previous refresh token within the window, from the same client, returns the same token pair that refresh already issued |
@@ -149,7 +188,8 @@ OAuth call, and the public proxy already refuses the token: it accepts only the
 Runs already admitted keep running until they finish or are cancelled.
 
 If the controller refuses to mint a token for a connection (HTTP 400: a consented
-workspace, pool or profile no longer exists), the code exchange or refresh answers
+workspace, pool or profile no longer exists), or the member an engine-session
+grant acts as is no longer in its org, the code exchange or refresh answers
 `invalid_grant` and a refresh also revokes the connection, so the app asks the
 owner again instead of retrying forever.
 
@@ -195,7 +235,8 @@ keep strict one-time refresh tokens.
   dashboard in the same browser and choose **Continue**. The consent page
   collects no credentials.
 - **Who approves.** Approving needs the `admin` or `owner` role in the approver's
-  active org. The grant records the approver (`user_id`: their user ID, or `owner`
+  active org, except for a grant of engine sessions only, which any member may
+  approve because it acts only as them. The grant records the approver (`user_id`: their user ID, or `owner`
   on grants made before orgs) and the org
   (`org_id`, absent for the platform org). The approver manages it under **MCP**;
   so do that org's admins and owners. Consent offers only the org's own pools,
@@ -222,8 +263,9 @@ keep strict one-time refresh tokens.
 - The `resource` parameter must be the origin (RFC 8707); it is required on
   authorization and checked on token requests when present.
 - The proxy ignores cookies, forwards only the presented scoped token, allows only
-  the seven agent-run route shapes (four workspace, three pool) and the four
-  repository route shapes, and rejects query strings. The repository backend
+  the seven agent-run route shapes (four workspace, three pool), the four
+  repository route shapes and the five engine-session route shapes, and rejects
+  query strings. The repository backend
   configuration and the owner's repository listing are never forwarded.
 - The proxy forwards to `ENGINEBOX_API_URL`, normally the supervisor's front door.
   The supervisor admits a write (or a credential-refreshing observation) only from

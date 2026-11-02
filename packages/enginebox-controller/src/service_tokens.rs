@@ -1,5 +1,6 @@
 //! Scoped service tokens: owner-minted bearer credentials limited to agent-run
-//! operations on named (host, workspace) pairs. They never authorize fleet
+//! operations on named (host, workspace) pairs, pools and project grants
+//! (repositories, and engine sessions acting as one member). They never authorize fleet
 //! administration, provider sign-in, CI, storage or minting further tokens.
 //! Only a SHA-256 digest of each secret is stored; the plaintext is returned once.
 use anyhow::{Context, Result, ensure};
@@ -29,6 +30,24 @@ pub enum Operation {
     List,
     #[serde(rename = "agent_runs.cancel")]
     Cancel,
+    /// Engine sessions (docs/ENGINE-SESSIONS.md), only with an
+    /// [`EngineSessionsGrant`] on the project and a [`Token::member`].
+    #[serde(rename = "engine_sessions.start")]
+    EngineStart,
+    #[serde(rename = "engine_sessions.get")]
+    EngineGet,
+    #[serde(rename = "engine_sessions.renew")]
+    EngineRenew,
+    #[serde(rename = "engine_sessions.end")]
+    EngineEnd,
+}
+impl Operation {
+    pub fn engine(self) -> bool {
+        matches!(
+            self,
+            Self::EngineStart | Self::EngineGet | Self::EngineRenew | Self::EngineEnd
+        )
+    }
 }
 
 /// Access to one project's hosted repositories. `write`: create, list,
@@ -39,6 +58,15 @@ pub enum Operation {
 pub struct RepositoryGrant {
     pub project: String,
     pub access: crate::repositories::Access,
+}
+
+/// Engine sessions in one project, acting as the token's [`Token::member`]:
+/// starts run on that member's own engine machine with their own Unity
+/// account, and only that member's sessions are visible.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineSessionsGrant {
+    pub project: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -84,6 +112,14 @@ pub struct Token {
     /// platform org so older releases still read the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_id: Option<String>,
+    /// Engine-session grants, one per project. Omitted when empty so older
+    /// releases still read the record.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub engine_sessions: BTreeSet<EngineSessionsGrant>,
+    /// The member (`usr_…`) engine-session grants act as: the user who
+    /// consented. Set exactly when `engine_sessions` is not empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -142,6 +178,19 @@ impl Token {
             .find(|g| g.project == project)
             .map(|g| g.access)
     }
+    /// The member an engine-session `operation` on `project` acts as, when
+    /// this token holds that operation and a grant on the project (inside
+    /// its project restriction if it has one).
+    pub fn engine_member(&self, operation: Operation, project: &str) -> Option<&str> {
+        if !operation.engine()
+            || !self.operations.contains(&operation)
+            || self.project.as_deref().is_some_and(|p| p != project)
+            || !self.engine_sessions.iter().any(|g| g.project == project)
+        {
+            return None;
+        }
+        self.member.as_deref()
+    }
     pub fn sees(&self, host_id: &str, name: &str) -> bool {
         self.scopes
             .iter()
@@ -167,6 +216,8 @@ impl Token {
             "pools":self.pools,
             "project":self.project,
             "repositories":self.repositories,
+            "engine_sessions":self.engine_sessions,
+            "member":self.member,
             "org_id":self.org(),
             "has_callback_secret":self.callback_secret.is_some(),
             "active":self.revoked_at.is_none() && !self.expired(now),
@@ -197,6 +248,11 @@ pub struct MintRequest {
     /// The org the token acts for; omit for the platform org.
     #[serde(default)]
     pub org_id: Option<String>,
+    #[serde(default)]
+    pub engine_sessions: Vec<EngineSessionsGrant>,
+    /// The member engine-session grants act as; required with them.
+    #[serde(default)]
+    pub member: Option<String>,
 }
 
 use enginebox_node_protocol::service_token::{secret_hash, valid_id};
@@ -257,9 +313,40 @@ impl ServiceTokens {
         ensure!(
             (!request.scopes.is_empty()
                 || !request.pools.is_empty()
-                || !request.repositories.is_empty())
+                || !request.repositories.is_empty()
+                || !request.engine_sessions.is_empty())
                 && request.scopes.len() <= MAX_SCOPES,
-            "scopes must name 1-256 workspaces, or pools or repositories at least one grant"
+            "scopes must name 1-256 workspaces, or pools, repositories or engine sessions at least one grant"
+        );
+        ensure!(
+            request.engine_sessions.len() <= MAX_SCOPES
+                && request
+                    .engine_sessions
+                    .iter()
+                    .all(|g| enginebox_agents::pools::valid_project(&g.project))
+                && request
+                    .engine_sessions
+                    .iter()
+                    .map(|g| &g.project)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == request.engine_sessions.len(),
+            "engine_sessions must name at most 256 distinct projects"
+        );
+        // Engine-session grants act as exactly one member, never as the owner.
+        ensure!(
+            request.engine_sessions.is_empty() == request.member.is_none()
+                && request
+                    .member
+                    .as_deref()
+                    .is_none_or(|m| { m != "owner" && crate::audit::valid_actor(m) }),
+            "member must name the user engine_sessions act as, and only with engine_sessions"
+        );
+        let engine_operations = request.operations.iter().any(|o| o.engine());
+        let engine_grants = !request.engine_sessions.is_empty();
+        ensure!(
+            engine_operations == engine_grants,
+            "engine_sessions operations need an engine_sessions grant, and the grant needs them"
         );
         ensure!(
             request.repositories.len() <= MAX_SCOPES
@@ -290,12 +377,21 @@ impl ServiceTokens {
                 "project must be a project ID"
             );
             ensure!(
-                !request.pools.is_empty() || !request.repositories.is_empty(),
-                "project restricts pool and repository grants; name at least one"
+                !request.pools.is_empty()
+                    || !request.repositories.is_empty()
+                    || !request.engine_sessions.is_empty(),
+                "project restricts pool, repository and engine-session grants; name at least one"
             );
             ensure!(
                 request.repositories.iter().all(|g| &g.project == project),
                 "Every repository grant must name the token's project"
+            );
+            ensure!(
+                request
+                    .engine_sessions
+                    .iter()
+                    .all(|g| &g.project == project),
+                "Every engine-session grant must name the token's project"
             );
             ensure!(
                 request
@@ -327,7 +423,7 @@ impl ServiceTokens {
         // A repository-only token (for example read-only indexing) needs no
         // agent-run operation; any workspace or pool grant does.
         ensure!(
-            !request.operations.is_empty()
+            request.operations.iter().any(|o| !o.engine())
                 || (request.scopes.is_empty() && request.pools.is_empty()),
             "operations must name at least one agent-run operation"
         );
@@ -382,6 +478,8 @@ impl ServiceTokens {
             project: request.project,
             repositories: request.repositories.into_iter().collect(),
             org_id: request.org_id,
+            engine_sessions: request.engine_sessions.into_iter().collect(),
+            member: request.member,
         };
         self.save(&token)?;
         let public = token.public();
@@ -505,6 +603,8 @@ mod tests {
             project: None,
             repositories: vec![],
             org_id: None,
+            engine_sessions: vec![],
+            member: None,
         }
     }
     #[test]
@@ -660,6 +760,101 @@ mod tests {
         );
     }
     #[test]
+    fn engine_session_grants_act_as_one_member_inside_the_project_restriction() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        let temp = tempfile::tempdir().unwrap();
+        let tokens = ServiceTokens::open(temp.path()).unwrap();
+        let engine = |projects: &[&str], member: Option<&str>, operations: Vec<Operation>| {
+            let mut r = request(None);
+            r.scopes.clear();
+            r.operations = operations;
+            r.engine_sessions = projects
+                .iter()
+                .map(|p| EngineSessionsGrant {
+                    project: p.to_string(),
+                })
+                .collect();
+            r.member = member.map(str::to_owned);
+            r
+        };
+        let all = vec![
+            Operation::EngineStart,
+            Operation::EngineGet,
+            Operation::EngineRenew,
+            Operation::EngineEnd,
+        ];
+        let minted = tokens
+            .mint(
+                engine(&["qoh"], Some(ALICE), all.clone()),
+                |_| true,
+                |_| true,
+                |_| None,
+            )
+            .unwrap();
+        assert_eq!(
+            minted["token"]["engine_sessions"],
+            json!([{"project":"qoh"}])
+        );
+        assert_eq!(minted["token"]["member"], ALICE);
+        let token = tokens
+            .authenticate(minted["secret"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            token.engine_member(Operation::EngineStart, "qoh"),
+            Some(ALICE)
+        );
+        assert_eq!(token.engine_member(Operation::EngineStart, "other"), None);
+        // Agent-run operations never stand in for engine ones.
+        assert_eq!(token.engine_member(Operation::Start, "qoh"), None);
+        assert!(!token.operations.contains(&Operation::List));
+        let reader = tokens
+            .mint(
+                engine(&["qoh"], Some(ALICE), vec![Operation::EngineGet]),
+                |_| true,
+                |_| true,
+                |_| None,
+            )
+            .unwrap();
+        let reader = tokens
+            .authenticate(reader["secret"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            reader.engine_member(Operation::EngineGet, "qoh"),
+            Some(ALICE)
+        );
+        assert_eq!(reader.engine_member(Operation::EngineEnd, "qoh"), None);
+        // A project restriction must cover every engine grant.
+        let mut restricted = engine(&["qoh"], Some(ALICE), all.clone());
+        restricted.project = Some("qoh".into());
+        assert!(
+            tokens
+                .mint(restricted, |_| true, |_| true, |_| None)
+                .is_ok()
+        );
+        let mut outside = engine(&["qoh"], Some(ALICE), all.clone());
+        outside.project = Some("other".into());
+        for bad in [
+            outside,
+            engine(&["qoh"], None, all.clone()),
+            engine(&["qoh"], Some("owner"), all.clone()),
+            engine(&["qoh"], Some("usr_nothex"), all.clone()),
+            engine(&[], Some(ALICE), all.clone()),
+            engine(&["qoh"], Some(ALICE), vec![]),
+            engine(&["qoh", "qoh"], Some(ALICE), all.clone()),
+            engine(&["Bad_Project"], Some(ALICE), all.clone()),
+        ] {
+            assert!(tokens.mint(bad, |_| true, |_| true, |_| None).is_err());
+        }
+        // Engine operations alone do not satisfy a workspace grant.
+        let mut mixed = request(None);
+        mixed.operations = all.clone();
+        mixed.engine_sessions = vec![EngineSessionsGrant {
+            project: "qoh".into(),
+        }];
+        mixed.member = Some(ALICE.into());
+        assert!(tokens.mint(mixed, |_| true, |_| true, |_| None).is_err());
+    }
+    #[test]
     fn secrets_are_hashed_shown_once_and_revocation_persists() {
         let temp = tempfile::tempdir().unwrap();
         let tokens = ServiceTokens::open(temp.path()).unwrap();
@@ -765,6 +960,8 @@ mod tests {
                     project: None,
                     repositories: BTreeSet::new(),
                     org_id: None,
+                    engine_sessions: BTreeSet::new(),
+                    member: None,
                 };
                 tokens.save(&token).unwrap();
                 map.insert(id, token);

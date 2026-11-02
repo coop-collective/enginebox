@@ -25,6 +25,12 @@ export type PoolGrant = { pool: string; profile: string | null; project?: string
  * tokens and name a repository on a run. `read`: list, read and mint read tokens.
  */
 export type RepositoryGrant = { project: string; access: "read" | "write" };
+/**
+ * Consented engine sessions in one project (docs/ENGINE-SESSIONS.md), acting as the consenting member
+ * (the grant's `user_id`, in its org): starts run on that member's own engine machine with their own Unity
+ * account, and only that member's sessions (and their stream blocks) are visible.
+ */
+export type EngineSessionsGrant = { project: string };
 
 export type Client = {
   client_id: string;
@@ -64,6 +70,8 @@ export type Code = {
   pools?: PoolGrant[];
   /** Absent in state written before repository grants existed. */
   repositories?: RepositoryGrant[];
+  /** Absent in state written before engine-session grants existed. */
+  engine_sessions?: EngineSessionsGrant[];
   /** Restricts the grant's pools to one project (absent or null: no restriction). */
   project?: string | null;
   expires_at: number;
@@ -87,6 +95,8 @@ export type Grant = {
   pools?: PoolGrant[];
   /** Absent in state written before repository grants existed. */
   repositories?: RepositoryGrant[];
+  /** Absent in state written before engine-session grants existed. Acts as `user_id` in `org_id`. */
+  engine_sessions?: EngineSessionsGrant[];
   /**
    * HMAC key the controller signs this grant's run callbacks with. Passed to
    * every access token minted for the grant, returned to the client once at

@@ -14,13 +14,12 @@
 //! minted on demand, held only in memory and handed only to the node and
 //! epoch the session is placed on. They are never written to a record.
 //!
-//! Callers today: the owner token, and members through the dashboard (the
-//! owner token plus `X-EngineBox-Org` / `X-EngineBox-Actor`).
-//! TODO(engine-sessions OAuth): a service-token grant
-//! `{kind:"engine_sessions", project}` with operations
-//! `engine_sessions.start|get|renew|end` and the `engine-sessions` OAuth scope,
-//! so Gamejam can start sessions as an OAuth client (design note in
-//! docs/ENGINE-SESSIONS.md, "OAuth").
+//! Callers: the owner token, members through the dashboard (the owner token
+//! plus `X-EngineBox-Org` / `X-EngineBox-Actor`), and service tokens with an
+//! engine-session grant (`engine_sessions.start|get|renew|end` on a project,
+//! the OAuth `engine-sessions` scope), which act as the member who consented:
+//! the `actor` here is then that member, taken from the token
+//! (docs/ENGINE-SESSIONS.md, "Who can call it").
 use anyhow::{Context, Result, ensure};
 use enginebox_core::state;
 use serde::{Deserialize, Serialize};

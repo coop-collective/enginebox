@@ -527,6 +527,45 @@ impl Principal {
 
 /// A service token may reach only the agent-run routes it was granted, on its
 /// own workspaces. Every other route, including token minting, is refused.
+/// The engine-session operation and project a member-facing engine-session
+/// route needs (docs/ENGINE-SESSIONS.md). The owner-wide routes
+/// (`/v1/engine-sessions…`) are not among them.
+fn engine_session_route<'a>(
+    method: &Method,
+    parts: &[&'a str],
+) -> Option<(service_tokens::Operation, &'a str)> {
+    use service_tokens::Operation;
+    match (method, parts) {
+        (&Method::GET, ["v1", "projects", project, "engine-sessions"])
+        | (&Method::GET, ["v1", "projects", project, "engine-sessions", _]) => {
+            Some((Operation::EngineGet, project))
+        }
+        (&Method::POST, ["v1", "projects", project, "engine-sessions"]) => {
+            Some((Operation::EngineStart, project))
+        }
+        (&Method::POST, ["v1", "projects", project, "engine-sessions", _, "renew"]) => {
+            Some((Operation::EngineRenew, project))
+        }
+        (&Method::POST, ["v1", "projects", project, "engine-sessions", _, "end"]) => {
+            Some((Operation::EngineEnd, project))
+        }
+        _ => None,
+    }
+}
+
+/// The member a service token's engine-session request acts as: the user
+/// who consented to its grant, never a header the caller sets. None when the
+/// request is not an engine-session route the token holds.
+fn service_engine_member(
+    token: &service_tokens::Token,
+    method: &Method,
+    path: &str,
+) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (operation, project) = engine_session_route(method, &parts)?;
+    token.engine_member(operation, project).map(str::to_owned)
+}
+
 fn service_allows(
     token: &service_tokens::Token,
     method: &Method,
@@ -535,6 +574,10 @@ fn service_allows(
 ) -> bool {
     use service_tokens::Operation;
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Engine sessions: the token's own member's sessions in a granted project.
+    if let Some((operation, project)) = engine_session_route(method, &parts) {
+        return token.engine_member(operation, project).is_some();
+    }
     let pool_ok =
         |operation, pool: &str| token.allows_pool(operation, pool, project_of(pool).as_deref());
     match (method, parts.as_slice()) {
@@ -682,6 +725,12 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
     let actor = match acting_actor(&principal, request.headers()) {
         Ok(actor) => actor,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    // A service token's engine-session request acts as the member who
+    // consented to its grant (the session's starter), from the token alone.
+    let actor = match &principal {
+        Principal::Service(token) => service_engine_member(token, &method, &path).unwrap_or(actor),
+        Principal::Owner => actor,
     };
     let project_of = |pool: &str| {
         controller
@@ -1806,8 +1855,9 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
 
 /// `POST /v1/projects/{p}/engine-sessions` (start), `…/{id}/renew`,
 /// `…/{id}/end`, and the owner's `POST /v1/engine-sessions/{id}/end`.
-/// Owner token (the dashboard names the member); service tokens are refused
-/// by `service_allows` until the OAuth grant exists.
+/// Owner token (the dashboard names the member), or a service token with an
+/// engine-session grant acting as its member (`service_allows`,
+/// `service_engine_member`); service tokens never reach the owner end.
 fn engine_session_write(
     runtime: &Runtime,
     org: &str,
@@ -6360,18 +6410,107 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED, "{created}");
         assert_eq!(created["state"], "placed");
         let id = created["id"].as_str().unwrap().to_owned();
-        // Service tokens are not granted engine sessions yet.
+        // A repository grant is no engine-session grant.
         let (_, secret) = mint(
             &app,
             json!({"label":"repo","scopes":[],"operations":[],"repositories":[{"project":"qoh","access":"write"}]}),
         )
         .await;
-        let mut as_service = request(Method::GET, path, "", false);
-        as_service.headers_mut().insert(
-            header::AUTHORIZATION,
-            format!("Bearer {secret}").parse().unwrap(),
+        let as_token = |method: Method, path: &str, body: Value, secret: &str| {
+            let mut r = request(method, path, &body.to_string(), false);
+            r.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {secret}").parse().unwrap(),
+            );
+            // A caller-set actor header never changes who a token acts as.
+            r.headers_mut()
+                .insert(catalog::ACTOR_HEADER, BOB.parse().unwrap());
+            r
+        };
+        assert_eq!(
+            call(&app, as_token(Method::GET, path, json!({}), &secret))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
         );
-        assert_eq!(call(&app, as_service).await.0, StatusCode::FORBIDDEN);
+        // OAuth engine-session grants act as the member who consented.
+        let engine_ops = json!([
+            "engine_sessions.start",
+            "engine_sessions.get",
+            "engine_sessions.renew",
+            "engine_sessions.end"
+        ]);
+        let grant = |member: &str, project: &str| {
+            json!({"label":"gamejam","scopes":[],"operations":engine_ops,
+                "engine_sessions":[{"project":project}],"member":member})
+        };
+        let (_, alice_token) = mint(&app, grant(ALICE, "qoh")).await;
+        let (_, bob_token) = mint(&app, grant(BOB, "qoh")).await;
+        let (_, elsewhere_token) = mint(&app, grant(ALICE, "other")).await;
+        // Malformed grants are refused at mint.
+        for bad in [
+            json!({"label":"x","scopes":[],"operations":engine_ops,"engine_sessions":[{"project":"qoh"}]}),
+            grant("owner", "qoh"),
+            grant("alice", "qoh"),
+            json!({"label":"x","scopes":[],"operations":["engine_sessions.get"],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":[],"engine_sessions":[{"project":"qoh"}],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":engine_ops,"engine_sessions":[{"project":"qoh"}],"member":ALICE,"project":"other"}),
+        ] {
+            let (status, refused) = call(
+                &app,
+                request(Method::POST, "/v1/service-tokens", &bad.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {refused}");
+        }
+        // Owner-only routes, other projects and agent runs stay closed.
+        for (method, route, secret) in [
+            (Method::GET, "/v1/engine-sessions".to_owned(), &alice_token),
+            (
+                Method::POST,
+                format!("/v1/engine-sessions/{id}/end"),
+                &alice_token,
+            ),
+            (
+                Method::GET,
+                "/v1/projects/other/engine-sessions".to_owned(),
+                &alice_token,
+            ),
+            (Method::GET, format!("{path}/{id}"), &elsewhere_token),
+            (Method::GET, "/v1/agent-runs".to_owned(), &alice_token),
+            (Method::GET, "/v1/credentials".to_owned(), &alice_token),
+            (
+                Method::GET,
+                "/v1/projects/qoh/repositories".to_owned(),
+                &alice_token,
+            ),
+        ] {
+            let (status, reply) = call(&app, as_token(method, &route, json!({}), secret)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{route} {reply}");
+        }
+        // Another member's token sees none of Alice's sessions.
+        let (status, listed) = call(&app, as_token(Method::GET, path, json!({}), &bob_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["sessions"], json!([]));
+        let (status, listed) =
+            call(&app, as_token(Method::GET, path, json!({}), &alice_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["sessions"][0]["id"], id.as_str());
+        // A get-only token cannot start.
+        let (_, reader) = mint(
+            &app,
+            json!({"label":"read","scopes":[],"operations":["engine_sessions.get"],
+                "engine_sessions":[{"project":"qoh"}],"member":ALICE}),
+        )
+        .await;
+        let mut second = start.clone();
+        second["request_id"] = json!("qoh-token-1");
+        assert_eq!(
+            call(&app, as_token(Method::POST, path, second.clone(), &reader))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         // The engine channel: a stale epoch is refused; the current one gets secrets.
         let mut stale = json!({"session":session,"epoch":0});
         assert_eq!(
@@ -6419,11 +6558,90 @@ mod tests {
                 .0,
             StatusCode::NOT_FOUND
         );
+        // Alice's token reads her stream block; Bob's token gets nothing, and
+        // cannot renew or end her session.
+        let (status, by_token) =
+            call(&app, as_token(Method::GET, &one, json!({}), &alice_token)).await;
+        assert_eq!(status, StatusCode::OK, "{by_token}");
+        assert_eq!(by_token["stream"]["audience"]["token"], subscribe);
+        assert_eq!(
+            by_token["stream"]["control"]["control_key"],
+            read["stream"]["control"]["control_key"]
+        );
+        let lease = created["lease"].as_str().unwrap();
+        for (method, route, body) in [
+            (Method::GET, one.clone(), json!({})),
+            (
+                Method::POST,
+                format!("{one}/renew"),
+                json!({"lease":lease,"ttl_seconds":600}),
+            ),
+            (Method::POST, format!("{one}/end"), json!({})),
+        ] {
+            let (status, reply) = call(&app, as_token(method, &route, body, &bob_token)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route} {reply}");
+            assert!(!reply.to_string().contains(subscribe));
+        }
+        let (status, renewed) = call(
+            &app,
+            as_token(
+                Method::POST,
+                &format!("{one}/renew"),
+                json!({"lease":lease,"ttl_seconds":900}),
+                &alice_token,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{renewed}");
+        // A token start is Alice's own session (queued: her one machine is busy),
+        // which she then ends with the same token.
+        let (status, queued) = call(
+            &app,
+            as_token(Method::POST, path, second.clone(), &alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+        let queued_id = queued["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            call(
+                &app,
+                as_member(
+                    Method::GET,
+                    &format!("{path}/{queued_id}"),
+                    json!({}),
+                    ALICE
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &app,
+                as_member(Method::GET, &format!("{path}/{queued_id}"), json!({}), BOB)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, ended) = call(
+            &app,
+            as_token(
+                Method::POST,
+                &format!("{path}/{queued_id}/end"),
+                json!({}),
+                &alice_token,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ended}");
+        assert_eq!(ended["state"], "ended");
         let (_, owner) = call(&app, request(Method::GET, &one, "", true)).await;
         assert_eq!(owner["state"], "ready");
         assert!(owner.get("stream").is_none());
         let (_, all) = call(&app, request(Method::GET, "/v1/engine-sessions", "", true)).await;
-        assert_eq!(all["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
         // Renew with the lease, then end; the node is told to stop.
         let lease = created["lease"].as_str().unwrap();
         let (status, _) = call(

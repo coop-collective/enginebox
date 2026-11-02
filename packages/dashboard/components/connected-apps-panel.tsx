@@ -11,6 +11,8 @@ type Connection = {
   workspaces: { host: string; instance: string; profiles: string[] }[];
   pools?: { pool: string; profile: string | null; project?: string }[];
   repositories?: { project: string; access: "read" | "write" }[];
+  /** Engine sessions it runs as the approving member, by project. */
+  engine_sessions?: { project: string }[];
   /** The connection is restricted to this project's pools. */
   project?: string | null;
   created_at: string;
@@ -88,7 +90,7 @@ export function ConnectedAppsPanel() {
       <article className="host-card">
         <h3>Connect an app with OAuth</h3>
         <p>App integrations use OAuth and the scoped HTTP API at <code>{publicOrigin || "this dashboard's public origin"}</code>. This is a separate connection method: there is currently no remote <code>/mcp</code> endpoint to paste into a URL-only MCP client.</p>
-        <p>An app discovers <code>/.well-known/oauth-authorization-server</code>, registers at <code>/oauth/register</code>, and sends you through <code>/oauth/authorize</code>. Approve only the project pools, environments and repository access it needs. The app exchanges and refreshes its own scoped token at <code>/oauth/token</code>.</p>
+        <p>An app discovers <code>/.well-known/oauth-authorization-server</code>, registers at <code>/oauth/register</code>, and sends you through <code>/oauth/authorize</code>. Approve only the project pools, environments, repository access and engine sessions it needs. The app exchanges and refreshes its own scoped token at <code>/oauth/token</code>.</p>
         <p><a href="https://github.com/coop-collective/enginebox/blob/main/docs/OAUTH.md" target="_blank" rel="noopener noreferrer">OAuth integration guide and supported API routes</a></p>
       </article>
       <h3>Connected apps and grants</h3>
@@ -123,6 +125,11 @@ export function ConnectedAppsPanel() {
               {(c.repositories ?? []).map((r) => (
                 <li key={`repositories:${r.project}`}>
                   repositories in project <code>{r.project}</code> · {r.access === "write" ? "read and write" : "read only"}
+                </li>
+              ))}
+              {(c.engine_sessions ?? []).map((e) => (
+                <li key={`engine_sessions:${e.project}`}>
+                  live engine sessions in project <code>{e.project}</code> · as the member who approved it
                 </li>
               ))}
             </ul>
