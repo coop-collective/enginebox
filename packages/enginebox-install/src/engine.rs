@@ -1105,6 +1105,103 @@ pub fn prepare_project(
     Ok((project, config, token_file, port))
 }
 
+/// Checks in a row (about two seconds apart) that something other than the
+/// bridge must hold the bridge's port before the node moves it.
+pub const BRIDGE_PORT_STRIKES: u32 = 3;
+/// Port moves a session allows before it fails.
+pub const BRIDGE_PORT_MOVES: u32 = 5;
+
+/// A free loopback port, released for the bridge to bind.
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port())
+}
+/// Whether something already listens on `127.0.0.1:port`.
+fn port_held(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
+/// The Editor bridge's loopback port. The node picks a free port and writes
+/// it into `bridge.json`, but another program can take it before Unity binds
+/// it. The bridge then fails its start and retries on every Editor update,
+/// reading `bridge.json` again each time. So when the port stays held by
+/// something that does not answer as the bridge, the node writes a new free
+/// port there and waits on that one instead. `port` is always the port the
+/// bridge was last told, and it is the one the stream host is given once the
+/// bridge answers on it.
+pub struct BridgePort {
+    pub port: u16,
+    token: String,
+    config: PathBuf,
+    strikes: u32,
+    pub moves: u32,
+}
+impl BridgePort {
+    pub fn new(port: u16, token: &str, config: &Path) -> Self {
+        Self {
+            port,
+            token: token.trim().to_owned(),
+            config: config.to_owned(),
+            strikes: 0,
+            moves: 0,
+        }
+    }
+    /// The bridge's status when it answers on the current port. Otherwise
+    /// `None`, after moving the bridge to a new port if a foreign listener
+    /// has held this one for [`BRIDGE_PORT_STRIKES`] checks.
+    pub async fn check(&mut self) -> Result<Option<Value>> {
+        if let Some(status) = bridge_status(self.port, &self.token).await
+            && status["type"] == "unity-editor"
+        {
+            self.strikes = 0;
+            return Ok(Some(status));
+        }
+        if !port_held(self.port) {
+            // Free: the Editor is still importing or compiling.
+            self.strikes = 0;
+            return Ok(None);
+        }
+        self.strikes += 1;
+        if self.strikes < BRIDGE_PORT_STRIKES {
+            return Ok(None);
+        }
+        ensure!(
+            self.moves < BRIDGE_PORT_MOVES,
+            "The Unity editor bridge could not keep a local port: another program on the engine machine kept taking it"
+        );
+        let next = free_port()?;
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&self.config)?)?;
+        config["port"] = json!(next);
+        atomic_json(&self.config, &config)?;
+        self.port = next;
+        self.moves += 1;
+        self.strikes = 0;
+        Ok(None)
+    }
+    /// Wait (up to `limit`) until the bridge answers, moving its port if needed.
+    pub async fn answering(
+        &mut self,
+        limit: Duration,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let t = Instant::now();
+        loop {
+            if self.check().await?.is_some() {
+                return Ok(());
+            }
+            ensure!(
+                t.elapsed() < limit,
+                "The Unity editor bridge stopped answering"
+            );
+            tokio::select! {
+                _ = cancelled(stop) => bail!("Stopped"),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+        }
+    }
+}
+
 /// The bridge's `/status`, when it answers.
 async fn bridge_status(port: u16, token: &str) -> Option<Value> {
     let client = reqwest::Client::builder()
@@ -1166,7 +1263,7 @@ pub async fn run_session(
         report("preparing", None, json!({"commit": commit}));
         let (project, bridge_json, token_file, port) =
             prepare_project(&ctx, &spec, &checkout, &session_dir)?;
-        let bridge_token = std::fs::read_to_string(&token_file)?;
+        let mut bridge = BridgePort::new(port, &std::fs::read_to_string(&token_file)?, &bridge_json);
         let pids = PidRecord::new(ctx.private.join("engine-pids.json"));
         let mut g = Group::new()?;
         if ctx.config.unity_region.as_deref() == Some("global") {
@@ -1223,7 +1320,7 @@ pub async fn run_session(
         let editor_pid = g.child(editor_index).id().unwrap_or(0);
         let mut dialog: Option<(String, Instant)> = None;
         loop {
-            if let Some(status) = bridge_status(port, bridge_token.trim()).await
+            if let Some(status) = bridge.check().await?
                 && status["playing"] == true
                 && status["view"] == "play"
             {
@@ -1253,14 +1350,19 @@ pub async fn run_session(
             }
         }
         receipt["editor_ready_seconds"] = json!(t.elapsed().as_secs());
+        receipt["bridge_port_moves"] = json!(bridge.moves);
         // The stream host, restarted while the session runs (its permit is fixed).
         let session_file = session_dir.join("moq-session.json");
         let mut ready = false;
         let mut quick_failures = 0;
         loop {
+            // Always the port the bridge answers on now (it may have moved
+            // after a domain reload let another program take the old one).
+            bridge.answering(Duration::from_secs(120), &mut stop).await?;
+            receipt["bridge_port_moves"] = json!(bridge.moves);
             std::fs::write(
                 &session_file,
-                serde_json::to_vec(&stream_session(&spec, &secrets.moq, port, &token_file, &ctx.config.ffmpeg))?,
+                serde_json::to_vec(&stream_session(&spec, &secrets.moq, bridge.port, &token_file, &ctx.config.ffmpeg))?,
             )?;
             let mut host = Command::new(&ctx.config.stream_host);
             host.arg("--moq-session")
@@ -1587,6 +1689,115 @@ pub fn report_body(session: &str, epoch: u64, r: &Report) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loopback HTTP server answering every request with `reply` (status line and body).
+    fn serve_http(reply: &'static str) -> std::net::TcpListener {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in server.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let request = String::from_utf8_lossy(&buf).to_string();
+                let (status, body) = if request.contains(&format!("Bearer {}", "b".repeat(64))) {
+                    reply.split_once('|').unwrap()
+                } else {
+                    ("403 Forbidden", "")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        listener
+    }
+    fn bridge_file(dir: &Path, port: u16) -> PathBuf {
+        let config = dir.join("bridge.json");
+        std::fs::write(
+            &config,
+            json!({"port": port, "token": "b".repeat(64), "width": 1280}).to_string(),
+        )
+        .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn a_bridge_port_taken_by_another_program_moves_to_a_free_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Another program answers HTTP on the port the bridge was given.
+        let foreign = serve_http("404 Not Found|{}");
+        let taken = foreign.local_addr().unwrap().port();
+        let config = bridge_file(dir.path(), taken);
+        let mut bridge = BridgePort::new(taken, &"b".repeat(64), &config);
+        for _ in 1..BRIDGE_PORT_STRIKES {
+            assert!(bridge.check().await.unwrap().is_none());
+            assert_eq!(bridge.port, taken, "a moment's conflict is not a move");
+        }
+        assert!(bridge.check().await.unwrap().is_none());
+        assert_ne!(bridge.port, taken);
+        assert_eq!(bridge.moves, 1);
+        let written: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(written["port"], bridge.port);
+        assert_eq!(
+            written["token"],
+            "b".repeat(64),
+            "the rest of the config is kept"
+        );
+        assert_eq!(written["width"], 1280);
+        // Nothing listens on the new port yet (the Editor is still retrying): no strikes.
+        for _ in 0..BRIDGE_PORT_STRIKES + 1 {
+            assert!(bridge.check().await.unwrap().is_none());
+        }
+        assert_eq!(bridge.moves, 1);
+        drop(foreign);
+    }
+
+    #[tokio::test]
+    async fn the_bridge_answering_on_its_port_is_never_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge_server =
+            serve_http(r#"200 OK|{"type":"unity-editor","playing":true,"view":"play"}"#);
+        let port = bridge_server.local_addr().unwrap().port();
+        let config = bridge_file(dir.path(), port);
+        let mut bridge = BridgePort::new(port, &format!("{}\n", "b".repeat(64)), &config);
+        for _ in 0..BRIDGE_PORT_STRIKES * 2 {
+            let status = bridge.check().await.unwrap().unwrap();
+            assert_eq!(status["playing"], true);
+        }
+        assert_eq!((bridge.port, bridge.moves), (port, 0));
+        let (_, mut stop) = watch::channel(false);
+        bridge
+            .answering(Duration::from_secs(5), &mut stop)
+            .await
+            .unwrap();
+        // A listener that answers 200 but is not the bridge still counts as foreign.
+        let impostor = serve_http(r#"200 OK|{"ok":true}"#);
+        let held = impostor.local_addr().unwrap().port();
+        let mut other = BridgePort::new(held, &"b".repeat(64), &bridge_file(dir.path(), held));
+        for _ in 0..BRIDGE_PORT_STRIKES {
+            other.check().await.unwrap();
+        }
+        assert_ne!(other.port, held);
+    }
+
+    #[tokio::test]
+    async fn a_port_that_keeps_being_taken_fails_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = serve_http("404 Not Found|{}");
+        let taken = foreign.local_addr().unwrap().port();
+        let config = bridge_file(dir.path(), taken);
+        let mut bridge = BridgePort::new(taken, &"b".repeat(64), &config);
+        bridge.moves = BRIDGE_PORT_MOVES;
+        for _ in 1..BRIDGE_PORT_STRIKES {
+            bridge.check().await.unwrap();
+        }
+        let error = bridge.check().await.unwrap_err().to_string();
+        assert!(error.contains("could not keep a local port"), "{error}");
+    }
 
     #[test]
     fn known_blocking_dialogs_are_recognised() {
