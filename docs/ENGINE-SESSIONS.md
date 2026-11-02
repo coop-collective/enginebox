@@ -147,7 +147,8 @@ reports in order. If the engine channel fails for a minute, it stops its session
      "ffmpeg": "C:\\Enginebox\\engine-tools\\ffmpeg\\bin\\ffmpeg.exe",
      "editor_bridge": "C:\\Enginebox\\engine-tools\\unity-editor-bridge",
      "git": "C:\\Program Files\\Git\\cmd\\git.exe",
-     "startup_timeout_seconds": 3600
+     "startup_timeout_seconds": 3600,
+     "unity_region": "global"
    }
    ```
 
@@ -187,13 +188,20 @@ reports in order. If the engine channel fails for a minute, it stops its session
 - The licensing client writes its command line, access token included, to `%LOCALAPPDATA%\Unity\Unity.Licensing.Client.log`.
   The node replaces the token with `<redacted>` in those logs right after activation, whether or not it succeeded
   (`licensing_logs_scrubbed` in the receipt).
-- A new engine account has never accepted Unity's Editor Software Terms, and the Editor would wait at that dialog
-  before writing its log. The node passes `-acceptSoftwareTermsForThisRunOnly`, as Unity's CLI does for unattended
-  opens; the member accepted the terms with the Unity account the session uses.
-- Region: Unity's config CDN (`public-cdn.cloud.unity3d.com/config/production`) answers by IP. From mainland China
-  or Hong Kong it redirects to Unity China, whose license server does not know global Unity IDs (`Token not found in
-  cache`). The global license, activation and identity hosts work from those networks; pin the global config in the
-  engine account's `%LOCALAPPDATA%\Unity\config\production.json` (read-only for that account) on such machines.
+- **Editor terms.** A new engine account has never accepted Unity's Editor Software Terms, and the Editor waits at that
+  dialog (window class `EditorSoftwareTermsWindowClass`) before writing its log. Before each launch the node reads the
+  `Terms-<hash>` key the Editor build checks (from `Editor\Unity.dll`) and records it in the engine account's
+  EditorPrefs (`HKCU\Software\Unity Technologies\Unity Editor 5.x`, `<key>_h<djb2-xor>` = 1), as Accept does; the member
+  accepted the terms with the Unity account the session uses (`unity_terms_key` in the receipt). It also passes
+  `-acceptSoftwareTermsForThisRunOnly`, which newer Editors honour.
+- **Region.** Unity's config CDN (`public-cdn.cloud.unity3d.com/config/production`) answers by IP; from mainland China or
+  Hong Kong it redirects to Unity China, whose license server does not know global Unity IDs (`Token not found in
+  cache`). The global license, activation and identity hosts work from those networks. With `"unity_region": "global"`
+  the node pins the licensing client's cached `%LOCALAPPDATA%\Unity\config\production.json` to the global services
+  (a copy shipped with the node) and leaves it read-only (`unity_region_pinned` in the receipt).
+- **Editor bridge.** Unity writes `.meta` files into `file:` packages, and a missing one in a read-only package keeps the
+  Editor at "Opening project" forever. The node copies `editor_bridge` into its own `work\engine\packages`
+  (keyed by content, refreshed when the bridge changes) and references the copy.
 
 ### Known v1 limits
 
