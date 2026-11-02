@@ -21,7 +21,7 @@ import { memberCookie } from "./session-fixture";
 
 // Engine sessions over OAuth (docs/ENGINE-SESSIONS.md, "Who can call it").
 
-const ENGINE_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end"];
+const ENGINE_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end", "engine_sessions.watch"];
 const userId = (email: string) => userByEmail(readIdentity(), email)!.id;
 /** A plain member (not an admin) of the platform org, signed in. */
 function plainMember(email = "dev@fixture.example") {
@@ -79,6 +79,9 @@ test("engine sessions are offered only for the engine-sessions scope; the token 
   const read = await (await call(`${base}/${session.id}`, tokens.access_token)).json();
   assert.equal(read.stream.audience.token, "subscribe-jwt");
   assert.equal((await call(`${base}/${session.id}/renew`, tokens.access_token, "POST", { lease: session.lease, ttl_seconds: 600 })).status, 200);
+  const watch = await call(`${base}/${session.id}/watch-token`, tokens.access_token, "POST", {});
+  assert.equal(watch.status, 200);
+  assert.equal((await watch.json()).token, "watch-jwt");
   assert.equal((await call(`${base}/${session.id}/end`, tokens.access_token, "POST", {})).status, 200);
   for (const c of controller.calls.filter((c) => c.path.includes("engine-sessions"))) {
     assert.equal(c.auth, `Bearer ${tokens.access_token}`);
@@ -97,6 +100,7 @@ test("engine sessions are offered only for the engine-sessions scope; the token 
     ["GET", `${base}/not-an-id`],
     ["POST", `${base}/${session.id}`],
     ["GET", `${base}/${session.id}/renew`],
+    ["GET", `${base}/${session.id}/watch-token`],
     ["POST", `${base}/${session.id}/stop`],
     ["GET", "v1/projects/Alpha/engine-sessions"],
   ] as const)
@@ -128,6 +132,7 @@ test("one token never sees another member's engine sessions", async (t) => {
     ["GET", `${base}/${session.id}`],
     ["POST", `${base}/${session.id}/renew`],
     ["POST", `${base}/${session.id}/end`],
+    ["POST", `${base}/${session.id}/watch-token`],
   ] as const) {
     const refused = await call(path, devToken, method, method === "POST" ? { lease: session.lease, ttl_seconds: 600 } : undefined);
     assert.equal(refused.status, 404, `${method} ${path}`);

@@ -133,7 +133,7 @@ export function consentPage(opts: {
     .join("");
   const any = (showAgentRuns && (opts.workspaces.length > 0 || pools.length > 0 || repositoryProjects.length > 0)) || engineProjects.length > 0;
   const engineNote = engineProjects.length
-    ? ` For engine sessions it acts as you: it can start, read, renew and end only your own sessions in the projects you tick (including their live stream), never anyone else's.`
+    ? ` For engine sessions it acts as you: it can start, read, renew and end only your own sessions in the projects you tick (including their live stream and its controls), and hand out watch-only access to their stream (for example to viewers of a public room), never anyone else's.`
     : "";
   const agentRunSections = showAgentRuns
     ? (pools.length ? `<fieldset><legend>${poolLegend}</legend>${poolList}</fieldset>` : "") +

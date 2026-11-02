@@ -40,12 +40,20 @@ pub enum Operation {
     EngineRenew,
     #[serde(rename = "engine_sessions.end")]
     EngineEnd,
+    /// Mint public watch tokens (subscribe-only, short-lived) for the
+    /// member's ready sessions.
+    #[serde(rename = "engine_sessions.watch")]
+    EngineWatch,
 }
 impl Operation {
     pub fn engine(self) -> bool {
         matches!(
             self,
-            Self::EngineStart | Self::EngineGet | Self::EngineRenew | Self::EngineEnd
+            Self::EngineStart
+                | Self::EngineGet
+                | Self::EngineRenew
+                | Self::EngineEnd
+                | Self::EngineWatch
         )
     }
 }

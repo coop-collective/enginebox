@@ -966,6 +966,8 @@ export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}$`)],
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/renew$`)],
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/end$`)],
+  // A short-lived subscribe-only token for the session's own relay (public viewers; no control).
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/watch-token$`)],
 ];
 const ENGINE_ROUTE = new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions(?:/|$)`);
 

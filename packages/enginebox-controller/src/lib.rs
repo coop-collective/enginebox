@@ -13,6 +13,7 @@ mod environment;
 pub mod jobs;
 pub mod kitbash;
 pub mod metering;
+pub mod moq;
 pub mod previews;
 pub mod profiles;
 pub mod repo_config;
@@ -82,6 +83,8 @@ struct Runtime {
     usage: Arc<dyn metering::UsageSink>,
     credentials: credentials::Credentials,
     engine_sessions: engine_sessions::EngineSessions,
+    /// Cloudflare's API base for per-session MoQ relays (moq.rs).
+    moq_api: String,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -111,6 +114,8 @@ pub struct Controller {
     usage_sink: Mutex<Arc<dyn metering::UsageSink>>,
     /// Test harnesses stand in for Unity's login endpoint (unity.rs).
     unity_login: Mutex<Option<String>>,
+    /// Test harnesses stand in for Cloudflare's MoQ relay API (moq.rs).
+    moq_api: Mutex<Option<String>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -148,6 +153,7 @@ impl Controller {
             preview_api: Mutex::new(None),
             usage_sink: Mutex::new(metering::noop()),
             unity_login: Mutex::new(None),
+            moq_api: Mutex::new(None),
         }))
     }
     /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
@@ -233,6 +239,12 @@ impl Controller {
             },
             tenancy: tenancy::Tenancy::open(&self.root)?,
             engine_sessions: engine_sessions::EngineSessions::open(&self.root)?,
+            moq_api: self
+                .moq_api
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| moq::API_BASE.to_owned()),
             credentials: {
                 let store =
                     credentials::Credentials::open(&self.root, &std::collections::BTreeMap::new())?;
@@ -335,6 +347,11 @@ impl Controller {
     #[doc(hidden)]
     pub fn set_unity_login_url(&self, url: &str) {
         *self.unity_login.lock().unwrap() = Some(url.to_owned());
+    }
+    /// Stand in for Cloudflare's API base. Takes effect at the next activation.
+    #[doc(hidden)]
+    pub fn set_moq_api_url(&self, url: &str) {
+        *self.moq_api.lock().unwrap() = Some(url.to_owned());
     }
     #[doc(hidden)]
     pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
@@ -549,6 +566,17 @@ fn engine_session_route<'a>(
         (&Method::POST, ["v1", "projects", project, "engine-sessions", _, "end"]) => {
             Some((Operation::EngineEnd, project))
         }
+        (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "engine-sessions",
+                _,
+                "watch-token",
+            ],
+        ) => Some((Operation::EngineWatch, project)),
         _ => None,
     }
 }
@@ -1845,6 +1873,30 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
             _ => Err(engine_sessions::relay_missing()),
         }
     }
+    fn relay_broker(&self) -> Result<Option<Arc<dyn moq::Broker>>> {
+        let value = |name| {
+            self.0
+                .catalog
+                .connections
+                .source_value(
+                    enginebox_agents::pools::DEFAULT_ORG,
+                    engine_sessions::MOQ_CONNECTION,
+                    name,
+                )
+                .ok()
+        };
+        match (value(moq::API_TOKEN), value(moq::ACCOUNT_ID)) {
+            (None, None) => Ok(None),
+            (Some(token), Some(account)) => Ok(Some(Arc::new(
+                moq::Cloudflare::new(&self.0.moq_api, &account, &token).map_err(|error| {
+                    anyhow::anyhow!("The cloudflare-moq connection is invalid: {error}")
+                })?,
+            ))),
+            _ => anyhow::bail!(
+                "The cloudflare-moq connection needs both CLOUDFLARE_MOQ_API_TOKEN and CLOUDFLARE_ACCOUNT_ID for per-session relays."
+            ),
+        }
+    }
     fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value) {
         self.0
             .catalog
@@ -1875,6 +1927,9 @@ fn engine_session_write(
         (Some(project), [id, "renew"]) => sessions.renew(org, project, actor, id, body, &platform),
         (Some(project), [id, "end"]) => {
             sessions.end(Some(org), Some(project), actor, id, body, &platform)
+        }
+        (Some(project), [id, "watch-token"]) => {
+            sessions.watch_token(org, project, actor, id, body, &platform)
         }
         (None, [id, "end"]) if owner => sessions.end(None, None, actor, id, body, &platform),
         _ => Ok((404, json!({"error": "Unknown engine session operation."}))),
@@ -6295,6 +6350,8 @@ mod tests {
         let (_temp, c) = setup();
         let (url, _) = unity::fake::serve();
         c.set_unity_login_url(&url);
+        let cloudflare = moq::fake::serve();
+        c.set_moq_api_url(&cloudflare.url);
         c.activate().unwrap();
         let app = router(c.clone());
         let as_member = |method: Method, path: &str, body: Value, actor: &str| {
@@ -6675,6 +6732,138 @@ mod tests {
             std::fs::read_to_string(c.root.join(format!("engine-sessions/{id}.json"))).unwrap();
         for secret in [publish, subscribe, repo_token, unity::fake::TOKEN] {
             assert!(!disk.contains(secret));
+        }
+        // The node confirms the stop; the machine is free again.
+        let mut confirm = stale.clone();
+        confirm["id"] = json!(id);
+        confirm["generation"] = generation.clone();
+        confirm["state"] = json!("ended");
+        assert_eq!(
+            call(&app, node_post("engine-report", &token, confirm))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Per-session relays: the owner adds the Cloudflare API token and
+        // account to cloudflare-moq; the next session gets its own relay.
+        let (status, updated) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/connections/cloudflare-moq",
+                &json!({"secrets":{"CLOUDFLARE_MOQ_API_TOKEN":moq::fake::API_TOKEN,"CLOUDFLARE_ACCOUNT_ID":moq::fake::ACCOUNT}}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        let mut third = start.clone();
+        third["request_id"] = json!("qoh-relay");
+        let (status, created) = call(&app, as_token(Method::POST, path, third, &alice_token)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let relayed = created["id"].as_str().unwrap().to_owned();
+        let (_, polled) = call(&app, node_post("engine-poll", &token, stale.clone())).await;
+        let row = polled["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == relayed.as_str())
+            .unwrap()
+            .clone();
+        let relay = runtime.engine_sessions.relay_of(&relayed).unwrap();
+        let node_publish = row["secrets"]["moq"]["publish_token"].as_str().unwrap();
+        assert!(node_publish.contains(&relay) && node_publish != publish);
+        for state in ["preparing", "starting", "ready"] {
+            let mut report = stale.clone();
+            report["id"] = json!(relayed);
+            report["generation"] = row["generation"].clone();
+            report["state"] = json!(state);
+            assert_eq!(
+                call(&app, node_post("engine-report", &token, report))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let one = format!("{path}/{relayed}");
+        let (_, read) = call(&app, as_token(Method::GET, &one, json!({}), &alice_token)).await;
+        let audience = read["stream"]["audience"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(audience.contains(&relay) && audience != subscribe);
+        // Watch tokens: the owner, and a token holding engine_sessions.watch for
+        // the starter; not a token without it, and not another member's.
+        let watch = format!("{one}/watch-token");
+        assert_eq!(
+            call(
+                &app,
+                as_token(Method::POST, &watch, json!({}), &alice_token)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let watcher = |member: &str| {
+            json!({"label":"gamejam-watch","scopes":[],"operations":["engine_sessions.get","engine_sessions.watch"],
+                "engine_sessions":[{"project":"qoh"}],"member":member})
+        };
+        let (_, alice_watch) = mint(&app, watcher(ALICE)).await;
+        let (_, bob_watch) = mint(&app, watcher(BOB)).await;
+        let (status, watched) = call(
+            &app,
+            as_token(Method::POST, &watch, json!({}), &alice_watch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{watched}");
+        let public = watched["token"].as_str().unwrap();
+        assert!(public.contains(&relay) && public != audience);
+        assert!(watched.get("control").is_none());
+        assert_eq!(watched["namespace"], format!("eb-{relayed}"));
+        let ops = cloudflare
+            .live(&relay)
+            .into_iter()
+            .find(|t| t.secret == public)
+            .unwrap()
+            .operations;
+        assert_eq!(ops, ["subscribe"]);
+        assert_eq!(
+            call(&app, as_token(Method::POST, &watch, json!({}), &bob_watch))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, by_owner) = call(&app, request(Method::POST, &watch, "{}", true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(by_owner["token"], public);
+        // Ending (confirmed by the node) deletes the relay.
+        call(
+            &app,
+            as_token(Method::POST, &format!("{one}/end"), json!({}), &alice_token),
+        )
+        .await;
+        let mut done = stale.clone();
+        done["id"] = json!(relayed);
+        done["generation"] = row["generation"].clone();
+        done["state"] = json!("ended");
+        call(&app, node_post("engine-report", &token, done)).await;
+        assert!(cloudflare.state.lock().unwrap().deleted.contains(&relay));
+        // No relay secret reaches state on disk.
+        let mut secrets: Vec<String> = cloudflare
+            .state
+            .lock()
+            .unwrap()
+            .relays
+            .values()
+            .flatten()
+            .map(|t| t.secret.clone())
+            .collect();
+        secrets.extend([public.to_owned(), audience.clone(), node_publish.to_owned()]);
+        for secret in secrets {
+            assert!(
+                files_contain(&c.root, &secret).is_empty(),
+                "a relay token reached disk"
+            );
         }
     }
 }
