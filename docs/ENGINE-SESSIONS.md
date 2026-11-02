@@ -33,18 +33,19 @@ the rest is design, October 31, 2026.
 v1 is the personal-machine path only: a member starts the Unity Editor for a repository on **their own** Windows
 engine machine and gets a MoQ stream back. First target: Queen of Hearts on the owner's RTX 4080 machine. Everything
 below the "Design" heading that v1 does not list here (cloud Linux nodes, containers, LayerFS exports, measured
-admission, the per-session relay broker) is still design. OAuth landed on November 2 ("Who can call it").
+admission) is still design. OAuth landed on November 2 ("Who can call it"), and per-session relays with public watch
+tokens the same day ("Per-session relays").
 
 ### Who can call it
 
-- The owner token, and members through the dashboard (`/api/engine-sessions/{project}[/{id}[/renew|end]]`, which
+- The owner token, and members through the dashboard (`/api/engine-sessions/{project}[/{id}[/renew|end|watch-token]]`, which
   sends the owner token with `X-EngineBox-Org` and `X-EngineBox-Actor` from the member's session).
 - OAuth apps (Gamejam's hosted room) on the public origin, `https://<dashboard>/v1/projects/{p}/engine-sessions…`,
   with the `engine-sessions` scope ([OAuth](OAUTH.md#engine-sessions)). The member who consents ticks "Run live
   engine sessions in project X"; the grant (`{kind:"engine_sessions", project, member}` in `enginebox_grants`)
   records that member and their org. Its access token is a service token with `engine_sessions: [{project}]`,
-  `member` and the operations `engine_sessions.start|get|renew|end`; `service_allows` admits exactly the five
-  project routes (start, list, read, renew, end) on a granted project, and the controller takes the actor from the
+  `member` and the operations `engine_sessions.start|get|renew|end|watch`; `service_allows` admits exactly the six
+  project routes (start, list, read, renew, end, watch-token) on a granted project, and the controller takes the actor from the
   token's `member` (never from `X-EngineBox-Actor`) and the org from the token. So the token is that member: starts
   go to their own engine machine with their own Unity account, and only their reads carry the `stream` block.
   Other members' sessions are `404`; the owner-wide routes are `403` (and never forwarded by the proxy).
@@ -62,8 +63,15 @@ admission, the per-session relay broker) is still design. OAuth landed on Novemb
 - `GET /v1/projects/{p}/engine-sessions[/{id}]`: the member's own sessions (the owner token without a member sees
   all of the org's). When `ready`, **only the starting member's** read adds
   `stream:{relay_url, url, namespace, session, tag, width, height, audience:{token}, control:{control_key, token}}`
-  (`control.token` only when the owner configured `MOQ_CONTROL_TOKEN`, below). The
-  owner, other members and every other response never carry a token; the node's publish token never leaves the poll.
+  (with a per-session relay, `audience.token` is a subscribe-only token and `control.token` a publish+subscribe token
+  for that relay alone; on the shared relay they are `MOQ_SUBSCRIBE_TOKEN` and, when configured, `MOQ_CONTROL_TOKEN`).
+  Reads also show `relay`, the session's relay id (null on the shared relay). The owner, other members and every
+  other response never carry a token; the node's publish token never leaves the poll.
+- `POST …/{id}/watch-token {}` → `200 {relay_url, url, token, expires_at, expires_in, namespace, session, tag, width,
+  height}`: a subscribe-only token for the session's own relay, for viewers of a public room. No control key or
+  control token. Callers: the owner token, the starter, and a token with `engine_sessions.watch` acting as the
+  starter (Gamejam asks server-side for each public viewer). `409` when the session is not `ready` or has no relay of
+  its own; others' sessions are `404`. See "Per-session relays".
 - `POST …/{id}/renew {lease, ttl_seconds}`, `POST …/{id}/end {}` (or `{lease}`).
 - Owner: `GET /v1/engine-sessions`, `POST /v1/engine-sessions/{id}/end`.
 - `POST /v1/contributors/{node}/engine-owner {member}` (owner token; the dashboard's `…/{id}/engine-owner` sends the
@@ -100,7 +108,8 @@ Secrets are minted on demand and cached in memory per (session, generation) unti
   `MOQ_SUBSCRIBE_TOKEN` (operator tokens of the draft-16 Cloudflare relay, which the stream host fixes at
   `https://draft-16.cloudflare.mediaoverquic.com/<token>`). Each session gets its own namespace (`eb-<id>`),
   session UUID, tag and 32-byte control key. These operator tokens are relay-wide, not per namespace: anyone holding
-  the subscribe token can watch any session's namespace. The per-session relay broker (below) replaces this.
+  the subscribe token can watch any session's namespace. With the broker configured, each session gets its own relay
+  instead and `publish_token` is for that relay only ("Per-session relays").
 
 The dashboard's node proxy allows `engine-poll` and `engine-report`.
 
@@ -180,6 +189,9 @@ reports in order. If the engine channel fails for a minute, it stops its session
   the starting member's browser to act as the controlling client (it publishes `<namespace>-input` liveness and input
   with the control key). Without a controlling client the stream host ends itself about 15 s after start
   (`control-liveness-expired`) and the node restarts it, so a steady stream needs `MOQ_CONTROL_TOKEN`.
+- For per-session relays and public watching, the same connection also holds `CLOUDFLARE_MOQ_API_TOKEN` (a
+  Cloudflare API token with MoQ edit on the account) and `CLOUDFLARE_ACCOUNT_ID`. Both or neither: one without the
+  other fails every start with a clear reason.
 - Each member saves their Unity account on the Agents page (PR #92).
 - The repository is hosted or GitHub-linked in the project, or has an `engine-repo-<name>` connection.
 
@@ -222,11 +234,43 @@ reports in order. If the engine channel fails for a minute, it stops its session
   Editor at "Opening project" forever. The node copies `editor_bridge` into its own `work\engine\packages`
   (keyed by content, refreshed when the bridge changes) and references the copy.
 
+### Per-session relays (`packages/enginebox-controller/src/moq.rs`)
+
+Cloudflare MoQ tokens are scoped to a relay and to operations (`publish`, `subscribe`), never to a namespace, so a
+public viewer holding a relay-wide subscribe token could watch every session. With `CLOUDFLARE_MOQ_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` on `cloudflare-moq`, every session gets a relay of its own:
+
+- **Creation.** When the node first polls a placed session, the controller creates a relay
+  (`POST /accounts/{account}/moq/relays {name:"enginebox-session-<id>"}`), revokes the two year-long tokens Cloudflare
+  creates with it, and mints the node's publish+subscribe token (7 days; deleting the relay ends it sooner). The node
+  receives it in `secrets.moq.publish_token` as before; `relay_url` is unchanged, because a token's `sub` claim names
+  its relay and every relay is reached at `https://draft-16.cloudflare.mediaoverquic.com/<token>` (checked against
+  Cloudflare on November 2: a token of one relay receives that relay's objects, a token of another relay does not, and
+  a revoked token is refused).
+- **If creation fails, the start fails** (`failed`, "Engine Box could not create this session's MoQ relay
+  (Cloudflare MoQ relay creation failed (HTTP …)). Start the session again."). There is no fall back to the shared
+  relay: its subscribe token would let a public viewer watch every session. Without the two fields at all, sessions
+  keep using the shared relay as before, and `watch-token` answers `409`.
+- **Tokens.** The starter's read mints a subscribe-only and a publish+subscribe (control) token for the relay, 4 hours
+  each, reused while an hour remains. `watch-token` returns one shared subscribe-only token, 30 minutes, replaced once
+  less than 10 minutes remain, so every answer is good for at least 10 minutes; viewers ask again to refresh. A replaced
+  token keeps working until it expires and is then revoked. Cloudflare holds at most ten tokens per relay; the
+  controller revokes expired ones first and keeps at most eight (never the node's).
+- **Release.** When the session ends, fails or is lost, the controller deletes the relay (which revokes every token);
+  a failed deletion is retried a minute later on the next request. Deleting a relay does not close established peers,
+  so stopping the node's stream host remains the real teardown.
+- **Records.** `<state>/engine-sessions/relays/<session>.json` holds the relay id, the ids (`jti`), roles and expiry of
+  the tokens minted on it and when it was released; never a token. It sits beside the session record so releases that
+  predate relays still read `engine-sessions/<id>.json`. Token secrets live only in controller memory: after a restart
+  the starter and watch tokens are minted again.
+- Errors and logs carry HTTP status and Cloudflare error codes only, never a token or a response body.
+
 ### Known v1 limits
 
 - One session per engine machine; no capacity measurement; no `UsageEvent`.
-- Without `MOQ_CONTROL_TOKEN` streams are view-only and restart about every 15 s (see above). The control token is
-  relay-wide, so hand it only to members you trust with the relay until per-session tokens exist.
+- On the shared relay (no broker configured), streams without `MOQ_CONTROL_TOKEN` are view-only and restart about every
+  15 s (see above), and the control token is relay-wide, so hand it only to members you trust with the relay. Per-session
+  relays give every starter a control token for their own relay.
 - The stream host restart every ten minutes is visible to viewers.
 - The node exits on a failed heartbeat (existing behavior); its process Job Object then ends every session.
 
@@ -329,10 +373,9 @@ verification) and exports the exact commit to `sessions/<id>/project` without `.
 
 ## MoQ credentials
 
-The controller holds the Cloudflare account ID and MoQ API token as the platform `secret_source` `cloudflare-moq`.
-Per session, `moq.rs` (behind a `RelayApi` trait) creates one relay with three tokens: node publish, controlling
-client publish+subscribe, shared audience subscribe; plus a 32-byte control key. End deletes tokens and relay; since
-deletion does not close established peers, killing the container is the real teardown.
+Implemented as "Per-session relays" above (`moq.rs`, the `Broker` trait): the platform `cloudflare-moq` connection
+holds `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_MOQ_API_TOKEN`; each session gets one relay with a node publish token, the
+starter's subscribe and control tokens, and a rotating public watch token; ending deletes the relay.
 
 ## Observability
 
@@ -346,7 +389,7 @@ Node receipt without secrets: checkout/LFS bytes, Library hit, import time, firs
 2. Controller store, API, fencing: new `engine_sessions.rs`; `lib.rs`, `service_allows`; `contributors.rs`.
 3. Admission and quotas: `tenancy.rs`, `metering.rs`, `audit.rs`.
 4. OAuth: `service_tokens.rs`, dashboard OAuth and `contributors.ts` allowlists.
-5. MoQ relay broker: new `moq.rs` and the `cloudflare-moq` connection check.
+5. MoQ relay broker: `moq.rs` (done November 2, "Per-session relays").
 6. Node executor: new `enginebox-install/src/engine.rs`, parallel loop in `contributor.rs`, `runtime.sh` network
    rules and slice sizing.
 7. Licensing activator.

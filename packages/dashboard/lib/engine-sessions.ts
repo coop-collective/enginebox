@@ -59,7 +59,7 @@ export async function engineSessions(request: Request, segments: string[]) {
     (id === undefined || ID.test(id)) &&
     (request.method === "GET"
       ? action === undefined
-      : request.method === "POST" && (segments.length === 1 || (segments.length === 3 && (action === "renew" || action === "end"))));
+      : request.method === "POST" && (segments.length === 1 || (segments.length === 3 && (action === "renew" || action === "end" || action === "watch-token"))));
   if (!allowed) throw new HttpError(404, "Unknown engine session operation.");
   const body = request.method === "POST" ? await bodyJson(request, 16000) : undefined;
   if (body !== undefined && (typeof body !== "object" || body === null || Array.isArray(body))) throw new HttpError(400, "Send a JSON object.");
