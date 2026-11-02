@@ -130,3 +130,49 @@ inputs, not completed lifecycle effects. Record the workflow's explicit policy
 in `BENCHMARK_INSTALL_POLICY` and run all real container integration checks.
 This measures a controlled cold-to-seeded benefit; it does not learn reusable
 state by snapshotting a job that has run arbitrary workflow code.
+
+## Live run orchestration
+
+`run.mjs` submits real workflows only when explicitly executed. It defaults to
+five alternating cold/warm pairs for `coop-collective/cloudflare-template`,
+`compatibility.yml`, ref `perf/ci-startup-benchmark`, runner group 4, and commit
+`24a4fe9ded7ca31ffc2af996802246146b105d46`. The exact dependency command and
+`pnpm run benchmark:integration` are part of its measured-workload contract.
+Node v24.14.0 and pnpm 12.15.0 must match the qualified runner image.
+
+Create a private configuration file, explicitly changing `expectedSha` if the
+reviewed workflow commit changes:
+
+```json
+{
+  "output": "/private/new-ci-startup-comparison",
+  "expectedSha": "24a4fe9ded7ca31ffc2af996802246146b105d46"
+}
+```
+
+```sh
+node research/ci-startup-benchmark/run.mjs /private/comparison-config.json
+```
+
+The output directory must not exist. It is created mode 0700. Every dispatch
+requires a fresh remote-ref check and an online, non-busy `ebox-ci-` runner with
+the configured label in the configured GitHub group. Readiness polls every ten
+seconds for at most five minutes. A synced intent journal precedes each
+`gh workflow run`. Only that command's returned numeric ID or repository run URL
+authorizes subsequent polling. A lost response or missing ID stops the batch;
+the harness never searches by timestamps, retries submission, or silently resumes
+an existing output directory.
+
+Each returned run is followed for at most sixty minutes. Raw job/run responses,
+available logs, the exact run's named artifact, and measurement JSON remain in
+its private sample directory. Numeric job `created_at` supplies queue timing.
+Any failed sample, source/toolchain/cache mismatch, changed stage command or
+unexpected runner group stops further submissions. `comparison.json` is updated
+after each valid sample; `result.json` is written only after all ten match.
+Timeouts retain the known run ID without cancelling or replaying it. Live tests
+and their artifacts remain distinct from CI approval or cache publication.
+
+`node --test research/ci-startup-benchmark/run.test.mjs` uses a fake gh protocol
+and submits no workflows. It covers all ten samples, durable dispatch intent,
+ambiguous responses, changed refs, unavailable runners, run timeouts, failed
+samples, source/command mismatches, and refusal to replay an existing directory.
