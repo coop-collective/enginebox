@@ -48,6 +48,8 @@ export type FakeToken = {
   callback_secret?: string;
   project?: string;
   repositories?: { project: string; access: "read" | "write" }[];
+  engine_sessions?: { project: string }[];
+  member?: string;
 };
 export type FakePool = { name: string; description: string; profile: string | null; members: { host_id: string; name: string }[]; project?: string };
 export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fleetDown?: boolean } = {}) {
@@ -59,15 +61,18 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
   ]);
   const profiles = ["review", "build", "coder"];
   const tokens = new Map<string, FakeToken>();
-  const calls: { method: string; path: string; auth: string; body?: unknown }[] = [];
+  const calls: { method: string; path: string; auth: string; body?: unknown; actor: string | null; org: string | null }[] = [];
+  /** Engine sessions by ID, with the member who started each. */
+  const engineSessions = new Map<string, { id: string; project: string; started_by: string; state: string }>();
   const reply = (body: unknown, status = 200) => Response.json(body, { status });
   t.mock.method(globalThis, "fetch", async (input: string, init: RequestInit = {}) => {
     const url = new URL(input);
     assert.equal(url.origin, "http://127.0.0.1:8765", "only the loopback controller is called");
-    const auth = new Headers(init.headers).get("authorization") ?? "";
+    const headers = new Headers(init.headers);
+    const auth = headers.get("authorization") ?? "";
     const method = init.method ?? "GET";
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
-    calls.push({ method, path: url.pathname, auth, body });
+    calls.push({ method, path: url.pathname, auth, body, actor: headers.get("x-enginebox-actor"), org: headers.get("x-enginebox-org") });
     const parts = url.pathname.split("/").filter(Boolean);
     if (auth === `Bearer ${ownerToken}`) {
       if (method === "GET" && url.pathname === "/v1/pools") return reply({ pools: [...pools.values()] });
@@ -101,6 +106,10 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           return reply({ error: "Every granted pool must belong to the token's project" }, 400);
         if (body.project && (body.repositories ?? []).some((r: { project: string }) => r.project !== body.project))
           return reply({ error: "Every repository grant must name the token's project" }, 400);
+        if (body.project && (body.engine_sessions ?? []).some((r: { project: string }) => r.project !== body.project))
+          return reply({ error: "Every engine-session grant must name the token's project" }, 400);
+        if (!(body.engine_sessions ?? []).length !== !body.member || (body.member && !/^usr_[a-f0-9]{24}$/.test(body.member)))
+          return reply({ error: "member must name the user engine_sessions act as, and only with engine_sessions" }, 400);
         const id = randomBytes(16).toString("hex");
         const secret = `ebst_${id}.${randomBytes(32).toString("hex")}`;
         tokens.set(id, {
@@ -115,6 +124,8 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           callback_secret: body.callback_secret,
           project: body.project,
           repositories: body.repositories,
+          engine_sessions: body.engine_sessions,
+          member: body.member,
         });
         return reply({ token: { id, expires_at: body.expires_at }, secret, secret_shown_once: true }, 201);
       }
@@ -132,7 +143,25 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     const held = [...tokens.values()].find((x) => x.secret === presented && !x.revoked);
     if (!held) return reply({ error: "Service token is unknown, expired or revoked." }, 401);
     const sees = (h: string, n: string) => held.scopes.some((s) => s.host_id === h && s.name === n);
-    if (url.pathname === "/v1/agent-runs") return reply({ runs: [] });
+    if (url.pathname === "/v1/agent-runs")
+      return held.operations.includes("agent_runs.list") ? reply({ runs: [] }) : reply({ error: "This service token is not granted that operation on that workspace." }, 403);
+    if (parts[1] === "projects" && parts[3] === "engine-sessions") {
+      // The controller acts as the token's member; sessions of other members are unknown to it.
+      const operation = method === "GET" ? "get" : parts.length === 4 ? "start" : parts[5];
+      if (!held.member || !held.operations.includes(`engine_sessions.${operation}`) || !(held.engine_sessions ?? []).some((e) => e.project === parts[2]))
+        return reply({ error: "This service token is not granted that operation on that workspace." }, 403);
+      const mine = [...engineSessions.values()].filter((e) => e.project === parts[2] && e.started_by === held.member);
+      if (method === "GET" && parts.length === 4) return reply({ sessions: mine });
+      if (method === "POST" && parts.length === 4) {
+        const session = { id: randomBytes(16).toString("hex"), project: parts[2], started_by: held.member, state: "ready" };
+        engineSessions.set(session.id, session);
+        return reply({ ...session, lease: "l".repeat(64) }, 202);
+      }
+      const session = mine.find((e) => e.id === parts[4]);
+      if (!session) return reply({ error: "Unknown engine session." }, 404);
+      if (parts[5] === "end") session.state = "ending";
+      return reply(method === "GET" ? { ...session, stream: { audience: { token: "subscribe-jwt" }, control: { control_key: "k".repeat(64) } } } : session);
+    }
     if (parts[1] === "projects" && parts[3] === "repositories") {
       const access = (held.repositories ?? []).find((r) => r.project === parts[2])?.access;
       const refused = () => reply({ error: "This service token is not granted that operation on that project." }, 403);
@@ -157,7 +186,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
       return reply({ error: "This service token is not granted that operation on that workspace." }, 403);
     return reply({ run: { id: "1".repeat(32), host_id: host, name } }, method === "POST" ? 202 : 200);
   });
-  return { tokens, calls, pools };
+  return { tokens, calls, pools, engineSessions };
 }
 
 // ------------------------------------------------------------ helpers

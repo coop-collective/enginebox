@@ -13,8 +13,10 @@ import { DEFAULT_ORG, identityEnabled } from "./identity/store";
  *   subscribe token, control key); the controller enforces that.
  * - The owner-wide list and end (`/v1/engine-sessions`) are not proxied.
  *
- * TODO(engine-sessions OAuth): Gamejam will reach the same routes as an OAuth
- * client with an `engine_sessions` grant (RESOURCE_ROUTES in oauth/server.ts).
+ * OAuth apps (Gamejam) reach the same controller routes on the public origin
+ * (`/v1/projects/{project}/engine-sessions…`, RESOURCE_ROUTES in
+ * oauth/server.ts) with an `engine_sessions` grant; their token acts as the
+ * member who consented, so this proxy is for the dashboard session only.
  */
 const PROJECT = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
 const ID = /^[a-f0-9]{32}$/;

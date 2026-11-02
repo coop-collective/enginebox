@@ -33,16 +33,22 @@ the rest is design, October 31, 2026.
 v1 is the personal-machine path only: a member starts the Unity Editor for a repository on **their own** Windows
 engine machine and gets a MoQ stream back. First target: Queen of Hearts on the owner's RTX 4080 machine. Everything
 below the "Design" heading that v1 does not list here (cloud Linux nodes, containers, LayerFS exports, measured
-admission, the per-session relay broker, OAuth) is still design.
+admission, the per-session relay broker) is still design. OAuth landed on November 2 ("Who can call it").
 
 ### Who can call it
 
 - The owner token, and members through the dashboard (`/api/engine-sessions/{project}[/{id}[/renew|end]]`, which
   sends the owner token with `X-EngineBox-Org` and `X-EngineBox-Actor` from the member's session).
-- Service tokens are refused. **TODO (OAuth):** a grant `{kind:"engine_sessions", project}` with operations
-  `engine_sessions.start|get|renew|end`, the `engine-sessions` OAuth scope, and the routes in the dashboard's
-  `RESOURCE_ROUTES`, so Gamejam's dev server can start sessions as an OAuth client. The controller side is one more
-  arm in `service_allows` plus mapping the token's principal to the starting member.
+- OAuth apps (Gamejam's hosted room) on the public origin, `https://<dashboard>/v1/projects/{p}/engine-sessions…`,
+  with the `engine-sessions` scope ([OAuth](OAUTH.md#engine-sessions)). The member who consents ticks "Run live
+  engine sessions in project X"; the grant (`{kind:"engine_sessions", project, member}` in `enginebox_grants`)
+  records that member and their org. Its access token is a service token with `engine_sessions: [{project}]`,
+  `member` and the operations `engine_sessions.start|get|renew|end`; `service_allows` admits exactly the five
+  project routes (start, list, read, renew, end) on a granted project, and the controller takes the actor from the
+  token's `member` (never from `X-EngineBox-Actor`) and the org from the token. So the token is that member: starts
+  go to their own engine machine with their own Unity account, and only their reads carry the `stream` block.
+  Other members' sessions are `404`; the owner-wide routes are `403` (and never forwarded by the proxy).
+- Other service tokens are refused.
 
 ### API (`packages/enginebox-controller/src/engine_sessions.rs`)
 
@@ -268,9 +274,11 @@ reservations fit the node budget minus its LayerFS workspaces.
 
 ## OAuth
 
-Scope `engine-sessions`; consent row "Run engine sessions in project X"; grant `{kind:"engine_sessions", project}`.
-Service tokens gain `engine_sessions` and operations `engine_sessions.start|get|renew|end`. Start also requires
-repository `read`. Files: `service_tokens.rs`, `packages/dashboard/lib/oauth/{server,controller,store,pages}.ts`.
+Implemented as described under "Who can call it" and in [OAuth](OAUTH.md#engine-sessions): scope
+`engine-sessions`; consent row "Run live engine sessions in project X"; grant `{kind:"engine_sessions", project,
+member}`; service tokens gain `engine_sessions`, `member` and operations `engine_sessions.start|get|renew|end`. The
+grant does not also require a repository grant: the controller checks the repository in the token's org at start
+and mints the node's read token itself.
 
 ## Node protocol
 

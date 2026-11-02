@@ -75,8 +75,17 @@ export function consentPage(opts: {
   repositoryProjects?: string[];
   /** The app asked for this project's pools only. */
   project?: string | null;
+  /** Show workspaces, pools and repositories (the `agent-runs` scope was requested). Default true. */
+  agentRuns?: boolean;
+  /** The approver may grant agent runs (an org admin or owner). Default true. */
+  mayApprove?: boolean;
+  /** Projects whose engine sessions the approver can grant as themselves (the `engine-sessions` scope). */
+  engineProjects?: string[];
   error?: string;
 }) {
+  const agentRuns = opts.agentRuns ?? true;
+  const mayApprove = opts.mayApprove ?? true;
+  const showAgentRuns = agentRuns && mayApprove;
   const redirect = new URL(opts.redirectUri);
   const pools = opts.pools ?? [];
   const list = opts.workspaces.length
@@ -114,7 +123,28 @@ export function consentPage(opts: {
         `<option value="">No access</option><option value="read">Read (clone, read-only tokens)</option><option value="write">Write (create, push, use on runs)</option></select></label>`,
     )
     .join("");
-  const any = opts.workspaces.length > 0 || pools.length > 0 || repositoryProjects.length > 0;
+  const engineProjects = opts.engineProjects ?? [];
+  const engineList = engineProjects
+    .map(
+      (project) =>
+        `<label class="ws"><input type="checkbox" name="engine_sessions" value="${escape(project)}"> Run live engine sessions in project <code>${escape(project)}</code> ` +
+        `<span class="muted">as you: on your own engine machine with your own Unity account</span></label>`,
+    )
+    .join("");
+  const any = (showAgentRuns && (opts.workspaces.length > 0 || pools.length > 0 || repositoryProjects.length > 0)) || engineProjects.length > 0;
+  const engineNote = engineProjects.length
+    ? ` For engine sessions it acts as you: it can start, read, renew and end only your own sessions in the projects you tick (including their live stream), never anyone else's.`
+    : "";
+  const agentRunSections = showAgentRuns
+    ? (pools.length ? `<fieldset><legend>${poolLegend}</legend>${poolList}</fieldset>` : "") +
+      (repositoryProjects.length ? `<fieldset><legend>Hosted Git repositories it may use, by project</legend>${repositoryList}</fieldset>` : "") +
+      `<fieldset><legend>Workspaces it may run agents on</legend>${list}</fieldset>`
+    : agentRuns
+      ? `<p class="muted">It also asks to run agents and use repositories; only an admin or owner of your organization can allow that.</p>`
+      : "";
+  const scopeNote = showAgentRuns
+    ? `It can start, read, list and cancel agent runs in the workspaces and pools you select, and use the repositories of the projects you choose, and nothing else: no fleet, template, storage, provider sign-in, repository backend or account settings.`
+    : `It can do nothing else: no agent runs, fleet, template, storage, provider sign-in, repository or account settings.`;
   return page(
     "Connect an app to Engine Box",
     `<h1>Connect “${escape(opts.clientName)}”?</h1>` +
@@ -122,10 +152,9 @@ export function consentPage(opts: {
       `<p class="muted">The app chose its own name; check that you started this connection. Client ID <code>${escape(opts.clientId)}</code>.</p>` +
       (opts.error ? `<p class="warn" role="alert">${escape(opts.error)}</p>` : "") +
       `<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escape(opts.request)}">` +
-      (pools.length ? `<fieldset><legend>${poolLegend}</legend>${poolList}</fieldset>` : "") +
-      (repositoryProjects.length ? `<fieldset><legend>Hosted Git repositories it may use, by project</legend>${repositoryList}</fieldset>` : "") +
-      `<fieldset><legend>Workspaces it may run agents on</legend>${list}</fieldset>` +
-      `<p class="muted">It can start, read, list and cancel agent runs in the workspaces and pools you select, and use the repositories of the projects you choose, and nothing else: no fleet, template, storage, provider sign-in, repository backend or account settings. You can disconnect it at any time from the dashboard.</p>` +
+      (engineProjects.length ? `<fieldset><legend>Live engine sessions it may run as you, by project</legend>${engineList}</fieldset>` : "") +
+      agentRunSections +
+      `<p class="muted">${scopeNote}${engineNote} You can disconnect it at any time from the dashboard.</p>` +
       `<div class="actions"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="approve"${any ? "" : " disabled"}>Allow access</button></div></form>`,
     { formTarget: redirect.origin },
   );

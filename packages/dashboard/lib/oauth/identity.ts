@@ -1,4 +1,21 @@
 import { atLeast, HttpError, principal } from "../server";
+import { identityEnabled, membership, readIdentity } from "../identity/store";
+
+/** A member's user ID, as the controller's engine sessions record their starter. */
+export const MEMBER_ID = /^usr_[a-f0-9]{24}$/;
+
+/**
+ * Whether `userId` still belongs to `orgId`: engine-session grants act as that member, so a member who left
+ * (or an Engine Box without accounts) ends them at the next refresh.
+ */
+export function stillMember(userId: string, orgId: string): boolean {
+  if (!MEMBER_ID.test(userId) || !identityEnabled()) return false;
+  try {
+    return membership(readIdentity(), orgId, userId) !== null;
+  } catch {
+    return false;
+  }
+}
 
 /** The person who approves a client and owns the resulting grant. */
 export type User = {
@@ -7,7 +24,10 @@ export type User = {
   label: string;
   /** The org the approver acts in; the grant belongs to it. */
   org_id: string;
-  /** Approving an app hands out run and repository access: org admins and owners only. */
+  /**
+   * Approving an app hands out run and repository access: org admins and owners only. Any member may approve
+   * an engine-sessions-only grant, which acts only as themselves.
+   */
   may_approve: boolean;
 };
 

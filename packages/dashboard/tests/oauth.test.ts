@@ -41,7 +41,7 @@ test("discovery documents describe the resource and the authorization server", a
   const prm = await protectedResourceMetadata().json();
   assert.deepEqual(prm.authorization_servers, [origin]);
   assert.equal(prm.resource, origin);
-  assert.deepEqual(prm.scopes_supported, ["agent-runs"]);
+  assert.deepEqual(prm.scopes_supported, ["agent-runs", "engine-sessions"]);
   const as = await authorizationServerMetadata().json();
   assert.equal(as.issuer, origin);
   assert.equal(as.authorization_endpoint, `${origin}/oauth/authorize`);
