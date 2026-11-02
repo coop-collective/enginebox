@@ -27,6 +27,7 @@ Engine Box is in early development; each guide states what is implemented, quali
 - [Agent usage](AGENT-USAGE.md): provider allowance and billing visibility.
 - [Project tasks](TASK-WORKFLOW.md) and [task assistant](TASK-ASSISTANT.md): roadmap tasks and native assistant bindings.
 - [Integration and CI](INTEGRATION-CI.md): batching, candidate validation and protected CI evidence.
+- [This repository's GitHub Actions](CI.md#this-repositorys-own-ci-on-engine-box) and [CI optimization lessons](ci-optimization-lessons.md): what `verify.yml` actually runs, mapped to Boardy's playbook. Recommendations only; workflows were not rewritten.
 - [Updates and rollback](UPDATES.md): pinned releases, draining and rollback.
 - [Codex sandbox](CODEX-SANDBOX.md) and [Cursor sandbox](CURSOR-SANDBOX.md): Ubuntu 24.04 sandbox requirements.
 - [Storage API](STORAGE-API.md): controller checkout storage API and MCP.
