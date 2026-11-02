@@ -3003,9 +3003,12 @@ mod tests {
     #[tokio::test]
     async fn signed_webhook_dispatches_without_waiting_for_periodic_reconciliation() {
         let (_temp, c) = setup();
+        // Use a platform-native absolute path. No worker is executed: the
+        // fixture has no connected account and fails closed before API work.
+        let worker = c.root.join("unused-fixture-worker");
         enginebox_core::state::write_json(&c.root.join("github.json"), &json!({"schema":1,"callback_url":"https://example.invalid/callback",
             "app":{"client_id":"fixture","client_secret":"fixture","slug":"fixture","private_key":"fixture","webhook_secret":"fixture-webhook-secret-32-characters"},
-            "pools":[{"id":"linux","installation_id":2,"organization":"fixture","runner_group_id":1,"labels":["enginebox-linux"],"max_runners":1,"timeout_seconds":60,"worker":["/unused/fixture-worker"]}]})).unwrap();
+            "pools":[{"id":"linux","installation_id":2,"organization":"fixture","runner_group_id":1,"labels":["enginebox-linux"],"max_runners":1,"timeout_seconds":60,"worker":[worker]}]})).unwrap();
         enginebox_core::state::private_dir(&c.root.join("github")).unwrap();
         enginebox_core::state::write_json(&c.root.join("github/state.json"), &json!({"repositories":{"5":{"id":5,"installation_id":2,"full_name":"fixture/private","private":true,"branch":"main"}}})).unwrap();
         c.activate().unwrap();
