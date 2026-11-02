@@ -66,7 +66,7 @@ test("members start and read their own engine sessions; the member comes from th
   const id = "c".repeat(32);
   await engineSessions(req(`/api/engine-sessions/qoh/${id}`, "GET", owner), ["qoh", id]);
   assert.equal(sent.at(-1)!.url, `http://127.0.0.1:8765/v1/projects/qoh/engine-sessions/${id}`);
-  for (const action of ["renew", "end"]) {
+  for (const action of ["renew", "end", "watch-token"]) {
     await engineSessions(req(`/api/engine-sessions/qoh/${id}/${action}`, "POST", owner, {}), ["qoh", id, action]);
     assert.equal(sent.at(-1)!.url, `http://127.0.0.1:8765/v1/projects/qoh/engine-sessions/${id}/${action}`);
   }
@@ -76,6 +76,7 @@ test("members start and read their own engine sessions; the member comes from th
     ["POST", ["qoh", id, "start"]],
     ["POST", ["qoh", id]],
     ["GET", ["qoh", id, "end"]],
+    ["GET", ["qoh", id, "watch-token"]],
     ["GET", ["QOH"]],
     ["GET", ["qoh", "../x"]],
     ["GET", []],

@@ -5,7 +5,7 @@ import type { EngineSessionsGrant, PoolGrant, RepositoryGrant, WorkspaceGrant } 
 /** Every agent-run operation; the `agent-runs` scope grants exactly these. */
 export const AGENT_RUN_OPERATIONS = ["agent_runs.start", "agent_runs.get", "agent_runs.list", "agent_runs.cancel"];
 /** Every engine-session operation; the `engine-sessions` scope grants exactly these, on the consented projects. */
-export const ENGINE_SESSION_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end"];
+export const ENGINE_SESSION_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end", "engine_sessions.watch"];
 
 async function call(path: string, init: { method: string; body?: unknown }) {
   const { apiUrl, apiToken } = config();

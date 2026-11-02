@@ -112,7 +112,7 @@ request, because the grant acts only as them; workspaces, pools and repositories
 still need an admin or owner, and a member's consent page does not offer them. The
 grant records the consenting member (`user_id`) and org, and every access token
 carries the controller grant `engine_sessions: [{project}]`, `member: <user id>`,
-the grant's org, and the operations `engine_sessions.start|get|renew|end` (an
+the grant's org, and the operations `engine_sessions.start|get|renew|end|watch` (an
 engine-sessions-only token holds no agent-run operation).
 
 The token acts as that member on the controller: a start is that member's session,
@@ -122,7 +122,10 @@ token, control key and token) because the token's member is the starter; renew a
 end reach only their sessions. Another member's session is `404`. The member is
 taken from the token, never from a header the app sends, and the public proxy
 forwards no actor or org header. The owner-wide `/v1/engine-sessions` routes are
-never forwarded. When the member leaves the org, the next refresh answers
+never forwarded. For a public room, `POST …/{id}/watch-token {}` returns a
+short-lived subscribe-only token for that session's own relay (no control key),
+which the app hands to its viewers; see
+[per-session relays](ENGINE-SESSIONS.md#per-session-relays-packagesenginebox-controllersrcmoqrs). When the member leaves the org, the next refresh answers
 `invalid_grant` and ends the connection. The request and response bodies are those
 of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllersrcengine_sessionsrs).
 
@@ -153,6 +156,7 @@ of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllers
 | `GET /v1/projects/{project}/engine-sessions/{id}` | Read one; `stream` when ready |
 | `POST /v1/projects/{project}/engine-sessions/{id}/renew` | `{lease, ttl_seconds}` |
 | `POST /v1/projects/{project}/engine-sessions/{id}/end` | `{}` or `{lease}` |
+| `POST /v1/projects/{project}/engine-sessions/{id}/watch-token` | `{}`; a short-lived subscribe-only token for public viewers |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 
 The dashboard's **MCP** section includes Connected apps and grants: every live
@@ -172,7 +176,7 @@ local configuration. Operator credentials stay outside project environments.
 |---|---|
 | Pending authorization request | 10 minutes; consumed by approve or deny |
 | Authorization code | 60 seconds, single use. Any presentation burns it (a wrong verifier cannot be retried); a replay revokes the connection it produced |
-| Access token | 1 hour. A scoped controller service token (`agent_runs.start/get/list/cancel` on exactly the consented workspaces and `pools`, with the named workspace profiles as its `profiles` grant and the connection's `callback_secret`; plus `engine_sessions.start/get/renew/end` with its `engine_sessions` projects and `member` for an engine-session grant), labelled `oauth grant <id>` |
+| Access token | 1 hour. A scoped controller service token (`agent_runs.start/get/list/cancel` on exactly the consented workspaces and `pools`, with the named workspace profiles as its `profiles` grant and the connection's `callback_secret`; plus `engine_sessions.start/get/renew/end/watch` with its `engine_sessions` projects and `member` for an engine-session grant), labelled `oauth grant <id>` |
 | Callback key | The life of the connection; generated at the code exchange and passed to every access token minted for it |
 | Refresh token | 30 days, sliding: each refresh issues a new one and resets the 30 days. Rotated tokens are remembered; presenting one again revokes the whole connection, except within the grace window below |
 | Refresh grace window | 30 seconds (`ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS`, 0 to 300; 0 turns it off). Presenting the immediately-previous refresh token within the window, from the same client, returns the same token pair that refresh already issued |
@@ -264,7 +268,7 @@ keep strict one-time refresh tokens.
   authorization and checked on token requests when present.
 - The proxy ignores cookies, forwards only the presented scoped token, allows only
   the seven agent-run route shapes (four workspace, three pool), the four
-  repository route shapes and the five engine-session route shapes, and rejects
+  repository route shapes and the six engine-session route shapes, and rejects
   query strings. The repository backend
   configuration and the owner's repository listing are never forwarded.
 - The proxy forwards to `ENGINEBOX_API_URL`, normally the supervisor's front door.

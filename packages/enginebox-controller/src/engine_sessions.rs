@@ -49,7 +49,26 @@ pub const MOQ_SUBSCRIBE: &str = "MOQ_SUBSCRIBE_TOKEN";
 /// about 15 s without a controlling client's liveness).
 pub const MOQ_CONTROL: &str = "MOQ_CONTROL_TOKEN";
 /// The relay the stream host publishes to (it is fixed in the stream host).
+/// Per-session relays use the same URL: a token's `sub` names its relay.
 pub const DEFAULT_RELAY: &str = "https://draft-16.cloudflare.mediaoverquic.com";
+/// Per-session relay tokens (`moq.rs`). The node's publish token must outlast
+/// the session (it is handed over once); deleting the relay at the end
+/// revokes it sooner.
+pub const PUBLISH_TOKEN_SECONDS: u64 = 7 * 24 * 3600;
+/// The starter's own subscribe and control tokens: reused while at least
+/// [`STARTER_TOKEN_MIN_LEFT`] remains, then replaced.
+pub const STARTER_TOKEN_SECONDS: u64 = 4 * 3600;
+pub const STARTER_TOKEN_MIN_LEFT: u64 = 3600;
+/// Public watch tokens: subscribe-only, shared by every viewer of a session
+/// and replaced once less than [`WATCH_TOKEN_MIN_LEFT`] remains, so a token
+/// handed out always has at least that long. Viewers ask again to refresh.
+pub const WATCH_TOKEN_SECONDS: u64 = 30 * 60;
+pub const WATCH_TOKEN_MIN_LEFT: u64 = 10 * 60;
+/// Cloudflare holds at most ten tokens per relay; keep headroom.
+const MAX_RELAY_TOKENS: usize = 8;
+/// A relay whose deletion failed is retried after this long.
+const RELEASE_RETRY_SECONDS: u64 = 60;
+pub const NO_SESSION_RELAY: &str = "Public watching needs a per-session relay. Add CLOUDFLARE_MOQ_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to the platform's cloudflare-moq connection; sessions started after that can be watched.";
 /// v1 fallback for repositories Engine Box neither hosts nor links: an
 /// org `secret_source` connection `engine-repo-<name>` yielding the remote and
 /// a read token (sent as GitHub-style Basic `x-access-token`).
@@ -275,6 +294,52 @@ pub struct Relay {
     pub control_token: Option<String>,
 }
 
+/// What a relay token is for (recorded by id with its relay, never its secret).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// The node's publish token.
+    Publish,
+    /// The starter's subscribe token (`stream.audience`).
+    Viewer,
+    /// The starter's control token (`stream.control.token`).
+    Control,
+    /// The public watch token (`…/watch-token`).
+    Watch,
+}
+impl Role {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Publish => "enginebox node",
+            Self::Viewer => "enginebox starter",
+            Self::Control => "enginebox control",
+            Self::Watch => "enginebox watch",
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayToken {
+    pub jti: String,
+    pub role: Role,
+    pub expires_at: u64,
+}
+/// A session's own relay, in `<state>/engine-sessions/relays/<session>.json`
+/// (beside the session record, so releases that do not know relays still read
+/// the session). Token ids only; secrets live in memory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayRecord {
+    pub session: String,
+    pub relay: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub tokens: Vec<RelayToken>,
+    /// When the relay was deleted (the session ended, failed or was lost).
+    #[serde(default)]
+    pub released_at: Option<u64>,
+}
+
 /// What the controller provides to sessions; the runtime implements it over
 /// contributors, tenancy, repositories, credentials and connections.
 pub trait Platform {
@@ -291,6 +356,10 @@ pub trait Platform {
     fn has_unity_account(&self, org: &str, member: &str) -> bool;
     fn unity_access_token(&self, org: &str, member: &str) -> Result<String>;
     fn relay(&self) -> Result<Relay>;
+    /// The per-session relay broker, when the platform's `cloudflare-moq`
+    /// connection names an API token and account (`Ok(None)`: neither, the
+    /// shared relay is used). A half or invalid configuration is an error.
+    fn relay_broker(&self) -> Result<Option<Arc<dyn crate::moq::Broker>>>;
     fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value);
 }
 
@@ -355,6 +424,24 @@ pub struct EngineSessions {
     /// Minted secrets per (session, generation), delivered while a session is
     /// `placed`; memory only.
     secrets: Arc<Mutex<BTreeMap<(String, u64), Value>>>,
+    /// Per-session relays by session id (`relays/<id>.json`).
+    relays: Arc<Mutex<BTreeMap<String, RelayRecord>>>,
+    /// The starter's and the public's current relay tokens; memory only.
+    tokens: Arc<Mutex<BTreeMap<(String, Role), crate::moq::Token>>>,
+    /// Serialises relay creation and token minting (network calls), never
+    /// held with `sessions`.
+    minting: Arc<Mutex<()>>,
+    /// Relay deletions to retry no earlier than this (unix seconds).
+    release_retry: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+/// Deletes the relays of finished sessions once the caller's locks are gone
+/// (it is created before them, so it drops after them).
+struct Release<'a>(&'a EngineSessions, &'a dyn Platform);
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.release_relays(self.1);
+    }
 }
 
 impl EngineSessions {
@@ -370,11 +457,227 @@ impl EngineSessions {
             );
             sessions.insert(s.id.clone(), s);
         }
+        let relay_root = root.join("relays");
+        state::private_dir(&relay_root)?;
+        let mut relays = BTreeMap::new();
+        for path in state::json_files(&relay_root)? {
+            let r: RelayRecord = serde_json::from_value(state::read_json(&path)?)?;
+            ensure!(
+                valid_session_id(&r.session)
+                    && crate::moq::valid_id(&r.relay)
+                    && path.file_stem().and_then(|f| f.to_str()) == Some(&r.session),
+                "Invalid engine session relay record"
+            );
+            relays.insert(r.session.clone(), r);
+        }
         Ok(Self {
             root,
             sessions: Arc::new(Mutex::new(sessions)),
             secrets: Arc::new(Mutex::new(BTreeMap::new())),
+            relays: Arc::new(Mutex::new(relays)),
+            tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            minting: Arc::new(Mutex::new(())),
+            release_retry: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+    fn save_relay(&self, r: &RelayRecord) -> Result<()> {
+        state::write_json(
+            &self.root.join("relays").join(format!("{}.json", r.session)),
+            &serde_json::to_value(r)?,
+        )
+    }
+    /// The session's relay id, if it has its own (not yet released).
+    pub fn relay_of(&self, session: &str) -> Option<String> {
+        self.relays
+            .lock()
+            .unwrap()
+            .get(session)
+            .filter(|r| r.released_at.is_none())
+            .map(|r| r.relay.clone())
+    }
+    /// The session's relay, created on first use. Errors carry a reason for
+    /// the session record, never a secret.
+    fn ensure_relay(&self, s: &Session, broker: &dyn crate::moq::Broker) -> Result<String> {
+        let _minting = self.minting.lock().unwrap();
+        if let Some(r) = self.relays.lock().unwrap().get(&s.id) {
+            ensure!(
+                r.released_at.is_none(),
+                refuse(409, "The session's relay was already released.")
+            );
+            return Ok(r.relay.clone());
+        }
+        let relay = broker
+            .create_relay(&format!("enginebox-session-{}", s.id))
+            .map_err(|error| {
+                eprintln!(
+                    "{}",
+                    json!({"event":"enginebox.engine.relay_create_failed","session":s.id,"reason":error.to_string()})
+                );
+                refuse(
+                    503,
+                    format!("Engine Box could not create this session's MoQ relay ({error}). Start the session again."),
+                )
+            })?;
+        let record = RelayRecord {
+            session: s.id.clone(),
+            relay: relay.clone(),
+            created_at: now(),
+            tokens: vec![],
+            released_at: None,
+        };
+        self.save_relay(&record)?;
+        self.relays.lock().unwrap().insert(s.id.clone(), record);
+        Ok(relay)
+    }
+    /// A token of `role` on the session's own relay. Starter and watch tokens
+    /// are reused while `min_left` seconds remain; expired tokens (and the
+    /// oldest beyond the per-relay budget) are revoked first.
+    fn relay_token(
+        &self,
+        session: &str,
+        role: Role,
+        broker: &dyn crate::moq::Broker,
+        ttl: u64,
+        min_left: u64,
+    ) -> Result<crate::moq::Token> {
+        let _minting = self.minting.lock().unwrap();
+        let t = now();
+        if role != Role::Publish
+            && let Some(token) = self.tokens.lock().unwrap().get(&(session.to_owned(), role))
+            && token.expires_at >= t + min_left
+        {
+            return Ok(token.clone());
+        }
+        let (relay, mut stale) = {
+            let relays = self.relays.lock().unwrap();
+            let r = relays
+                .get(session)
+                .filter(|r| r.released_at.is_none())
+                .ok_or_else(|| refuse(409, NO_SESSION_RELAY))?;
+            let stale: Vec<RelayToken> = r
+                .tokens
+                .iter()
+                .filter(|k| k.expires_at <= t)
+                .cloned()
+                .collect();
+            let mut live: Vec<RelayToken> = r
+                .tokens
+                .iter()
+                .filter(|k| k.expires_at > t && k.role != Role::Publish)
+                .cloned()
+                .collect();
+            live.sort_by_key(|k| k.expires_at);
+            let over = (r.tokens.len() - stale.len() + 1).saturating_sub(MAX_RELAY_TOKENS);
+            (
+                r.relay.clone(),
+                [stale, live.into_iter().take(over).collect()].concat(),
+            )
+        };
+        stale.retain(|k| match broker.revoke(&relay, &k.jti) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    json!({"event":"enginebox.engine.relay_token_revoke_failed","session":session,"jti":k.jti,"reason":error.to_string()})
+                );
+                false
+            }
+        });
+        let token = broker
+            .mint(
+                &relay,
+                matches!(role, Role::Publish | Role::Control),
+                t + ttl,
+                role.label(),
+            )
+            .map_err(|error| {
+                refuse(
+                    503,
+                    format!("Engine Box could not mint a relay token ({error})."),
+                )
+            })?;
+        {
+            let mut relays = self.relays.lock().unwrap();
+            if let Some(r) = relays.get_mut(session) {
+                r.tokens.retain(|k| !stale.iter().any(|g| g.jti == k.jti));
+                r.tokens.push(RelayToken {
+                    jti: token.jti.clone(),
+                    role,
+                    expires_at: token.expires_at,
+                });
+                self.save_relay(r)?;
+            }
+        }
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens.retain(|_, k| !stale.iter().any(|g| g.jti == k.jti));
+        if role != Role::Publish {
+            tokens.insert((session.to_owned(), role), token.clone());
+        }
+        Ok(token)
+    }
+    /// Delete the relays of finished (or forgotten) sessions. Never called
+    /// with `sessions` held; failures are retried after a minute.
+    fn release_relays(&self, platform: &dyn Platform) {
+        let t = now();
+        let live: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| !s.state.terminal())
+            .map(|s| s.id.clone())
+            .collect();
+        let due: Vec<(String, String)> = {
+            let retry = self.release_retry.lock().unwrap();
+            self.relays
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|r| r.released_at.is_none() && !live.contains(&r.session))
+                .filter(|r| retry.get(&r.session).is_none_or(|at| *at <= t))
+                .map(|r| (r.session.clone(), r.relay.clone()))
+                .collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        let broker = match platform.relay_broker() {
+            Ok(Some(broker)) => broker,
+            _ => {
+                let mut retry = self.release_retry.lock().unwrap();
+                for (session, _) in &due {
+                    retry.insert(session.clone(), t + RELEASE_RETRY_SECONDS);
+                }
+                return;
+            }
+        };
+        for (session, relay) in due {
+            match broker.delete_relay(&relay) {
+                Ok(()) => {
+                    self.release_retry.lock().unwrap().remove(&session);
+                    self.tokens
+                        .lock()
+                        .unwrap()
+                        .retain(|(s, _), _| s != &session);
+                    let mut relays = self.relays.lock().unwrap();
+                    if let Some(r) = relays.get_mut(&session) {
+                        r.released_at = Some(t);
+                        r.tokens.clear();
+                        let _ = self.save_relay(r);
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        json!({"event":"enginebox.engine.relay_delete_failed","session":session,"relay":relay,"reason":error.to_string()})
+                    );
+                    self.release_retry
+                        .lock()
+                        .unwrap()
+                        .insert(session, t + RELEASE_RETRY_SECONDS);
+                }
+            }
+        }
     }
     fn save(&self, s: &Session) -> Result<()> {
         state::write_json(
@@ -407,6 +710,7 @@ impl EngineSessions {
                 .lock()
                 .unwrap()
                 .retain(|(id, _), _| id != &s.id);
+            self.tokens.lock().unwrap().retain(|(id, _), _| id != &s.id);
             platform.audit(
                 &s.org_id,
                 &s.started_by,
@@ -502,6 +806,7 @@ impl EngineSessions {
         body: &Value,
         platform: &dyn Platform,
     ) -> Result<(u16, Value)> {
+        let _release = Release(self, platform);
         crate::keys(
             body,
             &[
@@ -730,6 +1035,7 @@ impl EngineSessions {
         actor: &str,
         platform: &dyn Platform,
     ) -> Value {
+        let _release = Release(self, platform);
         let mut sessions = self.sessions.lock().unwrap();
         self.tick(&mut sessions, platform);
         let mut rows: Vec<&Session> = sessions
@@ -750,33 +1056,123 @@ impl EngineSessions {
         id: &str,
         platform: &dyn Platform,
     ) -> Result<Value> {
+        let _release = Release(self, platform);
         ensure!(valid_session_id(id), "Unknown engine session");
-        let mut sessions = self.sessions.lock().unwrap();
-        self.tick(&mut sessions, platform);
-        let s = sessions
-            .get(id)
-            .filter(|s| Self::visible(s, org, Some(project), actor))
-            .context("Unknown engine session")?;
+        let s = {
+            let mut sessions = self.sessions.lock().unwrap();
+            self.tick(&mut sessions, platform);
+            sessions
+                .get(id)
+                .filter(|s| Self::visible(s, org, Some(project), actor))
+                .context("Unknown engine session")?
+                .clone()
+        };
         let mut v = s.public();
+        v["relay"] = json!(self.relay_of(&s.id));
         if s.state == State::Ready && s.started_by == actor {
-            let relay = match platform.relay() {
-                Ok(relay) => relay,
-                Err(error) => {
-                    v["stream_error"] = json!(status_of(&error).1);
-                    return Ok(v);
-                }
-            };
-            v["stream"] = json!({
-                "relay_url": relay.url,
-                "url": format!("{}/{}", relay.url, relay.subscribe_token),
+            match self.stream_block(&s, platform) {
+                Ok(stream) => v["stream"] = stream,
+                Err(error) => v["stream_error"] = json!(status_of(&error).1),
+            }
+        }
+        Ok(v)
+    }
+    /// The starter's `stream` block: the session's own relay with the
+    /// starter's subscribe and control tokens, or (for a session placed
+    /// without one) the platform's shared relay tokens.
+    fn stream_block(&self, s: &Session, platform: &dyn Platform) -> Result<Value> {
+        let (subscribe, control) = if self.relay_of(&s.id).is_some() {
+            let broker = platform
+                .relay_broker()?
+                .ok_or_else(|| refuse(409, NO_SESSION_RELAY))?;
+            let viewer = self.relay_token(
+                &s.id,
+                Role::Viewer,
+                &*broker,
+                STARTER_TOKEN_SECONDS,
+                STARTER_TOKEN_MIN_LEFT,
+            )?;
+            let control = self.relay_token(
+                &s.id,
+                Role::Control,
+                &*broker,
+                STARTER_TOKEN_SECONDS,
+                STARTER_TOKEN_MIN_LEFT,
+            )?;
+            (viewer.secret, Some(control.secret))
+        } else {
+            let relay = platform.relay()?;
+            (relay.subscribe_token, relay.control_token)
+        };
+        Ok(json!({
+            "relay_url": DEFAULT_RELAY,
+            "url": format!("{DEFAULT_RELAY}/{subscribe}"),
+            "namespace": s.namespace,
+            "session": session_uuid(&s.id),
+            "tag": s.tag, "width": s.width, "height": s.height,
+            "audience": {"token": subscribe},
+            "control": {"control_key": s.control_key, "token": control},
+        }))
+    }
+    /// `POST …/{id}/watch-token {}`: a short-lived subscribe-only token for
+    /// the session's own relay, for anyone the caller lets watch (a public
+    /// room's viewers). No control key or control token. The owner, the
+    /// starter, and a token with `engine_sessions.watch` acting as the starter
+    /// may ask; only for a ready session that has its own relay.
+    pub fn watch_token(
+        &self,
+        org: &str,
+        project: &str,
+        actor: &str,
+        id: &str,
+        body: &Value,
+        platform: &dyn Platform,
+    ) -> Result<(u16, Value)> {
+        let _release = Release(self, platform);
+        crate::keys(body, &[], &[]).map_err(|_| refuse(400, "Send {}."))?;
+        let s = {
+            let mut sessions = self.sessions.lock().unwrap();
+            self.tick(&mut sessions, platform);
+            sessions
+                .get(id)
+                .filter(|s| valid_session_id(id) && Self::visible(s, org, Some(project), actor))
+                .ok_or_else(|| refuse(404, "Unknown engine session."))?
+                .clone()
+        };
+        ensure!(
+            s.state == State::Ready,
+            refuse(
+                409,
+                "The session is not streaming yet; ask again when it is ready."
+            )
+        );
+        ensure!(
+            self.relay_of(&s.id).is_some(),
+            refuse(409, NO_SESSION_RELAY)
+        );
+        let broker = platform
+            .relay_broker()?
+            .ok_or_else(|| refuse(409, NO_SESSION_RELAY))?;
+        let token = self.relay_token(
+            &s.id,
+            Role::Watch,
+            &*broker,
+            WATCH_TOKEN_SECONDS,
+            WATCH_TOKEN_MIN_LEFT,
+        )?;
+        Ok((
+            200,
+            json!({
+                "relay_url": DEFAULT_RELAY,
+                "url": format!("{DEFAULT_RELAY}/{}", token.secret),
+                "token": token.secret,
+                "expires_at": token.expires_at,
+                "expires_in": token.expires_at.saturating_sub(now()),
                 "namespace": s.namespace,
                 "session": session_uuid(&s.id),
                 "tag": s.tag, "width": s.width, "height": s.height,
-                "audience": {"token": relay.subscribe_token},
-                "control": {"control_key": s.control_key, "token": relay.control_token},
-            });
-        }
-        Ok(v)
+            }),
+        ))
     }
     /// `POST …/{id}/renew {lease, ttl_seconds}`.
     pub fn renew(
@@ -788,6 +1184,7 @@ impl EngineSessions {
         body: &Value,
         platform: &dyn Platform,
     ) -> Result<(u16, Value)> {
+        let _release = Release(self, platform);
         crate::keys(body, &["lease", "ttl_seconds"], &["lease", "ttl_seconds"])
             .map_err(|_| refuse(400, "Send lease and ttl_seconds."))?;
         let ttl = body["ttl_seconds"]
@@ -829,6 +1226,7 @@ impl EngineSessions {
         body: &Value,
         platform: &dyn Platform,
     ) -> Result<(u16, Value)> {
+        let _release = Release(self, platform);
         crate::keys(body, &["lease"], &[]).map_err(|_| refuse(400, "Send {} or {lease}."))?;
         let mut sessions = self.sessions.lock().unwrap();
         self.tick(&mut sessions, platform);
@@ -868,6 +1266,7 @@ impl EngineSessions {
     /// by the contributor channel): the node's sessions with their desired
     /// state, and secrets for sessions it has not started yet.
     pub fn poll(&self, node: &str, epoch: u64, platform: &dyn Platform) -> Result<Value> {
+        let _release = Release(self, platform);
         let wanted: Vec<Session> = {
             let mut sessions = self.sessions.lock().unwrap();
             self.tick(&mut sessions, platform);
@@ -924,11 +1323,22 @@ impl EngineSessions {
         }
         let unity = platform.unity_access_token(&s.org_id, &s.started_by)?;
         let repository = platform.repository_access(&s.org_id, &s.project, &s.repository)?;
-        let relay = platform.relay()?;
+        // The session's own relay when the broker is configured; a failure
+        // fails the start (never a silent fall back to the shared relay,
+        // whose subscribe token would let a public viewer watch every
+        // session). Without a broker, the shared relay as before.
+        let publish_token = match platform.relay_broker()? {
+            Some(broker) => {
+                self.ensure_relay(s, &*broker)?;
+                self.relay_token(&s.id, Role::Publish, &*broker, PUBLISH_TOKEN_SECONDS, 0)?
+                    .secret
+            }
+            None => platform.relay()?.publish_token,
+        };
         let secrets = json!({
             "repository": {"remote": repository.remote, "token": repository.token, "auth": repository.auth, "expires_at": repository.expires_at},
             "unity": {"access_token": unity},
-            "moq": {"relay_url": relay.url, "publish_token": relay.publish_token, "control_key": s.control_key},
+            "moq": {"relay_url": DEFAULT_RELAY, "publish_token": publish_token, "control_key": s.control_key},
         });
         self.secrets.lock().unwrap().insert(key, secrets.clone());
         Ok(secrets)
@@ -943,6 +1353,7 @@ impl EngineSessions {
         body: &Value,
         platform: &dyn Platform,
     ) -> Result<Value> {
+        let _release = Release(self, platform);
         crate::keys(
             body,
             &[
@@ -1036,6 +1447,8 @@ pub(crate) mod tests {
         pub unity: Mutex<Vec<String>>,
         pub audit: Mutex<Vec<(String, bool)>>,
         pub relay_ok: bool,
+        /// The per-session relay broker (None: the shared relay).
+        pub broker: Option<Arc<dyn crate::moq::Broker>>,
     }
     impl Default for Fake {
         fn default() -> Self {
@@ -1053,6 +1466,7 @@ pub(crate) mod tests {
                 unity: Mutex::new(vec![ALICE.into()]),
                 audit: Mutex::new(vec![]),
                 relay_ok: true,
+                broker: None,
             }
         }
     }
@@ -1089,6 +1503,9 @@ pub(crate) mod tests {
                 control_token: Some("moq-control-secret".into()),
             })
         }
+        fn relay_broker(&self) -> Result<Option<Arc<dyn crate::moq::Broker>>> {
+            Ok(self.broker.clone())
+        }
         fn audit(&self, _: &str, _: &str, action: &str, _: &str, ok: bool, _: Value) {
             self.audit.lock().unwrap().push((action.into(), ok));
         }
@@ -1101,6 +1518,258 @@ pub(crate) mod tests {
     }
     fn report(id: &str, generation: u64, state: &str) -> Value {
         json!({"id":id,"generation":generation,"state":state})
+    }
+
+    fn with_broker(fake: &crate::moq::fake::Fake) -> Fake {
+        Fake {
+            broker: Some(Arc::new(
+                crate::moq::Cloudflare::new(
+                    &fake.url,
+                    crate::moq::fake::ACCOUNT,
+                    crate::moq::fake::API_TOKEN,
+                )
+                .unwrap(),
+            )),
+            ..Fake::default()
+        }
+    }
+    /// Start a session and drive it to ready; returns (id, generation, the node's moq secrets).
+    fn ready_session(es: &EngineSessions, p: &Fake, request: &str) -> (String, u64, Value) {
+        let (_, created) = es
+            .create(ORG, "qoh", ALICE, &start_body(request), p)
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_owned();
+        let polled = es.poll(&node(), 1, p).unwrap();
+        let row = polled["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id.as_str())
+            .unwrap()
+            .clone();
+        let generation = row["generation"].as_u64().unwrap();
+        for state in ["preparing", "starting", "ready"] {
+            es.report(&node(), 1, &report(&id, generation, state), p)
+                .unwrap();
+        }
+        (id, generation, row["secrets"]["moq"].clone())
+    }
+
+    #[test]
+    fn each_session_gets_its_own_relay_and_public_watch_tokens_are_subscribe_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cf = crate::moq::fake::serve();
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let p = with_broker(&cf);
+        let (_, created) = es.create(ORG, "qoh", ALICE, &start_body("w1"), &p).unwrap();
+        let id = created["id"].as_str().unwrap().to_owned();
+        // Not ready yet: no watch token.
+        assert_eq!(
+            status_of(
+                &es.watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)
+                    .unwrap_err()
+            )
+            .0,
+            409
+        );
+        let polled = es.poll(&node(), 1, &p).unwrap();
+        let moq = polled["sessions"][0]["secrets"]["moq"].clone();
+        let relay = es.relay_of(&id).expect("a relay of its own");
+        let live = cf.live(&relay);
+        assert_eq!(live.len(), 1, "defaults revoked; only the node's token");
+        assert_eq!(live[0].operations, ["publish", "subscribe"]);
+        assert_eq!(moq["publish_token"], live[0].secret.as_str());
+        assert_eq!(moq["relay_url"], DEFAULT_RELAY);
+        assert!(
+            !moq.to_string().contains("moq-publish-secret"),
+            "never the shared relay"
+        );
+        let generation = polled["sessions"][0]["generation"].as_u64().unwrap();
+        for state in ["preparing", "starting", "ready"] {
+            es.report(&node(), 1, &report(&id, generation, state), &p)
+                .unwrap();
+        }
+        // The starter's stream: subscribe and control tokens for this relay only.
+        let read = es.get(ORG, "qoh", ALICE, &id, &p).unwrap();
+        assert_eq!(read["relay"], relay.as_str());
+        let audience = read["stream"]["audience"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let control = read["stream"]["control"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(audience.contains(&relay) && control.contains(&relay));
+        assert_eq!(read["stream"]["url"], format!("{DEFAULT_RELAY}/{audience}"));
+        let ops = |secret: &str| {
+            cf.live(&relay)
+                .into_iter()
+                .find(|t| t.secret == secret)
+                .map(|t| t.operations)
+        };
+        assert_eq!(ops(&audience).unwrap(), ["subscribe"]);
+        assert_eq!(ops(&control).unwrap(), ["publish", "subscribe"]);
+        // Reused, not re-minted, on the next read.
+        let again = es.get(ORG, "qoh", ALICE, &id, &p).unwrap();
+        assert_eq!(again["stream"]["audience"]["token"], audience.as_str());
+        assert_eq!(cf.live(&relay).len(), 3);
+        // Watch tokens: subscribe-only, shared, no control; owner and starter may ask.
+        let (status, watch) = es
+            .watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)
+            .unwrap();
+        assert_eq!(status, 200);
+        let token = watch["token"].as_str().unwrap().to_owned();
+        assert_eq!(ops(&token).unwrap(), ["subscribe"]);
+        assert_eq!(watch["url"], format!("{DEFAULT_RELAY}/{token}"));
+        assert_eq!(watch["namespace"], format!("eb-{id}"));
+        assert_eq!(watch["session"], session_uuid(&id));
+        assert!(watch.get("control").is_none() && watch.get("control_key").is_none());
+        let text = watch.to_string();
+        for secret in [
+            audience.as_str(),
+            control.as_str(),
+            moq["publish_token"].as_str().unwrap(),
+        ] {
+            assert!(!text.contains(secret));
+        }
+        let left = watch["expires_in"].as_u64().unwrap();
+        assert!(
+            (WATCH_TOKEN_SECONDS - 5..=WATCH_TOKEN_SECONDS).contains(&left),
+            "{left}"
+        );
+        let (_, by_owner) = es
+            .watch_token(ORG, "qoh", "owner", &id, &json!({}), &p)
+            .unwrap();
+        assert_eq!(by_owner["token"], token.as_str());
+        assert_eq!(
+            status_of(
+                &es.watch_token(ORG, "qoh", BOB, &id, &json!({}), &p)
+                    .unwrap_err()
+            )
+            .0,
+            404
+        );
+        assert_eq!(
+            status_of(
+                &es.watch_token(ORG, "qoh", ALICE, &id, &json!({"x":1}), &p)
+                    .unwrap_err()
+            )
+            .0,
+            400
+        );
+        // Near its end the watch token is replaced; the old one stays valid
+        // until it expires, then is revoked when the next token is minted.
+        es.tokens
+            .lock()
+            .unwrap()
+            .get_mut(&(id.clone(), Role::Watch))
+            .unwrap()
+            .expires_at = now() + 60;
+        let (_, fresh) = es
+            .watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)
+            .unwrap();
+        assert_ne!(fresh["token"], token.as_str());
+        assert!(
+            ops(&token).is_some(),
+            "the previous token still works for its viewers"
+        );
+        {
+            let mut relays = es.relays.lock().unwrap();
+            let record = relays.get_mut(&id).unwrap();
+            let old = record
+                .tokens
+                .iter_mut()
+                .find(|k| k.role == Role::Watch)
+                .unwrap();
+            old.expires_at = now() - 1;
+        }
+        es.tokens
+            .lock()
+            .unwrap()
+            .get_mut(&(id.clone(), Role::Watch))
+            .unwrap()
+            .expires_at = now() + 60;
+        es.watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)
+            .unwrap();
+        assert!(ops(&token).is_none(), "the expired token was revoked");
+        // Restarts lose the in-memory tokens; the relay never exceeds its budget
+        // and the node's publish token is never revoked.
+        for _ in 0..6 {
+            let reopened = EngineSessions::open(dir.path()).unwrap();
+            reopened.get(ORG, "qoh", ALICE, &id, &p).unwrap();
+            reopened
+                .watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)
+                .unwrap();
+            assert!(cf.live(&relay).len() <= MAX_RELAY_TOKENS);
+            assert!(ops(moq["publish_token"].as_str().unwrap()).is_some());
+        }
+        // The relay record holds ids, never a secret.
+        let disk =
+            std::fs::read_to_string(dir.path().join(format!("engine-sessions/relays/{id}.json")))
+                .unwrap();
+        assert!(disk.contains(&relay));
+        for t in cf.state.lock().unwrap().relays.values().flatten() {
+            assert!(!disk.contains(&t.secret));
+        }
+        // Ending deletes the relay.
+        let es = EngineSessions::open(dir.path()).unwrap();
+        es.end(Some(ORG), Some("qoh"), ALICE, &id, &json!({}), &p)
+            .unwrap();
+        assert!(
+            cf.state.lock().unwrap().relays.contains_key(&relay),
+            "still running"
+        );
+        es.report(&node(), 1, &report(&id, generation, "ended"), &p)
+            .unwrap();
+        assert!(cf.state.lock().unwrap().deleted.contains(&relay));
+        assert!(es.relay_of(&id).is_none());
+        assert_eq!(
+            status_of(
+                &es.watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)
+                    .unwrap_err()
+            )
+            .0,
+            409
+        );
+        // The next session gets a different relay.
+        let (second, _, _) = ready_session(&es, &p, "w2");
+        assert_ne!(es.relay_of(&second).unwrap(), relay);
+    }
+
+    #[test]
+    fn a_relay_that_cannot_be_created_fails_the_start_and_lost_sessions_release_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cf = crate::moq::fake::serve();
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let p = with_broker(&cf);
+        cf.fail_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, created) = es.create(ORG, "qoh", ALICE, &start_body("f1"), &p).unwrap();
+        let id = created["id"].as_str().unwrap().to_owned();
+        let polled = es.poll(&node(), 1, &p).unwrap();
+        assert!(
+            polled["sessions"][0].is_null(),
+            "no secrets, no shared-relay fallback"
+        );
+        let read = es.get(ORG, "qoh", ALICE, &id, &p).unwrap();
+        assert_eq!(read["state"], "failed");
+        assert!(
+            read["error"].as_str().unwrap().starts_with("Engine Box could not create this session's MoQ relay (Cloudflare MoQ relay creation failed (HTTP 500"),
+            "{read}"
+        );
+        assert!(es.relay_of(&id).is_none());
+        // A machine that goes offline loses the session; its relay is deleted.
+        cf.fail_create
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (lost, _, _) = ready_session(&es, &p, "f2");
+        let relay = es.relay_of(&lost).unwrap();
+        p.nodes.lock().unwrap()[0].online = false;
+        assert_eq!(
+            es.get(ORG, "qoh", ALICE, &lost, &p).unwrap()["state"],
+            "lost"
+        );
+        assert!(cf.state.lock().unwrap().deleted.contains(&relay));
     }
 
     #[test]
