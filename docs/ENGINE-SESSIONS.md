@@ -199,6 +199,12 @@ reports in order. If the engine channel fails for a minute, it stops its session
   cache`). The global license, activation and identity hosts work from those networks. With `"unity_region": "global"`
   the node pins the licensing client's cached `%LOCALAPPDATA%\Unity\config\production.json` to the global services
   (a copy shipped with the node) and leaves it read-only (`unity_region_pinned` in the receipt).
+- **Crash leftovers.** The node always stops a session's Editor, which leaves scene backups and a lock file in the
+  project's `Temp` ("Scene Backup Detected" next time). The node removes `Temp` before each launch; imports stay in
+  `Library`.
+- **Blocking dialogs.** If a known blocking dialog ("Scene Backup Detected", "Enter Safe Mode?", "Project Upgrade
+  Required", the Software Terms, …) stays up for 20 s during startup, the session fails with its title instead of
+  waiting out `startup_timeout_seconds`.
 - **Editor bridge.** Unity writes `.meta` files into `file:` packages, and a missing one in a read-only package keeps the
   Editor at "Opening project" forever. The node copies `editor_bridge` into its own `work\engine\packages`
   (keyed by content, refreshed when the bridge changes) and references the copy.
