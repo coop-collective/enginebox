@@ -417,14 +417,13 @@ pub fn unity_argv(project: &Path, bridge_config: &Path, log: &Path) -> Vec<OsStr
         project.as_os_str().to_owned(),
         "-jam-editor-config".into(),
         bridge_config.as_os_str().to_owned(),
-        "-enginebox-autoplay".into(),
         "-logFile".into(),
         log.as_os_str().to_owned(),
     ]
 }
 pub fn bridge_config(port: u16, token: &str, spec: &Spec) -> Value {
     json!({"port": port, "token": token, "scene": spec.scene.clone().unwrap_or_default(),
-        "width": spec.width, "height": spec.height, "playOnly": true})
+        "width": spec.width, "height": spec.height, "playOnly": false})
 }
 /// The stream host's private MoQ session file (`--moq-session`).
 pub fn stream_session(
@@ -439,7 +438,7 @@ pub fn stream_session(
         "session": spec.session, "namespace": spec.namespace, "tag": spec.tag,
         "durationSeconds": STREAM_SECONDS, "width": spec.width, "height": spec.height,
         "capture": {"kind": "unity-editor", "origin": format!("http://127.0.0.1:{port}"),
-            "tokenFile": token_file, "ffmpeg": ffmpeg},
+            "tokenFile": token_file, "ffmpeg": ffmpeg, "editor": true},
     })
 }
 /// The stream host's WebRTC fallback block (`moq-session.json` `webrtc`):
@@ -1356,16 +1355,18 @@ pub async fn run_session(
         let editor_pid = g.child(editor_index).id().unwrap_or(0);
         let mut dialog: Option<(String, Instant)> = None;
         loop {
+            // The full Editor (Scene and Game views, Play / Stop / Save from
+            // the controlling client): ready once the bridge answers and the
+            // first import and compile are done.
             if let Some(status) = bridge.check().await?
-                && status["playing"] == true
-                && status["view"] == "play"
+                && status["compiling"] != true
             {
                 break;
             }
             if let Some(exit) = g.child(editor_index).try_wait()? {
                 bail!("The Unity Editor exited during startup (exit {}); see unity.log on the engine machine", exit.code().unwrap_or(-1));
             }
-            ensure!(t.elapsed() < limit, "The Unity Editor did not enter Play mode in time");
+            ensure!(t.elapsed() < limit, "The Unity Editor did not finish opening in time");
             match blocking_dialog(&window_titles(editor_pid)) {
                 Some(title) => {
                     let since = match &dialog {
@@ -2158,7 +2159,6 @@ mod tests {
                 "/w/c/unity-project",
                 "-jam-editor-config",
                 "/w/s/bridge.json",
-                "-enginebox-autoplay",
                 "-logFile",
                 "/w/s/unity.log"
             ]
@@ -2187,7 +2187,7 @@ mod tests {
             session,
             json!({"schema":1,"token":PUBLISH,"controlKey":"f".repeat(64),"session":"01234567-89ab-4def-8123-456789abcdef",
                 "namespace":"eb-0123456789abcdef0123456789abcdef","tag":7,"durationSeconds":600,"width":1280,"height":720,
-                "capture":{"kind":"unity-editor","origin":"http://127.0.0.1:4100","tokenFile":"/w/s/bridge.token","ffmpeg":"/ffmpeg.exe"}})
+                "capture":{"kind":"unity-editor","origin":"http://127.0.0.1:4100","tokenFile":"/w/s/bridge.token","ffmpeg":"/ffmpeg.exe","editor":true}})
         );
         assert!(!session.to_string().contains(UNITY) && !session.to_string().contains(REPO));
         let host = WebrtcSecret {
@@ -2213,7 +2213,7 @@ mod tests {
         let bridge = bridge_config(4100, &"a".repeat(64), &spec);
         assert_eq!(
             bridge,
-            json!({"port":4100,"token":"a".repeat(64),"scene":"Assets/_Project/Scenes/Prototype.unity","width":1280,"height":720,"playOnly":true})
+            json!({"port":4100,"token":"a".repeat(64),"scene":"Assets/_Project/Scenes/Prototype.unity","width":1280,"height":720,"playOnly":false})
         );
         let mut bad = spec.clone();
         bad.namespace = "eb/x".into();

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Engine sessions open the full Unity Editor.** Sessions no longer auto-enter Play mode with a play-only bridge: Unity opens in the Editor (Scene view), the session is ready once the editor bridge answers and has compiled, and the stream host runs the full editor bridge (`capture.editor: true`), so the controlling client can switch between the Editor and Play mode, save the scene and use the hierarchy and Inspector ([Windows executor](docs/ENGINE-SESSIONS.md#windows-executor-packagesenginebox-installsrcenginers)).
+
 - **WebRTC fallback for engine-session viewers.** Viewers whose network blocks QUIC (UDP 443, as some VPNs do) can watch and control over WebRTC relayed through Cloudflare TURN (including TLS on 443): `POST /v1/projects/{p}/engine-sessions/{id}/peers` opens a peer (`watch`, or `control` for the starter), then one offer and one answer pass through the controller; the stream host signals with a per-session host token through `/api/node/engine-peers/…`. Needs the platform `cloudflare-turn` connection (`TURN_KEY_ID`, `TURN_API_TOKEN`); MoQ stays primary and engine machines still open no port ([WebRTC fallback](docs/ENGINE-SESSIONS.md#webrtc-fallback-packagesenginebox-controllersrcengine_sessionspeersrs-turnrs)).
 
 - **Engine node: the editor bridge port recovers from conflicts.** If another program takes the loopback port picked for the Unity editor bridge before Unity binds it, the node writes a new free port into `bridge.json` (the bridge retries and re-reads it) after about 6 s, up to five times, and the stream host is always started against the port the bridge is answering on ([Windows executor](docs/ENGINE-SESSIONS.md#windows-executor-packagesenginebox-installsrcenginers)).
