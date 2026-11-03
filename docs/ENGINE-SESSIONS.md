@@ -127,9 +127,10 @@ reports in order. If the engine channel fails for a minute, it stops its session
    environment, with the credential helper disabled and prompts off; error text is redacted.
 2. The project's `ProjectVersion.txt` must match the requested version (no upgrade dialog). `Packages/manifest.json`
    gains `dev.unityjam.editor-bridge` (`file:` the configured bridge) and `dev.enginebox.session` (`file:` a generated
-   package whose editor script enters Play mode after import when Unity runs with `-enginebox-autoplay`; the bridge
-   streams only in Play mode). The next session's `checkout -f` restores the manifest.
-3. `bridge.json {port, token, scene, width, height, playOnly:true}` and `bridge.token` are written to
+   package whose editor script would enter Play mode after import when Unity runs with `-enginebox-autoplay`; since
+   November 3, 2026 sessions open the full Editor instead and the flag is not passed). The next session's
+   `checkout -f` restores the manifest.
+3. `bridge.json {port, token, scene, width, height, playOnly:false}` and `bridge.token` are written to
    `work\engine\sessions\<id>` (the node's owner-only directory). `port` is a free loopback port picked just before
    (bind `127.0.0.1:0`). Another program can take it before Unity binds; the bridge then retries its start on every
    Editor update and reads `bridge.json` again each time. So while the node waits for the bridge (step 5, and before
@@ -140,12 +141,15 @@ reports in order. If the engine channel fails for a minute, it stops its session
 4. `<Editor>\Data\Resources\Licensing\Client\Unity.Licensing.Client.exe --activate-all --accessToken <token>
    --include-personal`. **This is the one place a secret is in argv**; the client has no other input. Its output is
    discarded.
-5. `Unity.exe -acceptSoftwareTermsForThisRunOnly -projectPath <project> -jam-editor-config <bridge.json> -enginebox-autoplay -logFile <session>\unity.log`
+5. `Unity.exe -acceptSoftwareTermsForThisRunOnly -projectPath <project> -jam-editor-config <bridge.json> -logFile <session>\unity.log`
    in the node's own interactive session (the `enginebox` account, session 1); then the node polls the bridge's
-   `/status` until `playing` and `view:"play"` (default limit one hour, `startup_timeout_seconds`).
+   `/status` until it answers and is not compiling (default limit one hour, `startup_timeout_seconds`). The session
+   opens in the Editor: the controlling client switches between the Editor and Play mode, saves the scene and reads
+   the hierarchy and Inspector over its WebRTC peer, as the Unity Jam Games tab always did.
 6. `enginebox-stream-host.exe --moq-session <session>\moq-session.json` with
    `{schema:1, token:<publish>, controlKey, session, namespace, tag, durationSeconds:600, width, height,
-   capture:{kind:"unity-editor", origin:"http://127.0.0.1:<port>", tokenFile, ffmpeg}}`, where `<port>` is always the
+   capture:{kind:"unity-editor", origin:"http://127.0.0.1:<port>", tokenFile, ffmpeg, editor:true}}` (`editor`: the
+   full editor bridge rather than play-only), where `<port>` is always the
    port the bridge is answering on at that start (the node waits up to two minutes for it). Its first
    `moq-source-running` line reports `ready`. The stream host's permit is fixed at 600 s and it also ends cleanly
    when no controlling client keeps it alive, so the node restarts it while the session runs (viewers reconnect);
