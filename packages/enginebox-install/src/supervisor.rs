@@ -529,6 +529,9 @@ async fn proxy(supervisor: Supervisor, request: Request, dashboard: bool) -> Res
                 "engine-report",
             ]
             .contains(action)
+            // A stream host's WebRTC fallback signaling, authenticated by
+            // its session's host token at the controller.
+            || action.starts_with("engine-peers/")
         });
     let finishing_node = node_action
         .is_some_and(|action| ["heartbeat", "result", "engine-report"].contains(&action));

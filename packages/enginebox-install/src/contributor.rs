@@ -355,11 +355,14 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
     let mut engine = if c.workloads.engine {
         let swept = crate::engine::sweep(&root, private)?;
         atomic_json(&private.join("engine-sweep.json"), &swept)?;
-        Some(crate::engine::Executor::new(
-            engine_config.clone(),
-            root.clone(),
-            private.to_owned(),
-        ))
+        Some(
+            crate::engine::Executor::new(engine_config.clone(), root.clone(), private.to_owned())
+                .with_controller(
+                    native_node::controller_origin(&c.controller, test)?
+                        .origin()
+                        .ascii_serialization(),
+                ),
+        )
     } else {
         None
     };

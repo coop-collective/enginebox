@@ -157,6 +157,7 @@ of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllers
 | `POST /v1/projects/{project}/engine-sessions/{id}/renew` | `{lease, ttl_seconds}` |
 | `POST /v1/projects/{project}/engine-sessions/{id}/end` | `{}` or `{lease}` |
 | `POST /v1/projects/{project}/engine-sessions/{id}/watch-token` | `{}`; a short-lived subscribe-only token for public viewers |
+| `POST /v1/projects/{project}/engine-sessions/{id}/peers[/{peer}/offer\|poll\|renew\|end]` | The WebRTC fallback for viewers whose network blocks QUIC (`engine_sessions.watch`; [details](ENGINE-SESSIONS.md#webrtc-fallback-packagesenginebox-controllersrcengine_sessionspeersrs-turnrs)) |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 
 The dashboard's **MCP** section includes Connected apps and grants: every live

@@ -102,6 +102,9 @@ test("engine sessions are offered only for the engine-sessions scope; the token 
     ["GET", `${base}/${session.id}/renew`],
     ["GET", `${base}/${session.id}/watch-token`],
     ["POST", `${base}/${session.id}/stop`],
+    ["GET", `${base}/${session.id}/peers`],
+    ["POST", `${base}/${session.id}/peers/not-a-peer/offer`],
+    ["POST", `${base}/${session.id}/peers/${"e".repeat(32)}/answer`],
     ["GET", "v1/projects/Alpha/engine-sessions"],
   ] as const)
     assert.equal((await call(path, tokens.access_token, method, method === "POST" ? {} : undefined)).status, 404, `${method} ${path}`);

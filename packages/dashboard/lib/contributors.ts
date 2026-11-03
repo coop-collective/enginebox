@@ -133,3 +133,20 @@ export async function nodeProxy(request: Request, action: string) {
   // The caller's scoped token is forwarded unchanged. Never substitute owner auth.
   return json(await forward(`/v1/node/${action}`, 'POST', token, await bodyJson(request, 350000)));
 }
+// A stream host's WebRTC fallback signaling (docs/ENGINE-SESSIONS.md, "WebRTC fallback"):
+// poll for viewers' peers, read a peer's offer, post its answer, end it. The
+// session's host token is forwarded unchanged; the controller checks it.
+export async function enginePeerProxy(request: Request, segments: string[]) {
+  const search = new URL(request.url).search;
+  const [first, action] = segments;
+  const post = request.method === 'POST' && !search;
+  const allowed = segments.length === 1
+    ? post && first === 'poll'
+    : segments.length === 2 && /^[a-f0-9]{32}$/.test(first) &&
+      ((action === 'signals' && (post || (request.method === 'GET' && /^(\?after=\d{1,3})?$/.test(search)))) || (action === 'end' && post));
+  if (!allowed) throw new HttpError(404, 'Unknown stream host operation.');
+  if (request.headers.has('origin')) throw new HttpError(403, 'Node API is for installed workers.');
+  const token = request.headers.get('authorization')?.match(/^Bearer (ehp_[a-f0-9]{64})$/)?.[1];
+  if (!token) throw new HttpError(401, 'Stream host credential required.');
+  return json(await forward(`/v1/node/engine-peers/${segments.join('/')}${search}`, request.method, token, request.method === 'POST' ? await bodyJson(request, 80000) : undefined));
+}
