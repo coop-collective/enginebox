@@ -43,6 +43,29 @@ fn transient(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}");
     text.starts_with("Controller request failed") || text.starts_with("Controller returned HTTP 5")
 }
+/// Appends why the worker stopped to `exits.log` beside its config (owner-only,
+/// bounded), so an engine machine that drops its sessions can be diagnosed.
+/// Node errors never carry controller text or secrets (`native_node::post`).
+fn record_exit(private: &Path, error: &anyhow::Error) {
+    use std::io::Write;
+    let path = private.join("exits.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line =
+        json!({"at": at, "error": format!("{error:#}").chars().take(500).collect::<String>()});
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
 fn endpoint(action: &str, test: bool) -> String {
     format!("/{}/node/{action}", if test { "v1" } else { "api" })
 }
@@ -421,7 +444,15 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
             }
             if heartbeat["blocked"]!=true {
                 check_disk(&root,&c.budget)?;
-                let poll=post(&c,"poll",json!({"session":session,"epoch":epoch}),test).await?;
+                // The job slot's poll rides out the same blips as the heartbeat.
+                let poll = match post(&c,"poll",json!({"session":session,"epoch":epoch}),test).await {
+                    Ok(value) => value,
+                    Err(error) if transient(&error) && heartbeat_ok.elapsed() < HEARTBEAT_GRACE => {
+                        tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if poll["job"].is_object() {
                     let job=&poll["job"];let id=job["id"].as_str().context("Missing job identity")?;
                     ensure!(enginebox_node_protocol::id(id) && job["node"]==c.id,"Unexpected assignment");
@@ -467,6 +498,9 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
     if let Some(ex) = engine.as_mut() {
         // The session Job Objects close with this process; ask tasks to stop first.
         ex.stop_all();
+    }
+    if let Err(error) = &result {
+        record_exit(private, error);
     }
     if cfg!(target_os = "linux") {
         crate::wsl::stop_runtime()?;
@@ -553,5 +587,21 @@ mod tests {
             )));
         }
         assert!(!transient(&anyhow::anyhow!("Invalid controller response")));
+    }
+
+    #[test]
+    fn exits_are_recorded_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        super::record_exit(dir.path(), &anyhow::anyhow!("Controller returned HTTP 409"));
+        let text = std::fs::read_to_string(dir.path().join("exits.log")).unwrap();
+        assert!(text.contains("Controller returned HTTP 409") && text.ends_with('\n'));
+        std::fs::write(dir.path().join("exits.log"), vec![b'x'; 70 * 1024]).unwrap();
+        super::record_exit(dir.path(), &anyhow::anyhow!("again"));
+        assert!(
+            std::fs::metadata(dir.path().join("exits.log"))
+                .unwrap()
+                .len()
+                < 1024
+        );
     }
 }
