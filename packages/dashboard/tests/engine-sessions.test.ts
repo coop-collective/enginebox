@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, test, type TestContext } from "node:test";
 import { startEmailSignIn, verifyEmailCode } from "../lib/identity/auth";
 import { engineSessions } from "../lib/engine-sessions";
-import { contributors, nodeProxy } from "../lib/contributors";
+import { contributors, enginePeerProxy, nodeProxy } from "../lib/contributors";
 import { HttpError } from "../lib/server";
 
 const origin = "https://enginebox.example";
@@ -115,4 +115,26 @@ test("the node proxy allows the engine channel and nothing else new", async (t) 
   for (const action of ["engine-start", "engine-poll/../poll", "engine"]) {
     await assert.rejects(nodeProxy(node(action), action), (e: unknown) => e instanceof HttpError && e.status === 404);
   }
+});
+
+test("the stream host's peer routes forward its host token and nothing else", async (t) => {
+  const sent = fakeController(t);
+  const host = `ehp_${"c".repeat(64)}`;
+  const peer = "e".repeat(32);
+  const call = (path: string, method = "POST", token = host, extra: Record<string, string> = {}) =>
+    enginePeerProxy(new Request(`${origin}/api/node/engine-peers/${path}`, { method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...extra }, body: method === "POST" ? "{}" : undefined }), path.split("?")[0].split("/"));
+  await call("poll");
+  assert.equal(sent.at(-1)!.url, "http://127.0.0.1:8765/v1/node/engine-peers/poll");
+  await call(`${peer}/signals?after=0`, "GET");
+  assert.equal(sent.at(-1)!.url, `http://127.0.0.1:8765/v1/node/engine-peers/${peer}/signals?after=0`);
+  assert.equal(sent.at(-1)!.method, "GET");
+  await call(`${peer}/signals`);
+  await call(`${peer}/end`);
+  assert.equal(sent.at(-1)!.url, `http://127.0.0.1:8765/v1/node/engine-peers/${peer}/end`);
+  const count = sent.length;
+  for (const [path, method] of [["poll", "GET"], [`${peer}/end`, "GET"], [`${peer}/signals?after=x`, "GET"], ["nope/signals", "POST"], [`${peer}/answer`, "POST"], [`${peer}/signals/extra`, "POST"]] as const)
+    await assert.rejects(call(path, method), (e: unknown) => e instanceof HttpError && e.status === 404, `${method} ${path}`);
+  await assert.rejects(call("poll", "POST", nodeToken), (e: unknown) => e instanceof HttpError && e.status === 401);
+  await assert.rejects(call("poll", "POST", host, { origin }), (e: unknown) => e instanceof HttpError && e.status === 403);
+  assert.equal(sent.length, count);
 });

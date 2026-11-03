@@ -23,6 +23,7 @@ pub mod repositories;
 pub mod service_tokens;
 pub mod storage;
 pub mod tenancy;
+pub mod turn;
 pub mod unity;
 mod workspaces;
 
@@ -85,6 +86,8 @@ struct Runtime {
     engine_sessions: engine_sessions::EngineSessions,
     /// Cloudflare's API base for per-session MoQ relays (moq.rs).
     moq_api: String,
+    /// Cloudflare Realtime's API base for TURN credentials (turn.rs).
+    turn_api: String,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -116,6 +119,8 @@ pub struct Controller {
     unity_login: Mutex<Option<String>>,
     /// Test harnesses stand in for Cloudflare's MoQ relay API (moq.rs).
     moq_api: Mutex<Option<String>>,
+    /// Test harnesses stand in for Cloudflare's TURN API (turn.rs).
+    turn_api: Mutex<Option<String>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -154,6 +159,7 @@ impl Controller {
             usage_sink: Mutex::new(metering::noop()),
             unity_login: Mutex::new(None),
             moq_api: Mutex::new(None),
+            turn_api: Mutex::new(None),
         }))
     }
     /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
@@ -245,6 +251,12 @@ impl Controller {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| moq::API_BASE.to_owned()),
+            turn_api: self
+                .turn_api
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| turn::API_BASE.to_owned()),
             credentials: {
                 let store =
                     credentials::Credentials::open(&self.root, &std::collections::BTreeMap::new())?;
@@ -352,6 +364,11 @@ impl Controller {
     #[doc(hidden)]
     pub fn set_moq_api_url(&self, url: &str) {
         *self.moq_api.lock().unwrap() = Some(url.to_owned());
+    }
+    /// Stand in for Cloudflare's TURN API base. Takes effect at the next activation.
+    #[doc(hidden)]
+    pub fn set_turn_api_url(&self, url: &str) {
+        *self.turn_api.lock().unwrap() = Some(url.to_owned());
     }
     #[doc(hidden)]
     pub fn dev_agent_service(&self) -> Result<enginebox_agents::AgentService> {
@@ -577,6 +594,21 @@ fn engine_session_route<'a>(
                 "watch-token",
             ],
         ) => Some((Operation::EngineWatch, project)),
+        // The WebRTC fallback (create a peer, then offer/poll/renew/end it).
+        (&Method::POST, ["v1", "projects", project, "engine-sessions", _, "peers"])
+        | (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "engine-sessions",
+                _,
+                "peers",
+                _,
+                "offer" | "poll" | "renew" | "end",
+            ],
+        ) => Some((Operation::EngineWatch, project)),
         _ => None,
     }
 }
@@ -734,6 +766,9 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             StatusCode::FORBIDDEN,
             "Browser requests must use the authenticated dashboard proxy.",
         );
+    }
+    if path.starts_with("/v1/node/engine-peers/") {
+        return engine_peer_request(controller, request).await;
     }
     if path.starts_with("/v1/node/") {
         return node_request(controller, request).await;
@@ -997,6 +1032,106 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
                 "Request could not be admitted. Check its fields, workspace state and configured capacity.",
             ),
         },
+    }
+}
+
+/// The stream host's side of the engine-session WebRTC fallback
+/// (`engine_sessions/peers.rs`): `POST /v1/node/engine-peers/poll`,
+/// `GET|POST /v1/node/engine-peers/{peer}/signals` and
+/// `POST /v1/node/engine-peers/{peer}/end`, authenticated by the session's
+/// host token. Refusals keep their status (401, 410) so the host can tell a
+/// lost credential from an ended peer.
+async fn engine_peer_request(controller: Arc<Controller>, request: Request<Body>) -> Response {
+    let path = request.uri().path().to_owned();
+    let parts: Vec<String> = path
+        .trim_start_matches("/v1/node/engine-peers/")
+        .split('/')
+        .map(str::to_owned)
+        .collect();
+    let method = request.method().clone();
+    let after = match (&method, request.uri().query()) {
+        (&Method::GET, Some(query)) => match query.strip_prefix("after=").map(str::parse::<u64>) {
+            Some(Ok(after)) => Some(after),
+            _ => return error(StatusCode::BAD_REQUEST, "Unknown query."),
+        },
+        (&Method::GET, None) => Some(0),
+        (_, None) => None,
+        _ => return error(StatusCode::BAD_REQUEST, "Unknown query."),
+    };
+    let known = matches!(
+        (
+            &method,
+            parts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+        ),
+        (&Method::POST, ["poll"])
+            | (&Method::GET | &Method::POST, [_, "signals"])
+            | (&Method::POST, [_, "end"])
+    );
+    if !known {
+        return error(StatusCode::NOT_FOUND, "Unknown stream host operation.");
+    }
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_owned();
+    if token.is_empty() || token.len() > 200 {
+        return error(StatusCode::UNAUTHORIZED, "Stream host credential required.");
+    }
+    let runtime = match controller.runtime() {
+        Ok(r) => r,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Controller unavailable."),
+    };
+    let body = if method == Method::POST {
+        let bytes = match to_bytes(request.into_body(), 80_000).await {
+            Ok(b) => b,
+            Err(_) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Stream host request too large.",
+                );
+            }
+        };
+        match enginebox_core::templates::decode_json(&bytes) {
+            Ok(v) if v.is_object() => v,
+            _ => return error(StatusCode::BAD_REQUEST, "Invalid stream host request."),
+        }
+    } else {
+        json!({})
+    };
+    let result = blocking(move || {
+        let platform = RuntimePlatform(&runtime);
+        let sessions = &runtime.engine_sessions;
+        Ok(
+            match parts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["poll"] => sessions.peer_host_poll(&token, &platform),
+                [peer, action] => sessions.peer_host(&token, peer, action, after, &body, &platform),
+                _ => Err(anyhow::anyhow!("Unknown stream host operation.")),
+            },
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => reply(StatusCode::OK, value),
+        Ok(Err(e)) => {
+            let (status, message) = engine_sessions::status_of(&e);
+            error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                &message,
+            )
+        }
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "Controller unavailable."),
     }
 }
 
@@ -1897,6 +2032,26 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
             ),
         }
     }
+    fn turn(&self) -> Result<Option<Arc<dyn turn::Issuer>>> {
+        let value = |name| {
+            self.0
+                .catalog
+                .connections
+                .source_value(enginebox_agents::pools::DEFAULT_ORG, turn::CONNECTION, name)
+                .ok()
+        };
+        match (value(turn::KEY_ID), value(turn::API_TOKEN)) {
+            (None, None) => Ok(None),
+            (Some(key), Some(token)) => Ok(Some(Arc::new(
+                turn::Cloudflare::new(&self.0.turn_api, &key, &token).map_err(|error| {
+                    anyhow::anyhow!("The cloudflare-turn connection is invalid: {error}")
+                })?,
+            ))),
+            _ => anyhow::bail!(
+                "The cloudflare-turn connection needs both TURN_KEY_ID and TURN_API_TOKEN."
+            ),
+        }
+    }
     fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value) {
         self.0
             .catalog
@@ -1930,6 +2085,12 @@ fn engine_session_write(
         }
         (Some(project), [id, "watch-token"]) => {
             sessions.watch_token(org, project, actor, id, body, &platform)
+        }
+        (Some(project), [id, "peers"]) => {
+            sessions.peer_create(org, project, actor, id, body, &platform)
+        }
+        (Some(project), [id, "peers", peer, action]) => {
+            sessions.peer_client(org, project, actor, id, peer, action, body, &platform)
         }
         (None, [id, "end"]) if owner => sessions.end(None, None, actor, id, body, &platform),
         _ => Ok((404, json!({"error": "Unknown engine session operation."}))),
@@ -6352,6 +6513,7 @@ mod tests {
         c.set_unity_login_url(&url);
         let cloudflare = moq::fake::serve();
         c.set_moq_api_url(&cloudflare.url);
+        c.set_turn_api_url(&turn::fake::serve());
         c.activate().unwrap();
         let app = router(c.clone());
         let as_member = |method: Method, path: &str, body: Value, actor: &str| {
@@ -6375,6 +6537,7 @@ mod tests {
         for body in [
             json!({"name":"cloudflare-moq","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"MOQ_PUBLISH_TOKEN":publish,"MOQ_SUBSCRIBE_TOKEN":subscribe}}),
             json!({"name":"engine-repo-queen-of-hearts","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"GIT_REMOTE_URL":"https://github.com/coop-collective/queen-of-hearts.git","GIT_READ_TOKEN":repo_token}}),
+            json!({"name":"cloudflare-turn","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"TURN_KEY_ID":turn::fake::KEY,"TURN_API_TOKEN":turn::fake::API_TOKEN}}),
         ] {
             let (status, created) = call(
                 &app,
@@ -6650,6 +6813,125 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{renewed}");
+        // The WebRTC fallback over HTTP: a watch-scoped token opens a peer and
+        // offers; the stream host answers with the session's host token.
+        let host = row["secrets"]["webrtc"]["host_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (_, watcher) = mint(
+            &app,
+            json!({"label":"watch","scopes":[],"operations":["engine_sessions.watch"],
+                "engine_sessions":[{"project":"qoh"}],"member":ALICE}),
+        )
+        .await;
+        let peers = format!("{one}/peers");
+        assert_eq!(
+            call(
+                &app,
+                as_token(Method::POST, &peers, json!({"mode":"watch"}), &reader)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, peer) = call(
+            &app,
+            as_token(Method::POST, &peers, json!({"mode":"control"}), &watcher),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{peer}");
+        assert_eq!(peer["ice_transport_policy"], "relay");
+        assert_eq!(peer["ice_servers"][1]["credential"], turn::fake::CREDENTIAL);
+        assert!(!peer.to_string().contains(":53"));
+        let pid = peer["peer"]["id"].as_str().unwrap().to_owned();
+        let client = peer["client_token"].clone();
+        let (status, offered) = call(
+            &app,
+            as_token(
+                Method::POST,
+                &format!("{peers}/{pid}/offer"),
+                json!({"client_token":client,"sdp":"v=0 offer"}),
+                &watcher,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{offered}");
+        let host_call = |method: Method, path: &str, body: Option<Value>, bearer: &str| {
+            Request::builder()
+                .method(method)
+                .uri(format!("/v1/node/engine-peers/{path}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap()
+        };
+        let (status, listed) = call(
+            &app,
+            host_call(Method::POST, "poll", Some(json!({})), &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["sessions"][0]["id"], pid.as_str());
+        assert_eq!(listed["sessions"][0]["nodeId"], id.as_str());
+        let wrong = format!("ehp_{}", "1".repeat(64));
+        assert_eq!(
+            call(
+                &app,
+                host_call(Method::POST, "poll", Some(json!({})), &wrong)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, signals) = call(
+            &app,
+            host_call(Method::GET, &format!("{pid}/signals?after=0"), None, &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{signals}");
+        assert_eq!(signals["signals"][0]["signal"]["sdp"], "v=0 offer");
+        assert_eq!(
+            call(
+                &app,
+                host_call(Method::GET, &format!("{pid}/signals?x=1"), None, &host)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &app,
+                host_call(
+                    Method::GET,
+                    &format!("{}/signals", "f".repeat(32)),
+                    None,
+                    &host
+                )
+            )
+            .await
+            .0,
+            StatusCode::GONE
+        );
+        let answer = json!({"id":"answer-1","signal":{"type":"answer","sdp":"v=0 answer"}});
+        let (status, answered) = call(
+            &app,
+            host_call(Method::POST, &format!("{pid}/signals"), Some(answer), &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answered}");
+        let (_, polled_answer) = call(
+            &app,
+            as_token(
+                Method::POST,
+                &format!("{peers}/{pid}/poll"),
+                json!({"client_token":client}),
+                &watcher,
+            ),
+        )
+        .await;
+        assert_eq!(polled_answer["answer"], "v=0 answer");
         // A token start is Alice's own session (queued: her one machine is busy),
         // which she then ends with the same token.
         let (status, queued) = call(

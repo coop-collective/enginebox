@@ -224,6 +224,13 @@ pub struct Secrets {
     pub repository: RepositorySecret,
     pub unity: UnitySecret,
     pub moq: MoqSecret,
+    /// The WebRTC fallback's host token, when the controller offers it.
+    #[serde(default)]
+    pub webrtc: Option<WebrtcSecret>,
+}
+#[derive(Clone, Deserialize)]
+pub struct WebrtcSecret {
+    pub host_token: String,
 }
 #[derive(Clone, Deserialize)]
 pub struct RepositorySecret {
@@ -433,6 +440,32 @@ pub fn stream_session(
         "durationSeconds": STREAM_SECONDS, "width": spec.width, "height": spec.height,
         "capture": {"kind": "unity-editor", "origin": format!("http://127.0.0.1:{port}"),
             "tokenFile": token_file, "ffmpeg": ffmpeg},
+    })
+}
+/// The stream host's WebRTC fallback block (`moq-session.json` `webrtc`):
+/// it polls the controller for viewers' peers with the session's host token.
+/// The file is owner-only, like the publish token beside it.
+pub fn webrtc_block(
+    controller: &str,
+    secret: &WebrtcSecret,
+    spec: &Spec,
+    id: &str,
+    generation: u64,
+) -> Option<Value> {
+    let project = spec
+        .repository
+        .split('/')
+        .next()
+        .filter(|p| !p.is_empty())?;
+    let token = &secret.host_token;
+    let valid = token.len() == 68
+        && token.starts_with("ehp_")
+        && token[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    valid.then(|| {
+        json!({"controller": controller, "token": token, "project": project,
+            "engineSession": id, "generation": generation})
     })
 }
 fn file_url(path: &Path) -> String {
@@ -951,6 +984,9 @@ pub struct SessionContext {
     pub config: EngineConfig,
     pub work: PathBuf,
     pub private: PathBuf,
+    /// The controller's public origin, for the stream host's WebRTC fallback
+    /// signaling (None: the stream host offers MoQ only).
+    pub controller: Option<String>,
 }
 
 async fn cancelled(stop: &mut watch::Receiver<bool>) {
@@ -1362,7 +1398,13 @@ pub async fn run_session(
             receipt["bridge_port_moves"] = json!(bridge.moves);
             std::fs::write(
                 &session_file,
-                serde_json::to_vec(&stream_session(&spec, &secrets.moq, bridge.port, &token_file, &ctx.config.ffmpeg))?,
+                serde_json::to_vec(&{
+                    let mut session = stream_session(&spec, &secrets.moq, bridge.port, &token_file, &ctx.config.ffmpeg);
+                    if let Some(block) = ctx.controller.as_deref().zip(secrets.webrtc.as_ref()).and_then(|(origin, w)| webrtc_block(origin, w, &spec, &id, generation)) {
+                        session["webrtc"] = block;
+                    }
+                    session
+                })?,
             )?;
             let mut host = Command::new(&ctx.config.stream_host);
             host.arg("--moq-session")
@@ -1457,6 +1499,7 @@ pub struct Executor {
     running: BTreeMap<String, (u64, watch::Sender<bool>)>,
     reports_tx: mpsc::UnboundedSender<Report>,
     reports_rx: mpsc::UnboundedReceiver<Report>,
+    controller: Option<String>,
 }
 impl Executor {
     /// `config_path` is read when a session starts, so an owner's fix to
@@ -1470,7 +1513,13 @@ impl Executor {
             running: BTreeMap::new(),
             reports_tx,
             reports_rx,
+            controller: None,
         }
+    }
+    /// The controller origin sessions' stream hosts signal WebRTC peers through.
+    pub fn with_controller(mut self, origin: String) -> Self {
+        self.controller = Some(origin);
+        self
     }
     pub fn running(&self) -> usize {
         self.running.len()
@@ -1532,6 +1581,7 @@ impl Executor {
                                     config,
                                     work: self.work.clone(),
                                     private: self.private.clone(),
+                                    controller: self.controller.clone(),
                                 }),
                                 id.to_owned(),
                                 generation,
@@ -1615,6 +1665,7 @@ pub async fn rehearse(config_path: &Path, work: &Path, spec: Value, remote: &str
         config,
         work: work.to_owned(),
         private: private.clone(),
+        controller: None,
     };
     let (_tx, mut stop) = watch::channel(false);
     let access = RepositorySecret {
@@ -2139,6 +2190,26 @@ mod tests {
                 "capture":{"kind":"unity-editor","origin":"http://127.0.0.1:4100","tokenFile":"/w/s/bridge.token","ffmpeg":"/ffmpeg.exe"}})
         );
         assert!(!session.to_string().contains(UNITY) && !session.to_string().contains(REPO));
+        let host = WebrtcSecret {
+            host_token: format!("ehp_{}", "a".repeat(64)),
+        };
+        assert_eq!(
+            webrtc_block(
+                "https://enginebox.example",
+                &host,
+                &spec,
+                "0123456789abcdef0123456789abcdef",
+                3
+            ),
+            Some(
+                json!({"controller":"https://enginebox.example","token":host.host_token,"project":spec.repository.split('/').next().unwrap(),
+                "engineSession":"0123456789abcdef0123456789abcdef","generation":3})
+            )
+        );
+        let bad = WebrtcSecret {
+            host_token: "ehp_short".into(),
+        };
+        assert!(webrtc_block("https://enginebox.example", &bad, &spec, "x", 1).is_none());
         let bridge = bridge_config(4100, &"a".repeat(64), &spec);
         assert_eq!(
             bridge,
@@ -2176,6 +2247,7 @@ mod tests {
             config: config.clone(),
             work: dir.path().canonicalize().unwrap().join("work"),
             private: dir.path().canonicalize().unwrap().join("private"),
+            controller: None,
         };
         let session = dir.path().canonicalize().unwrap().join("session");
         std::fs::create_dir_all(&session).unwrap();

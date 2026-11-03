@@ -265,6 +265,41 @@ public viewer holding a relay-wide subscribe token could watch every session. Wi
   the starter and watch tokens are minted again.
 - Errors and logs carry HTTP status and Cloudflare error codes only, never a token or a response body.
 
+### WebRTC fallback (`packages/enginebox-controller/src/engine_sessions/peers.rs`, `turn.rs`)
+
+Added November 3, 2026. Browsers reach the MoQ relay over WebTransport, which needs QUIC on UDP 443. Some networks drop
+exactly that: measured through ExpressVPN (Lightway, Network Lock), forced-QUIC loads of any site fail while TCP loads
+work, and Cloudflare TURN answers on udp:3478, tcp:80/3478, tls:5349 and tls:443 but not udp:443. Such viewers fall back
+to WebRTC with media relayed through **Cloudflare TURN on both sides** (`iceTransportPolicy: "relay"`, TURN over TLS on
+443 included). MoQ stays the primary path; the engine machine still opens no port.
+
+- **Configuration.** The platform org's `secret_source` connection `cloudflare-turn` with `TURN_KEY_ID` (32 hex) and
+  `TURN_API_TOKEN` (the TURN key's API token). Both or neither; without it nothing below is offered and peers are `503`.
+- **Viewers** (owner token, the starter, or an OAuth token with `engine_sessions.watch` acting as the starter; same
+  visibility as `watch-token`; the session must be `ready`):
+  - `POST …/{id}/peers {mode:"watch"|"control"}` → `201 {peer:{id, mode, state, expires_at}, client_token, ice_servers,
+    ice_transport_policy:"relay", ice_expires_at, width, height}`. Control is the starter's (or the owner token's), and a
+    new control peer ends their previous one. At most 8 open peers per session (`429`), 64 overall. ICE servers are
+    minted per peer for an hour (Cloudflare STUN/TURN URLs only, port 53 dropped).
+  - `POST …/peers/{pid}/offer {client_token, sdp}` (one complete offer, ≤ 64 KiB), `…/poll {client_token}` →
+    `{peer, answer}`, `…/renew {client_token}` (lease 60 s, capped at the ICE expiry), `…/end {client_token}`. A wrong
+    `client_token` is `403`; an ended peer `410`.
+- **Stream host** (`Authorization: Bearer <host token>`, through the dashboard at `/api/node/engine-peers/…`, which
+  forwards to the controller's `/v1/node/engine-peers/…`): `POST poll {}` → `{now, sessions:[{id, project, nodeId:<engine
+  session>, nodeEpoch:<generation>, mode, state, expires, iceServers, iceTransportPolicy, iceExpires}]}` (the stream host's
+  machine-session shape), `GET {pid}/signals?after=N` (the offer as signal 1), `POST {pid}/signals {id, signal:{type:
+  "answer", sdp}}` (one answer, idempotent on `id`; a different second answer ends the peer, `410`), `POST {pid}/end
+  {id}`. A bad token is `401`; refusals about one peer are `410` so the host keeps its other peers.
+- **Host token.** With TURN configured, the node's `secrets` gain `webrtc:{host_token}` (`ehp_<64 hex>`), minted once per
+  session generation. Only its SHA-256 is kept, on the session record (`peer_host_hash`). The node writes it, the
+  controller origin, project, session id and generation into the owner-only `moq-session.json` as `webrtc`, and the
+  stream host polls about every second while MoQ runs. A connected control peer keeps the stream host's control
+  liveness, as a MoQ controlling client does.
+- **Lifetime.** Peers live in controller memory only: a restart, the session leaving `ready` or changing generation,
+  a lapsed lease, or either side ending it ends the peer, and the viewer opens a new one. The stream host's ten-minute
+  restart ends its peers too.
+- `engine.peer_open` is audited with the mode.
+
 ### Known v1 limits
 
 - One session per engine machine; no capacity measurement; no `UsageEvent`.

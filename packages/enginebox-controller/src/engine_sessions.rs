@@ -31,6 +31,8 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+mod peers;
+
 pub const MIN_TTL_SECONDS: u64 = 60;
 pub const MAX_TTL_SECONDS: u64 = 4 * 3600;
 pub const DEFAULT_TTL_SECONDS: u64 = 3600;
@@ -236,6 +238,10 @@ pub struct Session {
     pub ending_since: Option<u64>,
     #[serde(default)]
     pub ended_at: Option<u64>,
+    /// SHA-256 of the stream host's token for the WebRTC fallback
+    /// (`peers.rs`), set when the node receives the session's secrets.
+    #[serde(default)]
+    pub peer_host_hash: Option<String>,
 }
 impl Session {
     /// What any caller who may see the session reads. No lease, control key
@@ -360,6 +366,11 @@ pub trait Platform {
     /// connection names an API token and account (`Ok(None)`: neither, the
     /// shared relay is used). A half or invalid configuration is an error.
     fn relay_broker(&self) -> Result<Option<Arc<dyn crate::moq::Broker>>>;
+    /// Cloudflare TURN for the WebRTC fallback (`Ok(None)`: not configured,
+    /// viewers have MoQ only).
+    fn turn(&self) -> Result<Option<Arc<dyn crate::turn::Issuer>>> {
+        Ok(None)
+    }
     fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value);
 }
 
@@ -433,6 +444,8 @@ pub struct EngineSessions {
     minting: Arc<Mutex<()>>,
     /// Relay deletions to retry no earlier than this (unix seconds).
     release_retry: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// WebRTC fallback peers by id; memory only (`peers.rs`).
+    peers: Arc<Mutex<BTreeMap<String, peers::Peer>>>,
 }
 
 /// Deletes the relays of finished sessions once the caller's locks are gone
@@ -478,6 +491,7 @@ impl EngineSessions {
             tokens: Arc::new(Mutex::new(BTreeMap::new())),
             minting: Arc::new(Mutex::new(())),
             release_retry: Arc::new(Mutex::new(BTreeMap::new())),
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
     fn save_relay(&self, r: &RelayRecord) -> Result<()> {
@@ -1001,6 +1015,7 @@ impl EngineSessions {
             report: json!({}),
             ending_since: None,
             ended_at: None,
+            peer_host_hash: None,
         };
         self.save(&session)?;
         platform.audit(
@@ -1335,11 +1350,26 @@ impl EngineSessions {
             }
             None => platform.relay()?.publish_token,
         };
-        let secrets = json!({
+        let mut secrets = json!({
             "repository": {"remote": repository.remote, "token": repository.token, "auth": repository.auth, "expires_at": repository.expires_at},
             "unity": {"access_token": unity},
             "moq": {"relay_url": DEFAULT_RELAY, "publish_token": publish_token, "control_key": s.control_key},
         });
+        // The WebRTC fallback's host token, when TURN is configured: the
+        // stream host polls for viewers' peers with it (`peers.rs`). Only
+        // its digest is kept, on the session record.
+        if platform.turn()?.is_some() {
+            let token = peers::host_token();
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(live) = sessions
+                .get_mut(&s.id)
+                .filter(|l| l.state == State::Placed && l.generation == s.generation)
+            {
+                live.peer_host_hash = Some(peers::digest(&token));
+                self.save(live)?;
+                secrets["webrtc"] = json!({"host_token": token});
+            }
+        }
         self.secrets.lock().unwrap().insert(key, secrets.clone());
         Ok(secrets)
     }
@@ -1449,6 +1479,8 @@ pub(crate) mod tests {
         pub relay_ok: bool,
         /// The per-session relay broker (None: the shared relay).
         pub broker: Option<Arc<dyn crate::moq::Broker>>,
+        /// Cloudflare TURN for the WebRTC fallback (None: not configured).
+        pub turn: Option<Arc<dyn crate::turn::Issuer>>,
     }
     impl Default for Fake {
         fn default() -> Self {
@@ -1467,6 +1499,7 @@ pub(crate) mod tests {
                 audit: Mutex::new(vec![]),
                 relay_ok: true,
                 broker: None,
+                turn: None,
             }
         }
     }
@@ -1502,6 +1535,9 @@ pub(crate) mod tests {
                 subscribe_token: "moq-subscribe-secret".into(),
                 control_token: Some("moq-control-secret".into()),
             })
+        }
+        fn turn(&self) -> Result<Option<Arc<dyn crate::turn::Issuer>>> {
+            Ok(self.turn.clone())
         }
         fn relay_broker(&self) -> Result<Option<Arc<dyn crate::moq::Broker>>> {
             Ok(self.broker.clone())
@@ -2177,6 +2213,372 @@ pub(crate) mod tests {
         );
         assert!(
             !valid_project_path("../a") && !valid_project_path("/a") && !valid_project_path("a\\b")
+        );
+    }
+
+    struct FakeTurn;
+    impl crate::turn::Issuer for FakeTurn {
+        fn ice_servers(&self, ttl: u64) -> Result<Vec<Value>> {
+            assert_eq!(ttl, peers::ICE_TTL_SECONDS);
+            Ok(vec![
+                json!({"urls": ["turns:turn.cloudflare.com:443?transport=tcp"], "username": "u", "credential": "turn-secret"}),
+            ])
+        }
+    }
+
+    /// Start and drive a session to ready; returns (id, generation, the node's secrets).
+    fn ready_with_secrets(es: &EngineSessions, p: &Fake, request: &str) -> (String, u64, Value) {
+        let (_, created) = es
+            .create(ORG, "qoh", ALICE, &start_body(request), p)
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_owned();
+        let polled = es.poll(&node(), 1, p).unwrap();
+        let row = polled["sessions"][0].clone();
+        let generation = row["generation"].as_u64().unwrap();
+        for state in ["preparing", "starting", "ready"] {
+            es.report(&node(), 1, &report(&id, generation, state), p)
+                .unwrap();
+        }
+        (id, generation, row["secrets"].clone())
+    }
+    fn status(result: Result<(u16, Value)>) -> u16 {
+        match result {
+            Ok((status, _)) => status,
+            Err(error) => status_of(&error).0,
+        }
+    }
+    fn host_status(result: Result<Value>) -> u16 {
+        result.map(|_| 200).unwrap_or_else(|e| status_of(&e).0)
+    }
+
+    #[test]
+    fn webrtc_fallback_peers_exchange_one_offer_and_answer_through_the_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let p = Fake {
+            turn: Some(Arc::new(FakeTurn)),
+            ..Fake::default()
+        };
+        let (id, generation, secrets) = ready_with_secrets(&es, &p, "req-peers");
+        let host = secrets["webrtc"]["host_token"].as_str().unwrap().to_owned();
+        assert!(host.starts_with("ehp_") && host.len() == 68);
+        // Only the digest is on the record; reads never show it.
+        let record = std::fs::read_to_string(
+            dir.path()
+                .join("engine-sessions")
+                .join(format!("{id}.json")),
+        )
+        .unwrap();
+        assert!(!record.contains(&host) && record.contains(&peers::digest(&host)));
+        assert!(
+            !es.get(ORG, "qoh", ALICE, &id, &p)
+                .unwrap()
+                .to_string()
+                .contains("peer_host")
+        );
+
+        assert_eq!(es.peer_host_poll(&host, &p).unwrap()["sessions"], json!([]));
+        assert_eq!(
+            host_status(es.peer_host_poll(&format!("ehp_{}", "0".repeat(64)), &p)),
+            401
+        );
+
+        // Bob cannot see Alice's session; the owner may watch but not... control is the starter's or the owner's.
+        assert_eq!(
+            status(es.peer_create(ORG, "qoh", BOB, &id, &json!({"mode": "watch"}), &p)),
+            404
+        );
+        assert_eq!(
+            status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "spy"}), &p)),
+            400
+        );
+        let (code, watch) = es
+            .peer_create(ORG, "qoh", "owner", &id, &json!({"mode": "watch"}), &p)
+            .unwrap();
+        assert_eq!(code, 201);
+        assert_eq!(watch["ice_transport_policy"], "relay");
+        assert_eq!(watch["ice_servers"][0]["credential"], "turn-secret");
+        let (_, first) = es
+            .peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "control"}), &p)
+            .unwrap();
+        let (_, control) = es
+            .peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "control"}), &p)
+            .unwrap();
+        let pid = control["peer"]["id"].as_str().unwrap().to_owned();
+        let token = control["client_token"].as_str().unwrap().to_owned();
+        // A new control peer replaces the previous one.
+        let first_pid = first["peer"]["id"].as_str().unwrap();
+        let first_token = first["client_token"].as_str().unwrap();
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                first_pid,
+                "poll",
+                &json!({"client_token": first_token}),
+                &p
+            )),
+            410
+        );
+
+        let listed = es.peer_host_poll(&host, &p).unwrap();
+        let rows = listed["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = rows.iter().find(|r| r["id"] == pid.as_str()).unwrap();
+        assert_eq!(row["nodeId"], id.as_str());
+        assert_eq!(row["nodeEpoch"], generation);
+        assert_eq!(
+            (
+                row["mode"].as_str(),
+                row["state"].as_str(),
+                row["project"].as_str()
+            ),
+            (Some("control"), Some("open"), Some("qoh"))
+        );
+        assert_eq!(row["iceTransportPolicy"], "relay");
+
+        // Someone else's token, then the offer.
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "offer",
+                &json!({"client_token": watch["client_token"], "sdp": "v=0"}),
+                &p
+            )),
+            403
+        );
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "offer",
+                &json!({"client_token": token, "sdp": "x".repeat(peers::MAX_SDP + 1)}),
+                &p
+            )),
+            400
+        );
+        let none = es
+            .peer_host(&host, &pid, "signals", Some(0), &json!({}), &p)
+            .unwrap();
+        assert_eq!(none["signals"], json!([]));
+        // Answering before the offer is refused for that peer only.
+        let (_, early) = es
+            .peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)
+            .unwrap();
+        let early = early["peer"]["id"].as_str().unwrap();
+        assert_eq!(
+            host_status(es.peer_host(
+                &host,
+                early,
+                "signals",
+                None,
+                &json!({"id": "a0", "signal": {"type": "answer", "sdp": "v=0 answer"}}),
+                &p
+            )),
+            410
+        );
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "offer",
+                &json!({"client_token": token, "sdp": "v=0 offer"}),
+                &p
+            )),
+            200
+        );
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "offer",
+                &json!({"client_token": token, "sdp": "v=0 again"}),
+                &p
+            )),
+            409
+        );
+        let offered = es
+            .peer_host(&host, &pid, "signals", Some(0), &json!({}), &p)
+            .unwrap();
+        assert_eq!(
+            offered["signals"],
+            json!([{"sequence": 1, "signal": {"type": "offer", "sdp": "v=0 offer"}}])
+        );
+        assert_eq!(
+            es.peer_host(&host, &pid, "signals", Some(1), &json!({}), &p)
+                .unwrap()["signals"],
+            json!([])
+        );
+        let (_, polled) = es
+            .peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "poll",
+                &json!({"client_token": token}),
+                &p,
+            )
+            .unwrap();
+        assert_eq!(polled["answer"], Value::Null);
+
+        let answer = json!({"id": "a1", "signal": {"type": "answer", "sdp": "v=0 answer"}});
+        es.peer_host(&host, &pid, "signals", None, &answer, &p)
+            .unwrap();
+        // A retried answer is idempotent; a different one is refused.
+        es.peer_host(&host, &pid, "signals", None, &answer, &p)
+            .unwrap();
+        // A second answer (a restarted stream host) ends the peer; its viewer reconnects.
+        assert_eq!(
+            host_status(es.peer_host(
+                &host,
+                &pid,
+                "signals",
+                None,
+                &json!({"id": "a2", "signal": {"type": "answer", "sdp": "other"}}),
+                &p
+            )),
+            410
+        );
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "poll",
+                &json!({"client_token": token}),
+                &p
+            )),
+            410
+        );
+        let (_, control) = es
+            .peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "control"}), &p)
+            .unwrap();
+        let pid = control["peer"]["id"].as_str().unwrap().to_owned();
+        let token = control["client_token"].as_str().unwrap().to_owned();
+        es.peer_client(
+            ORG,
+            "qoh",
+            ALICE,
+            &id,
+            &pid,
+            "offer",
+            &json!({"client_token": token, "sdp": "v=0 offer"}),
+            &p,
+        )
+        .unwrap();
+        es.peer_host(&host, &pid, "signals", None, &answer, &p)
+            .unwrap();
+        let (_, polled) = es
+            .peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "poll",
+                &json!({"client_token": token}),
+                &p,
+            )
+            .unwrap();
+        assert_eq!(polled["answer"], "v=0 answer");
+
+        let (_, renewed) = es
+            .peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "renew",
+                &json!({"client_token": token}),
+                &p,
+            )
+            .unwrap();
+        assert!(renewed["peer"]["expires_at"].as_u64().unwrap() > peers::now_ms());
+        es.peer_client(
+            ORG,
+            "qoh",
+            ALICE,
+            &id,
+            &pid,
+            "end",
+            &json!({"client_token": token}),
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            status(es.peer_client(
+                ORG,
+                "qoh",
+                ALICE,
+                &id,
+                &pid,
+                "poll",
+                &json!({"client_token": token}),
+                &p
+            )),
+            410
+        );
+        assert_eq!(
+            host_status(es.peer_host(&host, &pid, "signals", Some(0), &json!({}), &p)),
+            410
+        );
+
+        // Capacity per session.
+        let mut created = 0;
+        while status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)) == 201 {
+            created += 1;
+            assert!(created <= peers::MAX_PEERS_PER_SESSION);
+        }
+        assert_eq!(
+            status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)),
+            429
+        );
+        let open = es.peer_host_poll(&host, &p).unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(open, peers::MAX_PEERS_PER_SESSION);
+
+        // Ending the session ends its peers and the host token's reach.
+        es.end(Some(ORG), Some("qoh"), ALICE, &id, &json!({}), &p)
+            .unwrap();
+        assert_eq!(host_status(es.peer_host_poll(&host, &p)), 410);
+        assert_eq!(
+            status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)),
+            409
+        );
+    }
+
+    #[test]
+    fn without_turn_there_is_no_host_token_and_no_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let p = Fake::default();
+        let (id, _, secrets) = ready_with_secrets(&es, &p, "req-no-turn");
+        assert!(secrets.get("webrtc").is_none());
+        assert_eq!(
+            status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)),
+            503
         );
     }
 }
