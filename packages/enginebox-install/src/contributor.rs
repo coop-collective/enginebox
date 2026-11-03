@@ -33,6 +33,16 @@ pub struct Config {
 fn hash(value: &str) -> String {
     hex::encode(Sha256::digest(serde_json::to_vec(value).unwrap()))
 }
+/// How long the node keeps running through heartbeats the controller did not
+/// answer. Engine sessions still stop after a minute without their own channel.
+const HEARTBEAT_GRACE: Duration = Duration::from_secs(90);
+/// Whether a failed node request may succeed on retry: no answer at all, or a
+/// 5xx (the dashboard or supervisor while the controller restarts). The
+/// controller's own refusals (401, 403, 409) are final.
+fn transient(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.starts_with("Controller request failed") || text.starts_with("Controller returned HTTP 5")
+}
 fn endpoint(action: &str, test: bool) -> String {
     format!("/{}/node/{action}", if test { "v1" } else { "api" })
 }
@@ -368,13 +378,24 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
     };
     let mut pending: Vec<(crate::engine::Report, u32)> = Vec::new();
     let mut engine_polled = std::time::Instant::now();
+    let mut heartbeat_ok = std::time::Instant::now();
     let result: Result<()>=async {
         loop {
             let mut inventory=tools(&root,&c,false).await;
             if let Some(ex) = &engine {
                 inventory["engine"] = crate::engine::inventory(&engine_config, ex.running());
             }
-            let heartbeat=post(&c,"heartbeat",json!({"session":session,"epoch":epoch,"tools":inventory}),test).await?;
+            let heartbeat = match post(&c,"heartbeat",json!({"session":session,"epoch":epoch,"tools":inventory}),test).await {
+                Ok(value) => { heartbeat_ok = std::time::Instant::now(); value }
+                // A controller restart or network blip (no answer, or a 5xx from
+                // the proxy) must not end the node and every engine session on
+                // it. A refusal (fenced, revoked) still ends it at once.
+                Err(error) if transient(&error) && heartbeat_ok.elapsed() < HEARTBEAT_GRACE => {
+                    tokio::time::sleep(Duration::from_secs(HEARTBEAT_SECONDS)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             atomic_json(&private.join("status.json"),&json!({"online":true,"id":c.id,"controller":c.controller,"budget":c.budget,"tools":inventory,"blocked":heartbeat["blocked"]}))?;
             if let Some(ex) = engine.as_mut() {
                 match post(&c, "engine-poll", json!({"session":session,"epoch":epoch}), test).await {
@@ -511,4 +532,26 @@ pub fn execute(input: Value) -> Result<Value> {
         return enginebox_ci::executor::execute_at(&node, &request, &root.join("ci"));
     }
     anyhow::bail!("Host agent execution is disabled. Use a WSL template workspace.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transient;
+
+    #[test]
+    fn only_unanswered_requests_and_5xx_are_retried() {
+        let unanswered = anyhow::anyhow!("connection refused").context("Controller request failed");
+        assert!(transient(&unanswered));
+        for status in [502, 503, 504] {
+            assert!(transient(&anyhow::anyhow!(
+                "Controller returned HTTP {status}"
+            )));
+        }
+        for status in [401, 403, 409] {
+            assert!(!transient(&anyhow::anyhow!(
+                "Controller returned HTTP {status}"
+            )));
+        }
+        assert!(!transient(&anyhow::anyhow!("Invalid controller response")));
+    }
 }
