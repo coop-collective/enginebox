@@ -125,7 +125,11 @@ forwards no actor or org header. The owner-wide `/v1/engine-sessions` routes are
 never forwarded. For a public room, `POST …/{id}/watch-token {}` returns a
 short-lived subscribe-only token for that session's own relay (no control key),
 which the app hands to its viewers; see
-[per-session relays](ENGINE-SESSIONS.md#per-session-relays-packagesenginebox-controllersrcmoqrs). When the member leaves the org, the next refresh answers
+[per-session relays](ENGINE-SESSIONS.md#per-session-relays-packagesenginebox-controllersrcmoqrs). A world session (`mode:"world"`, the
+hosted shared world) may name only a `room_origin` the owner allowed for the project in the
+`engine-world-<project>` connection's `ROOM_ORIGINS`, and `POST …/{id}/ice {}` (`engine_sessions.watch`) returns
+relay-only Cloudflare TURN ICE servers for its players and viewers; see
+[world sessions](ENGINE-SESSIONS.md#world-sessions-mode-world). When the member leaves the org, the next refresh answers
 `invalid_grant` and ends the connection. The request and response bodies are those
 of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllersrcengine_sessionsrs).
 
@@ -157,6 +161,7 @@ of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllers
 | `POST /v1/projects/{project}/engine-sessions/{id}/renew` | `{lease, ttl_seconds}` |
 | `POST /v1/projects/{project}/engine-sessions/{id}/end` | `{}` or `{lease}` |
 | `POST /v1/projects/{project}/engine-sessions/{id}/watch-token` | `{}`; a short-lived subscribe-only token for public viewers |
+| `POST /v1/projects/{project}/engine-sessions/{id}/ice` | `{}`; relay-only TURN ICE servers for a world session (`engine_sessions.watch`) |
 | `POST /v1/projects/{project}/engine-sessions/{id}/peers[/{peer}/offer\|poll\|renew\|end]` | The WebRTC fallback for viewers whose network blocks QUIC (`engine_sessions.watch`; [details](ENGINE-SESSIONS.md#webrtc-fallback-packagesenginebox-controllersrcengine_sessionspeersrs-turnrs)) |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 

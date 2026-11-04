@@ -968,6 +968,8 @@ export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/end$`)],
   // A short-lived subscribe-only token for the session's own relay (public viewers; no control).
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/watch-token$`)],
+  // A world session's Cloudflare TURN ICE servers (relay only) for the room's players and viewers.
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/ice$`)],
   // The WebRTC fallback for viewers whose network blocks QUIC: open a peer, then offer/poll/renew/end it.
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/peers$`)],
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/peers/[a-f0-9]{32}/(?:offer|poll|renew|end)$`)],

@@ -147,7 +147,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
       return held.operations.includes("agent_runs.list") ? reply({ runs: [] }) : reply({ error: "This service token is not granted that operation on that workspace." }, 403);
     if (parts[1] === "projects" && parts[3] === "engine-sessions") {
       // The controller acts as the token's member; sessions of other members are unknown to it.
-      const operation = method === "GET" ? "get" : parts.length === 4 ? "start" : parts[5] === "watch-token" ? "watch" : parts[5];
+      const operation = method === "GET" ? "get" : parts.length === 4 ? "start" : parts[5] === "watch-token" || parts[5] === "ice" ? "watch" : parts[5];
       if (!held.member || !held.operations.includes(`engine_sessions.${operation}`) || !(held.engine_sessions ?? []).some((e) => e.project === parts[2]))
         return reply({ error: "This service token is not granted that operation on that workspace." }, 403);
       const mine = [...engineSessions.values()].filter((e) => e.project === parts[2] && e.started_by === held.member);
@@ -161,6 +161,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
       if (!session) return reply({ error: "Unknown engine session." }, 404);
       if (parts[5] === "end") session.state = "ending";
       if (parts[5] === "watch-token") return reply({ token: "watch-jwt", expires_in: 1800, namespace: `eb-${session.id}` });
+      if (parts[5] === "ice") return reply({ ice_servers: [{ urls: ["turns:turn.cloudflare.com:443?transport=tcp"], username: "u", credential: "turn-secret" }], ice_transport_policy: "relay", expires_at: 1 });
       return reply(method === "GET" ? { ...session, stream: { audience: { token: "subscribe-jwt" }, control: { control_key: "k".repeat(64) } } } : session);
     }
     if (parts[1] === "projects" && parts[3] === "repositories") {
