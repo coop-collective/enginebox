@@ -348,6 +348,11 @@ The optional [GitHub account and Actions service](GITHUB-ACTIONS.md) adds separa
 
 ## This repository's own CI on Engine Box
 
+An analysis of this repository's GitHub Actions (not a workflow rewrite) is in
+[ci-optimization-lessons.md](ci-optimization-lessons.md). It inventories
+`verify.yml` and the path-filtered installer workflows, maps Boardy's CI
+playbook onto the Rust/pnpm gate, and ranks recommended next steps.
+
 The Linux jobs in `verify.yml`, `native-gpu-node.yml` (package and controller
 preview), `release.yml` (x86_64 package) and the Docker jobs (`linux-image`,
 `linux-node`) take their runner from repository variables and fall back to
