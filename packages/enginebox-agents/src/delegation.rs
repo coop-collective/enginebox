@@ -12,6 +12,7 @@ pub fn native_file(provider: &str) -> &str {
     match provider {
         "codex" => ".codex/auth.json",
         "claude" => ".claude/.credentials.json",
+        "glm" => ".zcode/v2/credentials.json",
         _ => ".config/cursor/auth.json",
     }
 }
@@ -54,6 +55,13 @@ pub fn material(provider: &str, v: &Value) -> Result<Value> {
                 "Native Claude subscription connection with expiration required."
             );
             json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":t["accessToken"]},"expires_at":t["expiresAt"].as_f64().unwrap()/1000.})
+        }
+        "glm" => {
+            ensure!(
+                crate::glm::coding_plan_ready(v),
+                "Native GLM coding-plan connection required."
+            );
+            json!({"kind":"native","content":{"ready":true},"expires_at":Value::Null})
         }
         _ => {
             ensure!(
@@ -129,7 +137,10 @@ fn current_content(home: &Path, p: &str, kind: &str) -> Result<Value> {
         return Ok(json!({"CLAUDE_CODE_OAUTH_TOKEN":v["env"]["CLAUDE_CODE_OAUTH_TOKEN"]}));
     }
     if p == "cursor" && kind == "environment" {
-        return Ok(json!({"CURSOR_API_KEY":native::environment(home)?.get("CURSOR_API_KEY")}));
+        return Ok(json!({"CURSOR_API_KEY": native::cursor_api_key(home)?}));
+    }
+    if p == "glm" {
+        return Ok(json!({"ready": true}));
     }
     Ok(security::read_json(home, native_file(p))?.unwrap_or(json!({})))
 }
@@ -173,6 +184,7 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
             let has = match p {
                 "codex" => !existing["tokens"].is_null() || token(&existing["OPENAI_API_KEY"]),
                 "claude" => !existing["claudeAiOauth"].is_null(),
+                "glm" => crate::glm::coding_plan_ready(&existing),
                 _ => token(&existing["accessToken"]) || token(&existing["refreshToken"]),
             };
             ensure!(
@@ -204,7 +216,7 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
     }
     if let Some(expected) = request["expected_version"].as_str() {
         let env = native::environment(home)?;
-        let exe = native::find_binary(native::binary(p), &env)
+        let exe = native::find_provider_binary(p, &env)
             .ok_or_else(|| anyhow::anyhow!("Native provider unavailable."))?;
         let actual = native::verify_client(&exe, p, &env, home)?;
         ensure!(
@@ -285,6 +297,13 @@ pub fn transfer(home: &Path, request: &Value, instance_id: &str) -> Result<Value
                 "Refresh credentials must remain on controller."
             );
             security::write_json(home, native_file(p), content)?;
+        }
+        "glm" => {
+            ensure!(
+                content.as_object().unwrap().len() == 1 && content["ready"] == true,
+                "Invalid delegated content."
+            );
+            // Identity stays in ZCode's data directory; never copy credential values.
         }
         _ => bail!("Unknown provider."),
     }

@@ -146,7 +146,7 @@ export type Job = {
   kind?: "workspace" | "template";
 };
 
-export type ProviderId = "codex" | "claude" | "cursor";
+export type ProviderId = "codex" | "claude" | "cursor" | "glm";
 export type AuthSession = {
   id: string;
   host_id?: string;
@@ -176,6 +176,7 @@ export type AgentUsage = {
   scope: "controller_account";
   status: "available" | "unavailable";
   detail: string;
+  usage_url?: string | null;
   source: string | null;
   observed_at: string | null;
   freshness: "current" | "stale" | "unknown";

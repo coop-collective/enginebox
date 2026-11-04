@@ -1011,18 +1011,13 @@ pub fn command(
                 args.extend(["--resume".into(), id.clone()]);
             }
         }
-        _ => {
-            args.extend(
-                [
-                    "-p",
-                    "--output-format",
-                    "stream-json",
-                    "--trust",
-                    "--sandbox",
-                    "enabled",
-                ]
-                .map(str::to_owned),
-            );
+        "cursor" => {
+            args.extend([
+                "-p".into(),
+                r.prompt.clone(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ]);
             if block.permission_profile == PermissionProfile::ReadOnly {
                 args.extend(["--mode".into(), "ask".into()]);
             }
@@ -1033,13 +1028,14 @@ pub fn command(
                 args.extend(["--resume".into(), id.clone()]);
             }
         }
+        _ => {}
     }
-    if let Some(model) = &r.model {
+    if matches!(r.provider.as_str(), "codex" | "claude" | "cursor")
+        && let Some(model) = &r.model
+    {
         args.extend(["--model".into(), model.clone()]);
     }
-    if r.provider == "cursor" {
-        args.extend(["--".into(), r.prompt.clone()]);
-    } else if r.provider == "codex" {
+    if r.provider == "codex" {
         args.push("-".into());
     }
     ensure!(

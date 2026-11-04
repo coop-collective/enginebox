@@ -81,10 +81,10 @@ pub fn assert_remote_idle(h: &Host, name: &str) -> Result<()> {
     if bx.status(name)?["status"] != "Running" {
         return Ok(());
     }
-    for provider in ["codex", "claude", "cursor"] {
+    for provider in crate::providers::IDS {
         let bytes = bx.execute(
             name,
-            &["enginebox-guest".into(), "lease".into(), provider.into()],
+            &["enginebox-guest".into(), "lease".into(), (*provider).into()],
             Duration::from_secs(15),
         )?;
         let v: Value = serde_json::from_slice(&bytes)?;
@@ -157,7 +157,8 @@ pub fn readiness(g: &GuestConfig) -> Result<Value> {
     );
     let mut clients = Vec::new();
     for (command, details) in manifest["clients"].as_object().unwrap() {
-        if !["codex", "claude", "agent", "node", "npm"].contains(&command.as_str()) {
+        if !["codex", "claude", "agent", "cursor-agent", "node", "npm"].contains(&command.as_str())
+        {
             continue;
         }
         ensure!(
@@ -173,7 +174,7 @@ pub fn readiness(g: &GuestConfig) -> Result<Value> {
             ],
             5,
         )?;
-        if ["codex", "claude", "agent"].contains(&command.as_str()) {
+        if ["codex", "claude", "agent", "cursor-agent"].contains(&command.as_str()) {
             clients.push(command.clone());
         }
     }
@@ -627,24 +628,24 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
             120,
         )?;
     }
-    for (provider, command, url, interpreter, extras) in [
+    for (provider, commands, url, interpreter, extras) in [
         (
             "codex",
-            "codex",
+            &["codex"][..],
             "https://chatgpt.com/codex/install.sh",
             "sh",
             vec!["--release", CODEX_VERSION],
         ),
         (
             "claude",
-            "claude",
+            &["claude"][..],
             "https://claude.ai/install.sh",
             "bash",
             vec![CLAUDE_VERSION],
         ),
         (
             "cursor",
-            "agent",
+            &["cursor-agent", "agent"][..],
             "https://cursor.com/install",
             "bash",
             vec![],
@@ -653,11 +654,14 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
         if !enabled(provider) {
             continue;
         }
-        if let Ok(version) = guest_run(&g, &[command, "--version"], None, 30) {
+        let existing = commands
+            .iter()
+            .find_map(|command| guest_run(&g, &[command, "--version"], None, 30).ok());
+        if let Some(version) = existing {
             verify_qualified_version(provider, &String::from_utf8(version)?)?;
             continue;
         }
-        let file = temp.path().join(format!("{command}-install"));
+        let file = temp.path().join(format!("{provider}-install"));
         run(&["curl", "-fsSL", url, "-o", file.to_str().unwrap()], 120)?;
         let mut args = vec![
             "env",
@@ -667,7 +671,10 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
         ];
         args.extend(extras);
         guest_run(&g, &args, None, 600)?;
-        let version = guest_run(&g, &[command, "--version"], None, 30)?;
+        let version = commands
+            .iter()
+            .find_map(|command| guest_run(&g, &[command, "--version"], None, 30).ok())
+            .with_context(|| format!("Native {provider} client did not install"))?;
         verify_qualified_version(provider, &String::from_utf8(version)?)?;
     }
     if enabled("cursor") {
@@ -744,7 +751,7 @@ pub fn prepare_guest(c: &Value) -> Result<Value> {
         180,
     )?;
     let mut versions = serde_json::Map::new();
-    for command in ["codex", "claude", "agent", "node", "npm"] {
+    for command in ["codex", "claude", "cursor-agent", "agent", "node", "npm"] {
         if let Ok(bytes) = guest_run(&g, &[command, "--version"], None, 30) {
             versions.insert(
                 command.into(),

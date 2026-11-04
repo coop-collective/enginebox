@@ -917,7 +917,7 @@ impl Connections {
         let mut used = Vec::new();
         let mut env = BTreeMap::new();
         let mut sources = BTreeMap::new();
-        let mcp_capable = provider != "cursor";
+        let mcp_capable = enginebox_core::providers::get(provider).is_some_and(|p| p.profile_mcp);
         for name in names {
             let record = self
                 .get(org, name)

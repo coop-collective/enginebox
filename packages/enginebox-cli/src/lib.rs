@@ -157,7 +157,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "pool_agent_launch",
             "Submit a native agent task to an authorized project pool. May consume provider allowance. An unconfirmed response must be reconciled using agent_runs, never automatically replayed. Run success does not approve promotion.",
-            json!({"pool":{"type":"string"},"provider":{"type":"string","enum":["codex","claude","cursor"]},"prompt":{"type":"string","minLength":1,"maxLength":12000},"repository":{"type":"string","description":"Optional existing project/name source; credential access does not prepare source."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"model":{"type":"string"}}),
+            json!({"pool":{"type":"string"},"provider":enginebox_core::providers::schema(),"prompt":{"type":"string","minLength":1,"maxLength":12000},"repository":{"type":"string","description":"Optional existing project/name source; credential access does not prepare source."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":86400},"model":{"type":"string"}}),
             &["pool", "provider", "prompt"],
         ),
         tool(
@@ -271,7 +271,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "agent_launch",
             "Run an official native CLI in a private workspace using its existing home/memory. May consume provider allowance. Resume only an exact native_session_id returned by agent_run.",
-            json!({"host_id":{"type":"string"},"name":{"type":"string"},"provider":{"type":"string","enum":["codex","claude","cursor"]},"prompt":{"type":"string","minLength":1,"maxLength":12000},"resume_id":{"type":["string","null"]},"workdir":{"type":"string","default":"."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":120},"model":{"type":["string","null"]}}),
+            json!({"host_id":{"type":"string"},"name":{"type":"string"},"provider":enginebox_core::providers::schema(),"prompt":{"type":"string","minLength":1,"maxLength":12000},"resume_id":{"type":["string","null"]},"workdir":{"type":"string","default":"."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":120},"model":{"type":["string","null"]}}),
             &["host_id", "name", "provider", "prompt"],
         ),
         tool(
@@ -677,10 +677,7 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         ),
         "pool_agent_launch" => {
             let pool = id(args, "pool", false)?;
-            ensure!(
-                ["codex", "claude", "cursor"].contains(&field(args, "provider")?),
-                "Unknown agent"
-            );
+            enginebox_core::providers::require(field(args, "provider")?)?;
             let prompt = field(args, "prompt")?;
             ensure!(
                 !prompt.trim().is_empty() && prompt.len() <= 12000 && !prompt.contains('\0'),
@@ -1052,10 +1049,7 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
         ),
         "agent_launch" => {
             let provider = field(args, "provider")?;
-            ensure!(
-                ["codex", "claude", "cursor"].contains(&provider),
-                "Unknown agent"
-            );
+            enginebox_core::providers::require(provider)?;
             let prompt = field(args, "prompt")?;
             ensure!(
                 !prompt.trim().is_empty() && prompt.len() <= 12000 && !prompt.contains('\0'),

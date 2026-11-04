@@ -158,7 +158,7 @@ fn run() -> Result<()> {
                     .map(|p| {
                         let env = &env;
                         scope.spawn(move || {
-                            let exe = native::find_binary(native::binary(p), env);
+                            let exe = native::find_provider_binary(p, env);
                             auth::probe(p, exe.as_deref(), env)
                         })
                     })

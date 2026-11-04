@@ -15,7 +15,7 @@ pub struct Options {
     /// Show only queued or running tasks.
     #[arg(long)]
     pub active: bool,
-    #[arg(long, value_parser = ["codex", "claude", "cursor"])]
+    #[arg(long, value_parser = enginebox_core::providers::parse_id)]
     pub provider: Option<String>,
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
     pub interval: u64,

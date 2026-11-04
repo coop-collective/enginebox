@@ -56,6 +56,7 @@ test("provider links accept only verified official HTTPS sign-in endpoints", () 
     ),
     null,
   );
+  assert.equal(officialAuthorizationUrl("glm", "https://z.ai/login"), null);
 });
 
 test("workspace availability requires both connected account and confirmed delegation", () => {

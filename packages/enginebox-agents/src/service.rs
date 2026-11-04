@@ -382,6 +382,9 @@ impl AgentService {
             security::private_dir(&home)?;
             security::private_dir(&home.join(".codex"))?;
             security::private_dir(&home.join(".claude"))?;
+            if *p == "glm" {
+                security::private_dir(&home.join(".zcode"))?;
+            }
             let env = BTreeMap::from([(
                 "PATH".into(),
                 format!(
@@ -390,16 +393,16 @@ impl AgentService {
                 ),
             )]);
             let path = provided
-                .get(p)
+                .get(*p)
                 .cloned()
-                .or_else(|| native::find_binary(native::binary(p), &env));
+                .or_else(|| native::find_provider_binary(p, &env));
             if let Some(path) = &path {
                 ensure!(
                     Path::new(path).is_absolute() && !path.chars().any(char::is_control),
                     "Native binary path must be absolute."
                 );
             }
-            binaries.insert(p.into(), path);
+            binaries.insert((*p).into(), path);
         }
         let mut records: BTreeMap<String, Value> = BTreeMap::new();
         let mut adoptable: Vec<String> = Vec::new();
@@ -836,6 +839,10 @@ impl AgentService {
     }
     pub fn start(&self, p: &str) -> Result<Value> {
         crate::provider(p)?;
+        ensure!(
+            p != "glm",
+            "Connect GLM by running zcode login for the Z.ai Coding Plan. Engine Box does not proxy that sign-in."
+        );
         let home = self.home(p)?;
         ensure!(
             !home.join("pending-adoption.json").exists(),
@@ -1134,7 +1141,7 @@ impl AgentService {
             providers.unwrap_or_else(|| crate::PROVIDERS.iter().map(|p| p.to_string()).collect());
         ensure!(
             !selected.is_empty()
-                && selected.len() <= 3
+                && selected.len() <= crate::PROVIDERS.len()
                 && selected.iter().collect::<BTreeSet<_>>().len() == selected.len(),
             "Select distinct native providers."
         );
@@ -4768,7 +4775,10 @@ pub fn validate_record(v: &Value, id: &str) -> Result<()> {
         native::validate_result(result)?;
     }
     if let Some(session) = v["native_session_id"].as_str() {
-        ensure!(security::exact_uuid(session), "Invalid native session ID.");
+        ensure!(
+            enginebox_core::providers::recorded_session_id(session),
+            "Invalid native session ID."
+        );
     }
     ensure!(
         v["native_session_id"].is_null() || v["native_session_id"].is_string(),

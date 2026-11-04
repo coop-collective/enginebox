@@ -389,6 +389,37 @@ fn native_timeout_is_an_error_and_cannot_silently_start_a_new_conversation() {
 }
 
 #[test]
+fn glm_sessions_are_first_class_and_unknown_providers_are_rejected() {
+    let fleet = Fleet::new();
+    let mut client = Client::new(&fleet);
+    client.initialize();
+    client.send(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/workspace","mcpServers":[],"_meta":{"enginebox":{"provider":"gemini"}}}}));
+    assert_eq!(client.response(2)["error"]["code"], -32602);
+    let session = client.session(3, "glm");
+    client.prompt(4, &session, "Hello GLM");
+    fleet.wait_launches(1);
+    assert_eq!(fleet.state.lock().unwrap().launches[0]["provider"], "glm");
+    {
+        let mut state = fleet.state.lock().unwrap();
+        for run in state.runs.values_mut() {
+            run["status"] = json!("succeeded");
+            run["native_session_id"] = json!("sess_abc123");
+            run["result"] = json!({"output":"{\"type\":\"session.created\",\"session_id\":\"sess_abc123\"}\n{\"type\":\"part.delta\",\"delta\":{\"text\":\"Hi\"}}\n{\"type\":\"result\",\"result\":\"Hi\"}\n"});
+            run["elapsed_seconds"] = json!(0.2);
+            run["usage"] = json!({"scope":"run","input_tokens":2,"output_tokens":1});
+        }
+    }
+    let result = client.response(4);
+    assert_eq!(result["result"]["stopReason"], "end_turn");
+    client.prompt(5, &session, "Continue");
+    fleet.wait_launches(2);
+    assert_eq!(
+        fleet.state.lock().unwrap().launches[1]["resume_id"],
+        "sess_abc123"
+    );
+}
+
+#[test]
 fn malformed_frames_receive_protocol_errors_and_watch_json_stays_machine_readable() {
     let fleet = Fleet::new();
     let mut client = Client::new(&fleet);

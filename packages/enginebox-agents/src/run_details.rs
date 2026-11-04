@@ -143,9 +143,45 @@ pub fn token_usage(provider: &str, output: &str) -> Value {
             scope = "run";
             // modelUsage is session-cumulative on resume, so it is not a fallback
             // for a missing invocation result.usage.
+        } else if provider == "cursor" && event["type"] == "result" {
+            let usage = &event["usage"];
+            input = usage["input_tokens"]
+                .as_u64()
+                .or_else(|| usage["inputTokens"].as_u64())
+                .or_else(|| usage["prompt_tokens"].as_u64());
+            output_count = usage["output_tokens"]
+                .as_u64()
+                .or_else(|| usage["outputTokens"].as_u64())
+                .or_else(|| usage["completion_tokens"].as_u64());
+            cached = usage["cached_input_tokens"]
+                .as_u64()
+                .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                .or_else(|| usage["cacheReadTokens"].as_u64())
+                .or_else(|| usage["cache_read_tokens"].as_u64());
+            if input.is_some() || output_count.is_some() || cached.is_some() {
+                scope = "run";
+            }
+        } else if provider == "glm"
+            && (event["type"] == "turn.completed" || event["type"] == "result")
+        {
+            let usage = &event["usage"];
+            if usage.is_object() {
+                input = usage["input_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["inputTokens"].as_u64());
+                output_count = usage["output_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["outputTokens"].as_u64());
+                cached = usage["cached_input_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["cache_read_input_tokens"].as_u64());
+                scope = if event["type"] == "result" {
+                    "run"
+                } else {
+                    "session_total"
+                };
+            }
         }
-        // Cursor's published terminal result has no token counters. Do not infer
-        // usage from duration, transcript size or similarly named arbitrary fields.
     }
     if input.is_none() && output_count.is_none() && cached.is_none() {
         scope = "unknown";

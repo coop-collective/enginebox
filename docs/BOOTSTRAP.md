@@ -55,7 +55,7 @@ Pause retains RAM; hibernation writes memory to storage; a disk fork boots a fre
 
 | Flag | Meaning |
 |---|---|
-| `agents.install` | Select any subset of `codex`, `cursor`, `claude`; no proxy or custom harness. |
+| `agents.install` | Select any subset of `codex`, `cursor`, `claude` (Linux-installable clients). `glm` is a first-class run provider via ZCode.app on macOS and is not installed by the guest recipe; no proxy or custom harness. |
 | `modules.browser` | Install Chromium and the pinned Playwright MCP recipe. Browser use works without a desktop. |
 | `modules.desktop` | Install the optional virtual display and desktop services. |
 | `modules.guest_computer_mcp` | Register guest computer tools; requires the desktop. |

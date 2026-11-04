@@ -34,7 +34,7 @@ pub fn plan(state_root: &Path, providers: &[String]) -> Result<Value> {
     security::check_components(state_root)?;
     ensure!(
         !providers.is_empty()
-            && providers.len() <= 3
+            && providers.len() <= crate::PROVIDERS.len()
             && providers
                 .iter()
                 .collect::<std::collections::BTreeSet<_>>()
@@ -45,6 +45,10 @@ pub fn plan(state_root: &Path, providers: &[String]) -> Result<Value> {
     let mut actions = Vec::new();
     for p in providers {
         crate::provider(p)?;
+        if enginebox_core::providers::get(p).is_some_and(|s| !s.installable) {
+            actions.push(json!({"provider":p,"native_binary":null,"installer":null,"action":"unavailable; GLM runs ZCode.app on macOS and is not installed by the Linux guest recipe","qualified_version":null}));
+            continue;
+        }
         let (url, shell, args, version) = recipe(p);
         actions.push(json!({"provider":p,"native_binary":native::binary(p),"installer":url,"shell":shell,"arguments":args,"qualified_version":version,"location":state_root.join("agents/bin").join(native::binary(p)),"action":"install if absent; verify native identity and qualified version; preserve foreign files"}));
     }
@@ -116,9 +120,17 @@ pub fn apply(state_root: &Path, providers: &[String]) -> Result<Value> {
     environment.insert("DISABLE_AUTOUPDATER".into(), "1".into());
     let mut versions = security::read_json(&root, "installed-versions.json")?.unwrap_or(json!({}));
     for p in providers {
-        let binary = native::binary(p);
+        if enginebox_core::providers::get(p).is_some_and(|s| !s.installable) {
+            continue;
+        }
+        let names = enginebox_core::providers::binary_names(p);
+        let binary = *names.first().unwrap_or(&native::binary(p));
         let (url, shell, args, expected) = recipe(p);
-        let executable = home.join(".local/bin").join(binary);
+        let mut executable = names
+            .iter()
+            .map(|name| home.join(".local/bin").join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| home.join(".local/bin").join(binary));
         let link = bindir.join(binary);
         if fs::symlink_metadata(&link).is_ok() {
             ensure!(
@@ -182,6 +194,11 @@ pub fn apply(state_root: &Path, providers: &[String]) -> Result<Value> {
                 .chain(args.into_iter().map(str::to_owned))
                 .collect::<Vec<_>>();
             process::checked(&command, Some(&environment), Some(&home), b"", 300, 262144)?;
+            executable = names
+                .iter()
+                .map(|name| home.join(".local/bin").join(name))
+                .find(|path| path.is_file())
+                .unwrap_or(executable);
         }
         let version = native::verify_client(&executable.to_string_lossy(), p, &environment, &home)?;
         ensure!(
@@ -235,7 +252,9 @@ pub fn main(args: &[String]) -> Result<Value> {
         std::env::current_dir()?.join(root)
     };
     if providers.is_empty() {
-        providers = crate::PROVIDERS.iter().map(|p| p.to_string()).collect();
+        providers = enginebox_core::providers::installable()
+            .map(|p| p.id.to_string())
+            .collect();
     }
     if apply_changes {
         apply(&root, &providers)

@@ -1,7 +1,7 @@
 //! Org agent credentials (docs/ORGS.md, "Agent credentials").
 //!
 //! Every credential belongs to one org and one provider (`codex`, `claude`,
-//! `cursor`):
+//! `cursor`, `glm`):
 //!
 //! - `personal`: a member's own subscription, connected under their identity
 //!   with the provider's native sign-in into a private home of its own. Only
@@ -258,10 +258,10 @@ impl Credentials {
         )]);
         for p in enginebox_agents::PROVIDERS {
             let path = provided
-                .get(p)
+                .get(*p)
                 .cloned()
-                .or_else(|| native::find_binary(native::binary(p), &env));
-            binaries.insert(p.to_owned(), path);
+                .or_else(|| native::find_provider_binary(p, &env));
+            binaries.insert((*p).to_owned(), path);
         }
         let mut records = BTreeMap::new();
         for path in state::json_files(&records_dir)? {

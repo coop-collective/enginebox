@@ -22,11 +22,27 @@ fn usage_is_reported_only_from_terminal_provider_counters() {
         json!({"input_tokens":130,"output_tokens":7,"cached_input_tokens":100,"scope":"run"})
     );
     assert!(run_details::token_usage("claude",r#"{"type":"result","modelUsage":{"one":{"inputTokens":10,"cacheReadInputTokens":20,"cacheCreationInputTokens":30,"outputTokens":5}}}"#)["input_tokens"].is_null());
-    for (provider, output) in [
-        (
+    assert_eq!(
+        run_details::token_usage(
             "cursor",
-            r#"{"type":"result","duration_ms":34,"usage":{"input_tokens":999}}"#,
+            r#"{"type":"result","duration_ms":34,"usage":{"input_tokens":999,"output_tokens":4,"cached_input_tokens":10}}"#
         ),
+        json!({"input_tokens":999,"output_tokens":4,"cached_input_tokens":10,"scope":"run"})
+    );
+    assert_eq!(
+        run_details::token_usage(
+            "glm",
+            concat!(
+                r#"{"type":"session.created","session_id":"sess_abc"}"#,
+                "\n",
+                r#"{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":2}}"#,
+                "\n",
+                r#"{"type":"result","result":"Hello","usage":{"input_tokens":5,"output_tokens":4}}"#
+            )
+        ),
+        json!({"input_tokens":5,"output_tokens":4,"cached_input_tokens":null,"scope":"run"})
+    );
+    for (provider, output) in [
         ("codex", "not JSON"),
         (
             "claude",

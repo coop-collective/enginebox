@@ -83,7 +83,7 @@ export function AgentUsageSummary({ account, refreshToken }: { account: Provider
       <dl className="usage-billing"><dt>Billing cycle</dt><dd>Not reported</dd></dl>
       <p className="usage-note">Quota resets and billing renewal can have different dates.</p>
       <div className="usage-links">
-        <a href={providerUsageLinks[account.id]} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">Open provider usage &amp; billing ↗</a>
+        <a href={usage?.usage_url ?? providerUsageLinks[account.id]} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">Open provider usage &amp; billing ↗</a>
       </div>
     </div>
   );

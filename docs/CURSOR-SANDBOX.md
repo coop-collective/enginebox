@@ -6,8 +6,8 @@ for `/usr/bin/bwrap` alone does not authorize that first step. With the normal
 namespace restriction enabled, the helper can enter `unprivileged_userns` and
 fail with `sys_admin`/`uid_map` permission errors.
 
-The native CLI exposes a model-free `agent sandbox run` command and sandbox
-controls. Cursor describes namespace-based Linux isolation, Landlock/bubblewrap
+The native CLI exposes a model-free `cursor-agent sandbox run` (`agent` alias) command and sandbox
+controls. Engine Box launches Cursor runs as `cursor-agent -p <prompt> --output-format stream-json`. Cursor describes namespace-based Linux isolation, Landlock/bubblewrap
 backend diagnostics, and the boundary between workspace and other paths in its
 [CLI parameters](https://cursor.com/docs/cli/reference/parameters) and
 [sandbox documentation](https://cursor.com/docs/agent/security/run-modes).

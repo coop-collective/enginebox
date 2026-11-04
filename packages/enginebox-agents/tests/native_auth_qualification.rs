@@ -100,13 +100,14 @@ fn native_authorization_prompts_cancel_without_credentials() -> Result<()> {
     // No existing state, accounts or provider homes may be reused.
     fs::DirBuilder::new().mode(0o700).create(&root)?;
     let mut binaries = BTreeMap::new();
-    for provider in enginebox_agents::PROVIDERS {
-        let path = clients.join("agents/bin").join(native::binary(provider));
+    for spec in enginebox_core::providers::installable() {
+        let path = clients.join("agents/bin").join(native::binary(spec.id));
         ensure!(
             path.is_file(),
-            "Qualified native client is missing: {provider}"
+            "Qualified native client is missing: {}",
+            spec.id
         );
-        binaries.insert(provider.to_owned(), path.to_string_lossy().into_owned());
+        binaries.insert(spec.id.to_owned(), path.to_string_lossy().into_owned());
     }
     let fleet = Fleet::from_hosts(
         vec![Host {
@@ -123,7 +124,8 @@ fn native_authorization_prompts_cancel_without_credentials() -> Result<()> {
         "Qualification starts with existing child processes"
     );
     let mut results = Vec::new();
-    for provider in enginebox_agents::PROVIDERS {
+    for spec in enginebox_core::providers::installable() {
+        let provider = spec.id;
         let home = root.join("agents/homes").join(provider);
         ensure!(credentials_absent(&home), "Fresh home contains credentials");
         let started = Instant::now();

@@ -1,6 +1,6 @@
 # Agent usage and remaining allowance
 
-Research checked 2026-10-19. The dashboard now includes account-level usage and billing information. Codex allowance collection is implemented; Claude/Cursor collection and subscription billing dates remain unavailable through this integration. A successful sign-in alone does not establish a paid entitlement.
+Research checked 2026-10-19, with GLM (Z.ai Coding Plan via ZCode) added 2026-11-04. The dashboard now includes account-level usage and billing information. Codex allowance collection is implemented; Claude, Cursor and GLM collection and subscription billing dates remain unavailable through this integration. A successful sign-in alone does not establish a paid entitlement.
 
 The **Agents** cards show provider-reported allowance percentages, quota reset times and optional provider credit balances separately. They do not convert token counts into a guessed subscription balance or add the same account's allowance across workspaces. Billing renewal is explicitly **Not reported**; provider links lead to account usage/billing. The connected provider does not establish a specific subscription plan.
 
@@ -10,7 +10,7 @@ Authenticated `GET /v1/agents/{provider}/usage` returns a sanitized controller-a
 
 Reads are cached in memory for 60 seconds per connection fingerprint; reconnecting with different credentials invalidates the previous observation. Refresh failures preserve any earlier values only as stale. Both API and UI stop reporting a remaining percentage once the reported quota window expires, and the UI additionally expires missed observations after five minutes. The Agents view polls Codex once per minute while open and stops on navigation/logout. Connection status loads independently of usage.
 
-Claude and Cursor currently return explicit unavailable states and provider links. Claude's documented status-line observation hook is not yet installed; ordinary native stream observations are not yet ingested. A billing cycle, subscription renewal date, personal Cursor balance, and Claude remaining allowance are **not** inferred or scraped. Provider credits preserve their reported unit and are never relabeled as dollars.
+Claude, Cursor and GLM currently return explicit unavailable states and provider links (`cursor.com/dashboard`, `z.ai/manage-apikey/billing`). Claude's documented status-line observation hook is not yet installed; ordinary native stream observations are not yet ingested. A billing cycle, subscription renewal date, a personal Cursor or GLM balance, and Claude remaining allowance are **not** inferred or scraped. Provider credits preserve their reported unit and are never relabeled as dollars.
 
 Offline validation covers malformed/missing fields, duplicate multi-bucket views, no-model native RPC traces, output/time bounds, account changes, concurrent cached reads, reset/failure staleness, authenticated read-only routes, and browser display. Live verification of the deployed collector is tracked separately in `VALIDATION.md`.
 
@@ -19,6 +19,7 @@ Offline validation covers malformed/missing fields, duplicate multi-bucket views
 | Codex / ChatGPT | Native app-server account methods | Remaining percentage per reported window, reset time, optional workspace credits; token activity separately | Implemented read-only quota adapter; unsupported native methods return unavailable |
 | Claude Code | Native status-line JSON; interactive `/usage` | Five-hour/seven-day usage and resets when supplied; local session statistics separately | Provider usage link implemented; native observation ingestion remains planned |
 | Cursor Agent | Enterprise Admin API; personal dashboard | Enterprise spending/activity where authorized; personal remaining allowance in provider dashboard | Provider usage links implemented; no personal balance API claimed |
+| GLM (Z.ai Coding Plan) | Z.ai billing dashboard | Personal remaining allowance in the Z.ai usage page | Provider usage link implemented; ZCode has no on-demand allowance API |
 
 ## Codex
 
@@ -50,9 +51,13 @@ Optional later work: native `/usage` capture with a pinned terminal parser if an
 
 Current documentation distinguishes newer shared weekly subscription pools from legacy monthly Cursor pools. Reset timing and remaining allowance appear in the provider's usage UI; prepaid credit and additional spend caps are separate. Do not hardcode the older Pro/Pro+/Ultra dollar allowances or assume a billing cycle from a successful login. [Usage and limits](https://cursor.com/help/models-and-usage/usage-limits).
 
-The current native CLI reference documents authentication status, not a personal remaining-balance command. `agent status --format json` was verified locally to return authentication fields; it does not establish subscription credit. The first version should offer **Open provider usage** and say **Balance unavailable through the supported integration**. Use the account's applicable dashboard: current plans route through the usage page described in the provider docs; legacy plans use Cursor's Spending tab. [CLI reference](https://cursor.com/docs/cli/reference/parameters).
+The current native CLI reference documents authentication status, not a personal remaining-balance command. `cursor-agent status --format json` (`agent` remains an accepted alias) returns authentication fields; it does not establish subscription credit. Engine Box maps `stream-json` `result.usage` into run `token_usage` and offers **Open provider usage** at [cursor.com/dashboard](https://cursor.com/dashboard). [CLI reference](https://cursor.com/docs/cli/reference/parameters).
 
 An optional Enterprise integration can use the documented Admin API with a separately supplied admin credential. Spending data includes `spendCents`, `overallSpendCents`, per-user limits and `subscriptionCycleStart`; usage events provide activity detail. These are reporting/cap fields, not automatically prepaid balance. The current API overview lists Admin and Analytics access for Enterprise teams. Verify the account's access before enabling the connector; do not reuse a native browser session token against undocumented endpoints. [Admin API](https://cursor.com/docs/account/teams/admin-api), [API availability](https://cursor.com/docs/api).
+
+## GLM (Z.ai Coding Plan)
+
+ZCode does not expose a personal remaining-balance command through the `zcode.cjs` stream-json surface. Engine Box returns `status: unavailable` with the [Z.ai billing dashboard](https://z.ai/manage-apikey/billing). Run `token_usage` still maps `turn.completed` / `{type:result}` usage objects when the CLI reports them. Do not scrape ZCode credential files for quota numbers.
 
 ## Controller-level accounts and delegated workspaces
 
@@ -61,7 +66,8 @@ Keep the canonical account observation in Agent Access and attach workspaces to 
 Supported credential mechanisms differ:
 
 - **Claude:** `claude setup-token` creates a one-year subscription OAuth token for `CLAUDE_CODE_OAUTH_TOKEN`. It supports model requests, but not Remote Control or claude.ai connectors. Do not assume it grants account-usage API access. [Long-lived tokens](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token).
-- **Cursor:** user API keys through `CURSOR_API_KEY` are the documented automation method. This is a Cursor credential; it must not be labeled an OpenAI/Anthropic API billing account. A documented browser-token delegation contract was not found. [CLI authentication](https://cursor.com/docs/cli/reference/authentication).
+- **Cursor:** user API keys through `CURSOR_API_KEY` are the documented automation method. The controller secret store injects that variable into the `cursor-agent` process environment only. This is a Cursor credential; it must not be labeled an OpenAI/Anthropic API billing account. A documented browser-token delegation contract was not found. [CLI authentication](https://cursor.com/docs/cli/reference/authentication).
+- **GLM:** ZCode Coding Plan identity in `~/.zcode/v2/credentials.json` (or `ZCODE_DATA_BASE_DIR`). Engine Box checks for the `account-provider:account:<zai|bigmodel>-individual-coding-plan:identity` key names only and does not copy those values. Sign in with `zcode login`. Linux hosts without `ZCode.app` report the provider unavailable.
 - **Codex:** `CODEX_ACCESS_TOKEN` and `codex login --with-access-token` are for workspace access tokens, currently Business/Enterprise. They are not browser OAuth-token import flags. The experimental `chatgptAuthTokens` route is separate. [Workspace access tokens](https://learn.chatgpt.com/docs/enterprise/access-tokens), [external-token app-server interface](https://learn.chatgpt.com/docs/app-server#3c-log-in-with-externally-managed-chatgpt-tokens-chatgptauthtokens).
 
 Pinned Codex 0.163.0 source accepts `auth_mode: chatgptAuthTokens` from auth storage and skips native refresh for that mode, but its protocol source labels the interface internal/unstable. Direct file delegation therefore needs a version gate and regression coverage; it is not a stable documented CLI import contract. Never distribute refresh tokens merely to avoid this compatibility work. [Native loader and refresh implementation](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/login/src/auth/manager.rs), [protocol caveat](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server-protocol/src/protocol/v2/account.rs).
@@ -72,7 +78,7 @@ Keep independent fields for `connection`, `plan` (nullable), `allowance_windows[
 
 Delivery status:
 
-1. **Implemented:** provider usage links and explicit unsupported/stale states for all three accounts.
+1. **Implemented:** provider usage links and explicit unsupported/stale states for Codex, Claude, Cursor and GLM.
 2. **Implemented:** Codex native read-only usage collector, with bounded refresh frequency and unsupported-method handling.
 3. **Planned:** Claude status-line observations, preserving existing configuration.
 4. **Planned:** optional Cursor Enterprise reporting after an admin credential is configured.
