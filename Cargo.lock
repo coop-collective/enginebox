@@ -591,6 +591,7 @@ dependencies = [
  "futures-util",
  "hex",
  "libc",
+ "regex",
  "reqwest",
  "semver",
  "serde",

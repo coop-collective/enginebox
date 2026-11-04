@@ -73,6 +73,28 @@ enum Action {
         #[arg(long)]
         remote: String,
     },
+    /// Remove the token after `--accessToken` from Unity licensing client
+    /// logs in this account's profile (the node runs it as the editor
+    /// account; it never receives the token).
+    #[command(hide = true)]
+    ScrubLicensingLogs,
+    /// Prove Unity renders and streams as `enginebox-editor` and that slot
+    /// accounts are isolated (Windows; run by qualify-editor-account.ps1 as
+    /// the engine account).
+    EngineQualifyEditor {
+        #[arg(long)]
+        config: PathBuf,
+        /// A Unity project directory (a copy: its manifest gains the bridge).
+        #[arg(long)]
+        project: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// A file holding a Unity access token, deleted after reading.
+        #[arg(long)]
+        unity_token_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+    },
     Inspect {
         #[arg(long, value_enum)]
         profile: Profile,
@@ -172,6 +194,43 @@ async fn main() -> Result<()> {
                     &enginebox_install::engine::rehearse(&config, &work, spec, &remote).await?
                 )?
             );
+        }
+        Action::ScrubLicensingLogs => {
+            let dir = enginebox_install::engine::licensing_log_dir()
+                .ok_or_else(|| anyhow::anyhow!("No Unity log folder for this account"))?;
+            let changed = enginebox_install::editor_account::scrub_access_token_args(&dir)?;
+            anyhow::ensure!(
+                !enginebox_install::editor_account::access_token_remains(&dir)?,
+                "A licensing log still holds an access token"
+            );
+            println!("{changed}");
+        }
+        Action::EngineQualifyEditor {
+            config,
+            project,
+            out,
+            unity_token_file,
+            seconds,
+        } => {
+            let result = match enginebox_install::editor_account::qualify(
+                &config,
+                &project,
+                unity_token_file.as_deref(),
+                seconds,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    serde_json::json!({"ok": false, "checks": [{"name": "qualify", "ok": false,
+                    "detail": format!("{e:#}")}], "unity_log_tail": ""})
+                }
+            };
+            // Written whole, then renamed: the script treats the file as done.
+            let tmp = out.with_extension("tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&result)?)?;
+            std::fs::rename(&tmp, &out)?;
+            anyhow::ensure!(result["ok"] == true, "Qualification failed");
         }
         Action::ExecuteWorker => {
             use tokio::io::AsyncReadExt;

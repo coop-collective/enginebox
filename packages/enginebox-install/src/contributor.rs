@@ -390,6 +390,7 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
         atomic_json(&private.join("engine-sweep.json"), &swept)?;
         Some(
             crate::engine::Executor::new(engine_config.clone(), root.clone(), private.to_owned())
+                .with_forks()
                 .with_controller(
                     native_node::controller_origin(&c.controller, test)?
                         .origin()
@@ -400,6 +401,7 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
         None
     };
     let mut pending: Vec<(crate::engine::Report, u32)> = Vec::new();
+    let mut pending_forks: Vec<(&'static str, Value, u32)> = Vec::new();
     let mut engine_polled = std::time::Instant::now();
     let mut heartbeat_ok = std::time::Instant::now();
     let result: Result<()>=async {
@@ -407,6 +409,9 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
             let mut inventory=tools(&root,&c,false).await;
             if let Some(ex) = &engine {
                 inventory["engine"] = crate::engine::inventory(&engine_config, ex.running());
+                if let Some(forks) = ex.forks_inventory() {
+                    inventory["engine"]["forks"] = forks;
+                }
             }
             let heartbeat = match post(&c,"heartbeat",json!({"session":session,"epoch":epoch,"tools":inventory}),test).await {
                 Ok(value) => { heartbeat_ok = std::time::Instant::now(); value }
@@ -433,6 +438,21 @@ pub async fn run(path: &Path, test: bool) -> Result<()> {
                     Err(_) => {}
                 }
                 pending.extend(ex.drain().into_iter().map(|r| (r, 0)));
+                // Fork posts are fenced like engine-report: the node's own
+                // session and epoch (the fork id names the engine session).
+                for p in ex.drain_forks() {
+                    let mut body = p.body;
+                    body["session"] = json!(session);
+                    body["epoch"] = json!(epoch);
+                    pending_forks.push((p.action, body, 0));
+                }
+                while let Some((action, body, attempts)) = pending_forks.first_mut() {
+                    match post(&c, action, body.clone(), test).await {
+                        Ok(_) => { pending_forks.remove(0); }
+                        Err(_) if *attempts < 5 => { *attempts += 1; break; }
+                        Err(_) => { pending_forks.remove(0); }
+                    }
+                }
                 // In order; a report the controller refuses is retried a few times, then dropped.
                 while let Some((report, attempts)) = pending.first_mut() {
                     match post(&c, "engine-report", crate::engine::report_body(&session, epoch, report), test).await {

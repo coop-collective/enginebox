@@ -214,7 +214,17 @@ async fn register_checked(
         .create(true)
         .truncate(false)
         .open(parent.join("register.lock"))?;
-    lock.try_lock_exclusive()?;
+    // A process another thread is spawning can hold an inherited copy of the
+    // lock's descriptor for an instant; a real concurrent registration still
+    // fails after the short wait.
+    let mut tries = 0;
+    while let Err(e) = lock.try_lock_exclusive() {
+        tries += 1;
+        if tries >= 20 {
+            return Err(e.into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let mut previous = None;
     let mut config = if path.exists() {
         let mut c = read_config(path)?;
