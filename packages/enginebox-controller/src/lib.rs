@@ -594,6 +594,10 @@ fn engine_session_route<'a>(
                 "watch-token",
             ],
         ) => Some((Operation::EngineWatch, project)),
+        // A world session's TURN ICE servers.
+        (&Method::POST, ["v1", "projects", project, "engine-sessions", _, "ice"]) => {
+            Some((Operation::EngineWatch, project))
+        }
         // The WebRTC fallback (create a peer, then offer/poll/renew/end it).
         (&Method::POST, ["v1", "projects", project, "engine-sessions", _, "peers"])
         | (
@@ -2032,6 +2036,18 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
             ),
         }
     }
+    fn world_origins(&self, org: &str, project: &str) -> Vec<String> {
+        self.0
+            .catalog
+            .connections
+            .source_value(
+                org,
+                &format!("{}{project}", engine_sessions::WORLD_CONNECTION_PREFIX),
+                engine_sessions::WORLD_ORIGINS,
+            )
+            .map(|list| engine_sessions::parse_origins(&list))
+            .unwrap_or_default()
+    }
     fn turn(&self) -> Result<Option<Arc<dyn turn::Issuer>>> {
         let value = |name| {
             self.0
@@ -2065,6 +2081,11 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
 /// Owner token (the dashboard names the member), or a service token with an
 /// engine-session grant acting as its member (`service_allows`,
 /// `service_engine_member`); service tokens never reach the owner end.
+///
+/// `service`: a service token's world session must name a `room_origin` the
+/// owner allowed for the project (`engine-world-<project>` connection); the
+/// owner token may name any https origin.
+#[allow(clippy::too_many_arguments)]
 fn engine_session_write(
     runtime: &Runtime,
     org: &str,
@@ -2073,12 +2094,14 @@ fn engine_session_write(
     rest: &[String],
     body: &Value,
     owner: bool,
+    service: bool,
 ) -> (StatusCode, Value) {
     let platform = RuntimePlatform(runtime);
     let sessions = &runtime.engine_sessions;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     let result = match (project, rest.as_slice()) {
-        (Some(project), []) => sessions.create(org, project, actor, body, &platform),
+        (Some(project), []) => sessions.start(org, project, actor, body, service, &platform),
+        (Some(project), [id, "ice"]) => sessions.ice(org, project, actor, id, body, &platform),
         (Some(project), [id, "renew"]) => sessions.renew(org, project, actor, id, body, &platform),
         (Some(project), [id, "end"]) => {
             sessions.end(Some(org), Some(project), actor, id, body, &platform)
@@ -2317,6 +2340,7 @@ async fn write(
         let runtime = c.runtime()?;
         let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
         let owner = matches!(principal, Principal::Owner) && actor == "owner";
+        let service = matches!(principal, Principal::Service(_));
         return blocking(move || {
             Ok(engine_session_write(
                 &runtime,
@@ -2326,6 +2350,7 @@ async fn write(
                 &rest,
                 &body,
                 owner,
+                service,
             ))
         })
         .await;
@@ -6502,6 +6527,260 @@ mod tests {
                 .collect();
             assert!(leaks.is_empty(), "{leaks:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn world_sessions_over_http_need_an_allowed_room_and_hand_the_code_only_to_the_node() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        const ROOM: &str = "https://gamejam.coopcollective.dev";
+        const CODE: &str = "enroll_0123456789abcdefghijklmnopqrstuvwxyz";
+        let (_temp, c) = setup();
+        let (url, _) = unity::fake::serve();
+        c.set_unity_login_url(&url);
+        c.set_turn_api_url(&turn::fake::serve());
+        c.activate().unwrap();
+        let app = router(c.clone());
+        let as_member = |method: Method, path: &str, body: Value, actor: &str| {
+            let mut r = request(method, path, &body.to_string(), true);
+            r.headers_mut()
+                .insert(catalog::ACTOR_HEADER, actor.parse().unwrap());
+            r
+        };
+        let as_token = |method: Method, path: &str, body: Value, secret: &str| {
+            let mut r = request(method, path, &body.to_string(), false);
+            r.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {secret}").parse().unwrap(),
+            );
+            r
+        };
+        let node_post = |action: &str, token: &str, body: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/node/{action}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let repo_token = "github_pat_gamejam_repo_read_value";
+        for body in [
+            json!({"name":"engine-repo-gamejam","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"GIT_REMOTE_URL":"https://github.com/coop-collective/gamejam.git","GIT_READ_TOKEN":repo_token}}),
+            json!({"name":"cloudflare-turn","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"TURN_KEY_ID":turn::fake::KEY,"TURN_API_TOKEN":turn::fake::API_TOKEN}}),
+        ] {
+            let (status, created) = call(
+                &app,
+                request(Method::POST, "/v1/connections", &body.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+        }
+        let runtime = c.runtime().unwrap();
+        let issued = runtime
+            .contributors
+            .issue(enginebox_node_protocol::Invitation {
+                label: "RTX 4080".into(),
+                budget: enginebox_node_protocol::installer_ceiling(),
+                workloads: enginebox_node_protocol::Workloads {
+                    ci: false,
+                    agents: false,
+                    engine: true,
+                },
+            })
+            .unwrap();
+        let node = issued["id"].as_str().unwrap().to_owned();
+        let token = format!("{node}.{}", "e".repeat(64));
+        runtime
+            .contributors
+            .enroll(
+                issued["code"].as_str().unwrap(),
+                enginebox_node_protocol::Enrollment {
+                    secret_hash: enginebox_core::state::digest(&json!(token)),
+                    budget: enginebox_node_protocol::Budget {
+                        cpu: 8,
+                        memory_gib: 32,
+                        disk_gib: 200,
+                    },
+                    os: "windows".into(),
+                    architecture: "x86_64".into(),
+                },
+            )
+            .unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let (_, hello) = call(&app, node_post("hello", &token, json!({"session":session}))).await;
+        let epoch = hello["epoch"].clone();
+        let tools = json!({"worker_running":false,"engine":{"ready":true,"world":true,"unity":["6000.6.5f1"],"running":0}});
+        let beat = json!({"session":session,"epoch":epoch,"tools":tools});
+        assert_eq!(
+            call(&app, node_post("heartbeat", &token, beat)).await.0,
+            StatusCode::OK
+        );
+        let (status, _) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                json!({"provider":"unity","kind":"personal","owner_user_id":ALICE,"username":"a@example.com","password":"right-password"}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                &format!("/v1/contributors/{node}/engine-owner"),
+                &json!({"member":ALICE}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ops = json!([
+            "engine_sessions.start",
+            "engine_sessions.get",
+            "engine_sessions.renew",
+            "engine_sessions.end",
+            "engine_sessions.watch"
+        ]);
+        let grant = |operations: &Value, project: &str| {
+            json!({"label":"gamejam","scopes":[],"operations":operations,
+                "engine_sessions":[{"project":project}],"member":ALICE})
+        };
+        let (_, gamejam) = mint(&app, grant(&ops, "gj")).await;
+        let (_, unbound) = mint(&app, grant(&ops, "other")).await;
+        let (_, reader) = mint(&app, grant(&json!(["engine_sessions.get"]), "gj")).await;
+        let path = "/v1/projects/gj/engine-sessions";
+        let world = |request_id: &str, origin: &str| {
+            json!({"request_id":request_id,"repository":"gamejam","ref":"main",
+                "project_path":"unity-examples/multiplayer-jam",
+                "engine":{"kind":"unity","version":"6000.6.5f1"},
+                "mode":"world","world":{"room_origin":origin,"enroll_code":CODE}})
+        };
+        // Before the owner allows an origin, a token's world start is refused.
+        let (status, refused) = call(
+            &app,
+            as_token(Method::POST, path, world("w-0", ROOM), &gamejam),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("engine-world-gj")
+        );
+        let allow = json!({"name":"engine-world-gj","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"ROOM_ORIGINS":format!("{ROOM}, https://staging.example")}});
+        let (status, created) = call(
+            &app,
+            request(Method::POST, "/v1/connections", &allow.to_string(), true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (status, refused) = call(
+            &app,
+            as_token(
+                Method::POST,
+                path,
+                world("w-evil", "https://evil.example"),
+                &gamejam,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert!(!refused.to_string().contains(CODE));
+        // Another project's grant reaches nothing here.
+        assert_eq!(
+            call(
+                &app,
+                as_token(Method::POST, path, world("w-x", ROOM), &unbound)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, created) = call(
+            &app,
+            as_token(Method::POST, path, world("w-1", ROOM), &gamejam),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        assert_eq!(created["mode"], "world");
+        assert_eq!(created["world"]["room_origin"], ROOM);
+        assert!(!created.to_string().contains(CODE));
+        let id = created["id"].as_str().unwrap().to_owned();
+        // The node alone receives the code.
+        let poll = json!({"session":session,"epoch":epoch});
+        let (status, polled) = call(&app, node_post("engine-poll", &token, poll.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{polled}");
+        let row = &polled["sessions"][0];
+        assert_eq!(row["spec"]["mode"], "world");
+        assert_eq!(row["spec"]["world"]["room_origin"], ROOM);
+        assert_eq!(row["secrets"]["world"]["enroll_code"], CODE);
+        assert_eq!(row["secrets"]["repository"]["token"], repo_token);
+        assert!(row["secrets"].get("moq").is_none());
+        let generation = row["generation"].clone();
+        for state in ["preparing", "starting", "ready"] {
+            let mut report = poll.clone();
+            report["id"] = json!(id);
+            report["generation"] = generation.clone();
+            report["state"] = json!(state);
+            let (status, reply) = call(&app, node_post("engine-report", &token, report)).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+        }
+        let one = format!("{path}/{id}");
+        for read in [
+            call(&app, as_token(Method::GET, &one, json!({}), &gamejam))
+                .await
+                .1,
+            call(&app, as_token(Method::GET, path, json!({}), &gamejam))
+                .await
+                .1,
+            call(&app, request(Method::GET, "/v1/engine-sessions", "", true))
+                .await
+                .1,
+            call(&app, request(Method::GET, "/v1/audit", "", true))
+                .await
+                .1,
+        ] {
+            assert!(!read.to_string().contains(CODE), "{read}");
+        }
+        // ICE servers: the watch operation, relay only.
+        let ice = format!("{one}/ice");
+        let (status, servers) = call(&app, as_token(Method::POST, &ice, json!({}), &gamejam)).await;
+        assert_eq!(status, StatusCode::OK, "{servers}");
+        assert_eq!(servers["ice_transport_policy"], "relay");
+        assert_eq!(
+            servers["ice_servers"][1]["credential"],
+            turn::fake::CREDENTIAL
+        );
+        assert!(servers["expires_at"].as_u64().is_some());
+        assert_eq!(
+            call(&app, as_token(Method::POST, &ice, json!({}), &reader))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(&app, as_member(Method::POST, &ice, json!({}), ALICE))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // The owner token may name any https room.
+        let (status, owned) = call(
+            &app,
+            as_member(
+                Method::POST,
+                path,
+                world("w-owner", "https://room.example"),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{owned}");
+        assert_eq!(owned["state"], "queued");
     }
 
     #[tokio::test]

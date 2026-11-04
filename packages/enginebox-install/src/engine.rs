@@ -11,6 +11,15 @@
 //! a lease loss or an epoch change terminates the job. A startup sweep kills
 //! anything a previous node process left behind.
 //!
+//! A world session (`mode: "world"`) checks out and activates the same way,
+//! then runs the owner-configured `world_host` (Gamejam's
+//! `gamejam-world-host`) instead of the Editor and stream host. It hands the
+//! host an owner-only session file (`--session`), with the room's one-time
+//! enrollment code inside, and is ready once the host prints
+//! `{"event":"world-host-connected"}`. The host's content-addressed player
+//! builds persist across sessions in `work\engine\world-builds`, lent to the
+//! session's work directory while it runs.
+//!
 //! Owner-written `engine.json` (beside the node's `config/` directory, e.g.
 //! `C:\ProgramData\Enginebox\engine-node\engine.json`) names the tools; the
 //! controller never chooses an executable. Secrets never appear in argv or
@@ -44,6 +53,10 @@ pub const STREAM_SECONDS: u64 = 600;
 const DEFAULT_STARTUP_SECONDS: u64 = 3600;
 const GIT_SECONDS: u64 = 3600;
 const LICENSE_SECONDS: u64 = 300;
+/// The world host's readiness line on stdout.
+pub const WORLD_READY_EVENT: &str = "world-host-connected";
+/// The world host's build cache directory (persistent under `work\engine`).
+pub const WORLD_BUILDS: &str = "world-builds";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +81,9 @@ pub struct EngineConfig {
     /// China, which does not know global Unity IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unity_region: Option<String>,
+    /// Optional `gamejam-world-host.exe`: this machine runs world sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_host: Option<PathBuf>,
 }
 
 fn valid_version(v: &str) -> bool {
@@ -151,6 +167,13 @@ impl EngineConfig {
         if let Some(git) = &self.git {
             exe(git, &["git.exe", "git"], "git")?;
         }
+        if let Some(host) = &self.world_host {
+            exe(
+                host,
+                &["gamejam-world-host.exe", "gamejam-world-host"],
+                "world_host",
+            )?;
+        }
         ensure!(
             self.editor_bridge.is_absolute() && self.editor_bridge.is_dir(),
             "editor_bridge must be an absolute path to the unity-editor-bridge package"
@@ -188,11 +211,12 @@ impl EngineConfig {
 pub fn inventory(config_path: &Path, running: usize) -> Value {
     match EngineConfig::load(config_path) {
         Ok(c) => {
-            json!({"ready": true, "unity": c.unity.keys().collect::<Vec<_>>(), "running": running})
+            json!({"ready": true, "unity": c.unity.keys().collect::<Vec<_>>(), "running": running,
+                "world": c.world_host.is_some()})
         }
         Err(e) => {
             let reason: String = format!("{e:#}").chars().take(300).collect();
-            json!({"ready": false, "unity": [], "running": running, "error": reason})
+            json!({"ready": false, "unity": [], "running": running, "world": false, "error": reason})
         }
     }
 }
@@ -213,6 +237,17 @@ pub struct Spec {
     pub namespace: String,
     pub session: String,
     pub tag: u64,
+    /// `editor` (the default, also for controllers that do not send it) or
+    /// `world`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// A world session's room.
+    #[serde(default)]
+    pub world: Option<WorldSpec>,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorldSpec {
+    pub room_origin: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct EngineSpec {
@@ -223,10 +258,38 @@ pub struct EngineSpec {
 pub struct Secrets {
     pub repository: RepositorySecret,
     pub unity: UnitySecret,
-    pub moq: MoqSecret,
+    /// The relay publish token (editor sessions).
+    #[serde(default)]
+    pub moq: Option<MoqSecret>,
     /// The WebRTC fallback's host token, when the controller offers it.
     #[serde(default)]
     pub webrtc: Option<WebrtcSecret>,
+    /// The room's one-time enrollment code (world sessions).
+    #[serde(default)]
+    pub world: Option<WorldSecret>,
+}
+#[derive(Clone, Deserialize)]
+pub struct WorldSecret {
+    pub enroll_code: String,
+}
+impl Secrets {
+    /// Every secret value, for redaction.
+    fn values(&self) -> Vec<&str> {
+        let mut out = vec![
+            self.repository.token.as_str(),
+            self.unity.access_token.as_str(),
+        ];
+        if let Some(moq) = &self.moq {
+            out.extend([moq.publish_token.as_str(), moq.control_key.as_str()]);
+        }
+        if let Some(w) = &self.webrtc {
+            out.push(&w.host_token);
+        }
+        if let Some(w) = &self.world {
+            out.push(&w.enroll_code);
+        }
+        out
+    }
 }
 #[derive(Clone, Deserialize)]
 pub struct WebrtcSecret {
@@ -248,7 +311,23 @@ pub struct MoqSecret {
     pub control_key: String,
 }
 impl Spec {
+    /// Whether this is a world session (`mode: "world"`).
+    pub fn is_world(&self) -> bool {
+        self.mode.as_deref() == Some("world")
+    }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(self.mode.as_deref(), None | Some("editor" | "world")),
+            "Unsupported session mode"
+        );
+        match (&self.world, self.is_world()) {
+            (Some(world), true) => ensure!(
+                https_origin(&world.room_origin),
+                "The world session's room is not an https origin"
+            ),
+            (None, false) => {}
+            _ => bail!("A world session names its room, and only a world session does"),
+        }
         ensure!(
             self.engine.kind == "unity" && valid_version(&self.engine.version),
             "Unsupported engine"
@@ -302,6 +381,86 @@ impl Spec {
 }
 
 // ---------------------------------------------------------------- plans (pure)
+
+/// `https://host[:port]` exactly, with nothing after it.
+fn https_origin(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.rsplit_once(':').map_or(rest, |(h, port)| {
+        if !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            ""
+        }
+    });
+    s.len() <= 300
+        && !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+}
+
+/// The world host's owner-only session file (`--session`; Gamejam's
+/// `packages/world-host` reads it with unknown fields denied).
+#[allow(clippy::too_many_arguments)]
+pub fn world_session(
+    world: &WorldSpec,
+    secret: &WorldSecret,
+    id: &str,
+    generation: u64,
+    unity: &Path,
+    project: &Path,
+    work_dir: &Path,
+) -> Value {
+    json!({
+        "schema": 1,
+        "room_origin": world.room_origin,
+        "enroll_code": secret.enroll_code,
+        "engine_session": id,
+        "generation": generation,
+        "unity_exe": unity,
+        "project_dir": project,
+        "work_dir": work_dir,
+    })
+}
+/// The world host's argv: the session file only, never a secret.
+pub fn world_host_argv(session_file: &Path) -> Vec<OsString> {
+    vec!["--session".into(), session_file.as_os_str().to_owned()]
+}
+/// Whether a world host stdout line is its readiness event (its first
+/// `HostWelcome` from the room).
+pub fn world_host_ready(line: &str) -> bool {
+    serde_json::from_str::<Value>(line.trim()).is_ok_and(|v| {
+        v.as_object()
+            .is_some_and(|o| o.get("event").and_then(Value::as_str) == Some(WORLD_READY_EVENT))
+    })
+}
+/// The persistent world build cache.
+pub fn world_builds(work: &Path) -> PathBuf {
+    work.join("engine").join(WORLD_BUILDS)
+}
+/// Lend the persistent build cache to a world session's work directory (a
+/// rename; a fresh cache when there is none).
+pub fn lend_world_builds(work: &Path, work_dir: &Path) -> Result<()> {
+    let shared = world_builds(work);
+    let lent = work_dir.join(WORLD_BUILDS);
+    if shared.is_dir() && !lent.exists() {
+        std::fs::rename(&shared, &lent)
+            .context("Cannot lend the world build cache to the session")?;
+    }
+    private_dir(&lent)
+}
+/// Move a session's lent build cache back (after its processes ended, or in
+/// the startup sweep). Returns whether it moved.
+pub fn return_world_builds(work: &Path, session_dir: &Path) -> bool {
+    let lent = session_dir.join("world").join(WORLD_BUILDS);
+    let shared = world_builds(work);
+    lent.is_dir()
+        && !shared.exists()
+        && private_dir(&work.join("engine")).is_ok()
+        && std::fs::rename(&lent, &shared).is_ok()
+}
 
 /// The environment that gives git the repository token: an `extraHeader`
 /// scoped to the remote, through `GIT_CONFIG_*` (never argv), and no
@@ -959,6 +1118,8 @@ pub fn sweep(work: &Path, private: &Path) -> Result<Value> {
     if sessions.is_dir() {
         for entry in std::fs::read_dir(&sessions)? {
             let path = entry?.path();
+            // A world session's lent build cache survives the sweep.
+            return_world_builds(work, &path);
             if std::fs::remove_dir_all(&path).is_ok() {
                 removed += 1;
             }
@@ -1097,24 +1258,7 @@ pub fn prepare_project(
     checkout: &Path,
     session_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, PathBuf, u16)> {
-    let project = if spec.project_path.trim_matches('/').is_empty() {
-        checkout.to_owned()
-    } else {
-        checkout.join(spec.project_path.trim_matches('/'))
-    };
-    reject_symlink_components(&project)?;
-    let version = std::fs::read_to_string(project.join("ProjectSettings/ProjectVersion.txt"))
-        .context("project_path is not a Unity project (no ProjectSettings/ProjectVersion.txt)")?;
-    let found = version
-        .lines()
-        .find_map(|l| l.strip_prefix("m_EditorVersion:"))
-        .map(str::trim)
-        .unwrap_or("");
-    ensure!(
-        found == spec.engine.version,
-        "The project uses Unity {found}, but the session asked for {}",
-        spec.engine.version
-    );
+    let project = project_dir(spec, checkout)?;
     let package = session_dir.join("packages").join(SESSION_PACKAGE);
     write_session_package(&package)?;
     let bridge = stage_bridge(
@@ -1138,6 +1282,30 @@ pub fn prepare_project(
     )?;
     std::fs::write(&token_file, &token)?;
     Ok((project, config, token_file, port))
+}
+
+/// The session's Unity project in the checkout, checked against the
+/// requested editor version.
+pub fn project_dir(spec: &Spec, checkout: &Path) -> Result<PathBuf> {
+    let project = if spec.project_path.trim_matches('/').is_empty() {
+        checkout.to_owned()
+    } else {
+        checkout.join(spec.project_path.trim_matches('/'))
+    };
+    reject_symlink_components(&project)?;
+    let version = std::fs::read_to_string(project.join("ProjectSettings/ProjectVersion.txt"))
+        .context("project_path is not a Unity project (no ProjectSettings/ProjectVersion.txt)")?;
+    let found = version
+        .lines()
+        .find_map(|l| l.strip_prefix("m_EditorVersion:"))
+        .map(str::trim)
+        .unwrap_or("");
+    ensure!(
+        found == spec.engine.version,
+        "The project uses Unity {found}, but the session asked for {}",
+        spec.engine.version
+    );
+    Ok(project)
 }
 
 /// Checks in a row (about two seconds apart) that something other than the
@@ -1296,9 +1464,22 @@ pub async fn run_session(
         receipt["commit"] = json!(commit);
         receipt["checkout_seconds"] = json!(t.elapsed().as_secs());
         report("preparing", None, json!({"commit": commit}));
-        let (project, bridge_json, token_file, port) =
-            prepare_project(&ctx, &spec, &checkout, &session_dir)?;
-        let mut bridge = BridgePort::new(port, &std::fs::read_to_string(&token_file)?, &bridge_json);
+        // A world session runs the world host, not the Editor: no packages,
+        // bridge or relay.
+        let editor = if spec.is_world() {
+            ensure!(
+                ctx.config.world_host.is_some(),
+                "This engine machine is not set up for world sessions: engine.json names no world_host"
+            );
+            None
+        } else {
+            let moq = secrets.moq.as_ref().context("The session has no relay token; start a new one.")?;
+            Some((prepare_project(&ctx, &spec, &checkout, &session_dir)?, moq))
+        };
+        let project = match &editor {
+            Some(((project, ..), _)) => project.clone(),
+            None => project_dir(&spec, &checkout)?,
+        };
         let pids = PidRecord::new(ctx.private.join("engine-pids.json"));
         let mut g = Group::new()?;
         if ctx.config.unity_region.as_deref() == Some("global") {
@@ -1335,6 +1516,14 @@ pub async fn run_session(
             status.code().unwrap_or(-1)
         );
         receipt["activation_seconds"] = json!(t.elapsed().as_secs());
+        let Some(((_, bridge_json, token_file, port), moq)) = editor else {
+            return run_world_host(
+                &ctx, &spec, &secrets, &id, generation, &unity, &project, &session_dir,
+                group.as_mut().unwrap(), &pids, &mut stop, &mut receipt, started, &report,
+            )
+            .await;
+        };
+        let mut bridge = BridgePort::new(port, &std::fs::read_to_string(&token_file)?, &bridge_json);
 
         // The Editor, in this node's interactive session.
         clear_unity_temp(&project)?;
@@ -1400,7 +1589,7 @@ pub async fn run_session(
             std::fs::write(
                 &session_file,
                 serde_json::to_vec(&{
-                    let mut session = stream_session(&spec, &secrets.moq, bridge.port, &token_file, &ctx.config.ffmpeg);
+                    let mut session = stream_session(&spec, moq, bridge.port, &token_file, &ctx.config.ffmpeg);
                     if let Some(block) = ctx.controller.as_deref().zip(secrets.webrtc.as_ref()).and_then(|(origin, w)| webrtc_block(origin, w, &spec, &id, generation)) {
                         session["webrtc"] = block;
                     }
@@ -1456,6 +1645,8 @@ pub async fn run_session(
     if let Some(g) = group.as_mut() {
         g.terminate().await;
     }
+    // The world build cache outlives the session (its processes have ended).
+    return_world_builds(&ctx.work, &session_dir);
     // Keep the Editor log (its last MiB) beside the receipt for the owner;
     // secrets on disk go with the session directory.
     let receipts = ctx.private.join("engine-receipts");
@@ -1468,15 +1659,7 @@ pub async fn run_session(
     let _ = std::fs::remove_dir_all(&session_dir);
     let stopped = *stop.borrow();
     let error = match &outcome {
-        Err(e) if !stopped => Some(redact(
-            &format!("{e:#}"),
-            &[
-                &secrets.repository.token,
-                &secrets.unity.access_token,
-                &secrets.moq.publish_token,
-                &secrets.moq.control_key,
-            ],
-        )),
+        Err(e) if !stopped => Some(redact(&format!("{e:#}"), &secrets.values())),
         _ => None,
     };
     receipt["state"] = json!(if error.is_some() { "failed" } else { "ended" });
@@ -1489,6 +1672,102 @@ pub async fn run_session(
     match error {
         Some(error) => report("failed", Some(error), json!({})),
         None => report("ended", None, json!({})),
+    }
+}
+
+/// A world session after activation: lend the build cache, write the
+/// owner-only session file, and run the world host in the session's Job
+/// Object until the session stops. Ready on the host's first
+/// `world-host-connected` line; restarted on exit like the stream host (only
+/// quick failures count, five in a row fail the session).
+#[allow(clippy::too_many_arguments)]
+async fn run_world_host(
+    ctx: &SessionContext,
+    spec: &Spec,
+    secrets: &Secrets,
+    id: &str,
+    generation: u64,
+    unity: &Path,
+    project: &Path,
+    session_dir: &Path,
+    g: &mut Group,
+    pids: &PidRecord,
+    stop: &mut watch::Receiver<bool>,
+    receipt: &mut Value,
+    started: Instant,
+    report: &(dyn Fn(&'static str, Option<String>, Value) + Send + Sync),
+) -> Result<()> {
+    let host = ctx
+        .config
+        .world_host
+        .clone()
+        .context("engine.json names no world_host")?;
+    let world = spec
+        .world
+        .as_ref()
+        .context("The world session names no room")?;
+    let secret = secrets
+        .world
+        .as_ref()
+        .context("The world session has no enrollment code; start the world again.")?;
+    let work_dir = session_dir.join("world");
+    private_dir(&work_dir)?;
+    lend_world_builds(&ctx.work, &work_dir)?;
+    let session_file = session_dir.join("world-session.json");
+    atomic_json(
+        &session_file,
+        &world_session(world, secret, id, generation, unity, project, &work_dir),
+    )?;
+    report("starting", None, json!({}));
+    let mut ready = false;
+    let mut quick_failures = 0;
+    loop {
+        let mut command = Command::new(&host);
+        command
+            .args(world_host_argv(&session_file))
+            .current_dir(&work_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let index = g.adopt(
+            command.spawn().context("Cannot start the world host")?,
+            pids,
+        )?;
+        let stdout = g.child(index).stdout.take().context("world host output")?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let launched = Instant::now();
+        loop {
+            tokio::select! {
+                _ = cancelled(stop) => bail!("Stopped"),
+                line = lines.next_line() => match line {
+                    Ok(Some(line)) => {
+                        if !ready && world_host_ready(&line) {
+                            ready = true;
+                            receipt["world_host_connected_seconds"] = json!(started.elapsed().as_secs());
+                            report("ready", None, json!({"commit": receipt["commit"]}));
+                        }
+                    }
+                    _ => break,
+                },
+            }
+        }
+        let exit = g.child(index).wait().await?;
+        receipt["world_host_exits"] = json!(receipt["world_host_exits"].as_u64().unwrap_or(0) + 1);
+        if !exit.success() && launched.elapsed() < Duration::from_secs(30) {
+            quick_failures += 1;
+            ensure!(
+                quick_failures < 5,
+                "The world host keeps failing (exit {}); see the world host's log on the engine machine",
+                exit.code().unwrap_or(-1)
+            );
+        } else {
+            quick_failures = 0;
+        }
+        tokio::select! {
+            _ = cancelled(stop) => bail!("Stopped"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
 }
 
@@ -2021,6 +2300,7 @@ mod tests {
             git: None,
             startup_timeout_seconds: None,
             unity_region: None,
+            world_host: None,
         };
         (dir, config)
     }
@@ -2047,8 +2327,23 @@ mod tests {
         let inv = inventory(&path, 0);
         assert_eq!(
             inv,
-            json!({"ready":true,"unity":["6000.6.5f1"],"running":0})
+            json!({"ready":true,"unity":["6000.6.5f1"],"running":0,"world":false})
         );
+        // An optional world host makes the machine report world sessions.
+        let host = dir.path().join("gamejam-world-host.exe");
+        std::fs::write(&host, "").unwrap();
+        let mut world = config.clone();
+        world.world_host = Some(host.canonicalize().unwrap());
+        world.validate().unwrap();
+        std::fs::write(&path, serde_json::to_vec(&world).unwrap()).unwrap();
+        assert_eq!(inventory(&path, 1)["world"], true);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut bad = world.clone();
+        bad.world_host = Some(PathBuf::from("gamejam-world-host.exe"));
+        assert!(bad.validate().is_err());
+        let mut bad = world.clone();
+        bad.world_host = Some(config.ffmpeg.clone());
+        assert!(bad.validate().is_err());
         let mut bad = config.clone();
         bad.unity = BTreeMap::from([("6000.6.5".into(), config.unity["6000.6.5f1"].clone())]);
         assert!(bad.validate().is_err());
@@ -2178,7 +2473,7 @@ mod tests {
         );
         let session = stream_session(
             &spec,
-            &s.moq,
+            s.moq.as_ref().unwrap(),
             4100,
             Path::new("/w/s/bridge.token"),
             Path::new("/ffmpeg.exe"),
@@ -2366,5 +2661,143 @@ mod tests {
         assert_eq!(ex.running(), 0);
         let body = report_body("s", 3, &reports[0]);
         assert_eq!(body["epoch"], 3);
+    }
+
+    const ROOM: &str = "https://gamejam.coopcollective.dev";
+    const CODE: &str = "enroll_0123456789abcdefghijklmnopqrstuvwxyz";
+    fn world_spec() -> Spec {
+        let mut v = json!({"repository":"queen-of-hearts/gamejam","ref":"main","project_path":"unity-examples/multiplayer-jam",
+            "engine":{"kind":"unity","version":"6000.6.5f1"},"width":1280,"height":720,"scene":null,
+            "namespace":"eb-0123456789abcdef0123456789abcdef","session":"01234567-89ab-4def-8123-456789abcdef","tag":7,
+            "mode":"world","world":{"room_origin":ROOM}});
+        v["mode"] = json!("world");
+        serde_json::from_value(v).unwrap()
+    }
+    fn world_secrets() -> Secrets {
+        serde_json::from_value(json!({"repository":{"remote":"https://github.com/coop-collective/gamejam.git","token":REPO,"auth":"github_token","expires_at":""},
+            "unity":{"access_token":UNITY},"world":{"enroll_code":CODE}})).unwrap()
+    }
+
+    #[test]
+    fn world_specs_name_their_room_and_editor_specs_stay_editor() {
+        let spec = world_spec();
+        spec.validate().unwrap();
+        assert!(spec.is_world());
+        assert!(!self::spec().is_world());
+        let mut editor = self::spec();
+        editor.mode = Some("editor".into());
+        editor.validate().unwrap();
+        for (mode, origin) in [
+            ("world", None),
+            ("editor", Some(ROOM)),
+            ("player", None),
+            ("world", Some("http://gamejam.coopcollective.dev")),
+            ("world", Some("https://gamejam.coopcollective.dev/")),
+            ("world", Some("https://gamejam.coopcollective.dev/engine")),
+            ("world", Some("https://x@gamejam.coopcollective.dev")),
+            ("world", Some("https://gamejam.coopcollective.dev:x")),
+        ] {
+            let mut bad = world_spec();
+            bad.mode = Some(mode.into());
+            bad.world = origin.map(|o| WorldSpec {
+                room_origin: o.into(),
+            });
+            assert!(bad.validate().is_err(), "{mode} {origin:?}");
+        }
+        let mut port = world_spec();
+        port.world = Some(WorldSpec {
+            room_origin: "https://room.example:8443".into(),
+        });
+        port.validate().unwrap();
+        // A world session's secrets carry no relay token; redaction covers the code.
+        let s = world_secrets();
+        assert!(s.moq.is_none());
+        assert!(s.values().contains(&CODE));
+        assert_eq!(
+            redact(&format!("failed with {CODE}"), &s.values()),
+            "failed with [redacted]"
+        );
+    }
+
+    #[test]
+    fn world_host_gets_its_secrets_only_in_the_session_file() {
+        let spec = world_spec();
+        let s = world_secrets();
+        let session = world_session(
+            spec.world.as_ref().unwrap(),
+            s.world.as_ref().unwrap(),
+            "0123456789abcdef0123456789abcdef",
+            4,
+            Path::new("/u/Unity.exe"),
+            Path::new("/w/c/unity-examples/multiplayer-jam"),
+            Path::new("/w/s/world"),
+        );
+        assert_eq!(
+            session,
+            json!({"schema":1,"room_origin":ROOM,"enroll_code":CODE,
+                "engine_session":"0123456789abcdef0123456789abcdef","generation":4,
+                "unity_exe":"/u/Unity.exe","project_dir":"/w/c/unity-examples/multiplayer-jam","work_dir":"/w/s/world"})
+        );
+        for secret in [REPO, UNITY] {
+            assert!(!session.to_string().contains(secret));
+        }
+        let argv: Vec<String> = world_host_argv(Path::new("/w/s/world-session.json"))
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(argv, ["--session", "/w/s/world-session.json"]);
+        for secret in [REPO, UNITY, CODE] {
+            assert!(!argv.iter().any(|a| a.contains(secret)));
+        }
+    }
+
+    #[test]
+    fn world_host_readiness_is_its_connected_event_line() {
+        assert!(world_host_ready(r#"{"event":"world-host-connected"}"#));
+        assert!(world_host_ready("{\"event\": \"world-host-connected\"}\r"));
+        for line in [
+            "",
+            "world-host-connected",
+            r#"{"event":"world-host-connecting"}"#,
+            r#"{"message":"world-host-connected"}"#,
+            r#"["world-host-connected"]"#,
+            r#"{"event":"build-finished","note":"world-host-connected"}"#,
+        ] {
+            assert!(!world_host_ready(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_world_build_cache_is_lent_to_a_session_and_survives_it_and_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().canonicalize().unwrap();
+        let session = work.join("engine/sessions/abc");
+        let work_dir = session.join("world");
+        private_dir(&work_dir).unwrap();
+        // First session: a fresh cache.
+        lend_world_builds(&work, &work_dir).unwrap();
+        std::fs::write(work_dir.join(WORLD_BUILDS).join("player.zip"), "built").unwrap();
+        assert!(!world_builds(&work).exists());
+        assert!(return_world_builds(&work, &session));
+        assert_eq!(
+            std::fs::read_to_string(world_builds(&work).join("player.zip")).unwrap(),
+            "built"
+        );
+        // The next session borrows it; a node that dies mid-session gets it
+        // back in the startup sweep, which removes the session directory.
+        let next = work.join("engine/sessions/def");
+        private_dir(&next.join("world")).unwrap();
+        lend_world_builds(&work, &next.join("world")).unwrap();
+        assert!(
+            next.join("world")
+                .join(WORLD_BUILDS)
+                .join("player.zip")
+                .is_file()
+        );
+        let private = work.join("private");
+        private_dir(&private).unwrap();
+        sweep(&work, &private).unwrap();
+        assert!(!next.exists());
+        assert!(world_builds(&work).join("player.zip").is_file());
     }
 }

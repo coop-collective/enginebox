@@ -147,6 +147,10 @@ impl EngineSessions {
         };
         let s = self.ready_session(org, project, actor, id, platform)?;
         ensure!(
+            s.mode == super::Mode::Editor,
+            refuse(409, super::WORLD_HAS_NO_STREAM)
+        );
+        ensure!(
             mode == Mode::Watch || actor == "owner" || actor == s.started_by,
             refuse(
                 403,

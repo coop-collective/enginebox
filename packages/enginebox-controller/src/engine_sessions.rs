@@ -14,6 +14,14 @@
 //! minted on demand, held only in memory and handed only to the node and
 //! epoch the session is placed on. They are never written to a record.
 //!
+//! World sessions (`mode: "world"`, docs/ENGINE-SESSIONS.md, "World
+//! sessions") run a room's world host instead of the Editor and stream host:
+//! the node checks out and activates as for an editor session, then starts the
+//! owner-configured `world_host`, which dials the room at `room_origin` and
+//! enrolls with the one-time `enroll_code`. The code lives only in memory and
+//! in the secrets handed to the node; no MoQ relay is created, and viewers'
+//! media goes through Cloudflare TURN (`…/{id}/ice`).
+//!
 //! Callers: the owner token, members through the dashboard (the owner token
 //! plus `X-EngineBox-Org` / `X-EngineBox-Actor`), and service tokens with an
 //! engine-session grant (`engine_sessions.start|get|renew|end` on a project,
@@ -77,6 +85,19 @@ pub const NO_SESSION_RELAY: &str = "Public watching needs a per-session relay. A
 pub const REPOSITORY_CONNECTION_PREFIX: &str = "engine-repo-";
 pub const REPOSITORY_REMOTE: &str = "GIT_REMOTE_URL";
 pub const REPOSITORY_TOKEN: &str = "GIT_READ_TOKEN";
+/// The rooms a service token's world sessions may name: an org
+/// `secret_source` connection `engine-world-<project>` yielding
+/// [`WORLD_ORIGINS`], comma-separated https origins. The owner token may name
+/// any https origin.
+pub const WORLD_CONNECTION_PREFIX: &str = "engine-world-";
+pub const WORLD_ORIGINS: &str = "ROOM_ORIGINS";
+/// The https origins of a `ROOM_ORIGINS` list (invalid entries are ignored).
+pub fn parse_origins(list: &str) -> Vec<String> {
+    list.split([',', ' ', '\n'])
+        .filter_map(|o| https_origin(o.trim()))
+        .take(32)
+        .collect()
+}
 pub fn relay_missing() -> anyhow::Error {
     refuse(
         409,
@@ -104,6 +125,11 @@ pub fn check_remote(remote: &str) -> Result<()> {
 pub const REPOSITORY_TOKEN_TTL: u64 = 3600;
 pub const NO_UNITY_ACCOUNT: &str =
     "Add your Unity account on the Agents page to run Unity engine sessions.";
+pub const WORLD_CODE_LOST: &str = "The world session's enrollment code is gone because Engine Box restarted; start the world again.";
+pub const NOT_A_WORLD: &str =
+    "ICE servers are for world sessions; editor sessions use the WebRTC fallback (…/peers).";
+pub const WORLD_HAS_NO_STREAM: &str =
+    "World sessions stream from the room's own players; ask for ICE servers (…/ice) instead.";
 pub const NO_ENGINE_MACHINE: &str = "You have no engine machine in this organization. Register a Windows engine machine on the Compute page, then claim it as yours.";
 
 fn now() -> u64 {
@@ -187,6 +213,21 @@ impl State {
     }
 }
 
+/// What a session runs: the Unity Editor streamed over MoQ (`editor`, the
+/// default), or a room's world host (`world`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Editor,
+    World,
+}
+impl Mode {
+    pub fn is_editor(&self) -> bool {
+        *self == Self::Editor
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Engine {
@@ -242,6 +283,12 @@ pub struct Session {
     /// (`peers.rs`), set when the node receives the session's secrets.
     #[serde(default)]
     pub peer_host_hash: Option<String>,
+    /// Omitted for editor sessions so older releases still read the record.
+    #[serde(default, skip_serializing_if = "Mode::is_editor")]
+    pub mode: Mode,
+    /// A world session's room (an https origin; not a secret).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_origin: Option<String>,
 }
 impl Session {
     /// What any caller who may see the session reads. No lease, control key
@@ -255,6 +302,8 @@ impl Session {
             "lease_expires_at": self.lease_expires_at, "created_at": self.created_at,
             "updated_at": self.updated_at, "node": self.node, "generation": self.generation,
             "commit": self.report.get("commit"), "ended_at": self.ended_at,
+            "mode": self.mode,
+            "world": self.room_origin.as_ref().map(|origin| json!({"room_origin": origin})),
         })
     }
 }
@@ -371,6 +420,11 @@ pub trait Platform {
     fn turn(&self) -> Result<Option<Arc<dyn crate::turn::Issuer>>> {
         Ok(None)
     }
+    /// The https room origins the owner allows service tokens' world
+    /// sessions in `project` to name (`engine-world-<project>`).
+    fn world_origins(&self, _org: &str, _project: &str) -> Vec<String> {
+        vec![]
+    }
     fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value);
 }
 
@@ -424,6 +478,28 @@ pub fn session_uuid(id: &str) -> String {
         .map(|u| u.hyphenated().to_string())
         .unwrap_or_default()
 }
+/// `s` exactly as an https origin (`https://host[:port]`, lower case, no
+/// path, credentials, query or fragment).
+pub fn https_origin(s: &str) -> Option<String> {
+    let url = url::Url::parse(s).ok()?;
+    let origin = url.origin().ascii_serialization();
+    (url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && origin == s)
+        .then_some(origin)
+}
+/// A room's one-time host enrollment code: 32-128 URL-safe characters.
+pub fn valid_enroll_code(code: &str) -> bool {
+    (32..=128).contains(&code.len())
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 fn valid_ref(r: &str) -> bool {
     crate::previews::valid_branch(r) && !r.starts_with('-')
 }
@@ -446,6 +522,9 @@ pub struct EngineSessions {
     release_retry: Arc<Mutex<BTreeMap<String, u64>>>,
     /// WebRTC fallback peers by id; memory only (`peers.rs`).
     peers: Arc<Mutex<BTreeMap<String, peers::Peer>>>,
+    /// World sessions' enrollment codes by session id until they end; memory
+    /// only, delivered to the node with the session's other secrets.
+    world_codes: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 /// Deletes the relays of finished sessions once the caller's locks are gone
@@ -492,6 +571,7 @@ impl EngineSessions {
             minting: Arc::new(Mutex::new(())),
             release_retry: Arc::new(Mutex::new(BTreeMap::new())),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
+            world_codes: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
     fn save_relay(&self, r: &RelayRecord) -> Result<()> {
@@ -725,6 +805,7 @@ impl EngineSessions {
                 .unwrap()
                 .retain(|(id, _), _| id != &s.id);
             self.tokens.lock().unwrap().retain(|(id, _), _| id != &s.id);
+            self.world_codes.lock().unwrap().remove(&s.id);
             platform.audit(
                 &s.org_id,
                 &s.started_by,
@@ -811,13 +892,28 @@ impl EngineSessions {
         }
     }
 
-    /// `POST /v1/projects/{project}/engine-sessions`.
+    /// `POST /v1/projects/{project}/engine-sessions` by the owner token (any
+    /// https `room_origin` for a world session).
     pub fn create(
         &self,
         org: &str,
         project: &str,
         actor: &str,
         body: &Value,
+        platform: &dyn Platform,
+    ) -> Result<(u16, Value)> {
+        self.start(org, project, actor, body, false, platform)
+    }
+    /// `POST /v1/projects/{project}/engine-sessions`. A `service` caller's
+    /// world session must name a room the owner allowed for the project
+    /// ([`Platform::world_origins`]); the owner token may name any https room.
+    pub fn start(
+        &self,
+        org: &str,
+        project: &str,
+        actor: &str,
+        body: &Value,
+        service: bool,
         platform: &dyn Platform,
     ) -> Result<(u16, Value)> {
         let _release = Release(self, platform);
@@ -834,10 +930,11 @@ impl EngineSessions {
                 "scene",
                 "width",
                 "height",
+                "world",
             ],
             &["request_id", "repository", "ref", "engine"],
         )
-        .map_err(|_| refuse(400, "Send request_id, repository, ref, project_path, engine {kind, version}, and optionally ttl_seconds, width and height."))?;
+        .map_err(|_| refuse(400, "Send request_id, repository, ref, project_path, engine {kind, version}, and optionally ttl_seconds, width, height, mode and world."))?;
         ensure!(
             enginebox_agents::pools::valid_project(project),
             refuse(404, "Unknown project.")
@@ -875,10 +972,70 @@ impl EngineSessions {
                 "engine must be {kind: \"unity\", version} with a Unity version such as 6000.6.5f1."
             )
         );
-        ensure!(
-            body.get("mode").is_none_or(|m| m == "editor"),
-            refuse(400, "mode must be editor in this release.")
-        );
+        let mode = match body.get("mode") {
+            None => Mode::Editor,
+            Some(m) if m == "editor" => Mode::Editor,
+            Some(m) if m == "world" => Mode::World,
+            Some(_) => return Err(refuse(400, "mode must be editor or world.")),
+        };
+        let (room_origin, enroll_code) = match (mode, body.get("world")) {
+            (Mode::Editor, None) => (None, None),
+            (Mode::Editor, Some(_)) => {
+                return Err(refuse(400, "world is only for mode world."));
+            }
+            (Mode::World, world) => {
+                let world = world.unwrap_or(&Value::Null);
+                crate::keys(
+                    world,
+                    &["room_origin", "enroll_code"],
+                    &["room_origin", "enroll_code"],
+                )
+                .map_err(|_| {
+                    refuse(
+                        400,
+                        "A world session needs world {room_origin, enroll_code}.",
+                    )
+                })?;
+                let origin = world["room_origin"]
+                    .as_str()
+                    .and_then(https_origin)
+                    .ok_or_else(|| {
+                        refuse(400, "world.room_origin must be an https origin such as https://gamejam.example.")
+                    })?;
+                let code = world["enroll_code"]
+                    .as_str()
+                    .filter(|c| valid_enroll_code(c))
+                    .ok_or_else(|| {
+                        refuse(
+                            400,
+                            "world.enroll_code must be 32-128 letters, digits, - or _.",
+                        )
+                    })?;
+                (Some(origin), Some(code.to_owned()))
+            }
+        };
+        let action = match mode {
+            Mode::Editor => "engine.session_start",
+            Mode::World => "engine.world_start",
+        };
+        if let Some(origin) = room_origin.as_ref().filter(|_| service)
+            && !platform.world_origins(org, project).contains(origin)
+        {
+            platform.audit(
+                org,
+                actor,
+                action,
+                &format!("{project}/{repository}"),
+                false,
+                json!({"reason": "room_origin is not allowed for this project", "room_origin": origin}),
+            );
+            return Err(refuse(
+                403,
+                format!(
+                    "{origin} is not an allowed world room for this project. The owner lists allowed rooms in the {WORLD_CONNECTION_PREFIX}{project} connection's {WORLD_ORIGINS}."
+                ),
+            ));
+        }
         let ttl = match body.get("ttl_seconds") {
             None => DEFAULT_TTL_SECONDS,
             Some(v) => v
@@ -918,18 +1075,31 @@ impl EngineSessions {
                     .to_owned(),
             ),
         };
-        let digest = state::digest(&json!({
+        let mut request = json!({
             "project": project, "repository": repository, "ref": git_ref,
             "project_path": project_path, "engine": engine, "ttl_seconds": ttl,
             "width": width, "height": height, "scene": scene,
-        }));
+        });
+        // Never the enrollment code: a retry's code is compared in memory.
+        if let Some(origin) = &room_origin {
+            request["mode"] = json!(mode);
+            request["room_origin"] = json!(origin);
+        }
+        let digest = state::digest(&request);
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(existing) = sessions
             .values()
             .find(|s| s.org_id == org && s.started_by == actor && s.request_id == request_id)
         {
             ensure!(
-                existing.request_digest == digest,
+                existing.request_digest == digest
+                    && enroll_code.as_ref().is_none_or(|code| {
+                        self.world_codes
+                            .lock()
+                            .unwrap()
+                            .get(&existing.id)
+                            .is_none_or(|held| equal(held, code))
+                    }),
                 refuse(409, "request_id was already used for a different session.")
             );
             return Ok((202, self.created_view(existing)));
@@ -938,7 +1108,7 @@ impl EngineSessions {
             platform.audit(
                 org,
                 actor,
-                "engine.session_start",
+                action,
                 &format!("{project}/{repository}"),
                 false,
                 json!({"reason": message}),
@@ -1016,16 +1186,18 @@ impl EngineSessions {
             ending_since: None,
             ended_at: None,
             peer_host_hash: None,
+            mode,
+            room_origin,
         };
         self.save(&session)?;
-        platform.audit(
-            org,
-            actor,
-            "engine.session_start",
-            &id,
-            true,
-            json!({"repository": format!("{project}/{repository}"), "ref": git_ref, "engine": session.engine}),
-        );
+        if let Some(code) = enroll_code {
+            self.world_codes.lock().unwrap().insert(id.clone(), code);
+        }
+        let mut detail = json!({"repository": format!("{project}/{repository}"), "ref": git_ref, "engine": session.engine});
+        if let Some(origin) = &session.room_origin {
+            detail["room_origin"] = json!(origin);
+        }
+        platform.audit(org, actor, action, &id, true, detail);
         sessions.insert(id.clone(), session);
         self.tick(&mut sessions, platform);
         Ok((202, self.created_view(&sessions[&id])))
@@ -1084,7 +1256,7 @@ impl EngineSessions {
         };
         let mut v = s.public();
         v["relay"] = json!(self.relay_of(&s.id));
-        if s.state == State::Ready && s.started_by == actor {
+        if s.state == State::Ready && s.started_by == actor && s.mode == Mode::Editor {
             match self.stream_block(&s, platform) {
                 Ok(stream) => v["stream"] = stream,
                 Err(error) => v["stream_error"] = json!(status_of(&error).1),
@@ -1154,6 +1326,7 @@ impl EngineSessions {
                 .ok_or_else(|| refuse(404, "Unknown engine session."))?
                 .clone()
         };
+        ensure!(s.mode == Mode::Editor, refuse(409, WORLD_HAS_NO_STREAM));
         ensure!(
             s.state == State::Ready,
             refuse(
@@ -1186,6 +1359,51 @@ impl EngineSessions {
                 "namespace": s.namespace,
                 "session": session_uuid(&s.id),
                 "tag": s.tag, "width": s.width, "height": s.height,
+            }),
+        ))
+    }
+    /// `POST …/{id}/ice {}`: Cloudflare TURN ICE servers (relay only, about an
+    /// hour) for a world session's players and viewers. The owner, the
+    /// starter, and a token with `engine_sessions.watch` acting as the
+    /// starter may ask, while the session is open.
+    pub fn ice(
+        &self,
+        org: &str,
+        project: &str,
+        actor: &str,
+        id: &str,
+        body: &Value,
+        platform: &dyn Platform,
+    ) -> Result<(u16, Value)> {
+        let _release = Release(self, platform);
+        crate::keys(body, &[], &[]).map_err(|_| refuse(400, "Send {}."))?;
+        let s = {
+            let mut sessions = self.sessions.lock().unwrap();
+            self.tick(&mut sessions, platform);
+            sessions
+                .get(id)
+                .filter(|s| valid_session_id(id) && Self::visible(s, org, Some(project), actor))
+                .ok_or_else(|| refuse(404, "Unknown engine session."))?
+                .clone()
+        };
+        ensure!(s.mode == Mode::World, refuse(409, NOT_A_WORLD));
+        ensure!(
+            !s.state.terminal() && s.state != State::Ending,
+            refuse(409, "The world session is over; start the world again.")
+        );
+        let issuer = platform
+            .turn()?
+            .ok_or_else(|| refuse(503, peers::NOT_CONFIGURED))?;
+        // Network call: never under a lock.
+        let ice_servers = issuer
+            .ice_servers(peers::ICE_TTL_SECONDS)
+            .map_err(|error| refuse(502, format!("{error}")))?;
+        Ok((
+            200,
+            json!({
+                "ice_servers": ice_servers,
+                "ice_transport_policy": "relay",
+                "expires_at": now() + peers::ICE_TTL_SECONDS,
             }),
         ))
     }
@@ -1306,8 +1524,12 @@ impl EngineSessions {
                     "engine": s.engine, "width": s.width, "height": s.height,
                     "scene": s.scene, "namespace": s.namespace,
                     "session": session_uuid(&s.id), "tag": s.tag,
+                    "mode": s.mode,
                 },
             });
+            if let Some(origin) = &s.room_origin {
+                row["spec"]["world"] = json!({"room_origin": origin});
+            }
             if s.state == State::Placed {
                 match self.secrets_for(&s, platform) {
                     Ok(secrets) => row["secrets"] = secrets,
@@ -1338,6 +1560,25 @@ impl EngineSessions {
         }
         let unity = platform.unity_access_token(&s.org_id, &s.started_by)?;
         let repository = platform.repository_access(&s.org_id, &s.project, &s.repository)?;
+        let repository = json!({"remote": repository.remote, "token": repository.token, "auth": repository.auth, "expires_at": repository.expires_at});
+        // A world session: the room's enrollment code instead of a relay; the
+        // world host needs no MoQ relay and no WebRTC fallback.
+        if s.mode == Mode::World {
+            let code = self
+                .world_codes
+                .lock()
+                .unwrap()
+                .get(&s.id)
+                .cloned()
+                .ok_or_else(|| refuse(409, WORLD_CODE_LOST))?;
+            let secrets = json!({
+                "repository": repository,
+                "unity": {"access_token": unity},
+                "world": {"enroll_code": code},
+            });
+            self.secrets.lock().unwrap().insert(key, secrets.clone());
+            return Ok(secrets);
+        }
         // The session's own relay when the broker is configured; a failure
         // fails the start (never a silent fall back to the shared relay,
         // whose subscribe token would let a public viewer watch every
@@ -1351,7 +1592,7 @@ impl EngineSessions {
             None => platform.relay()?.publish_token,
         };
         let mut secrets = json!({
-            "repository": {"remote": repository.remote, "token": repository.token, "auth": repository.auth, "expires_at": repository.expires_at},
+            "repository": repository,
             "unity": {"access_token": unity},
             "moq": {"relay_url": DEFAULT_RELAY, "publish_token": publish_token, "control_key": s.control_key},
         });
@@ -1538,6 +1779,13 @@ pub(crate) mod tests {
         }
         fn turn(&self) -> Result<Option<Arc<dyn crate::turn::Issuer>>> {
             Ok(self.turn.clone())
+        }
+        fn world_origins(&self, _: &str, project: &str) -> Vec<String> {
+            if project == "qoh" {
+                parse_origins("https://gamejam.coopcollective.dev, http://x.example, junk")
+            } else {
+                vec![]
+            }
         }
         fn relay_broker(&self) -> Result<Option<Arc<dyn crate::moq::Broker>>> {
             Ok(self.broker.clone())
@@ -2580,5 +2828,250 @@ pub(crate) mod tests {
             status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)),
             503
         );
+    }
+
+    const ROOM: &str = "https://gamejam.coopcollective.dev";
+    const CODE: &str = "enroll_0123456789abcdefghijklmnopqrstuvwxyz";
+    fn world_body(request_id: &str, origin: &str, code: &str) -> Value {
+        let mut body = start_body(request_id);
+        body["mode"] = json!("world");
+        body["world"] = json!({"room_origin": origin, "enroll_code": code});
+        body
+    }
+
+    #[test]
+    fn world_sessions_hand_the_enroll_code_only_to_the_node_and_skip_the_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let cf = crate::moq::fake::serve();
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let p = Fake {
+            turn: Some(Arc::new(FakeTurn)),
+            ..with_broker(&cf)
+        };
+        let (code, created) = es
+            .create(ORG, "qoh", ALICE, &world_body("world-1", ROOM, CODE), &p)
+            .unwrap();
+        assert_eq!(code, 202);
+        assert_eq!(created["mode"], "world");
+        assert_eq!(created["world"]["room_origin"], ROOM);
+        let id = created["id"].as_str().unwrap().to_owned();
+        assert!(!created.to_string().contains(CODE));
+        assert_eq!(
+            p.audit.lock().unwrap().last().unwrap(),
+            &("engine.world_start".to_owned(), true)
+        );
+        // A retry with the same request is the same session; a different
+        // code under the same request_id is refused.
+        let (_, again) = es
+            .create(ORG, "qoh", ALICE, &world_body("world-1", ROOM, CODE), &p)
+            .unwrap();
+        assert_eq!(again["id"], id.as_str());
+        let other_code = format!("{CODE}x");
+        assert_eq!(
+            status_of(
+                &es.create(
+                    ORG,
+                    "qoh",
+                    ALICE,
+                    &world_body("world-1", ROOM, &other_code),
+                    &p
+                )
+                .unwrap_err()
+            )
+            .0,
+            409
+        );
+        // The node's poll: the spec names the mode and room, the secrets carry
+        // the code, and no relay or WebRTC host token is minted.
+        let polled = es.poll(&node(), 1, &p).unwrap();
+        let row = &polled["sessions"][0];
+        assert_eq!(row["spec"]["mode"], "world");
+        assert_eq!(row["spec"]["world"], json!({"room_origin": ROOM}));
+        assert!(!row["spec"].to_string().contains(CODE));
+        assert_eq!(row["secrets"]["world"]["enroll_code"], CODE);
+        assert_eq!(
+            row["secrets"]["unity"]["access_token"],
+            "unity-access-secret"
+        );
+        assert!(row["secrets"].get("moq").is_none() && row["secrets"].get("webrtc").is_none());
+        assert!(es.relay_of(&id).is_none());
+        assert!(cf.state.lock().unwrap().relays.is_empty());
+        // Never in a record, a read or a list.
+        let generation = row["generation"].as_u64().unwrap();
+        for state in ["preparing", "starting", "ready"] {
+            es.report(&node(), 1, &report(&id, generation, state), &p)
+                .unwrap();
+        }
+        let read = es.get(ORG, "qoh", ALICE, &id, &p).unwrap();
+        assert_eq!(read["state"], "ready");
+        assert!(read.get("stream").is_none());
+        for text in [
+            read.to_string(),
+            es.list(ORG, Some("qoh"), ALICE, &p).to_string(),
+            std::fs::read_to_string(dir.path().join(format!("engine-sessions/{id}.json"))).unwrap(),
+        ] {
+            assert!(!text.contains(CODE), "{text}");
+        }
+        // No MoQ stream or WebRTC fallback for a world.
+        assert_eq!(
+            status(es.watch_token(ORG, "qoh", ALICE, &id, &json!({}), &p)),
+            409
+        );
+        assert_eq!(
+            status(es.peer_create(ORG, "qoh", ALICE, &id, &json!({"mode": "watch"}), &p)),
+            409
+        );
+        // ICE servers: relay only, for the starter and the owner.
+        let (status_code, ice) = es.ice(ORG, "qoh", ALICE, &id, &json!({}), &p).unwrap();
+        assert_eq!(status_code, 200);
+        assert_eq!(ice["ice_transport_policy"], "relay");
+        assert_eq!(ice["ice_servers"][0]["credential"], "turn-secret");
+        let left = ice["expires_at"].as_u64().unwrap() - now();
+        assert!((peers::ICE_TTL_SECONDS - 5..=peers::ICE_TTL_SECONDS).contains(&left));
+        assert_eq!(
+            status(es.ice(ORG, "qoh", "owner", &id, &json!({}), &p)),
+            200
+        );
+        assert_eq!(status(es.ice(ORG, "qoh", BOB, &id, &json!({}), &p)), 404);
+        assert_eq!(
+            status(es.ice(ORG, "qoh", ALICE, &id, &json!({"count": 2}), &p)),
+            400
+        );
+        // Ending forgets the code.
+        es.end(Some(ORG), Some("qoh"), ALICE, &id, &json!({}), &p)
+            .unwrap();
+        assert_eq!(status(es.ice(ORG, "qoh", ALICE, &id, &json!({}), &p)), 409);
+        es.report(&node(), 1, &report(&id, generation, "ended"), &p)
+            .unwrap();
+        assert!(es.world_codes.lock().unwrap().is_empty());
+        // Editor sessions are unchanged: mode editor, a relay, no ICE route.
+        let (editor, _, secrets) = ready_with_secrets(&es, &p, "editor-1");
+        assert!(secrets.get("moq").is_some() && secrets.get("world").is_none());
+        assert_eq!(
+            es.get(ORG, "qoh", ALICE, &editor, &p).unwrap()["mode"],
+            "editor"
+        );
+        assert_eq!(
+            status(es.ice(ORG, "qoh", ALICE, &editor, &json!({}), &p)),
+            409
+        );
+        let disk =
+            std::fs::read_to_string(dir.path().join(format!("engine-sessions/{editor}.json")))
+                .unwrap();
+        assert!(!disk.contains("\"mode\"") && !disk.contains("room_origin"));
+    }
+
+    #[test]
+    fn world_starts_check_the_room_origin_and_enroll_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let p = Fake::default();
+        let start = |body: Value, service: bool| {
+            es.start(ORG, "qoh", ALICE, &body, service, &p)
+                .map(|(s, _)| s)
+                .unwrap_or_else(|e| status_of(&e).0)
+        };
+        for bad in [
+            "http://gamejam.coopcollective.dev",
+            "https://gamejam.coopcollective.dev/",
+            "https://gamejam.coopcollective.dev/room",
+            "https://user@gamejam.coopcollective.dev",
+            "https://gamejam.coopcollective.dev?x=1",
+            "https://GAMEJAM.coopcollective.dev",
+            "wss://gamejam.coopcollective.dev",
+            "gamejam.coopcollective.dev",
+        ] {
+            assert_eq!(
+                start(world_body("bad-origin", bad, CODE), false),
+                400,
+                "{bad}"
+            );
+        }
+        for bad in [
+            "short",
+            &"a".repeat(129),
+            &format!("{CODE}!"),
+            &format!("{CODE} "),
+        ] {
+            assert_eq!(
+                start(world_body("bad-code", ROOM, bad), false),
+                400,
+                "{bad}"
+            );
+        }
+        let mut no_world = start_body("no-world");
+        no_world["mode"] = json!("world");
+        assert_eq!(start(no_world, false), 400);
+        let mut stray = start_body("stray");
+        stray["world"] = json!({"room_origin": ROOM, "enroll_code": CODE});
+        assert_eq!(start(stray, false), 400);
+        let mut player = start_body("player");
+        player["mode"] = json!("player");
+        assert_eq!(start(player, false), 400);
+        let mut extra = world_body("extra", ROOM, CODE);
+        extra["world"]["host"] = json!("x");
+        assert_eq!(start(extra, false), 400);
+        // A service token: only a room the owner allowed for the project.
+        assert_eq!(
+            start(world_body("elsewhere", "https://evil.example", CODE), true),
+            403
+        );
+        assert_eq!(
+            p.audit.lock().unwrap().last().unwrap(),
+            &("engine.world_start".to_owned(), false)
+        );
+        let refused = es
+            .start(
+                ORG,
+                "other",
+                ALICE,
+                &world_body("other", ROOM, CODE),
+                true,
+                &p,
+            )
+            .unwrap_err();
+        assert_eq!(status_of(&refused).0, 403);
+        assert!(
+            status_of(&refused)
+                .1
+                .contains("engine-world-other connection's ROOM_ORIGINS")
+        );
+        assert_eq!(start(world_body("ok", ROOM, CODE), true), 202);
+        // The owner token: any https origin.
+        assert_eq!(
+            start(
+                world_body("owner", "https://room.example:8443", CODE),
+                false
+            ),
+            202
+        );
+        assert_eq!(
+            parse_origins("https://a.example,https://b.example:8443 \n https://c.example/ x"),
+            ["https://a.example", "https://b.example:8443"]
+        );
+        assert_eq!(https_origin(ROOM).as_deref(), Some(ROOM));
+    }
+
+    #[test]
+    fn a_world_whose_code_was_lost_to_a_restart_fails_at_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Fake::default();
+        let id = {
+            let es = EngineSessions::open(dir.path()).unwrap();
+            // Queued: no machine of Alice's is online yet.
+            p.nodes.lock().unwrap()[0].online = false;
+            let (_, created) = es
+                .create(ORG, "qoh", ALICE, &world_body("lost", ROOM, CODE), &p)
+                .unwrap();
+            assert_eq!(created["state"], "queued");
+            created["id"].as_str().unwrap().to_owned()
+        };
+        p.nodes.lock().unwrap()[0].online = true;
+        let es = EngineSessions::open(dir.path()).unwrap();
+        let polled = es.poll(&node(), 1, &p).unwrap();
+        assert_eq!(polled["sessions"], json!([]));
+        let read = es.get(ORG, "qoh", ALICE, &id, &p).unwrap();
+        assert_eq!(read["state"], "failed");
+        assert_eq!(read["error"], WORLD_CODE_LOST);
     }
 }

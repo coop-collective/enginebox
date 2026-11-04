@@ -198,6 +198,8 @@ reports in order. If the engine channel fails for a minute, it stops its session
   other fails every start with a clear reason.
 - Each member saves their Unity account on the Agents page (PR #92).
 - The repository is hosted or GitHub-linked in the project, or has an `engine-repo-<name>` connection.
+- `engine-world-<project>` (org `secret_source`, `ROOM_ORIGINS`): the rooms OAuth apps' world sessions may name
+  ([world sessions](#world-sessions-mode-world)).
 
 ### Qualified so far (RTX 4080 Windows machine, November 1, 2026)
 
@@ -303,6 +305,70 @@ to WebRTC with media relayed through **Cloudflare TURN on both sides** (`iceTran
   a lapsed lease, or either side ending it ends the peer, and the viewer opens a new one. The stream host's ten-minute
   restart ends its peers too.
 - `engine.peer_open` is audited with the mode.
+
+### World sessions (`mode: "world"`)
+
+Added November 4, 2026, for Gamejam's hosted shared world. A world session runs a room's **world host**
+(Gamejam's `gamejam-world-host`) on the member's engine machine instead of the Editor and stream host. The world host
+dials the room (`wss://<room>/engine/host`), builds Windows players with the activated Editor in batch mode and runs
+them inside the session's Job Object; viewers' media goes browser ↔ player through Cloudflare TURN. The engine machine
+still opens no port, and no MoQ relay is created.
+
+- **Start.** `POST /v1/projects/{p}/engine-sessions` with the usual `request_id`, `repository`, `ref`, `project_path`
+  and `engine`, plus `mode:"world"` and `world:{room_origin, enroll_code}`. For Gamejam: repository `gamejam`, ref
+  `main`, `project_path:"unity-examples/multiplayer-jam"`. `mode` defaults to `editor`; `world` is refused without
+  `mode:"world"` and required with it.
+  - `room_origin` is exactly an https origin (`https://host[:port]`, lower case, no path, slash, query or
+    credentials).
+  - **Allowed rooms.** The owner token (and members through the dashboard) may name any https origin. A service token
+    (an OAuth app such as Gamejam's Account) may name only an origin the owner listed for the project: an org
+    `secret_source` connection **`engine-world-<project>`** yielding **`ROOM_ORIGINS`**, comma- or space-separated
+    https origins (invalid entries are ignored). Anything else is `403` naming that connection, and is audited.
+    To allow Gamejam's room in project `queen-of-hearts`:
+
+    ```json
+    POST /v1/connections
+    {"name": "engine-world-queen-of-hearts", "kind": "secret_source",
+     "source": {"provider": "stored", "environment": "production"},
+     "secrets": {"ROOM_ORIGINS": "https://gamejam.coopcollective.dev"}}
+    ```
+
+    (create it in the org the app's grant acts for; edit or delete it to change or revoke rooms; it is read on every
+    start).
+  - `enroll_code` is the room's one-time host enrollment code, 32–128 letters, digits, `-` or `_`. It is held **only in
+    controller memory** and delivered only in the node's secrets: never in the session record, the request digest,
+    reads, lists, audit or logs. A retry with the same `request_id` and a different code is `409`. A controller restart
+    before the node received it fails the session (`WORLD_CODE_LOST`: "start the world again"); the code is dropped when
+    the session ends.
+  - Audited as `engine.world_start` (with `room_origin`, never the code), refusals included.
+- **Reads** carry `mode` and `world:{room_origin}`; there is no `stream` block, and `watch-token` and `peers` answer
+  `409` for a world.
+- **ICE.** `POST …/{id}/ice {}` → `200 {ice_servers, ice_transport_policy:"relay", expires_at}` (unix seconds, one
+  hour) from the platform `cloudflare-turn` connection (Cloudflare STUN/TURN URLs only, TURN over TLS 443 included,
+  port 53 dropped). Owner token, the starter, or an OAuth token with `engine_sessions.watch` acting as the starter, for a
+  world that is not ending or over. Without TURN it is `503`; an editor session is `409`. The room hands these to its
+  players (`join`) and browsers (`session`), both with `iceTransportPolicy:"relay"`.
+- **Node channel.** The poll's `spec` carries `mode` (editor sessions too) and, for a world, `world:{room_origin}`;
+  `secrets` are `{repository, unity, world:{enroll_code}}` (no `moq`, no `webrtc`). Older nodes cannot parse a world's
+  secrets and fail the session rather than start an Editor.
+- **Node.** `engine.json` gains optional `"world_host": "C:\\Enginebox\\engine-tools\\gamejam-world-host.exe"`
+  (absolute, existing, named `gamejam-world-host[.exe]`); the heartbeat's `tools.engine.world` is `true` when it is set.
+  A world session checks out the ref and activates Unity exactly as above (steps 1, 3–4; no packages or bridge), then:
+  1. Lends the persistent build cache `work\engine\world-builds` to the session (a rename into
+     `work\engine\sessions\<id>\world\world-builds`) and moves it back after the session's processes end; the startup
+     sweep moves it back too, before removing session directories.
+  2. Writes the owner-only `work\engine\sessions\<id>\world-session.json`:
+     `{schema:1, room_origin, enroll_code, engine_session:<id>, generation, unity_exe:<engine.json's Unity for the
+     version>, project_dir:<checkout>/<project_path>, work_dir:<session>\world}`.
+  3. Starts `world_host --session <that file>` (nothing else in argv) in the session's Job Object, working directory
+     `work_dir`, stdout read line by line, stderr discarded. The first line that is the JSON object
+     `{"event":"world-host-connected"}` reports `ready`.
+  4. Restarts the host whenever it exits while the session runs, after a second; five quick (under 30 s) non-zero
+     exits in a row fail the session, like the stream host. The enrollment code is one-time, so a restarted host must
+     re-enroll with credentials the room accepts (the room's contract).
+  Stop, lease loss and epoch changes end the Job Object as for editor sessions. Placement is unchanged: one session per
+  engine machine, so a world and the Live Editor do not run at once; a machine without `world_host` fails a world it is
+  given with a clear reason.
 
 ### Known v1 limits
 

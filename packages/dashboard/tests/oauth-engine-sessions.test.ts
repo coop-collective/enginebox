@@ -82,6 +82,10 @@ test("engine sessions are offered only for the engine-sessions scope; the token 
   const watch = await call(`${base}/${session.id}/watch-token`, tokens.access_token, "POST", {});
   assert.equal(watch.status, 200);
   assert.equal((await watch.json()).token, "watch-jwt");
+  // A world session's TURN ICE servers (the watch operation).
+  const ice = await call(`${base}/${session.id}/ice`, tokens.access_token, "POST", {});
+  assert.equal(ice.status, 200);
+  assert.equal((await ice.json()).ice_transport_policy, "relay");
   assert.equal((await call(`${base}/${session.id}/end`, tokens.access_token, "POST", {})).status, 200);
   for (const c of controller.calls.filter((c) => c.path.includes("engine-sessions"))) {
     assert.equal(c.auth, `Bearer ${tokens.access_token}`);
@@ -101,6 +105,8 @@ test("engine sessions are offered only for the engine-sessions scope; the token 
     ["POST", `${base}/${session.id}`],
     ["GET", `${base}/${session.id}/renew`],
     ["GET", `${base}/${session.id}/watch-token`],
+    ["GET", `${base}/${session.id}/ice`],
+    ["POST", `${base}/${session.id}/ice/x`],
     ["POST", `${base}/${session.id}/stop`],
     ["GET", `${base}/${session.id}/peers`],
     ["POST", `${base}/${session.id}/peers/not-a-peer/offer`],
