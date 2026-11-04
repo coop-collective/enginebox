@@ -527,14 +527,26 @@ async fn proxy(supervisor: Supervisor, request: Request, dashboard: bool) -> Res
                 "result",
                 "engine-poll",
                 "engine-report",
+                "fork-report",
+                "fork-events",
+                "fork-artifact",
             ]
             .contains(action)
             // A stream host's WebRTC fallback signaling, authenticated by
             // its session's host token at the controller.
             || action.starts_with("engine-peers/")
         });
-    let finishing_node = node_action
-        .is_some_and(|action| ["heartbeat", "result", "engine-report"].contains(&action));
+    let finishing_node = node_action.is_some_and(|action| {
+        [
+            "heartbeat",
+            "result",
+            "engine-report",
+            "fork-report",
+            "fork-events",
+            "fork-artifact",
+        ]
+        .contains(&action)
+    });
     let owned_request = !dashboard
         && !finishing_node
         && (!matches!(

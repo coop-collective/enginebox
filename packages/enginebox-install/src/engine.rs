@@ -84,6 +84,15 @@ pub struct EngineConfig {
     /// Optional `gamejam-world-host.exe`: this machine runs world sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub world_host: Option<PathBuf>,
+    /// Agent forks: pinned `claude`/`codex`/Git Bash and the slot count
+    /// (docs/AGENT-FORKS.md). Absent: no agent runs on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<crate::forks::harness::AgentTools>,
+    /// `enginebox-editor`: run Unity and its licensing client as that
+    /// low-privilege account (Windows; qualify first with
+    /// `qualify-editor-account.ps1`). Absent: Unity runs as the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_account: Option<String>,
 }
 
 fn valid_version(v: &str) -> bool {
@@ -195,9 +204,23 @@ impl EngineConfig {
             self.unity_region.as_deref().is_none_or(|r| r == "global"),
             "unity_region must be global"
         );
+        if let Some(agents) = &self.agents {
+            agents.validate()?;
+        }
+        ensure!(
+            self.editor_account
+                .as_deref()
+                .is_none_or(|a| a == crate::forks::slots::EDITOR_ACCOUNT),
+            "editor_account must be {}",
+            crate::forks::slots::EDITOR_ACCOUNT
+        );
+        ensure!(
+            self.editor_account.is_none() || cfg!(windows),
+            "editor_account is supported on Windows only"
+        );
         Ok(())
     }
-    fn git(&self) -> Result<PathBuf> {
+    pub fn git(&self) -> Result<PathBuf> {
         match &self.git {
             Some(git) => Ok(git.clone()),
             None => crate::contributor::find_executable("git")
@@ -491,19 +514,27 @@ pub fn git_env(access: &RepositorySecret) -> Vec<(String, String)> {
     ]
 }
 /// The git commands for one checkout, in order. None carries a secret.
-pub fn git_plan(checkout: &Path, remote: &str, git_ref: &str, fresh: bool) -> Vec<Vec<OsString>> {
+/// The repository lives in the node-private `git_dir`; the work tree (the
+/// dev tree the Editor opens) contains no `.git`.
+pub fn git_plan(
+    git_dir: &Path,
+    work_tree: &Path,
+    remote: &str,
+    git_ref: &str,
+    fresh: bool,
+) -> Vec<Vec<OsString>> {
     let c = |args: &[&str]| -> Vec<OsString> {
-        let mut v: Vec<OsString> = vec!["-C".into(), checkout.as_os_str().to_owned()];
+        let mut gd = OsString::from("--git-dir=");
+        gd.push(git_dir);
+        let mut wt = OsString::from("--work-tree=");
+        wt.push(work_tree);
+        let mut v: Vec<OsString> = vec![gd, wt];
         v.extend(args.iter().map(OsString::from));
         v
     };
     let mut plan = Vec::new();
     if fresh {
-        plan.push(vec![
-            "init".into(),
-            "-q".into(),
-            checkout.as_os_str().to_owned(),
-        ]);
+        plan.push(c(&["init", "-q"]));
         plan.push(c(&["remote", "add", "origin", remote]));
     } else {
         plan.push(c(&["remote", "set-url", "origin", remote]));
@@ -1008,6 +1039,12 @@ impl Group {
         self.children.push(child);
         Ok(self.children.len() - 1)
     }
+    /// The session's Job Object (processes started as another account join it).
+    #[cfg(windows)]
+    pub fn job_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        self.job.as_raw_handle() as _
+    }
     pub fn child(&mut self, index: usize) -> &mut Child {
         &mut self.children[index]
     }
@@ -1125,7 +1162,25 @@ pub fn sweep(work: &Path, private: &Path) -> Result<Value> {
             }
         }
     }
-    Ok(json!({"killed": killed, "removed_sessions": removed}))
+    // Agent forks and editor-account directories of earlier node processes
+    // (their snapshots stay as refs in the node-private repositories).
+    let mut removed_forks = 0;
+    for dir in ["forks", "editor"] {
+        let root = work.join("engine").join(dir);
+        if root.is_dir() {
+            for entry in std::fs::read_dir(&root)? {
+                #[cfg(windows)]
+                let _ = crate::forks::slots::revoke_dirs(&[&entry
+                    .as_ref()
+                    .map(|e| e.path())
+                    .unwrap_or_default()]);
+                if crate::forks::git::remove_tree(&entry?.path()).is_ok() {
+                    removed_forks += 1;
+                }
+            }
+        }
+    }
+    Ok(json!({"killed": killed, "removed_sessions": removed, "removed_forks": removed_forks}))
 }
 
 // ---------------------------------------------------------------- running a session
@@ -1147,6 +1202,10 @@ pub struct SessionContext {
     /// The controller's public origin, for the stream host's WebRTC fallback
     /// signaling (None: the stream host offers MoQ only).
     pub controller: Option<String>,
+    /// Agent forks of the session's dev tree (None: no forks).
+    pub forks: Option<crate::forks::executor::ForkExecutor>,
+    /// The installer's sealed accounts (`enginebox-editor`, slots).
+    pub accounts: Option<std::sync::Arc<crate::forks::slots::Accounts>>,
 }
 
 async fn cancelled(stop: &mut watch::Receiver<bool>) {
@@ -1214,7 +1273,9 @@ async fn run_git(
 }
 
 /// Check out the exact ref with LFS into the repository's checkout. Returns
-/// (checkout, commit).
+/// (checkout, commit). The repository is node-private
+/// (`work\engine\repos\<key>.git`, index beside it); a checkout from an
+/// older node with `.git` inside is moved there once.
 pub async fn checkout(
     ctx: &SessionContext,
     spec: &Spec,
@@ -1223,22 +1284,62 @@ pub async fn checkout(
 ) -> Result<(PathBuf, String)> {
     let git = ctx.config.git()?;
     let checkouts = ctx.work.join("engine").join("checkouts");
+    let repos = ctx.work.join("engine").join("repos");
     private_dir(&checkouts)?;
-    let dir = checkouts.join(checkout_key(&access.remote));
-    let fresh = !dir.join(".git").is_dir();
+    private_dir(&repos)?;
+    let key = checkout_key(&access.remote);
+    let (dir, git_dir, index) = crate::forks::executor::repo_paths(&ctx.work, &key);
+    // Empty hooks and global config for every node git call.
+    let node_git = repos.join(".node");
+    crate::forks::git::GitTreeProvider::new(git.clone(), &node_git, true)?;
+    let inner = dir.join(".git");
+    if inner.is_dir() && !git_dir.exists() {
+        std::fs::rename(&inner, &git_dir)?;
+        if git_dir.join("index").is_file() {
+            std::fs::rename(git_dir.join("index"), &index)?;
+        }
+    } else if inner.exists() {
+        crate::forks::git::remove_tree(&inner)?;
+    }
+    let fresh = !git_dir.join("HEAD").is_file();
     if fresh && dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
-    let env = git_env(access);
+    if fresh && git_dir.exists() {
+        std::fs::remove_dir_all(&git_dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+    let mut env = git_env(access);
+    // The node never runs repository hooks or an fsmonitor.
+    if let Some(count) = env.iter_mut().find(|(k, _)| k == "GIT_CONFIG_COUNT") {
+        count.1 = "5".into();
+    }
+    env.extend([
+        ("GIT_CONFIG_KEY_3".into(), "core.hooksPath".into()),
+        (
+            "GIT_CONFIG_VALUE_3".into(),
+            node_git.join("hooks").to_string_lossy().into_owned(),
+        ),
+        ("GIT_CONFIG_KEY_4".into(), "core.fsmonitor".into()),
+        ("GIT_CONFIG_VALUE_4".into(), "false".into()),
+        (
+            "GIT_CONFIG_GLOBAL".into(),
+            node_git.join("gitconfig").to_string_lossy().into_owned(),
+        ),
+        (
+            "GIT_INDEX_FILE".into(),
+            index.to_string_lossy().into_owned(),
+        ),
+    ]);
     let mut commit = String::new();
-    for args in git_plan(&dir, &access.remote, &spec.git_ref, fresh) {
+    for args in git_plan(&git_dir, &dir, &access.remote, &spec.git_ref, fresh) {
         let mut env = env.clone();
         if args.iter().any(|a| a == "checkout") {
             env.push(("GIT_LFS_SKIP_SMUDGE".into(), "1".into()));
         }
         run_git(&git, &args, &env, &access.token, stop).await?;
         if args.iter().any(|a| a == "fetch") {
-            let mut rev: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
+            let mut rev = args[..2].to_vec();
             rev.extend(["rev-parse".into(), "FETCH_HEAD".into()]);
             commit = run_git(&git, &rev, &env, &access.token, stop).await?;
         }
@@ -1250,6 +1351,24 @@ pub async fn checkout(
     Ok((dir, commit))
 }
 
+/// The session's dev tree for agent forks.
+pub fn dev_tree(
+    ctx: &SessionContext,
+    spec: &Spec,
+    remote: &str,
+    id: &str,
+) -> crate::forks::DevTree {
+    let key = checkout_key(remote);
+    let (work_tree, git_dir, index) = crate::forks::executor::repo_paths(&ctx.work, &key);
+    crate::forks::DevTree {
+        session: id.to_owned(),
+        git_dir,
+        work_tree,
+        index,
+        project_path: spec.project_path.trim_matches('/').to_owned(),
+        forks_root: ctx.work.join("engine").join("forks"),
+    }
+}
 /// Prepare the project: version check, packages, bridge configuration.
 /// Returns (project, bridge config path, bridge token file, port).
 pub fn prepare_project(
@@ -1406,7 +1525,7 @@ impl BridgePort {
 }
 
 /// The bridge's `/status`, when it answers.
-async fn bridge_status(port: u16, token: &str) -> Option<Value> {
+pub(crate) async fn bridge_status(port: u16, token: &str) -> Option<Value> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
@@ -1423,6 +1542,29 @@ async fn bridge_status(port: u16, token: &str) -> Option<Value> {
         return None;
     }
     response.json().await.ok()
+}
+
+/// The Editor process: a child of the node, or started as the editor account.
+enum EditorProc {
+    Node(usize),
+    Account(crate::editor_account::EditorChild),
+}
+impl EditorProc {
+    fn pid(&self, g: &mut Group) -> u32 {
+        match self {
+            Self::Node(i) => g.child(*i).id().unwrap_or(0),
+            Self::Account(c) => crate::editor_account::child_pid(c),
+        }
+    }
+    fn exited(&self, g: &mut Group) -> Result<Option<i64>> {
+        Ok(match self {
+            Self::Node(i) => g
+                .child(*i)
+                .try_wait()?
+                .map(|s| i64::from(s.code().unwrap_or(-1))),
+            Self::Account(c) => crate::editor_account::child_exit(c).map(i64::from),
+        })
+    }
 }
 
 /// Run one session until it is stopped or fails; reports go to `reports`.
@@ -1463,6 +1605,13 @@ pub async fn run_session(
         let (checkout, commit) = checkout(&ctx, &spec, &secrets.repository, &mut stop).await?;
         receipt["commit"] = json!(commit);
         receipt["checkout_seconds"] = json!(t.elapsed().as_secs());
+        // Unity as `enginebox-editor` (engine.json opt-in, Windows).
+        let as_editor = crate::editor_account::resolve(&ctx)?;
+        let bridge_dir = match &as_editor {
+            Some(e) => e.prepare(&ctx.work, &id, &checkout)?,
+            None => session_dir.clone(),
+        };
+        receipt["editor_account"] = json!(as_editor.is_some());
         report("preparing", None, json!({"commit": commit}));
         // A world session runs the world host, not the Editor: no packages,
         // bridge or relay.
@@ -1474,7 +1623,7 @@ pub async fn run_session(
             None
         } else {
             let moq = secrets.moq.as_ref().context("The session has no relay token; start a new one.")?;
-            Some((prepare_project(&ctx, &spec, &checkout, &session_dir)?, moq))
+            Some((prepare_project(&ctx, &spec, &checkout, &bridge_dir)?, moq))
         };
         let project = match &editor {
             Some(((project, ..), _)) => project.clone(),
@@ -1482,39 +1631,57 @@ pub async fn run_session(
         };
         let pids = PidRecord::new(ctx.private.join("engine-pids.json"));
         let mut g = Group::new()?;
-        if ctx.config.unity_region.as_deref() == Some("global") {
+        if as_editor.is_none() && ctx.config.unity_region.as_deref() == Some("global") {
             let file = unity_config_file().context("The engine account has no Unity config folder")?;
             receipt["unity_region_pinned"] = json!(pin_unity_region(&file)?);
         }
-        receipt["unity_terms_key"] = json!(accept_unity_terms(&unity).await?);
+        if as_editor.is_none() {
+            receipt["unity_terms_key"] = json!(accept_unity_terms(&unity).await?);
+        }
         // Activation: the access token is the licensing client's only input.
         let t = Instant::now();
-        let mut activate = Command::new(licensing_client(&unity));
-        activate
-            .args(licensing_argv(&secrets.unity.access_token))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let index = g.adopt(activate.spawn().context("Cannot start Unity's licensing client")?, &pids)?;
-        group = Some(g);
-        let status = tokio::select! {
-            _ = cancelled(&mut stop) => bail!("Stopped"),
-            s = tokio::time::timeout(Duration::from_secs(LICENSE_SECONDS), group.as_mut().unwrap().child(index).wait()) =>
-                s.context("Unity license activation timed out")??,
-        };
-        // Whether or not activation worked, the token leaves the licensing client's logs.
-        receipt["licensing_logs_scrubbed"] =
-            match licensing_log_dir().map(|dir| scrub_licensing_logs(&dir, &secrets.unity.access_token)) {
-                Some(Ok(files)) => json!(files),
-                Some(Err(error)) => json!(format!("failed: {error:#}")),
-                None => json!(0),
+        if let Some(e) = &as_editor {
+            // The editor's own licensing; its logs are scrubbed by the editor.
+            group = Some(g);
+            let code = e
+                .run(&licensing_client(&unity), &licensing_argv(&secrets.unity.access_token), &project,
+                    group.as_ref().unwrap(), Duration::from_secs(LICENSE_SECONDS), &mut stop)
+                .await?;
+            ensure!(!*stop.borrow(), "Stopped");
+            receipt["licensing_logs_scrubbed"] = json!(e.scrub(group.as_ref().unwrap(), &mut stop).await?);
+            ensure!(
+                code == Some(0),
+                "Unity could not activate a license with your Unity account (licensing client exit {}). Check the account on the Agents page.",
+                code.map_or(-1, |c| c as i64)
+            );
+        } else {
+            let mut activate = Command::new(licensing_client(&unity));
+            activate
+                .args(licensing_argv(&secrets.unity.access_token))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let index = g.adopt(activate.spawn().context("Cannot start Unity's licensing client")?, &pids)?;
+            group = Some(g);
+            let status = tokio::select! {
+                _ = cancelled(&mut stop) => bail!("Stopped"),
+                s = tokio::time::timeout(Duration::from_secs(LICENSE_SECONDS), group.as_mut().unwrap().child(index).wait()) =>
+                    s.context("Unity license activation timed out")??,
             };
-        ensure!(
-            status.success(),
-            "Unity could not activate a license with your Unity account (licensing client exit {}). Check the account on the Agents page.",
-            status.code().unwrap_or(-1)
-        );
+            // Whether or not activation worked, the token leaves the licensing client's logs.
+            receipt["licensing_logs_scrubbed"] =
+                match licensing_log_dir().map(|dir| scrub_licensing_logs(&dir, &secrets.unity.access_token)) {
+                    Some(Ok(files)) => json!(files),
+                    Some(Err(error)) => json!(format!("failed: {error:#}")),
+                    None => json!(0),
+                };
+            ensure!(
+                status.success(),
+                "Unity could not activate a license with your Unity account (licensing client exit {}). Check the account on the Agents page.",
+                status.code().unwrap_or(-1)
+            );
+        }
         receipt["activation_seconds"] = json!(t.elapsed().as_secs());
         let Some(((_, bridge_json, token_file, port), moq)) = editor else {
             return run_world_host(
@@ -1527,21 +1694,34 @@ pub async fn run_session(
 
         // The Editor, in this node's interactive session.
         clear_unity_temp(&project)?;
-        let log = session_dir.join("unity.log");
-        let mut editor = Command::new(&unity);
-        editor
-            .args(unity_argv(&project, &bridge_json, &log))
-            .current_dir(&project)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+        let log = bridge_dir.join("unity.log");
         let g = group.as_mut().unwrap();
-        let editor_index = g.adopt(editor.spawn().context("Cannot start the Unity Editor")?, &pids)?;
+        let editor_proc = match &as_editor {
+            Some(e) => {
+                let argv: Vec<String> = unity_argv(&project, &bridge_json, &log)
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                let child = e.spawn(&unity, &argv, &project, g).context("Cannot start the Unity Editor as the editor account")?;
+                pids.add(crate::editor_account::child_pid(&child))?;
+                EditorProc::Account(child)
+            }
+            None => {
+                let mut editor = Command::new(&unity);
+                editor
+                    .args(unity_argv(&project, &bridge_json, &log))
+                    .current_dir(&project)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                EditorProc::Node(g.adopt(editor.spawn().context("Cannot start the Unity Editor")?, &pids)?)
+            }
+        };
         report("starting", None, json!({}));
         let t = Instant::now();
         let limit = Duration::from_secs(ctx.config.startup_timeout_seconds.unwrap_or(DEFAULT_STARTUP_SECONDS));
-        let editor_pid = g.child(editor_index).id().unwrap_or(0);
+        let editor_pid = editor_proc.pid(g);
         let mut dialog: Option<(String, Instant)> = None;
         loop {
             // The full Editor (Scene and Game views, Play / Stop / Save from
@@ -1552,8 +1732,8 @@ pub async fn run_session(
             {
                 break;
             }
-            if let Some(exit) = g.child(editor_index).try_wait()? {
-                bail!("The Unity Editor exited during startup (exit {}); see unity.log on the engine machine", exit.code().unwrap_or(-1));
+            if let Some(exit) = editor_proc.exited(g)? {
+                bail!("The Unity Editor exited during startup (exit {exit}); see unity.log on the engine machine");
             }
             ensure!(t.elapsed() < limit, "The Unity Editor did not finish opening in time");
             match blocking_dialog(&window_titles(editor_pid)) {
@@ -1577,6 +1757,37 @@ pub async fn run_session(
         }
         receipt["editor_ready_seconds"] = json!(t.elapsed().as_secs());
         receipt["bridge_port_moves"] = json!(bridge.moves);
+        // Agent forks: the dev tree is ready once the Editor answers.
+        if let Some(forks) = &ctx.forks {
+            let registered: Result<()> = async {
+                let tree = dev_tree(&ctx, &spec, &secrets.repository.remote, &id);
+                let provider = std::sync::Arc::new(crate::forks::git::GitTreeProvider::new(
+                    ctx.config.git()?,
+                    &ctx.work.join("engine").join("repos").join(".node"),
+                    true,
+                )?);
+                receipt["forks_git"] = json!(provider.check_version()?);
+                let project = tree.project_path.clone();
+                let rel = |p: &str| if project.is_empty() { p.to_owned() } else { format!("{project}/{p}") };
+                provider
+                    .hide_node_edits(&tree, &[rel("Packages/manifest.json"), rel("Packages/packages-lock.json")])
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let bridge = crate::forks::submit::Bridge {
+                    config: bridge_json.clone(),
+                    token: std::fs::read_to_string(&token_file)?.trim().to_owned(),
+                };
+                let known = secrets.values().into_iter().map(str::to_owned).collect();
+                forks
+                    .register(&id, generation, tree, provider, Some(bridge),
+                        crate::forks::Commit::parse(&commit).map_err(|e| anyhow::anyhow!("{e}"))?, known)
+                    .await
+            }
+            .await;
+            receipt["forks"] = match registered {
+                Ok(()) => json!(true),
+                Err(e) => json!(format!("unavailable: {e:#}")),
+            };
+        }
         // The stream host, restarted while the session runs (its permit is fixed).
         let session_file = session_dir.join("moq-session.json");
         let mut ready = false;
@@ -1623,7 +1834,7 @@ pub async fn run_session(
                 }
             }
             let exit = g.child(index).wait().await?;
-            if g.child(editor_index).try_wait()?.is_some() {
+            if editor_proc.exited(g)?.is_some() {
                 bail!("The Unity Editor exited");
             }
             // A clean exit is the stream host's own end: its fixed permit ran
@@ -1642,6 +1853,9 @@ pub async fn run_session(
         }
     }
     .await;
+    if let Some(forks) = &ctx.forks {
+        forks.unregister(&id).await;
+    }
     if let Some(g) = group.as_mut() {
         g.terminate().await;
     }
@@ -1651,12 +1865,21 @@ pub async fn run_session(
     // secrets on disk go with the session directory.
     let receipts = ctx.private.join("engine-receipts");
     if private_dir(&receipts).is_ok()
-        && let Ok(log) = std::fs::read(session_dir.join("unity.log"))
+        && let Ok(log) = std::fs::read(session_dir.join("unity.log")).or_else(|_| {
+            std::fs::read(
+                ctx.work
+                    .join("engine")
+                    .join("editor")
+                    .join(&id)
+                    .join("unity.log"),
+            )
+        })
     {
         let tail = &log[log.len().saturating_sub(1 << 20)..];
         let _ = std::fs::write(receipts.join(format!("{id}.unity.log")), tail);
     }
     let _ = std::fs::remove_dir_all(&session_dir);
+    let _ = std::fs::remove_dir_all(ctx.work.join("engine").join("editor").join(&id));
     let stopped = *stop.borrow();
     let error = match &outcome {
         Err(e) if !stopped => Some(redact(&format!("{e:#}"), &secrets.values())),
@@ -1780,6 +2003,8 @@ pub struct Executor {
     reports_tx: mpsc::UnboundedSender<Report>,
     reports_rx: mpsc::UnboundedReceiver<Report>,
     controller: Option<String>,
+    forks: Option<crate::forks::executor::ForkExecutor>,
+    accounts: Option<std::sync::Arc<crate::forks::slots::Accounts>>,
 }
 impl Executor {
     /// `config_path` is read when a session starts, so an owner's fix to
@@ -1794,7 +2019,35 @@ impl Executor {
             reports_tx,
             reports_rx,
             controller: None,
+            forks: None,
+            accounts: None,
         }
+    }
+    /// Run agent forks of this machine's sessions (needs a Tokio runtime).
+    /// Seals the installer's account passwords on Windows.
+    pub fn with_forks(mut self) -> Self {
+        let accounts = match crate::forks::slots::load_accounts(&self.private) {
+            Ok(a) => a.map(std::sync::Arc::new),
+            Err(_) => None,
+        };
+        let tools = EngineConfig::load(&self.config_path)
+            .ok()
+            .and_then(|c| c.agents)
+            .unwrap_or_default();
+        self.forks = Some(crate::forks::executor::ForkExecutor::new(
+            accounts.as_deref(),
+            tools,
+        ));
+        self.accounts = accounts;
+        self
+    }
+    /// `tools.engine.forks` for the heartbeat (None without forks).
+    pub fn forks_inventory(&self) -> Option<Value> {
+        self.forks.as_ref().map(|f| f.inventory())
+    }
+    /// Fork posts (`fork-report`, `fork-events`, `fork-artifact`) to send.
+    pub fn drain_forks(&mut self) -> Vec<crate::forks::executor::Post> {
+        self.forks.as_ref().map(|f| f.drain()).unwrap_or_default()
     }
     /// The controller origin sessions' stream hosts signal WebRTC peers through.
     pub fn with_controller(mut self, origin: String) -> Self {
@@ -1820,7 +2073,11 @@ impl Executor {
             listed.push(id.to_owned());
             let desired = row["desired"].as_str().unwrap_or("stop");
             match (desired, self.running.get(id)) {
-                ("run", Some((g, _))) if *g == generation => {}
+                ("run", Some((g, _))) if *g == generation => {
+                    if let Some(f) = &self.forks {
+                        f.apply(id, row);
+                    }
+                }
                 ("run", existing) => {
                     if let Some((_, stop)) = existing {
                         let _ = stop.send(true);
@@ -1854,6 +2111,9 @@ impl Executor {
                             detail: json!({}),
                         }),
                         Ok((spec, secrets, config)) => {
+                            if let (Some(f), Some(tools)) = (&self.forks, &config.agents) {
+                                f.set_tools(tools.clone());
+                            }
                             let (tx, rx) = watch::channel(false);
                             self.running.insert(id.to_owned(), (generation, tx));
                             tokio::spawn(run_session(
@@ -1862,6 +2122,8 @@ impl Executor {
                                     work: self.work.clone(),
                                     private: self.private.clone(),
                                     controller: self.controller.clone(),
+                                    forks: self.forks.clone(),
+                                    accounts: self.accounts.clone(),
                                 }),
                                 id.to_owned(),
                                 generation,
@@ -1905,6 +2167,27 @@ impl Executor {
     /// Reports the session tasks produced since the last call.
     pub fn drain(&mut self) -> Vec<Report> {
         let mut out = Vec::new();
+        // `dev` updates ride on `ready` reports of the running generation.
+        for d in self
+            .forks
+            .as_ref()
+            .map(|f| f.drain_dev())
+            .unwrap_or_default()
+        {
+            if self
+                .running
+                .get(&d.session)
+                .is_some_and(|(g, _)| *g == d.generation)
+            {
+                out.push(Report {
+                    id: d.session,
+                    generation: d.generation,
+                    state: "ready",
+                    error: None,
+                    detail: json!({"dev": d.dev}),
+                });
+            }
+        }
         while let Ok(r) = self.reports_rx.try_recv() {
             if matches!(r.state, "ended" | "failed") {
                 self.running
@@ -1946,6 +2229,8 @@ pub async fn rehearse(config_path: &Path, work: &Path, spec: Value, remote: &str
         work: work.to_owned(),
         private: private.clone(),
         controller: None,
+        forks: None,
+        accounts: None,
     };
     let (_tx, mut stop) = watch::channel(false);
     let access = RepositorySecret {
@@ -2301,6 +2586,8 @@ mod tests {
             startup_timeout_seconds: None,
             unity_region: None,
             world_host: None,
+            agents: None,
+            editor_account: None,
         };
         (dir, config)
     }
@@ -2373,10 +2660,105 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    /// The checkout keeps its repository outside the dev tree, moves an
+    /// older in-tree `.git` there once, and keeps ignored caches.
+    #[tokio::test]
+    async fn checkouts_use_a_node_private_repository() {
+        let lfs = std::process::Command::new("git")
+            .args(["lfs", "version"])
+            .output();
+        if !lfs.is_ok_and(|o| o.status.success()) {
+            eprintln!("git-lfs is not installed; skipping");
+            return;
+        }
+        let (dir, mut config) = fixture();
+        config.git = None;
+        let root = dir.path().canonicalize().unwrap();
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("unity-project/Assets")).unwrap();
+        std::fs::write(source.join("unity-project/Assets/a.txt"), "a").unwrap();
+        std::fs::write(source.join(".gitignore"), "unity-project/Library/\n").unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&source)
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let remote = format!("file://{}", source.display());
+        let ctx = SessionContext {
+            config,
+            work: root.join("work"),
+            private: root.join("private"),
+            controller: None,
+            forks: None,
+            accounts: None,
+        };
+        let access = RepositorySecret {
+            remote: remote.clone(),
+            token: "rehearsal-has-no-token".into(),
+            auth: "bearer".into(),
+        };
+        let mut spec = spec();
+        spec.git_ref = "main".into();
+        let (_tx, mut stop) = watch::channel(false);
+        // An older node's checkout: .git inside, plus a Library cache.
+        let key = checkout_key(&remote);
+        let (tree, git_dir, index) = crate::forks::executor::repo_paths(&ctx.work, &key);
+        std::fs::create_dir_all(tree.parent().unwrap()).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["clone", "-q", &remote])
+                .arg(&tree)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir_all(tree.join("unity-project/Library")).unwrap();
+        std::fs::write(tree.join("unity-project/Library/cache"), "c").unwrap();
+        let (checkout_dir, commit) = checkout(&ctx, &spec, &access, &mut stop).await.unwrap();
+        assert_eq!(checkout_dir, tree);
+        assert_eq!(commit.len(), 40);
+        assert!(!tree.join(".git").exists());
+        assert!(git_dir.join("HEAD").is_file() && index.is_file());
+        assert_eq!(
+            std::fs::read_to_string(tree.join("unity-project/Assets/a.txt")).unwrap(),
+            "a"
+        );
+        assert!(tree.join("unity-project/Library/cache").is_file());
+        // A second session reuses it, and the dev tree is a fork-able work tree.
+        let (_, again) = checkout(&ctx, &spec, &access, &mut stop).await.unwrap();
+        assert_eq!(again, commit);
+        let tree_info = dev_tree(&ctx, &spec, &remote, &"a".repeat(32));
+        let p = crate::forks::git::GitTreeProvider::new(
+            "git".into(),
+            &ctx.work.join("engine/repos/.node"),
+            false,
+        )
+        .unwrap();
+        use crate::forks::ForkProvider;
+        p.start_dev(&tree_info, &crate::forks::Commit::parse(&commit).unwrap())
+            .unwrap();
+        std::fs::write(tree.join("unity-project/Assets/b.txt"), "b").unwrap();
+        let cap = p.capture_live(&tree_info, &[]).unwrap();
+        assert_eq!(cap.changed.len(), 1);
+    }
+
     #[test]
     fn git_gets_the_token_only_through_scoped_config_env() {
         let s = secrets();
         let plan = git_plan(
+            Path::new("/work/engine/repos/x.git"),
             Path::new("/work/engine/checkouts/x"),
             &s.repository.remote,
             "main",
@@ -2401,13 +2783,13 @@ mod tests {
                     .join(" "))
                 .collect::<Vec<_>>(),
             vec![
-                "init -q /work/engine/checkouts/x",
-                "-C /work/engine/checkouts/x remote add origin https://github.com/coop-collective/queen-of-hearts.git",
-                "-C /work/engine/checkouts/x lfs install --local --skip-smudge",
-                "-C /work/engine/checkouts/x fetch --no-tags --depth=1 origin main",
-                "-C /work/engine/checkouts/x checkout --detach -f FETCH_HEAD",
-                "-C /work/engine/checkouts/x clean -ffdq",
-                "-C /work/engine/checkouts/x lfs pull origin",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x init -q",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x remote add origin https://github.com/coop-collective/queen-of-hearts.git",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x lfs install --local --skip-smudge",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x fetch --no-tags --depth=1 origin main",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x checkout --detach -f FETCH_HEAD",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x clean -ffdq",
+                "--git-dir=/work/engine/repos/x.git --work-tree=/work/engine/checkouts/x lfs pull origin",
             ]
         );
         let env: BTreeMap<String, String> = git_env(&s.repository).into_iter().collect();
@@ -2543,6 +2925,8 @@ mod tests {
             work: dir.path().canonicalize().unwrap().join("work"),
             private: dir.path().canonicalize().unwrap().join("private"),
             controller: None,
+            forks: None,
+            accounts: None,
         };
         let session = dir.path().canonicalize().unwrap().join("session");
         std::fs::create_dir_all(&session).unwrap();
