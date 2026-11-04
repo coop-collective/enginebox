@@ -580,6 +580,10 @@ impl EngineSessions {
             &serde_json::to_value(r)?,
         )
     }
+    /// A copy of the session record as last ticked (agent forks read it).
+    pub fn snapshot(&self, id: &str) -> Option<Session> {
+        self.sessions.lock().unwrap().get(id).cloned()
+    }
     /// The session's relay id, if it has its own (not yet released).
     pub fn relay_of(&self, session: &str) -> Option<String> {
         self.relays

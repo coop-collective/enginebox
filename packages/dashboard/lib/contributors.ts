@@ -3,7 +3,9 @@ import { DEFAULT_ORG } from './identity/store';
 import { forgetTenancy, hostOrg, tenancy } from './tenancy';
 
 // engine-poll and engine-report are the engine session channel, parallel to the job slot (docs/ENGINE-SESSIONS.md).
-const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result', 'engine-poll', 'engine-report']);
+// fork-report, fork-events and fork-artifact carry agent-fork results, run transcripts and changed files (docs/ENGINE-SESSIONS.md, "Agent forks").
+const nodeActions = new Set(['enroll', 'hello', 'heartbeat', 'poll', 'result', 'engine-poll', 'engine-report', 'fork-report', 'fork-events', 'fork-artifact']);
+const nodeBodyLimits: Record<string, number> = { 'fork-report': 1048576, 'fork-events': 300000, 'fork-artifact': 3145728 };
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
 type Platform = 'windows' | 'linux';
@@ -131,7 +133,7 @@ export async function nodeProxy(request: Request, action: string) {
   const token = request.headers.get('authorization')?.match(/^Bearer ([a-f0-9]{32}\.[a-f0-9]{64})$/)?.[1];
   if (!token) throw new HttpError(401, 'Node credential required.');
   // The caller's scoped token is forwarded unchanged. Never substitute owner auth.
-  return json(await forward(`/v1/node/${action}`, 'POST', token, await bodyJson(request, 350000)));
+  return json(await forward(`/v1/node/${action}`, 'POST', token, await bodyJson(request, nodeBodyLimits[action] ?? 350000)));
 }
 // A stream host's WebRTC fallback signaling (docs/ENGINE-SESSIONS.md, "WebRTC fallback"):
 // poll for viewers' peers, read a peer's offer, post its answer, end it. The

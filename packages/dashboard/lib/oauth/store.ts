@@ -31,6 +31,12 @@ export type RepositoryGrant = { project: string; access: "read" | "write" };
  * account, and only that member's sessions (and their stream blocks) are visible.
  */
 export type EngineSessionsGrant = { project: string };
+/**
+ * Consented agent forks of one project's live engine sessions (the `agent-forks` scope), acting as the
+ * consenting member like engine sessions. A confidential client that registered a principal key may also
+ * name room principals on these routes (the controller verifies them).
+ */
+export type AgentForksGrant = { project: string };
 
 export type Client = {
   client_id: string;
@@ -40,6 +46,11 @@ export type Client = {
   redirect_uris: string[];
   token_endpoint_auth_method: AuthMethod;
   grant_types: string[];
+  /**
+   * The app's Ed25519 public key (base64url, no padding) for signed room principals on agent-fork routes.
+   * Only confidential clients; absent in older state.
+   */
+  principal_key?: string;
   created_at: number;
 };
 /** An authorization request waiting for sign-in and consent. */
@@ -72,6 +83,8 @@ export type Code = {
   repositories?: RepositoryGrant[];
   /** Absent in state written before engine-session grants existed. */
   engine_sessions?: EngineSessionsGrant[];
+  /** Absent in state written before agent-fork grants existed. */
+  agent_forks?: AgentForksGrant[];
   /** Restricts the grant's pools to one project (absent or null: no restriction). */
   project?: string | null;
   expires_at: number;
@@ -97,6 +110,8 @@ export type Grant = {
   repositories?: RepositoryGrant[];
   /** Absent in state written before engine-session grants existed. Acts as `user_id` in `org_id`. */
   engine_sessions?: EngineSessionsGrant[];
+  /** Absent in state written before agent-fork grants existed. Acts as `user_id` in `org_id`, like engine sessions. */
+  agent_forks?: AgentForksGrant[];
   /**
    * HMAC key the controller signs this grant's run callbacks with. Passed to
    * every access token minted for the grant, returned to the client once at

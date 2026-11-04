@@ -13,3 +13,6 @@ async function handle(request: Request, context: Context) {
 }
 export const GET = handle;
 export const POST = handle;
+// Agent forks: the principal's own gateway connection (PUT updates it, DELETE disconnects).
+export const PUT = handle;
+export const DELETE = handle;

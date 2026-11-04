@@ -10,6 +10,7 @@ import {
   PROJECT,
   profileNames,
   revokeAccessToken,
+  type AgentForksToken,
   type Minted,
   type Pool,
   type Workspace,
@@ -25,6 +26,7 @@ import {
   sha256,
   stateDir,
   withState,
+  type AgentForksGrant,
   type AuthMethod,
   type Client,
   type EngineSessionsGrant,
@@ -38,7 +40,9 @@ import {
 export const SCOPE = "agent-runs";
 /** Engine sessions acting as the consenting member (docs/ENGINE-SESSIONS.md). */
 export const ENGINE_SCOPE = "engine-sessions";
-export const SCOPES = [SCOPE, ENGINE_SCOPE];
+/** Agent forks of the consenting member's live engine sessions, for room members (docs/ENGINE-SESSIONS.md, "Agent forks"). */
+export const FORKS_SCOPE = "agent-forks";
+export const SCOPES = [SCOPE, ENGINE_SCOPE, FORKS_SCOPE];
 /**
  * A requested scope: space-separated names from SCOPES, normalized (deduplicated, in SCOPES order). Absent:
  * `agent-runs`, as before engine sessions. Null when a name is unknown or the value is empty.
@@ -109,7 +113,7 @@ export function protectedResourceMetadata() {
     authorization_servers: [origin],
     scopes_supported: SCOPES,
     bearer_methods_supported: ["header"],
-    resource_name: "Engine Box agent runs and engine sessions",
+    resource_name: "Engine Box agent runs, engine sessions and agent forks",
   });
 }
 
@@ -180,6 +184,10 @@ export function validRedirectUri(uri: unknown): uri is string {
   return url.protocol === "http:" && LOOPBACK.has(url.hostname);
 }
 const printable = (value: string) => !/[\u0000-\u001f\u007f]/.test(value);
+/** An Ed25519 public key: 32 bytes as base64url without padding. */
+function validPrincipalKey(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value) && Buffer.from(value, "base64url").length === 32;
+}
 
 let registrations: number[] = [];
 export async function register(request: Request) {
@@ -211,10 +219,17 @@ export async function register(request: Request) {
   if (!Array.isArray(responseTypes) || responseTypes.length !== 1 || responseTypes[0] !== "code")
     throw new OAuthError("invalid_client_metadata", "response_types must be [\"code\"].");
   const registeredScope = body.scope === undefined ? SCOPE : typeof body.scope === "string" ? parseScope(body.scope) : null;
-  if (registeredScope === null) throw new OAuthError("invalid_client_metadata", `Scopes are ${SCOPES.join(" and ")}.`);
+  if (registeredScope === null) throw new OAuthError("invalid_client_metadata", `Scopes are ${SCOPES.join(", ")}.`);
   const name = body.client_name === undefined ? "Unnamed app" : body.client_name;
   if (typeof name !== "string" || !name.trim() || name.length > 100 || !printable(name))
     throw new OAuthError("invalid_client_metadata", "client_name must be 1-100 printable characters.");
+  // The key that signs room principals on agent-fork routes; only an app that can keep a secret may name one.
+  const principalKey = body.enginebox_principal_key;
+  if (principalKey !== undefined) {
+    if (method === "none") throw new OAuthError("invalid_client_metadata", "enginebox_principal_key needs a confidential client (a token_endpoint_auth_method other than none).");
+    if (!validPrincipalKey(principalKey))
+      throw new OAuthError("invalid_client_metadata", "enginebox_principal_key must be an Ed25519 public key as base64url without padding (43 characters).");
+  }
 
   const now = Date.now();
   registrations = registrations.filter((t) => t > now - 10 * 60 * 1000);
@@ -229,6 +244,7 @@ export async function register(request: Request) {
     redirect_uris: redirects as string[],
     token_endpoint_auth_method: method,
     grant_types: finalGrantTypes,
+    ...(principalKey !== undefined ? { principal_key: principalKey } : {}),
     created_at: now,
   };
   withState((state) => {
@@ -253,6 +269,7 @@ export async function register(request: Request) {
       grant_types: client.grant_types,
       response_types: ["code"],
       scope: registeredScope,
+      ...(client.principal_key ? { enginebox_principal_key: client.principal_key } : {}),
     },
     201,
   );
@@ -292,6 +309,7 @@ function render(
       agentRuns: hasScope(extra.scope, SCOPE),
       mayApprove: user?.may_approve ?? false,
       engineProjects: engineProjectsFor(user, extra.scope, listed),
+      forkProjects: forkProjectsFor(user, extra.scope, listed),
       error: extra.error,
     });
     if (extra.setCookie) response.headers.append("Set-Cookie", extra.setCookie);
@@ -307,6 +325,10 @@ type Grantable = { workspaces: Workspace[]; pools: Pool[]; projects: string[]; e
 /** Engine-session projects `user` may grant as themselves: only a real member, and only when the app asked for the scope. */
 function engineProjectsFor(user: User | null, scope: string | undefined, listed: Grantable) {
   return user && MEMBER_ID.test(user.id) && hasScope(scope, ENGINE_SCOPE) ? listed.engineProjects : [];
+}
+/** Agent-fork projects `user` may grant as themselves: the same projects and rule as engine sessions, for the `agent-forks` scope. */
+function forkProjectsFor(user: User | null, scope: string | undefined, listed: Grantable) {
+  return user && MEMBER_ID.test(user.id) && hasScope(scope, FORKS_SCOPE) ? listed.engineProjects : [];
 }
 async function grantable(project: string | null | undefined, org: string): Promise<Grantable | null> {
   const [workspaces, pools, view] = await Promise.allSettled([grantableWorkspaces(), grantablePools(), tenancy()]);
@@ -368,7 +390,7 @@ export async function authorize(request: Request) {
     return fail("invalid_request", "PKCE is required: send a code_challenge with code_challenge_method=S256.");
   // `agent-runs` (the default), `engine-sessions`, or both.
   const scope = parseScope(params.get("scope"));
-  if (scope === null) return fail("invalid_scope", `Scopes are ${SCOPES.join(" and ")}.`);
+  if (scope === null) return fail("invalid_scope", `Scopes are ${SCOPES.join(", ")}.`);
   const resource = params.get("resource") ?? "";
   if (!sameResource(resource)) return fail("invalid_target", `resource must be ${resourceId()}.`);
   // Optional: the app asks for one project's pools; the grant is then restricted to that project.
@@ -463,14 +485,21 @@ export async function authorizePost(request: Request) {
     chosenRepositories.push({ project: repoProject, access: value });
   }
   const chosenEngine: EngineSessionsGrant[] = [...new Set(form.getAll("engine_sessions"))].map((p) => ({ project: p }));
+  const chosenForks: AgentForksGrant[] = [...new Set(form.getAll("agent_forks"))].map((p) => ({ project: p }));
   const agentRunTargets = chosen.length + chosenPools.length + chosenRepositories.length;
-  if (!agentRunTargets && !chosenEngine.length)
-    return again(hasScope(scope, SCOPE) ? "Select at least one workspace or pool, or a project's repositories." : "Select at least one project's engine sessions.");
+  if (!agentRunTargets && !chosenEngine.length && !chosenForks.length)
+    return again(
+      hasScope(scope, SCOPE)
+        ? "Select at least one workspace or pool, or a project's repositories."
+        : hasScope(scope, ENGINE_SCOPE)
+          ? "Select at least one project's engine sessions."
+          : "Select at least one project's agent forks.",
+    );
   // Agent runs and repositories are the org's to hand out; engine sessions act only as the approver.
   if (agentRunTargets && !user.may_approve)
     return errorPage("Connecting an app to agent runs or repositories needs the admin or owner role in your organization. Ask an admin to approve it.", 403);
   if (agentRunTargets && !hasScope(scope, SCOPE)) return again("The app did not ask to run agents or use repositories.");
-  if (chosen.length > MAX_GRANT_WORKSPACES || agentRunTargets + chosenEngine.length > MAX_GRANT_TARGETS)
+  if (chosen.length > MAX_GRANT_WORKSPACES || agentRunTargets + chosenEngine.length + chosenForks.length > MAX_GRANT_TARGETS)
     return again("Select fewer workspaces, pools and projects.");
   const available = await grantable(project, user.org_id);
   if (!available) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
@@ -479,6 +508,9 @@ export async function authorizePost(request: Request) {
   const engineProjects = engineProjectsFor(user, scope, available);
   if (chosenEngine.some((e) => !PROJECT.test(e.project) || !engineProjects.includes(e.project)))
     return again("A selected project's engine sessions are not available.");
+  const forkProjects = forkProjectsFor(user, scope, available);
+  if (chosenForks.some((f) => !PROJECT.test(f.project) || !forkProjects.includes(f.project)))
+    return again("A selected project's agent forks are not available.");
   const workspaces: WorkspaceGrant[] = [];
   for (const value of chosen) {
     const workspace = available.workspaces.find((w) => `${w.host}/${w.instance}` === value);
@@ -507,7 +539,7 @@ export async function authorizePost(request: Request) {
     if (unknown.length) return again(`Unknown profile: ${unknown.join(", ")}.`);
   }
   // What was granted, not merely asked for.
-  const granted = SCOPES.filter((n) => (n === SCOPE ? agentRunTargets > 0 : chosenEngine.length > 0)).join(" ");
+  const granted = SCOPES.filter((n) => (n === SCOPE ? agentRunTargets > 0 : n === ENGINE_SCOPE ? chosenEngine.length > 0 : chosenForks.length > 0)).join(" ");
   const code = `${CODE_PREFIX}${randomToken()}`;
   const ok = withState((state, now) => {
     const index = state.pending.findIndex((p) => p.id_hash === pending.id_hash);
@@ -526,6 +558,7 @@ export async function authorizePost(request: Request) {
       pools,
       repositories: chosenRepositories,
       ...(chosenEngine.length ? { engine_sessions: chosenEngine } : {}),
+      ...(chosenForks.length ? { agent_forks: chosenForks } : {}),
       project,
       expires_at: now + CODE_SECONDS * 1000,
       used_at: null,
@@ -591,9 +624,15 @@ function authenticateClient(request: Request, form: URLSearchParams, state: Stat
  * whose repositories it may use (`{kind: "repositories", project, access}`,
  * `access` "read" or "write"), and per project whose engine sessions it may run
  * as the consenting member (`{kind: "engine_sessions", project, member}`,
- * `member` that member's user ID).
+ * `member` that member's user ID), and per project whose agent forks it may
+ * run as that member (`{kind: "agent_forks", project, member, room_principals}`,
+ * `room_principals` true when the client registered a principal key and may
+ * name room members).
  */
-export function grantsView(grant: Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions"> & { user_id?: string }) {
+export function grantsView(
+  grant: Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions" | "agent_forks"> & { user_id?: string },
+  roomPrincipals = false,
+) {
   return [
     ...grant.workspaces.map((w) => ({ kind: "workspace" as const, host: w.host, instance: w.instance, profiles: w.profiles })),
     ...(grant.pools ?? []).map((p) => ({
@@ -605,17 +644,18 @@ export function grantsView(grant: Pick<Grant, "workspaces" | "pools" | "reposito
     })),
     ...(grant.repositories ?? []).map((r) => ({ kind: "repositories" as const, project: r.project, access: r.access })),
     ...(grant.engine_sessions ?? []).map((e) => ({ kind: "engine_sessions" as const, project: e.project, member: grant.user_id })),
+    ...(grant.agent_forks ?? []).map((f) => ({ kind: "agent_forks" as const, project: f.project, member: grant.user_id, room_principals: roomPrincipals })),
   ];
 }
-type GrantShape = Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions" | "user_id" | "scope">;
-function tokenResponse(minted: Minted, refresh: string, grant: GrantShape, callbackSecret?: string) {
+type GrantShape = Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions" | "agent_forks" | "user_id" | "scope">;
+function tokenResponse(minted: Minted, refresh: string, grant: GrantShape, client: Client, callbackSecret?: string) {
   return oauthJson({
     access_token: minted.secret,
     token_type: "Bearer",
     expires_in: Math.max(1, Math.floor((minted.expires_at - Date.now()) / 1000)),
     refresh_token: refresh,
     scope: grant.scope || SCOPE,
-    enginebox_grants: grantsView(grant),
+    enginebox_grants: grantsView(grant, !!client.principal_key),
     // Only at the code exchange: the key that signs this connection's run callbacks.
     ...(callbackSecret ? { enginebox_callback_secret: callbackSecret } : {}),
   });
@@ -684,8 +724,8 @@ function graceReplay(grant: Grant, hash: string, now: number): GracePair | "clos
   if (!equalHash(grant.previous_refresh_hash, hash)) return "closed";
   return openGrace(grant.id, hash, grant.grace_pair) ?? "lost";
 }
-function graceResponse(pair: GracePair, grant: GrantShape) {
-  return tokenResponse({ id: pair.access_token_id, secret: pair.access_token, expires_at: pair.access_expires_at }, pair.refresh_token, grant);
+function graceResponse(pair: GracePair, grant: GrantShape, client: Client) {
+  return tokenResponse({ id: pair.access_token_id, secret: pair.access_token, expires_at: pair.access_expires_at }, pair.refresh_token, grant, client);
 }
 
 /** Revoke queued controller tokens; failures stay queued and are retried on the next call. */
@@ -708,7 +748,7 @@ export async function token(request: Request) {
   const grantType = form.get("grant_type");
   const resource = form.get("resource");
   if (resource !== null && !sameResource(resource)) throw new OAuthError("invalid_target", `resource must be ${resourceId()}.`);
-  if (form.get("scope") !== null && parseScope(form.get("scope")) === null) throw new OAuthError("invalid_scope", `Scopes are ${SCOPES.join(" and ")}.`);
+  if (form.get("scope") !== null && parseScope(form.get("scope")) === null) throw new OAuthError("invalid_scope", `Scopes are ${SCOPES.join(", ")}.`);
   try {
     if (grantType === "authorization_code") return await exchangeCode(request, form);
     if (grantType === "refresh_token") return await refresh(request, form);
@@ -749,12 +789,13 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
   const pools = record.pools ?? [];
   const repositories = record.repositories ?? [];
   const engine = record.engine_sessions ?? [];
+  const forks = record.agent_forks ?? [];
   const callbackSecret = randomToken(32);
   let minted: Minted;
   try {
     minted = await mintAccessToken(
       grantId,
-      { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project, org_id: record.org_id, ...engineGrant(record) },
+      { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project, org_id: record.org_id, ...engineGrant(record, client) },
       ACCESS_TOKEN_SECONDS,
     );
   } catch (error) {
@@ -779,6 +820,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
       pools,
       repositories,
       ...(engine.length ? { engine_sessions: engine } : {}),
+      ...(forks.length ? { agent_forks: forks } : {}),
       callback_secret: callbackSecret,
       project: record.project ?? null,
       created_at: now,
@@ -795,18 +837,44 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
     return true;
   });
   if (!stored) throw new OAuthError("invalid_grant", "The authorization code was already used; its tokens are revoked.");
-  return tokenResponse(minted, refreshToken, { workspaces: record.workspaces, pools, repositories, engine_sessions: engine, user_id: record.user_id, scope: record.scope }, callbackSecret);
+  return tokenResponse(
+    minted,
+    refreshToken,
+    { workspaces: record.workspaces, pools, repositories, engine_sessions: engine, agent_forks: forks, user_id: record.user_id, scope: record.scope },
+    client,
+    callbackSecret,
+  );
 }
 
 /**
- * The engine-session part of a token: the consented projects and the member it acts as. A member who has
- * left the grant's org (or was removed) is refused, which ends the connection at refresh.
+ * The engine-session and agent-fork part of a token: the consented projects and the member it acts as. A
+ * member who has left the grant's org (or was removed) is refused, which ends the connection at refresh.
+ * Agent forks also carry the client that holds the grant, its principal key and its https return origins.
  */
-function engineGrant(grant: { engine_sessions?: EngineSessionsGrant[]; user_id: string; org_id?: string }) {
+function engineGrant(
+  grant: { engine_sessions?: EngineSessionsGrant[]; agent_forks?: AgentForksGrant[]; user_id: string; org_id?: string },
+  client: Client,
+): { engine_sessions?: EngineSessionsGrant[]; agent_forks?: AgentForksToken[]; member?: string } {
   const engine = grant.engine_sessions ?? [];
-  if (!engine.length) return {};
-  if (!stillMember(grant.user_id, grant.org_id ?? DEFAULT_ORG)) throw new GrantRefused("The member who consented to engine sessions is no longer in this organization.");
-  return { engine_sessions: engine, member: grant.user_id };
+  const forks = grant.agent_forks ?? [];
+  if (!engine.length && !forks.length) return {};
+  if (!stillMember(grant.user_id, grant.org_id ?? DEFAULT_ORG))
+    throw new GrantRefused("The member who consented to engine sessions or agent forks is no longer in this organization.");
+  const returnOrigins = [...new Set(client.redirect_uris.map((u) => new URL(u)).filter((u) => u.protocol === "https:").map((u) => u.origin))];
+  return {
+    ...(engine.length ? { engine_sessions: engine } : {}),
+    ...(forks.length
+      ? {
+          agent_forks: forks.map((f) => ({
+            project: f.project,
+            client: client.client_id,
+            ...(client.principal_key ? { principal_key: client.principal_key } : {}),
+            return_origins: returnOrigins,
+          })),
+        }
+      : {}),
+    member: grant.user_id,
+  };
 }
 
 function sha256b64(value: string) {
@@ -826,17 +894,17 @@ async function refresh(request: Request, form: URLSearchParams) {
       // Answer with the same pair instead of treating it as theft.
       const replay = graceReplay(grant, parsed.hash, now);
       if (replay === "lost") throw new OAuthError("invalid_grant", "The refresh token was already used.");
-      if (replay !== "closed") return { reuse: false as const, replay, grant: structuredClone(grant) };
+      if (replay !== "closed") return { reuse: false as const, replay, grant: structuredClone(grant), client: structuredClone(client) };
       // Reuse of a rotated refresh token: assume theft and end the whole family.
       revokeGrantIn(state, grant, "refresh token reused", now);
       return { reuse: true as const };
     }
     if (grant.revoked_at !== null || grant.refresh_hash !== parsed.hash) throw new OAuthError("invalid_grant", "The refresh token is invalid.");
-    return { reuse: false as const, replay: null, grant: structuredClone(grant) };
+    return { reuse: false as const, replay: null, grant: structuredClone(grant), client: structuredClone(client) };
   });
   if (checked.reuse) throw new OAuthError("invalid_grant", "The refresh token was already used; this connection is revoked.");
-  if (checked.replay) return graceResponse(checked.replay, checked.grant);
-  const grant = checked.grant;
+  if (checked.replay) return graceResponse(checked.replay, checked.grant, checked.client);
+  const { grant, client } = checked;
   const graceSeconds = refreshGraceSeconds();
   let minted: Minted;
   try {
@@ -849,7 +917,7 @@ async function refresh(request: Request, form: URLSearchParams) {
         callback_secret: grant.callback_secret,
         project: grant.project,
         org_id: grant.org_id,
-        ...engineGrant(grant),
+        ...engineGrant(grant, client),
       },
       ACCESS_TOKEN_SECONDS,
     );
@@ -858,7 +926,7 @@ async function refresh(request: Request, form: URLSearchParams) {
     // What the owner consented to is gone: end the connection so the app asks again.
     withState((state, now) => {
       const current = state.grants.find((g) => g.id === grant.id);
-      if (current) revokeGrantIn(state, current, "consented workspaces, pools, repositories or engine sessions no longer available", now);
+      if (current) revokeGrantIn(state, current, "consented workspaces, pools, repositories, engine sessions or agent forks no longer available", now);
     });
     throw new OAuthError("invalid_grant", error.message);
   }
@@ -905,8 +973,8 @@ async function refresh(request: Request, form: URLSearchParams) {
   if (outcome === "reused") throw new OAuthError("invalid_grant", "The refresh token was already used; this connection is revoked.");
   if (outcome === "revoked") throw new OAuthError("invalid_grant", "The refresh token is invalid.");
   if (outcome === "lost") throw new OAuthError("invalid_grant", "The refresh token was already used.");
-  if (outcome !== "ok") return graceResponse(outcome, grant);
-  return tokenResponse(minted, next, grant);
+  if (outcome !== "ok") return graceResponse(outcome, grant, client);
+  return tokenResponse(minted, next, grant, client);
 }
 
 // ---------------------------------------------------------------- revocation (RFC 7009)
@@ -976,6 +1044,70 @@ export const RESOURCE_ROUTES: [string, RegExp][] = [
 ];
 const ENGINE_ROUTE = new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions(?:/|$)`);
 
+/** One query parameter an agent-fork route accepts: its value must match. */
+type QueryRule = (value: string) => boolean;
+/** An agent-fork route (the `agent-forks` scope): its method, path and the query parameters it accepts. */
+type ForkRoute = { method: string; pattern: RegExp; query?: Record<string, QueryRule> };
+/** Agent-fork, run and submission IDs. */
+const HEX_ID = "[a-f0-9]{32}";
+const FORK_BASE = `v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}`;
+const route = (method: string, path: string, query?: Record<string, QueryRule>): ForkRoute => ({ method, pattern: new RegExp(`^${path}$`), query });
+const DIFF_LIMIT = 2 * 1024 * 1024;
+export const FORK_ROUTES: ForkRoute[] = [
+  // Members list their own forks; the room owner lists everyone's with all=1.
+  route("GET", `${FORK_BASE}/forks`, { all: (v) => v === "1" }),
+  route("POST", `${FORK_BASE}/forks`),
+  route("GET", `${FORK_BASE}/forks/${HEX_ID}`),
+  // A text/x-diff answer (not JSON), optionally one path and a byte limit.
+  route("GET", `${FORK_BASE}/forks/${HEX_ID}/diff`, {
+    path: (v) => v.length >= 1 && v.length <= 300 && printable(v),
+    limit: (v) => /^[1-9][0-9]{0,6}$/.test(v) && Number(v) <= DIFF_LIMIT,
+  }),
+  route("POST", `${FORK_BASE}/forks/${HEX_ID}/runs`),
+  route("GET", `${FORK_BASE}/forks/${HEX_ID}/runs/${HEX_ID}/events`, { after: (v) => /^[0-9]{1,10}$/.test(v) }),
+  route("POST", `${FORK_BASE}/forks/${HEX_ID}/runs/${HEX_ID}/cancel`),
+  route("POST", `${FORK_BASE}/forks/${HEX_ID}/(?:submit|rebase|close)`),
+  route("GET", `${FORK_BASE}/submissions`, { state: (v) => /^[a-z_]{1,24}$/.test(v) }),
+  route("POST", `${FORK_BASE}/submissions/${HEX_ID}/(?:approve|reject)`),
+  route("GET", `${FORK_BASE}/dev`),
+  route("POST", `${FORK_BASE}/dev/(?:revert|publish)`),
+  // The principal's own Xava Inference gateway connection.
+  route("POST", `v1/projects/${PROJECT_ID}/gateway/connect`),
+  route("GET", `v1/projects/${PROJECT_ID}/gateway`),
+  route("PUT", `v1/projects/${PROJECT_ID}/gateway`),
+  route("DELETE", `v1/projects/${PROJECT_ID}/gateway`),
+];
+const DIFF_ROUTE = new RegExp(`^${FORK_BASE}/forks/${HEX_ID}/diff$`);
+/**
+ * The app-asserted room principal (docs/ENGINE-SESSIONS.md, "Agent forks"): forwarded verbatim on agent-fork routes only, where
+ * the controller verifies the signature against the grant's client; dropped everywhere else.
+ */
+const PRINCIPAL_HEADERS = [
+  "EngineBox-Principal",
+  "EngineBox-Principal-Name",
+  "EngineBox-Principal-Role",
+  "EngineBox-Principal-Time",
+  "EngineBox-Principal-Nonce",
+  "EngineBox-Principal-Sig",
+];
+
+/**
+ * The query an agent-fork route was called with, checked against what it accepts: known keys, each once,
+ * valid values, at most 512 characters. Returned verbatim (with its `?`), or null when refused.
+ */
+function forkQuery(route: ForkRoute | undefined, search: string): string | null {
+  if (!search) return "";
+  if (!route?.query || search.length - 1 > 512) return null;
+  const params = new URLSearchParams(search);
+  const keys = [...params.keys()];
+  if (new Set(keys).size !== keys.length) return null;
+  for (const [key, value] of params) {
+    const rule = Object.hasOwn(route.query, key) ? route.query[key] : undefined;
+    if (!rule || !rule(value)) return null;
+  }
+  return search;
+}
+
 function challenge(error?: string, description?: string, scope = SCOPE) {
   const parts = [`resource_metadata="${resourceMetadataUrl()}"`];
   if (error) parts.unshift(`error="${error}"`);
@@ -988,20 +1120,21 @@ function unauthorized(error?: string, description?: string) {
 }
 
 /**
- * Agent-run, repository and engine-session routes on the public origin. The
- * bearer must be the current access token of a live grant; the controller then
- * enforces the token's workspace, project and operation scope, and acts as the
- * consenting member on engine-session routes (no actor or org header is ever
- * forwarded from the caller). Cookies are ignored here, so this path cannot be driven by
- * the dashboard session.
+ * Agent-run, repository, engine-session and agent-fork routes on the public
+ * origin. The bearer must be the current access token of a live grant; the
+ * controller then enforces the token's workspace, project and operation scope,
+ * and acts as the consenting member on engine-session and agent-fork routes (no
+ * actor or org header is ever forwarded from the caller; on agent-fork routes
+ * only, the app's signed room-principal headers are, for the controller to
+ * verify). Cookies are ignored here, so this path cannot be driven by the
+ * dashboard session.
  */
 export async function resourceProxy(request: Request, segments: string[]) {
   requireEnabled();
   const path = segments.join("/");
-  if (
-    segments.some((s) => s.includes("/") || s.includes("..")) ||
-    !RESOURCE_ROUTES.some(([method, pattern]) => method === request.method && pattern.test(path))
-  )
+  const unsafe = segments.some((s) => s.includes("/") || s.includes(".."));
+  const fork = unsafe ? undefined : FORK_ROUTES.find((r) => r.method === request.method && r.pattern.test(path));
+  if (unsafe || (!fork && !RESOURCE_ROUTES.some(([method, pattern]) => method === request.method && pattern.test(path))))
     return json({ error: "Unknown operation." }, 404);
   const header = request.headers.get("authorization") ?? "";
   const match = /^Bearer (ebst_([a-f0-9]{32})\.[A-Za-z0-9_-]{1,128})$/.exec(header);
@@ -1013,13 +1146,23 @@ export async function resourceProxy(request: Request, segments: string[]) {
     (g) => g.revoked_at === null && g.access_token_id === tokenId && g.access_token_hash !== null && equalHash(g.access_token_hash, sha256(accessToken)) && g.access_expires_at > now,
   );
   if (!live) return unauthorized("invalid_token", "The access token is unknown, expired or revoked.");
-  if (new URL(request.url).search) return json({ error: "Query parameters are not supported." }, 400);
+  // Only agent-fork routes take a query, and only the parameters each one lists.
+  const query = forkQuery(fork, new URL(request.url).search);
+  if (query === null) return json({ error: "Query parameters are not supported." }, 400);
+  const principal: Record<string, string> = {};
+  if (fork)
+    for (const name of PRINCIPAL_HEADERS) {
+      const value = request.headers.get(name);
+      if (value === null) continue;
+      if (value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) return json({ error: `${name} is too long or not printable.` }, 400);
+      principal[name] = value;
+    }
   let body: string | undefined;
-  if (request.method === "POST") {
+  if (request.method === "POST" || request.method === "PUT") {
     if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
       return json({ error: "Send an application/json request." }, 415);
     try {
-      body = await readText(request, 16384);
+      body = await readText(request, fork ? 65536 : 16384);
     } catch {
       return json({ error: "Request is too large." }, 413);
     }
@@ -1027,9 +1170,9 @@ export async function resourceProxy(request: Request, segments: string[]) {
   const { apiUrl } = config();
   let response: Response;
   try {
-    response = await fetch(`${apiUrl}/${path}`, {
+    response = await fetch(`${apiUrl}/${path}${query}`, {
       method: request.method,
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json", ...principal },
       body,
       cache: "no-store",
       redirect: "error",
@@ -1037,6 +1180,15 @@ export async function resourceProxy(request: Request, segments: string[]) {
     });
   } catch {
     return json({ error: "The fleet service is unavailable." }, 502);
+  }
+  // A fork's diff is text/x-diff (bounded by the controller at 2 MiB), passed through as text.
+  if (DIFF_ROUTE.test(path) && /^text\/x-diff(?:;|$)/i.test(response.headers.get("content-type") ?? "") && response.status !== 401 && response.status !== 403) {
+    const text = await response.text().catch(() => null);
+    if (text === null || Buffer.byteLength(text) > DIFF_LIMIT + 65536) return json({ error: "The fleet service returned an invalid response." }, 502);
+    return new Response(text, {
+      status: response.status,
+      headers: { "Content-Type": "text/x-diff; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
+    });
   }
   let result: unknown;
   try {
@@ -1050,7 +1202,7 @@ export async function resourceProxy(request: Request, segments: string[]) {
       "WWW-Authenticate": challenge(
         "insufficient_scope",
         "The token is not granted that operation on that workspace, pool or project.",
-        ENGINE_ROUTE.test(path) ? ENGINE_SCOPE : SCOPE,
+        fork ? FORKS_SCOPE : ENGINE_ROUTE.test(path) ? ENGINE_SCOPE : SCOPE,
       ),
     });
   // A full run queue answers 429 with Retry-After; clients need it to wait rather than back off blindly.
@@ -1086,6 +1238,8 @@ export function listGrants(request: Request) {
         repositories: (g.repositories ?? []).map((r) => ({ project: r.project, access: r.access })),
         // Acts as the approving member (approver_id) in the grant's org.
         engine_sessions: (g.engine_sessions ?? []).map((e) => ({ project: e.project })),
+        // Room members run agents on forks of the approver's sessions (as the approver, by the app's principals).
+        agent_forks: (g.agent_forks ?? []).map((f) => ({ project: f.project })),
         approver_id: g.user_id,
         project: g.project ?? null,
         created_at: new Date(g.created_at).toISOString(),

@@ -49,6 +49,7 @@ export type FakeToken = {
   project?: string;
   repositories?: { project: string; access: "read" | "write" }[];
   engine_sessions?: { project: string }[];
+  agent_forks?: { project: string; client: string; principal_key?: string; return_origins: string[] }[];
   member?: string;
 };
 export type FakePool = { name: string; description: string; profile: string | null; members: { host_id: string; name: string }[]; project?: string };
@@ -61,7 +62,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
   ]);
   const profiles = ["review", "build", "coder"];
   const tokens = new Map<string, FakeToken>();
-  const calls: { method: string; path: string; auth: string; body?: unknown; actor: string | null; org: string | null }[] = [];
+  const calls: { method: string; path: string; auth: string; body?: unknown; actor: string | null; org: string | null; query: string; headers: Headers }[] = [];
   /** Engine sessions by ID, with the member who started each. */
   const engineSessions = new Map<string, { id: string; project: string; started_by: string; state: string }>();
   const reply = (body: unknown, status = 200) => Response.json(body, { status });
@@ -72,7 +73,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     const auth = headers.get("authorization") ?? "";
     const method = init.method ?? "GET";
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
-    calls.push({ method, path: url.pathname, auth, body, actor: headers.get("x-enginebox-actor"), org: headers.get("x-enginebox-org") });
+    calls.push({ method, path: url.pathname, auth, body, actor: headers.get("x-enginebox-actor"), org: headers.get("x-enginebox-org"), query: url.search, headers });
     const parts = url.pathname.split("/").filter(Boolean);
     if (auth === `Bearer ${ownerToken}`) {
       if (method === "GET" && url.pathname === "/v1/pools") return reply({ pools: [...pools.values()] });
@@ -108,8 +109,11 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           return reply({ error: "Every repository grant must name the token's project" }, 400);
         if (body.project && (body.engine_sessions ?? []).some((r: { project: string }) => r.project !== body.project))
           return reply({ error: "Every engine-session grant must name the token's project" }, 400);
-        if (!(body.engine_sessions ?? []).length !== !body.member || (body.member && !/^usr_[a-f0-9]{24}$/.test(body.member)))
-          return reply({ error: "member must name the user engine_sessions act as, and only with engine_sessions" }, 400);
+        if (body.project && (body.agent_forks ?? []).some((r: { project: string }) => r.project !== body.project))
+          return reply({ error: "Every agent-fork grant must name the token's project" }, 400);
+        const asMember = (body.engine_sessions ?? []).length > 0 || (body.agent_forks ?? []).length > 0;
+        if (asMember !== !!body.member || (body.member && !/^usr_[a-f0-9]{24}$/.test(body.member)))
+          return reply({ error: "member must name the user engine_sessions and agent_forks act as, and only with them" }, 400);
         const id = randomBytes(16).toString("hex");
         const secret = `ebst_${id}.${randomBytes(32).toString("hex")}`;
         tokens.set(id, {
@@ -125,6 +129,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           project: body.project,
           repositories: body.repositories,
           engine_sessions: body.engine_sessions,
+          agent_forks: body.agent_forks,
           member: body.member,
         });
         return reply({ token: { id, expires_at: body.expires_at }, secret, secret_shown_once: true }, 201);
@@ -145,6 +150,14 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     const sees = (h: string, n: string) => held.scopes.some((s) => s.host_id === h && s.name === n);
     if (url.pathname === "/v1/agent-runs")
       return held.operations.includes("agent_runs.list") ? reply({ runs: [] }) : reply({ error: "This service token is not granted that operation on that workspace." }, 403);
+    // Agent forks: the operation is checked against the token's grant; answers echo what arrived.
+    const forkOperation = agentForkOperation(method, parts);
+    if (forkOperation) {
+      if (!held.member || !held.operations.includes(`agent_forks.${forkOperation}`) || !(held.agent_forks ?? []).some((f) => f.project === parts[2]))
+        return reply({ error: "This service token is not granted that operation on that project." }, 403);
+      if (parts[7] === "diff") return new Response(`diff --git a/x b/x\n+${url.search}\n`, { headers: { "content-type": "text/x-diff; charset=utf-8" } });
+      return reply({ method, path: url.pathname, query: url.search, body: body ?? null, principal: headers.get("enginebox-principal") }, method === "POST" ? 202 : 200);
+    }
     if (parts[1] === "projects" && parts[3] === "engine-sessions") {
       // The controller acts as the token's member; sessions of other members are unknown to it.
       const operation = method === "GET" ? "get" : parts.length === 4 ? "start" : parts[5] === "watch-token" || parts[5] === "ice" ? "watch" : parts[5];
@@ -189,6 +202,23 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     return reply({ run: { id: "1".repeat(32), host_id: host, name } }, method === "POST" ? 202 : 200);
   });
   return { tokens, calls, pools, engineSessions };
+}
+
+/** The `agent_forks.*` operation a controller path needs (docs/ENGINE-SESSIONS.md, "Agent forks"), or null for other paths. */
+function agentForkOperation(method: string, parts: string[]): string | null {
+  if (parts[1] !== "projects") return null;
+  if (parts[3] === "gateway") return "gateway";
+  if (parts[3] !== "engine-sessions" || parts.length <= 5) return null;
+  const [kind, id, action] = parts.slice(5);
+  if (kind === "forks") {
+    if (!id) return method === "POST" ? "create" : "list";
+    if (!action || action === "diff") return "get";
+    if (action === "runs") return method === "GET" ? "get" : "run";
+    return action;
+  }
+  if (kind === "submissions") return id ? "review" : "list";
+  if (kind === "dev") return id ?? "dev";
+  return null;
 }
 
 // ------------------------------------------------------------ helpers
@@ -307,12 +337,12 @@ export function refreshWith(client: { client_id: string }, refreshToken: string)
     ["client_id", client.client_id],
   ]);
 }
-export function call(path: string, accessToken?: string, method = "GET", body?: unknown) {
-  const segments = path.split("/").filter(Boolean);
+export function call(path: string, accessToken?: string, method = "GET", body?: unknown, headers: Record<string, string> = {}) {
+  const segments = path.split("?")[0].split("/").filter(Boolean);
   return resourceProxy(
     new Request(`${origin}/${path}`, {
       method,
-      headers: { ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+      headers: { ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}), ...(body ? { "content-type": "application/json" } : {}), ...headers },
       body: body ? JSON.stringify(body) : undefined,
     }),
     segments,

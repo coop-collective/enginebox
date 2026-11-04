@@ -370,6 +370,173 @@ still opens no port, and no MoQ relay is created.
   engine machine, so a world and the Live Editor do not run at once; a machine without `world_host` fails a world it is
   given with a clear reason.
 
+### Agent forks (`packages/enginebox-controller/src/agent_forks/`)
+
+Added November 4, 2026 (controller side; the node side is a separate change). Room members run their own coding agent
+(Claude Code or Codex) on a **fork** of a live editor session's dev tree; a **submission** freezes the fork's head,
+checks it, waits for the room owner if any path is code, three-way merges it into the dev head and applies it to the
+live tree, which the Editor hot-refreshes. Owner decisions (2026-11-04): other members' agents may run on the owner's
+Windows machine only in isolated slot accounts, at most three at once, never with the owner's keys; Gamejam Account
+vouches for the signed-in user per request on agent routes only, and that person's own Xava Inference (xinf)
+connection pays; a merge that breaks compilation is reverted automatically and the author and owner see the compiler
+errors; builders edit the shared scene live, and code goes through forks and owner approval.
+
+**Who calls.** The owner token (the dashboard names the member), and OAuth apps with the `agent-forks` scope
+([OAuth](OAUTH.md#agent-forks)), whose token acts as the consenting room owner, or as a **room principal** the app
+vouches for (below). A member reaches only sessions they started; a room principal reaches only the grant member's
+sessions in the grant's project, sees and drives only its own forks (others' forks are `404`; the list shows them only
+as claims: owner name, title, state, intended paths), uses only its own xinf connection, and never approves, rejects,
+reverts or publishes (`403`). `viewer` principals read the list and dev status only.
+
+**API.** Base `/v1/projects/{p}/engine-sessions/{sid}`; ids are 32 hex; errors `{error}` plus `code` where a client
+acts on it. Mutations are JSON (≤ 64 KiB); reads take no body. Only the listed queries are accepted.
+
+| Route | Who | Body → result |
+|---|---|---|
+| `POST …/forks` | builder | `{request_id, prompt (≤ 16 KiB), provider:"claude"\|"codex", model?, budget_usd? (0.1–20, default 2), title?, paths?:[≤32 globs]}` → `202 {fork:{id, state:"creating", base}, run:{id, state:"queued"}}`; `409` with `code` `gateway_required`, `insufficient_balance` (+`topup_url`), `fork_limit` (3 open forks per person per session), `forks_unsupported` (the machine reports no fork provider), `isolation_required` (the machine has no slot accounts: only the room owner). Idempotent per `request_id`. |
+| `GET …/forks[?all=1]` | anyone in the room | `{forks:[…]}`: own forks in full (`id, owner{principal,name}, title, state, base, head, paths, paths_touched_count, updated_at`), others' open forks as claims; `all=1` (room owner) lists everything in full |
+| `GET …/forks/{fid}` | fork owner, room owner | `{id, state, base, head, changed:[{path, status, class, bytes, lfs}], runs:[{id, state, provider, model, budget_usd, spent_usd, requests, started_at, ended_at, error}], submission, rebase_conflict, has_diff, …}` |
+| `GET …/forks/{fid}/diff[?path=&limit=]` | same | `text/x-diff` (≤ 2 MiB; one file with `path`) |
+| `POST …/forks/{fid}/runs` | fork owner | `{request_id, prompt, resume?, budget_usd?}` → `202 {run}`; `resume` continues the agent's native session |
+| `GET …/forks/{fid}/runs/{rid}/events[?after=N]` | fork owner, room owner | `{events:[{seq, at, kind:"text"\|"tool"\|"status"\|"usage", data}], next}` (redacted, newest 512 KiB kept) |
+| `POST …/forks/{fid}/runs/{rid}/cancel` | fork owner, room owner | `{}` → `{run}` |
+| `POST …/forks/{fid}/submit` | fork owner | `{request_id, message, expected_head, auto_merge?:["scene","asset","config"]}` → `202 {submission:{id, state:"checking"}}` |
+| `POST …/forks/{fid}/rebase` | fork owner | `{request_id}` → `202 {fork}` (onto the current dev head) |
+| `POST …/forks/{fid}/close` | fork owner, room owner | `{keep_snapshot?}` → `{fork}` |
+| `GET …/submissions[?state=]` | room owner: all; others: own | `{submissions:[{id, fork, owner, message, state, fork_head, classes:{scene, asset, config, code, protected, refused}, findings:[{rule, path, line?}], needs_approval, approved_by, reason, conflict_paths, held_reason, dev_head_before, dev_head_after, reverted, …}]}` |
+| `POST …/submissions/{id}/approve` | room owner | `{request_id, expected_fork_head}` → `202 {submission}` (merged against the then-current dev head) |
+| `POST …/submissions/{id}/reject` | room owner | `{reason?}` → `{submission}` |
+| `GET …/dev` | anyone in the room | `{head, applied, applied_at, pending:[ids], held?:{reason}, compile:{state, errors:[{file, line, message}]}, live_code_pending:[paths], last_revert, notices:[…], published}` |
+| `POST …/dev/revert` | room owner | `{request_id, submission}` → `202 {submission}` (a new revert commit through the apply path) |
+| `POST …/dev/publish` | room owner | `{request_id, branch:"jam/<name>"}` → `202 {op_id}`; needs a repository Engine Box hosts or links (a one-shot write token goes to the node only for this op), else `409 publish_unavailable` |
+| `POST /v1/projects/{p}/gateway/connect` | anyone | `{return_to}` → `{authorize_url}` |
+| `GET\|PUT\|DELETE /v1/projects/{p}/gateway` | anyone (own only) | `{connected, kind:"oauth"\|"key", status, monthly_cap_usd, balance_usd?, spent_this_month_usd?, remaining_budget_usd?, topup_url}`; `PUT {key:"xk_live_…"}` (write-only); `DELETE` disconnects (revokes at xinf) |
+
+States. Fork: `creating → idle ⇄ running → submitted → idle`, `closing → closed`, `failed` (session ended, moved to
+another generation, or the node could not create it). Run: `queued → dispatched → running → succeeded | failed |
+cancelled`. Submission: `checking → rejected | awaiting_approval | merging → applying → applied | held | conflict |
+failed`; `held` (Play mode, unsaved overlapping scene, live edits) becomes `applied` when the node reports the commit
+on disk. A fork with an open submission takes no runs.
+
+**Limits.** 3 open forks per person per session; 3 concurrent runs per engine machine (fewer if the node reports fewer
+slots), dispatched round robin by person (the person served longest ago first); run budget $2 default, $20 max
+(enforced by the node's relay from xinf's per-request cost); 30-minute run limit: after it (plus a minute) the run is
+failed, its bearer is no longer delivered and the node gets a `cancel` op.
+
+**Checks on submit** (controller authoritative; `classify.rs`). Each changed path is classified, first match wins
+(`P` = the session's `project_path`):
+
+| Class | Paths | Merge |
+|---|---|---|
+| refused | invalid or Windows-hostile names (`..`, `\`, `:`, reserved names, trailing dot/space), a `.git` component, symlinks/submodules (modes 120000/160000), credential paths (`.ssh`, `.aws`, `.azure`, `.claude`, `.codex`, `.cursor` directories; `.env*` except `.example/.sample/.template`; `*.pem/.key/.pfx/.p12`; `id_<x>` key files; `.npmrc`, `.pypirc`, `.netrc`, `auth.json`, `*credentials*.json`), `P/ProjectSettings/ProjectVersion.txt`, `P/{Library,Temp,Logs,obj,UserSettings}/**`, anything outside `P` except root `README*` and `docs/**` | never |
+| protected | `.gitattributes`, `.lfsconfig`, `.gitmodules`, `.gitignore` anywhere, root `.github/**`, `package.json` and lockfiles outside `P`, files in `P` outside `Assets/`, `ProjectSettings/`, `Packages/` | room owner |
+| code | `*.cs`, `*.asmdef`, `*.asmref`, `*.rsp`, `*.dll`, `*.so`, `*.dylib`, `*.bundle/**`, `*.jslib`, `*.jspre`, `*.mm`, `*.m`, `*.cpp`, `*.c`, `*.h`, `*.java`, `*.kt`, `*.aar`, `*.jar`, `*.py`, `*.ps1`, `*.sh`, `*.bat`, `*.exe`; anything under an `Editor/` or `Plugins/` directory; `P/Packages/**`; the `.meta` of any of them | room owner |
+| config | `P/ProjectSettings/**`, `*.inputactions` | automatic |
+| scene | `*.unity`, `*.prefab`, `*.scenetemplate` | automatic |
+| asset | everything else under `P/Assets/`, root `README*`, `docs/**` | automatic |
+
+Then: files over 100 MiB not in LFS, more than 5 000 paths or more than 500 MiB added are refused; the node's
+findings are merged with the controller's own **secret scan** of the fork's diff artifact (added lines: `xk_live_`,
+`xat_/xrt_/xak_`, `ebr_`, `ebst_`, `ehp_`, `sk-ant-`, `sk-`, GitHub tokens, `AKIA…`, private key blocks, JWT shapes,
+high-entropy 40+ character strings in `*.json`, `*.asset`, `*.txt`, and an exact match of every bearer Engine Box
+delivered to that fork's runs). Any finding or refused path rejects the submission (findings name rule, path and line,
+never the value). Code or protected paths, or an automatic class the caller left out of `auto_merge` (room policy),
+wait for the room owner; the owner's own submissions too. An empty change set is rejected.
+
+**Compile failures (owner decision 3).** When `engine-report`'s `detail.dev.compile` says `errors` for the applied
+head, that head is not the last head that compiled, and an applied (or held) submission produced it, the controller
+queues a `revert` op for that submission (once), records `reverted:{state:"reverting", auto:true, reason, errors}` on
+it and a `notices` entry `{kind:"auto_revert", submission, author, errors}` on the dev status, and audits
+`agent_fork.revert` (actor `enginebox`). Compile errors from live edits (no submission produced the head) are only
+reported. A revert the node cannot apply leaves a `revert_failed` notice for the owner.
+
+**Model access: each person's own xinf connection** (`gateway.rs`). Engine Box is a confidential OAuth client of
+Xava Inference. `POST …/gateway/connect {return_to}` answers xinf's authorize URL (`scope=inference account:read`,
+`resource=https://xavainf.com`, PKCE S256, a one-time `state` held in memory for ten minutes); the person consents on
+xinf and picks a monthly cap; xinf returns the browser to `https://<engine box>/v1/gateway/xinf/callback`, which the
+dashboard forwards to the controller (`POST /v1/gateway/xinf/callback {state, code|error}`, owner token only); the
+controller exchanges the code and 303s the browser to `return_to?xinf=connected|denied|failed`. `return_to` must be
+on one of the app's registered redirect origins (the dashboard's origin for owner-token callers). Credentials are
+stored per (org, person) in `agent-credentials/gateway/<digest>.json`, sealed with AES-256-GCM under
+`agent-credentials/gateway-seal.key` (created on first use): no record, read, log or audit entry holds a token or
+key. Room principals are keyed by user and app, so one connection serves all of that app's rooms. Runs use only the
+person's own connection (never shared, team, API-key or controller accounts, never the owner's); without one the fork
+is refused `gateway_required`, and an xinf balance or app cap under $0.05 is `insufficient_balance` with xinf's top-up
+URL. A refresh xinf refuses marks the connection `reconnect`. Phase 2 (not implemented): org members' own Claude or
+Codex subscriptions first.
+
+**Room principals** (`principal.rs`). The app (Gamejam Account) registers an Ed25519 public key on its OAuth client
+(`enginebox_principal_key`); every access token minted for the grant carries it. Per request the app sends:
+
+```
+EngineBox-Principal:       gj:<room>:<user>        (each 1-64 of A-Z a-z 0-9 _ -)
+EngineBox-Principal-Name:  <percent-encoded UTF-8, 1-64 characters>
+EngineBox-Principal-Role:  builder | viewer
+EngineBox-Principal-Time:  <unix seconds>
+EngineBox-Principal-Nonce: <16-64 of A-Z a-z 0-9 _ ->
+EngineBox-Principal-Sig:   base64url(Ed25519(private key, message)), no padding
+message = join("\n", "enginebox-principal-v1", METHOD, path, raw query or "", hex(sha256(body bytes or "")),
+               principal, name header as sent, role, time, nonce, access token id (the 32 hex after "ebst_"))
+```
+
+The controller verifies the signature with the grant's key, refuses assertions more than 60 s from its clock and any
+nonce already accepted for that key in the window (memory; a restart forgets nonces but the window still bounds
+replays), and accepts the headers only on agent-fork routes of the grant's project (`400` elsewhere; `403` when the
+app registered no key). Without the headers the grant's member acts. Engine Box holds only the public key, so nothing
+on Engine Box can mint an assertion.
+
+**Node protocol** (the node side implements it; engine channel, fenced by node, epoch and the fork's generation, which
+is the session generation the fork was created in):
+
+- `engine-poll`: each session row gains `forks:[{id, generation, desired:"open"|"closed", base, keep_snapshot,
+  ops:[Op]}]` and `dev:{capture_on_save:true, head, ops:[publish ops]}`. A fork stays listed while it is open or has
+  ops (a closed fork's `revert` op). `Op = {op_id, kind, …payload}`:
+  `run:{run_id, provider, model, prompt, resume_id, timeout_seconds, budget_usd}` plus, only while the run is
+  dispatched or running, `secrets:{gateway:{access_token, expires_at, base_url, kind:"oauth"|"key"}}` (re-delivered,
+  refreshed when under 15 minutes remain; `expires_at` 0 for keys);
+  `snapshot:{expected_head, submission}` (freeze for a submission: the node must report the same head when the tree is
+  unchanged); `merge:{submission, fork_head, expected_dev_head, message, approved_by}`; `rebase:{onto}`;
+  `revert:{submission, commit, parent, expected_dev_head, message, auto}` (three-way: undo `commit` against the dev
+  head, i.e. merge-tree with merge base `commit`, theirs `parent`); `cancel:{run_id}`;
+  `publish:{branch, head, request_id}` with `secrets:{repository:{remote, token, auth, expires_at}}`.
+- `POST /v1/node/fork-report {session, epoch, fork, generation, op_id?, state, error?, detail?}`. Without `op_id`,
+  fork state `idle` (created; `detail.base`, `detail.head`), `failed` or `closed` (acknowledged). With `op_id`, op
+  state `running` (a run started), `applying`/`held` (merge in the dev head, not yet on disk) or final `done`,
+  `failed`, `conflict`, `cancelled`. `detail`: `head`, `base`, `changed:[{path, status:"A"|"M"|"D"|"R", mode (100644 or
+  "100644"), lfs, bytes}]` (the node's `class` is ignored), `findings:[{rule, path, line?}]`,
+  `run:{native_session_id, spent_usd, requests, exit}`, `merge:{dev_head, conflict_paths, stale}` (`stale:true` with
+  the current `dev_head` when the compare-and-swap lost: the controller retries up to three times),
+  `apply:{applied, held_reason}`, `conflict_paths` (rebase). Repeated reports of a finished op answer `{done:true}`.
+  Up to 1 MiB.
+- `POST /v1/node/fork-events {session, epoch, fork, generation?, run_id, events:[{kind, data, at?}]}` (≤ 1000 per call;
+  each `data` ≤ 16 KiB; redacted again here).
+- `POST /v1/node/fork-artifact {session, epoch, fork, generation?, head, kind:"diff", body}` (≤ 2 MiB; scanned for
+  secrets before it is stored; Engine Box's own bearers are redacted from the stored copy).
+- `engine-report`'s `detail.dev:{head, applied, held, compile:{state:"ok"|"compiling"|"errors", errors:[{file, line,
+  message}] (≤ 50), head?}, live_code_pending:[paths], publish:{op_id, state:"done"|"failed", commit, error}}` (≤ 64
+  KiB, outside the 4 KiB session detail bound; send it with the session's current state).
+- The node advertises forks in its heartbeat: `tools.engine.forks:{provider:"git"|"layerfs", slots, free_slots,
+  isolation:"accounts"|"sandbox"|"none"}`. Without it forks are refused; with `isolation:"none"` only the room owner
+  runs agents.
+- The dashboard node proxy and the supervisor's node gate allow the three new routes (the supervisor change needs a
+  supervisor upgrade, not just a controller handoff).
+
+**Records.** `engine-sessions/forks/<fork>.json`, `engine-sessions/fork-submissions/<id>.json`,
+`engine-sessions/dev/<session>.json`, run events `engine-sessions/fork-events/<fork>-<run>.json`, diffs
+`engine-sessions/fork-diffs/<fork>.diff` (directories older releases do not read). Run prompts sit in the fork record
+until the node finishes the op; bearers and write tokens are never written. Audit: `agent_fork.create`, `.run`,
+`.submit`, `.approve`, `.reject`, `.apply`, `.revert`, `.publish`, `.gateway`.
+
+**Platform configuration.** Register Engine Box at xinf as a confidential OAuth client (redirect URI
+`https://enginebox.coopcollective.dev/v1/gateway/xinf/callback`, scopes `inference account:read`) and store it in the
+platform org's `secret_source` connection **`xava-inference`**: `XINF_CLIENT_ID`, `XINF_CLIENT_SECRET`,
+`XINF_REDIRECT_URI`. Without it OAuth connects answer `409`; pasted keys still work.
+
+**Not yet.** The node side (fork provider, slot runner, relay) is a separate change; per-run xinf child keys (the relay
+forwards the person's access token); notifications beyond the dev status' `notices` and the submissions list (the app
+polls them); org members' own Claude/Codex subscriptions (phase 2); automatic publish at session end; multi-member
+live scene control.
+
 ### Known v1 limits
 
 - One session per engine machine; no capacity measurement; no `UsageEvent`.
