@@ -505,6 +505,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

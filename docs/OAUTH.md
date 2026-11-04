@@ -133,6 +133,33 @@ relay-only Cloudflare TURN ICE servers for its players and viewers; see
 `invalid_grant` and ends the connection. The request and response bodies are those
 of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllersrcengine_sessionsrs).
 
+### Agent forks
+
+An app asks for `scope=agent-forks` (usually with `engine-sessions` and `project=<id>`) to let people in its room run
+their own coding agents on forks of the consenting member's live engine sessions
+([agent forks](ENGINE-SESSIONS.md#agent-forks-packagesenginebox-controllersrcagent_forks)). Like engine sessions, any
+member may approve it, because it acts as them: the consent page offers "Let room members run their own agents on
+forks of your live engine sessions in project X". Tokens carry the operations
+`agent_forks.create|get|list|run|submit|rebase|close|gateway|dev|review|revert|publish`, `member: <user id>`, and the
+controller grant `agent_forks: [{project, client, principal_key?, return_origins}]`: the OAuth client's id, its
+registered room-principal key, and the distinct https origins of its redirect URIs (where a gateway connect may send
+the browser back). `enginebox_grants` adds `{kind:"agent_forks", project, member, room_principals}`.
+
+**Room principals.** Most people in a room are not Engine Box members. A confidential client may register an Ed25519
+public key, `enginebox_principal_key` (base64url without padding, 32 bytes), with its client metadata at
+`/oauth/register`. With it, the app signs an assertion of the signed-in person on each agent-fork request
+(`EngineBox-Principal: gj:<room>:<user>`, name, role, time, nonce, signature over the method, path, query, body
+digest and access token id); the controller verifies it, refuses replays and anything older than 60 s, and then acts
+as that person: their forks only, their own Xava Inference connection only, never review, revert or publish. The
+headers are forwarded only on agent-fork routes and refused elsewhere; without them the token acts as its member. The
+key cannot be changed on a registered client: register a new client (and reconnect) to rotate it. The signature
+format is in [agent forks](ENGINE-SESSIONS.md#agent-forks-packagesenginebox-controllersrcagent_forks).
+
+The resource proxy forwards the agent-fork routes (`GET`, `POST`, and `PUT`/`DELETE` for `…/gateway`), accepts their
+queries (`forks?all=1`, `diff?path=&limit=`, `events?after=`, `submissions?state=`), allows 64 KiB bodies there, and
+passes the diff through as `text/x-diff`. `GET /v1/gateway/xinf/callback` is Xava Inference's redirect back to Engine
+Box; it needs no bearer (its one-time `state` is the authenticator) and ends in a `303` to the app's `return_to`.
+
 ## Endpoints
 
 | Path | Purpose |

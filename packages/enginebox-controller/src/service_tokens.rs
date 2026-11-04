@@ -44,6 +44,36 @@ pub enum Operation {
     /// member's ready sessions.
     #[serde(rename = "engine_sessions.watch")]
     EngineWatch,
+    /// Agent forks of the member's live engine sessions
+    /// (docs/ENGINE-SESSIONS.md, "Agent forks"), only with an
+    /// [`AgentForksGrant`] on the project and a [`Token::member`].
+    #[serde(rename = "agent_forks.create")]
+    ForksCreate,
+    #[serde(rename = "agent_forks.get")]
+    ForksGet,
+    #[serde(rename = "agent_forks.list")]
+    ForksList,
+    #[serde(rename = "agent_forks.run")]
+    ForksRun,
+    #[serde(rename = "agent_forks.submit")]
+    ForksSubmit,
+    #[serde(rename = "agent_forks.rebase")]
+    ForksRebase,
+    #[serde(rename = "agent_forks.close")]
+    ForksClose,
+    /// The caller's own Xava Inference connection.
+    #[serde(rename = "agent_forks.gateway")]
+    ForksGateway,
+    #[serde(rename = "agent_forks.dev")]
+    ForksDev,
+    /// Approve or reject submissions: only when the token acts as its
+    /// member (never for a room principal).
+    #[serde(rename = "agent_forks.review")]
+    ForksReview,
+    #[serde(rename = "agent_forks.revert")]
+    ForksRevert,
+    #[serde(rename = "agent_forks.publish")]
+    ForksPublish,
 }
 impl Operation {
     pub fn engine(self) -> bool {
@@ -55,6 +85,27 @@ impl Operation {
                 | Self::EngineEnd
                 | Self::EngineWatch
         )
+    }
+    pub fn forks(self) -> bool {
+        matches!(
+            self,
+            Self::ForksCreate
+                | Self::ForksGet
+                | Self::ForksList
+                | Self::ForksRun
+                | Self::ForksSubmit
+                | Self::ForksRebase
+                | Self::ForksClose
+                | Self::ForksGateway
+                | Self::ForksDev
+                | Self::ForksReview
+                | Self::ForksRevert
+                | Self::ForksPublish
+        )
+    }
+    /// Agent-run operations (workspaces and pools).
+    fn agent_run(self) -> bool {
+        !self.engine() && !self.forks()
     }
 }
 
@@ -75,6 +126,24 @@ pub struct RepositoryGrant {
 #[serde(deny_unknown_fields)]
 pub struct EngineSessionsGrant {
     pub project: String,
+}
+
+/// Agent forks in one project, acting as the token's [`Token::member`] (the
+/// room owner who consented). `principal_key` (the OAuth client's registered
+/// Ed25519 key) lets the app vouch for room members per request; without it
+/// only the member acts. `return_origins` are the https origins a gateway
+/// connect may return to (the client's redirect origins).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentForksGrant {
+    pub project: String,
+    /// The OAuth client (`ebc_…`) the grant belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_origins: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -124,10 +193,14 @@ pub struct Token {
     /// releases still read the record.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub engine_sessions: BTreeSet<EngineSessionsGrant>,
-    /// The member (`usr_…`) engine-session grants act as: the user who
-    /// consented. Set exactly when `engine_sessions` is not empty.
+    /// The member (`usr_…`) engine-session and agent-fork grants act as: the
+    /// user who consented. Set exactly when either is not empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<String>,
+    /// Agent-fork grants, one per project. Omitted when empty so older
+    /// releases still read the record.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agent_forks: BTreeSet<AgentForksGrant>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,6 +272,18 @@ impl Token {
         }
         self.member.as_deref()
     }
+    /// The agent-fork grant on `project` for `operation`, when this token
+    /// holds both (inside its project restriction if it has one).
+    pub fn forks_grant(&self, operation: Operation, project: &str) -> Option<&AgentForksGrant> {
+        if !operation.forks()
+            || !self.operations.contains(&operation)
+            || self.project.as_deref().is_some_and(|p| p != project)
+            || self.member.is_none()
+        {
+            return None;
+        }
+        self.agent_forks.iter().find(|g| g.project == project)
+    }
     pub fn sees(&self, host_id: &str, name: &str) -> bool {
         self.scopes
             .iter()
@@ -225,6 +310,7 @@ impl Token {
             "project":self.project,
             "repositories":self.repositories,
             "engine_sessions":self.engine_sessions,
+            "agent_forks":self.agent_forks.iter().map(|g| json!({"project":g.project,"client":g.client,"room_principals":g.principal_key.is_some(),"return_origins":g.return_origins})).collect::<Vec<_>>(),
             "member":self.member,
             "org_id":self.org(),
             "has_callback_secret":self.callback_secret.is_some(),
@@ -258,9 +344,12 @@ pub struct MintRequest {
     pub org_id: Option<String>,
     #[serde(default)]
     pub engine_sessions: Vec<EngineSessionsGrant>,
-    /// The member engine-session grants act as; required with them.
+    /// The member engine-session and agent-fork grants act as; required
+    /// with them.
     #[serde(default)]
     pub member: Option<String>,
+    #[serde(default)]
+    pub agent_forks: Vec<AgentForksGrant>,
 }
 
 use enginebox_node_protocol::service_token::{secret_hash, valid_id};
@@ -322,7 +411,8 @@ impl ServiceTokens {
             (!request.scopes.is_empty()
                 || !request.pools.is_empty()
                 || !request.repositories.is_empty()
-                || !request.engine_sessions.is_empty())
+                || !request.engine_sessions.is_empty()
+                || !request.agent_forks.is_empty())
                 && request.scopes.len() <= MAX_SCOPES,
             "scopes must name 1-256 workspaces, or pools, repositories or engine sessions at least one grant"
         );
@@ -341,20 +431,67 @@ impl ServiceTokens {
                     == request.engine_sessions.len(),
             "engine_sessions must name at most 256 distinct projects"
         );
-        // Engine-session grants act as exactly one member, never as the owner.
         ensure!(
-            request.engine_sessions.is_empty() == request.member.is_none()
+            request.agent_forks.len() <= MAX_SCOPES
+                && request
+                    .agent_forks
+                    .iter()
+                    .map(|g| &g.project)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == request.agent_forks.len(),
+            "agent_forks must name at most 256 distinct projects"
+        );
+        for g in &request.agent_forks {
+            ensure!(
+                enginebox_agents::pools::valid_project(&g.project),
+                "agent_forks must name project IDs"
+            );
+            ensure!(
+                g.client.as_deref().is_none_or(|c| {
+                    (1..=100).contains(&c.len())
+                        && c.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                }),
+                "agent_forks client must be an OAuth client id"
+            );
+            ensure!(
+                g.principal_key
+                    .as_deref()
+                    .is_none_or(crate::agent_forks::principal::valid_key)
+                    && (g.principal_key.is_none() || g.client.is_some()),
+                "agent_forks principal_key must be a base64url Ed25519 public key, with its client"
+            );
+            ensure!(
+                g.return_origins.len() <= 10
+                    && g.return_origins
+                        .iter()
+                        .all(|o| crate::engine_sessions::https_origin(o).as_deref()
+                            == Some(o.as_str())),
+                "agent_forks return_origins must be https origins"
+            );
+        }
+        // Engine-session and agent-fork grants act as exactly one member,
+        // never as the owner.
+        let member_grants = !request.engine_sessions.is_empty() || !request.agent_forks.is_empty();
+        ensure!(
+            member_grants == request.member.is_some()
                 && request
                     .member
                     .as_deref()
                     .is_none_or(|m| { m != "owner" && crate::audit::valid_actor(m) }),
-            "member must name the user engine_sessions act as, and only with engine_sessions"
+            "member must name the user engine_sessions and agent_forks act as, and only with them"
         );
         let engine_operations = request.operations.iter().any(|o| o.engine());
         let engine_grants = !request.engine_sessions.is_empty();
         ensure!(
             engine_operations == engine_grants,
             "engine_sessions operations need an engine_sessions grant, and the grant needs them"
+        );
+        let fork_operations = request.operations.iter().any(|o| o.forks());
+        ensure!(
+            fork_operations != request.agent_forks.is_empty(),
+            "agent_forks operations need an agent_forks grant, and the grant needs them"
         );
         ensure!(
             request.repositories.len() <= MAX_SCOPES
@@ -387,8 +524,13 @@ impl ServiceTokens {
             ensure!(
                 !request.pools.is_empty()
                     || !request.repositories.is_empty()
-                    || !request.engine_sessions.is_empty(),
-                "project restricts pool, repository and engine-session grants; name at least one"
+                    || !request.engine_sessions.is_empty()
+                    || !request.agent_forks.is_empty(),
+                "project restricts pool, repository, engine-session and agent-fork grants; name at least one"
+            );
+            ensure!(
+                request.agent_forks.iter().all(|g| &g.project == project),
+                "Every agent-fork grant must name the token's project"
             );
             ensure!(
                 request.repositories.iter().all(|g| &g.project == project),
@@ -431,7 +573,7 @@ impl ServiceTokens {
         // A repository-only token (for example read-only indexing) needs no
         // agent-run operation; any workspace or pool grant does.
         ensure!(
-            request.operations.iter().any(|o| !o.engine())
+            request.operations.iter().any(|o| o.agent_run())
                 || (request.scopes.is_empty() && request.pools.is_empty()),
             "operations must name at least one agent-run operation"
         );
@@ -488,6 +630,7 @@ impl ServiceTokens {
             org_id: request.org_id,
             engine_sessions: request.engine_sessions.into_iter().collect(),
             member: request.member,
+            agent_forks: request.agent_forks.into_iter().collect(),
         };
         self.save(&token)?;
         let public = token.public();
@@ -613,6 +756,7 @@ mod tests {
             org_id: None,
             engine_sessions: vec![],
             member: None,
+            agent_forks: vec![],
         }
     }
     #[test]
@@ -970,6 +1114,7 @@ mod tests {
                     org_id: None,
                     engine_sessions: BTreeSet::new(),
                     member: None,
+                    agent_forks: BTreeSet::new(),
                 };
                 tokens.save(&token).unwrap();
                 map.insert(id, token);

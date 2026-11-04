@@ -424,6 +424,9 @@ async fn mock_server(state: Mock) -> (String, tokio::task::JoinHandle<()>) {
             .route("/v1/node/result", post(mock_node_result))
             .route("/v1/node/engine-poll", post(mock_node_heartbeat))
             .route("/v1/node/engine-report", post(mock_node_heartbeat))
+            .route("/v1/node/fork-report", post(mock_node_heartbeat))
+            .route("/v1/node/fork-events", post(mock_node_heartbeat))
+            .route("/v1/node/fork-artifact", post(mock_node_heartbeat))
             .with_state(state),
     )
     .await
@@ -1014,7 +1017,13 @@ async fn engine_session_node_actions_reach_the_controller_with_node_auth() {
     // engine machines never received their sessions.
     let f = fixture().await;
     let client = reqwest::Client::new();
-    for action in ["engine-poll", "engine-report"] {
+    for action in [
+        "engine-poll",
+        "engine-report",
+        "fork-report",
+        "fork-events",
+        "fork-artifact",
+    ] {
         let response = client
             .post(format!("{}/v1/node/{action}", f.url))
             .bearer_auth("fixture-node-token")

@@ -6,6 +6,21 @@ import type { EngineSessionsGrant, PoolGrant, RepositoryGrant, WorkspaceGrant } 
 export const AGENT_RUN_OPERATIONS = ["agent_runs.start", "agent_runs.get", "agent_runs.list", "agent_runs.cancel"];
 /** Every engine-session operation; the `engine-sessions` scope grants exactly these, on the consented projects. */
 export const ENGINE_SESSION_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end", "engine_sessions.watch"];
+/** Every agent-fork operation; the `agent-forks` scope grants exactly these, on the consented projects. */
+export const AGENT_FORK_OPERATIONS = [
+  "agent_forks.create",
+  "agent_forks.get",
+  "agent_forks.list",
+  "agent_forks.run",
+  "agent_forks.submit",
+  "agent_forks.rebase",
+  "agent_forks.close",
+  "agent_forks.gateway",
+  "agent_forks.dev",
+  "agent_forks.review",
+  "agent_forks.revert",
+  "agent_forks.publish",
+];
 
 async function call(path: string, init: { method: string; body?: unknown }) {
   const { apiUrl, apiToken } = config();
@@ -28,6 +43,12 @@ export type Minted = { id: string; secret: string; expires_at: number };
 /** The controller refused the grant itself (a workspace, pool or profile no longer exists). */
 export class GrantRefused extends Error {}
 
+/**
+ * One agent-forks project as the token carries it: the client that holds the grant, its room-principal key
+ * (if registered) and the https origins it may send a browser back to (the gateway connect's return_to).
+ */
+export type AgentForksToken = { project: string; client: string; principal_key?: string; return_origins: string[] };
+
 /** Everything one access token carries: the consented workspaces, pools and repository grants, and the grant's callback key. */
 export type TokenGrant = {
   workspaces: WorkspaceGrant[];
@@ -39,7 +60,9 @@ export type TokenGrant = {
   org_id?: string | null;
   /** Engine-session projects; the token acts as `member` there. */
   engine_sessions?: EngineSessionsGrant[];
-  /** The consenting member (`usr_…`); required with `engine_sessions`. */
+  /** Agent-fork projects; the token acts as `member` there too. */
+  agent_forks?: AgentForksToken[];
+  /** The consenting member (`usr_…`); required with `engine_sessions` or `agent_forks`. */
   member?: string;
 };
 
@@ -52,24 +75,42 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
   const profiles = [...new Set(grant.workspaces.flatMap((w) => w.profiles))].sort();
   const repositories = grant.repositories ?? [];
   const engine = grant.engine_sessions ?? [];
-  if (engine.length && !grant.member) throw new GrantRefused("Engine sessions need the member who consented.");
-  // An engine-session-only grant holds no agent-run operation; every other grant keeps them all, as before.
-  const agentRuns = !engine.length || grant.workspaces.length > 0 || grant.pools.length > 0 || repositories.length > 0;
+  const forks = grant.agent_forks ?? [];
+  const asMember = engine.length > 0 || forks.length > 0;
+  if (asMember && !grant.member) throw new GrantRefused("Engine sessions and agent forks need the member who consented.");
+  // An engine-session or agent-fork only grant holds no agent-run operation; every other grant keeps them all, as before.
+  const agentRuns = !asMember || grant.workspaces.length > 0 || grant.pools.length > 0 || repositories.length > 0;
   const response = await call("v1/service-tokens", {
     method: "POST",
     body: {
       label: `oauth grant ${grantId}`,
       scopes: grant.workspaces.map((w) => ({ host_id: w.host, name: w.instance })),
-      operations: [...(agentRuns ? AGENT_RUN_OPERATIONS : []), ...(engine.length ? ENGINE_SESSION_OPERATIONS : [])],
+      operations: [
+        ...(agentRuns ? AGENT_RUN_OPERATIONS : []),
+        ...(engine.length ? ENGINE_SESSION_OPERATIONS : []),
+        ...(forks.length ? AGENT_FORK_OPERATIONS : []),
+      ],
       expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
       // Optional fields only when used, so older controllers keep accepting workspace-only grants.
       ...(profiles.length ? { profiles } : {}),
       ...(grant.pools.length ? { pools: grant.pools.map((p) => p.pool) } : {}),
       ...(repositories.length ? { repositories: repositories.map((r) => ({ project: r.project, access: r.access })) } : {}),
-      ...(engine.length ? { engine_sessions: engine.map((e) => ({ project: e.project })), member: grant.member } : {}),
+      ...(engine.length ? { engine_sessions: engine.map((e) => ({ project: e.project })) } : {}),
+      ...(forks.length
+        ? {
+            agent_forks: forks.map((f) => ({
+              project: f.project,
+              client: f.client,
+              ...(f.principal_key ? { principal_key: f.principal_key } : {}),
+              return_origins: f.return_origins,
+            })),
+          }
+        : {}),
+      // Shared by engine sessions and agent forks: sent once.
+      ...(asMember ? { member: grant.member } : {}),
       ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
-      // Restricts the pool, repository and engine-session grants to one project; the controller re-checks it on every request.
-      ...(grant.project && (grant.pools.length || repositories.length || engine.length) ? { project: grant.project } : {}),
+      // Restricts the pool, repository, engine-session and agent-fork grants to one project; the controller re-checks it on every request.
+      ...(grant.project && (grant.pools.length || repositories.length || asMember) ? { project: grant.project } : {}),
       ...(grant.org_id && grant.org_id !== "default" ? { org_id: grant.org_id } : {}),
     },
   });
@@ -78,7 +119,7 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
     secret?: unknown;
   } | null;
   // 400: the controller validated the request and refused it, so this grant cannot be honoured any more.
-  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools, repositories, engine sessions or profiles are no longer available.");
+  if (response.status === 400) throw new GrantRefused("The consented workspaces, pools, repositories, engine sessions, agent forks or profiles are no longer available.");
   const id = body?.token?.id, secret = body?.secret, expires = Date.parse(String(body?.token?.expires_at));
   if (response.status !== 201 || typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id) || typeof secret !== "string" || !secret.startsWith(`ebst_${id}.`) || !Number.isFinite(expires))
     throw new HttpError(503, "The fleet service could not issue an access token.");

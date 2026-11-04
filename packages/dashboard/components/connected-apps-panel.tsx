@@ -13,6 +13,8 @@ type Connection = {
   repositories?: { project: string; access: "read" | "write" }[];
   /** Engine sessions it runs as the approving member, by project. */
   engine_sessions?: { project: string }[];
+  /** Agent forks of the approving member's live sessions room members may run, by project. */
+  agent_forks?: { project: string }[];
   /** The connection is restricted to this project's pools. */
   project?: string | null;
   created_at: string;
@@ -130,6 +132,11 @@ export function ConnectedAppsPanel() {
               {(c.engine_sessions ?? []).map((e) => (
                 <li key={`engine_sessions:${e.project}`}>
                   live engine sessions in project <code>{e.project}</code> · as the member who approved it
+                </li>
+              ))}
+              {(c.agent_forks ?? []).map((f) => (
+                <li key={`agent_forks:${f.project}`}>
+                  agent forks of live engine sessions in project <code>{f.project}</code> · for room members, as the member who approved it
                 </li>
               ))}
             </ul>

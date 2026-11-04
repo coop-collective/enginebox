@@ -1,4 +1,5 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
+pub mod agent_forks;
 pub mod audit;
 pub mod callbacks;
 pub mod catalog;
@@ -88,6 +89,10 @@ struct Runtime {
     moq_api: String,
     /// Cloudflare Realtime's API base for TURN credentials (turn.rs).
     turn_api: String,
+    /// Agent forks on live engine sessions (agent_forks/).
+    agent_forks: agent_forks::AgentForks,
+    /// Xava Inference's origin for agent-fork model access (agent_forks/gateway.rs).
+    xinf_api: String,
 }
 impl Runtime {
     fn pending_jobs(&self) -> usize {
@@ -121,6 +126,8 @@ pub struct Controller {
     moq_api: Mutex<Option<String>>,
     /// Test harnesses stand in for Cloudflare's TURN API (turn.rs).
     turn_api: Mutex<Option<String>>,
+    /// Test harnesses stand in for Xava Inference (agent_forks/gateway.rs).
+    xinf_api: Mutex<Option<String>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -160,6 +167,7 @@ impl Controller {
             unity_login: Mutex::new(None),
             moq_api: Mutex::new(None),
             turn_api: Mutex::new(None),
+            xinf_api: Mutex::new(None),
         }))
     }
     /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
@@ -257,6 +265,13 @@ impl Controller {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| turn::API_BASE.to_owned()),
+            agent_forks: agent_forks::AgentForks::open(&self.root)?,
+            xinf_api: self
+                .xinf_api
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| agent_forks::gateway::XINF_ORIGIN.to_owned()),
             credentials: {
                 let store =
                     credentials::Credentials::open(&self.root, &std::collections::BTreeMap::new())?;
@@ -367,6 +382,10 @@ impl Controller {
     }
     /// Stand in for Cloudflare's TURN API base. Takes effect at the next activation.
     #[doc(hidden)]
+    /// Tests: a stand-in for Xava Inference's OAuth endpoints.
+    pub fn set_xinf_api_url(&self, url: &str) {
+        *self.xinf_api.lock().unwrap() = Some(url.to_owned());
+    }
     pub fn set_turn_api_url(&self, url: &str) {
         *self.turn_api.lock().unwrap() = Some(url.to_owned());
     }
@@ -642,6 +661,13 @@ fn service_allows(
     if let Some((operation, project)) = engine_session_route(method, &parts) {
         return token.engine_member(operation, project).is_some();
     }
+    // Agent forks: the grant's project; the handler decides who acts.
+    if let Some(route) = agent_forks::route(method.as_str(), path) {
+        return route
+            .action
+            .operation()
+            .is_some_and(|operation| token.forks_grant(operation, &route.project).is_some());
+    }
     let pool_ok =
         |operation, pool: &str| token.allows_pool(operation, pool, project_of(pool).as_deref());
     match (method, parts.as_slice()) {
@@ -811,6 +837,20 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
         return error(
             StatusCode::FORBIDDEN,
             "This service token is not granted that operation on that workspace.",
+        );
+    }
+    // Agent forks take queries, PUT/DELETE, signed room principals and
+    // diffs, so they have their own front door.
+    if let Some(route) = agent_forks::route(method.as_str(), &path) {
+        return agent_forks_request(controller, request, principal, org, actor, route).await;
+    }
+    if agent_forks::principal::HEADERS
+        .iter()
+        .any(|h| request.headers().contains_key(*h))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Principal assertions are accepted only on agent-fork routes.",
         );
     }
     if request.uri().query().is_some() {
@@ -1156,6 +1196,9 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
             "result",
             "engine-poll",
             "engine-report",
+            "fork-report",
+            "fork-events",
+            "fork-artifact",
         ]
         .contains(&action.as_str())
     {
@@ -1174,7 +1217,15 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
     let admission = {
         let mut gate = controller.gate.lock().unwrap();
         // Already admitted work must keep its lease and finish during a drain.
-        let finishing = ["heartbeat", "result", "engine-report"].contains(&action.as_str());
+        let finishing = [
+            "heartbeat",
+            "result",
+            "engine-report",
+            "fork-report",
+            "fork-events",
+            "fork-artifact",
+        ]
+        .contains(&action.as_str());
         if gate.mode != Mode::Active && !(finishing && gate.mode == Mode::Draining) {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1194,7 +1245,13 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
             "Node credential expired or revoked.",
         );
     }
-    let bytes = match to_bytes(request.into_body(), 350_000).await {
+    // A fork's changed paths and diff are larger than other node reports.
+    let limit = match action.as_str() {
+        "fork-artifact" => 3 * 1024 * 1024,
+        "fork-report" => 1024 * 1024,
+        _ => 350_000,
+    };
+    let bytes = match to_bytes(request.into_body(), limit).await {
         Ok(b) => b,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "Node request too large."),
     };
@@ -1227,10 +1284,47 @@ async fn node_request(controller: Arc<Controller>, request: Request<Body>) -> Re
                 let (node, epoch) = runtime.contributors.engine_channel(&token, &body)?;
                 let platform = RuntimePlatform(&runtime);
                 match engine {
-                    "poll" => runtime.engine_sessions.poll(&node, epoch, &platform),
-                    _ => runtime
-                        .engine_sessions
-                        .report(&node, epoch, &body, &platform),
+                    "poll" => {
+                        let mut polled = runtime.engine_sessions.poll(&node, epoch, &platform)?;
+                        runtime
+                            .agent_forks
+                            .decorate_poll(&platform, &node, &mut polled)?;
+                        Ok(polled)
+                    }
+                    _ => {
+                        // The dev tree's state rides along in detail.dev
+                        // (agent forks); the session report keeps its bound.
+                        let mut body = body;
+                        let dev = body
+                            .get_mut("detail")
+                            .and_then(Value::as_object_mut)
+                            .and_then(|d| d.remove("dev"));
+                        let reply = runtime
+                            .engine_sessions
+                            .report(&node, epoch, &body, &platform)?;
+                        if let Some(dev) = dev {
+                            let id = body["id"].as_str().unwrap_or("");
+                            let session = agent_forks::Host::session(&platform, id)
+                                .filter(|s| {
+                                    s.node.as_deref() == Some(node.as_str())
+                                        && s.node_epoch == epoch
+                                        && Some(s.generation) == body["generation"].as_u64()
+                                })
+                                .context("Session is not placed on this node")?;
+                            runtime.agent_forks.dev_report(&platform, &session, &dev)?;
+                        }
+                        Ok(reply)
+                    }
+                }
+            } else if let Some(fork) = action.strip_prefix("fork-") {
+                // Agent forks report on the engine channel too.
+                let (node, epoch) = runtime.contributors.engine_channel(&token, &body)?;
+                let platform = RuntimePlatform(&runtime);
+                let forks = &runtime.agent_forks;
+                match fork {
+                    "report" => forks.report(&platform, &node, epoch, &body),
+                    "events" => forks.events_report(&platform, &node, epoch, &body),
+                    _ => forks.artifact(&platform, &node, epoch, &body),
                 }
             } else {
                 runtime.contributors.node_call(&token, &action, body)
@@ -2073,6 +2167,331 @@ impl engine_sessions::Platform for RuntimePlatform<'_> {
             .catalog
             .audit
             .record(org, actor, action, target, ok, detail);
+    }
+}
+
+/// Agent forks see the controller through this (agent_forks/).
+impl agent_forks::Host for RuntimePlatform<'_> {
+    fn session(&self, id: &str) -> Option<agent_forks::SessionInfo> {
+        let s = self.0.engine_sessions.snapshot(id)?;
+        Some(agent_forks::SessionInfo {
+            id: s.id.clone(),
+            org: s.org_id.clone(),
+            project: s.project.clone(),
+            repository: s.repository.clone(),
+            project_path: s.project_path.clone(),
+            started_by: s.started_by.clone(),
+            editor: s.mode == engine_sessions::Mode::Editor,
+            ready: s.state == engine_sessions::State::Ready,
+            open: !s.state.terminal(),
+            node: s.node.clone(),
+            node_epoch: s.node_epoch,
+            generation: s.generation,
+        })
+    }
+    fn caps(&self, node: &str) -> Option<agent_forks::Caps> {
+        self.0
+            .contributors
+            .engine_nodes()
+            .into_iter()
+            .find(|n| n.id == node && n.online && !n.revoked)
+            .and_then(|n| agent_forks::Caps::from_tools(&n.tools))
+    }
+    fn xinf(&self) -> Result<Option<Arc<dyn agent_forks::gateway::Xinf>>> {
+        use agent_forks::gateway;
+        let value = |name| {
+            self.0
+                .catalog
+                .connections
+                .source_value(
+                    enginebox_agents::pools::DEFAULT_ORG,
+                    gateway::CONNECTION,
+                    name,
+                )
+                .ok()
+        };
+        match (
+            value(gateway::CLIENT_ID),
+            value(gateway::CLIENT_SECRET),
+            value(gateway::REDIRECT_URI),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(id), Some(secret), Some(redirect)) => Ok(Some(Arc::new(
+                gateway::XinfClient::new(&self.0.xinf_api, &id, &secret, &redirect).map_err(
+                    |error| anyhow::anyhow!("The xava-inference connection is invalid: {error}"),
+                )?,
+            ))),
+            _ => anyhow::bail!(
+                "The xava-inference connection needs XINF_CLIENT_ID, XINF_CLIENT_SECRET and XINF_REDIRECT_URI."
+            ),
+        }
+    }
+    fn dashboard_origin(&self) -> Option<String> {
+        let redirect = self
+            .0
+            .catalog
+            .connections
+            .source_value(
+                enginebox_agents::pools::DEFAULT_ORG,
+                agent_forks::gateway::CONNECTION,
+                agent_forks::gateway::REDIRECT_URI,
+            )
+            .ok()?;
+        let origin = url::Url::parse(&redirect)
+            .ok()?
+            .origin()
+            .ascii_serialization();
+        engine_sessions::https_origin(&origin)
+    }
+    fn repository_write(
+        &self,
+        session: &agent_forks::SessionInfo,
+    ) -> Result<agent_forks::WriteAccess> {
+        let repositories = &self.0.repositories;
+        anyhow::ensure!(
+            repositories.exists(&session.project, &session.repository)
+                && repo_config::same_org(
+                    &session.org,
+                    repositories.org_of(&session.project, &session.repository)
+                ),
+            agent_forks::Refusal {
+                status: 409,
+                message: "Publishing needs a repository Engine Box hosts or links (a write token); this session's repository has only a read token.".into(),
+                code: Some("publish_unavailable"),
+                extra: Value::Null,
+            }
+        );
+        let credential = repositories.run_credential(
+            &repo_config::repository_ref(&session.project, &session.repository),
+            engine_sessions::REPOSITORY_TOKEN_TTL,
+        )?;
+        Ok(agent_forks::WriteAccess {
+            remote: credential.remote,
+            token: credential.token,
+            auth: match credential.auth {
+                enginebox_agents::repository::Auth::Bearer => "bearer",
+                enginebox_agents::repository::Auth::GithubToken => "github_token",
+            }
+            .into(),
+            expires_at: credential.expires_at,
+        })
+    }
+    fn audit(&self, org: &str, actor: &str, action: &str, target: &str, ok: bool, detail: Value) {
+        self.0
+            .catalog
+            .audit
+            .record(org, actor, action, target, ok, detail);
+    }
+}
+
+/// Agent-fork routes (docs/ENGINE-SESSIONS.md, "Agent forks"): the owner
+/// token (the dashboard names the member), or a service token with an
+/// `agent-forks` grant acting as its member, or as a room principal its app
+/// vouched for with a signed assertion (`agent_forks/principal.rs`).
+async fn agent_forks_request(
+    controller: Arc<Controller>,
+    request: Request<Body>,
+    principal: Principal,
+    org: String,
+    actor: String,
+    route: agent_forks::Route,
+) -> Response {
+    let fail = |status: u16, body: Value| {
+        reply(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            body,
+        )
+    };
+    let path = request.uri().path().to_owned();
+    let raw_query = request.uri().query().unwrap_or("").to_owned();
+    let method = request.method().as_str().to_owned();
+    let query = match agent_forks::parse_query(route.action, Some(&raw_query)) {
+        Ok(q) => q,
+        Err(e) => {
+            let (status, body) = agent_forks::status_of(&e);
+            return fail(status, body);
+        }
+    };
+    // Principal assertion headers, raw.
+    let headers = request.headers().clone();
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let asserted = agent_forks::principal::HEADERS
+        .iter()
+        .any(|h| headers.contains_key(*h));
+    let read = route.action.read();
+    let body_bytes = if read {
+        match to_bytes(request.into_body(), 1024).await {
+            Ok(b) if b.is_empty() => b,
+            _ => return error(StatusCode::BAD_REQUEST, "This operation takes no body."),
+        }
+    } else {
+        if headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            != Some("application/json")
+        {
+            return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Use application/json.");
+        }
+        match to_bytes(request.into_body(), 65536).await {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body is missing or too large.",
+                );
+            }
+        }
+    };
+    let body = if read {
+        json!({})
+    } else {
+        match enginebox_core::templates::decode_json(&body_bytes) {
+            Ok(v) if v.is_object() => v,
+            _ => return error(StatusCode::BAD_REQUEST, "Body must be a JSON object."),
+        }
+    };
+    let runtime = match controller.runtime() {
+        Ok(r) => r,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Controller is not active; retry through the supervisor.",
+            );
+        }
+    };
+    // Who acts.
+    let (caller, grant_member, return_origins) = match &principal {
+        Principal::Owner => {
+            if asserted {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "Principal assertions come only with an app's agent-forks token.",
+                );
+            }
+            let caller = if actor == "owner" {
+                agent_forks::Caller::Owner
+            } else {
+                agent_forks::Caller::Member(actor.clone())
+            };
+            (caller, None, vec![])
+        }
+        Principal::Service(token) => {
+            let Some(grant) = route
+                .action
+                .operation()
+                .and_then(|operation| token.forks_grant(operation, &route.project))
+            else {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "This service token is not granted that operation on that project.",
+                );
+            };
+            let member = token.member.clone().unwrap_or_default();
+            let caller = if asserted {
+                let (Some(key), Some(client)) = (&grant.principal_key, &grant.client) else {
+                    return error(
+                        StatusCode::FORBIDDEN,
+                        "This connection cannot vouch for room members (its app registered no principal key).",
+                    );
+                };
+                let assertion = agent_forks::principal::Assertion {
+                    principal: header(agent_forks::principal::HEADER).unwrap_or(""),
+                    name: header(agent_forks::principal::NAME_HEADER).unwrap_or(""),
+                    role: header(agent_forks::principal::ROLE_HEADER).unwrap_or(""),
+                    time: header(agent_forks::principal::TIME_HEADER).unwrap_or(""),
+                    nonce: header(agent_forks::principal::NONCE_HEADER).unwrap_or(""),
+                    signature: header(agent_forks::principal::SIG_HEADER).unwrap_or(""),
+                };
+                let bound = agent_forks::principal::Bound {
+                    method: &method,
+                    path: &path,
+                    query: &raw_query,
+                    body: &body_bytes,
+                    token_id: &token.id,
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                match runtime
+                    .agent_forks
+                    .verifier()
+                    .verify(key, client, &assertion, &bound, now)
+                {
+                    Ok(room) => agent_forks::Caller::Room(room),
+                    Err(refused) => {
+                        return error(StatusCode::UNAUTHORIZED, refused.0);
+                    }
+                }
+            } else {
+                agent_forks::Caller::Member(member.clone())
+            };
+            // Review, revert and publish stay with the member (room owner).
+            if matches!(caller, agent_forks::Caller::Room(_))
+                && matches!(
+                    route.action,
+                    agent_forks::Action::Approve
+                        | agent_forks::Action::Reject
+                        | agent_forks::Action::Revert
+                        | agent_forks::Action::Publish
+                )
+            {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "Only the room owner reviews, reverts and publishes.",
+                );
+            }
+            (caller, Some(member), grant.return_origins.clone())
+        }
+    };
+    let admission = if read {
+        None
+    } else {
+        match controller.admit() {
+            Ok(a) => Some(a),
+            Err(_) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Controller is draining; retry through the supervisor.",
+                );
+            }
+        }
+    };
+    let forks_request = agent_forks::Request {
+        route,
+        query,
+        body,
+        org,
+        caller,
+        grant_member,
+        return_origins,
+    };
+    let result = blocking(move || {
+        let _admission = admission;
+        let platform = RuntimePlatform(&runtime);
+        Ok(runtime.agent_forks.handle(&platform, forks_request))
+    })
+    .await;
+    match result {
+        Ok(Ok(agent_forks::Reply::Json(status, value))) => fail(status, value),
+        Ok(Ok(agent_forks::Reply::Diff(text))) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/x-diff; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            text,
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            let (status, body) = agent_forks::status_of(&e);
+            fail(status, body)
+        }
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "Controller unavailable."),
     }
 }
 
@@ -7424,6 +7843,684 @@ mod tests {
             assert!(
                 files_contain(&c.root, &secret).is_empty(),
                 "a relay token reached disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_forks_over_http_with_room_principals_and_xinf() {
+        use agent_forks::principal::{self as principal, tests as signing};
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_temp, c) = setup();
+        let (unity_url, _) = unity::fake::serve();
+        c.set_unity_login_url(&unity_url);
+        let xinf = agent_forks::gateway::fake::serve();
+        c.set_xinf_api_url(&xinf.url);
+        c.activate().unwrap();
+        let app = router(c.clone());
+        let as_member = |method: Method, path: &str, body: Value, actor: &str| {
+            let mut r = request(method, path, &body.to_string(), true);
+            r.headers_mut()
+                .insert(catalog::ACTOR_HEADER, actor.parse().unwrap());
+            r
+        };
+        let node_post = |action: &str, token: &str, body: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/node/{action}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for body in [
+            json!({"name":"cloudflare-moq","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"MOQ_PUBLISH_TOKEN":"eyJhbGciOiJFUzI1NiJ9.p.s","MOQ_SUBSCRIBE_TOKEN":"eyJhbGciOiJFUzI1NiJ9.s.s"}}),
+            json!({"name":"engine-repo-queen-of-hearts","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"GIT_REMOTE_URL":"https://github.com/coop-collective/queen-of-hearts.git","GIT_READ_TOKEN":"github_pat_engine_repo_read_value"}}),
+            json!({"name":"xava-inference","kind":"secret_source","source":{"provider":"stored","environment":"production"},"secrets":{"XINF_CLIENT_ID":agent_forks::gateway::fake::CLIENT_ID,"XINF_CLIENT_SECRET":agent_forks::gateway::fake::CLIENT_SECRET,"XINF_REDIRECT_URI":agent_forks::gateway::fake::REDIRECT}}),
+        ] {
+            let (status, created) = call(
+                &app,
+                request(Method::POST, "/v1/connections", &body.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+        }
+        // Alice's engine machine, with a fork provider and isolated slots.
+        let runtime = c.runtime().unwrap();
+        let issued = runtime
+            .contributors
+            .issue(enginebox_node_protocol::Invitation {
+                label: "RTX 4080".into(),
+                budget: enginebox_node_protocol::installer_ceiling(),
+                workloads: enginebox_node_protocol::Workloads {
+                    ci: false,
+                    agents: false,
+                    engine: true,
+                },
+            })
+            .unwrap();
+        let node = issued["id"].as_str().unwrap().to_owned();
+        let token = format!("{node}.{}", "e".repeat(64));
+        runtime
+            .contributors
+            .enroll(
+                issued["code"].as_str().unwrap(),
+                enginebox_node_protocol::Enrollment {
+                    secret_hash: enginebox_core::state::digest(&json!(token)),
+                    budget: enginebox_node_protocol::Budget {
+                        cpu: 8,
+                        memory_gib: 32,
+                        disk_gib: 200,
+                    },
+                    os: "windows".into(),
+                    architecture: "x86_64".into(),
+                },
+            )
+            .unwrap();
+        let node_session = uuid::Uuid::new_v4().to_string();
+        let (_, hello) = call(
+            &app,
+            node_post("hello", &token, json!({"session":node_session})),
+        )
+        .await;
+        let epoch = hello["epoch"].clone();
+        let tools = json!({"worker_running":false,"engine":{"ready":true,"unity":["6000.6.5f1"],"running":0,
+            "forks":{"provider":"git","slots":3,"free_slots":3,"isolation":"accounts"}}});
+        let fence = json!({"session":node_session,"epoch":epoch});
+        let mut beat = fence.clone();
+        beat["tools"] = tools;
+        assert_eq!(
+            call(&app, node_post("heartbeat", &token, beat)).await.0,
+            StatusCode::OK
+        );
+        call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/credentials",
+                json!({"provider":"unity","kind":"personal","owner_user_id":ALICE,"username":"a@example.com","password":"right-password"}),
+                ALICE,
+            ),
+        )
+        .await;
+        call(
+            &app,
+            request(
+                Method::POST,
+                &format!("/v1/contributors/{node}/engine-owner"),
+                &json!({"member":ALICE}).to_string(),
+                true,
+            ),
+        )
+        .await;
+        let (status, created) = call(
+            &app,
+            as_member(
+                Method::POST,
+                "/v1/projects/qoh/engine-sessions",
+                json!({"request_id":"qoh-1","repository":"queen-of-hearts","ref":"main","project_path":"unity-project","engine":{"kind":"unity","version":"6000.6.5f1"}}),
+                ALICE,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let sid = created["id"].as_str().unwrap().to_owned();
+        let (_, polled) = call(&app, node_post("engine-poll", &token, fence.clone())).await;
+        let generation = polled["sessions"][0]["generation"].clone();
+        for state in ["preparing", "starting", "ready"] {
+            let mut report = fence.clone();
+            report["id"] = json!(sid);
+            report["generation"] = generation.clone();
+            report["state"] = json!(state);
+            assert_eq!(
+                call(&app, node_post("engine-report", &token, report))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        // The dev head rides on engine-report's detail.dev.
+        let base = "1".repeat(40);
+        let mut report = fence.clone();
+        report["id"] = json!(sid);
+        report["generation"] = generation.clone();
+        report["state"] = json!("ready");
+        report["detail"] =
+            json!({"dev":{"head":base,"applied":base,"compile":{"state":"ok","errors":[]}}});
+        let (status, reply) = call(&app, node_post("engine-report", &token, report)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        // The room owner's grant: agent forks, with the app's principal key.
+        let (_, key) = signing::keypair();
+        let ops = json!([
+            "agent_forks.create",
+            "agent_forks.get",
+            "agent_forks.list",
+            "agent_forks.run",
+            "agent_forks.submit",
+            "agent_forks.rebase",
+            "agent_forks.close",
+            "agent_forks.gateway",
+            "agent_forks.dev",
+            "agent_forks.review",
+            "agent_forks.revert",
+            "agent_forks.publish"
+        ]);
+        for bad in [
+            json!({"label":"x","scopes":[],"operations":ops,"agent_forks":[{"project":"qoh"}]}),
+            json!({"label":"x","scopes":[],"operations":ops,"agent_forks":[{"project":"qoh","client":"ebc_gamejam","principal_key":"short"}],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":ops,"agent_forks":[{"project":"qoh","principal_key":key}],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":ops,"agent_forks":[{"project":"qoh","return_origins":["http://x.example"]}],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":["agent_forks.get"],"member":ALICE}),
+        ] {
+            let (status, refused) = call(
+                &app,
+                request(Method::POST, "/v1/service-tokens", &bad.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {refused}");
+        }
+        let (token_id, grant) = mint(
+            &app,
+            json!({"label":"gamejam","scopes":[],"operations":ops,"project":"qoh","member":ALICE,
+                "agent_forks":[{"project":"qoh","client":"ebc_gamejam","principal_key":key,"return_origins":["https://gamejam.example"]}]}),
+        )
+        .await;
+        let (_, plain) = mint(
+            &app,
+            json!({"label":"plain","scopes":[],"operations":ops,"member":ALICE,"agent_forks":[{"project":"qoh"}]}),
+        )
+        .await;
+        let (pair, _) = signing::keypair();
+        let nonce = std::cell::Cell::new(0u32);
+        // A request as a room principal, signed like Gamejam Account does.
+        let signed = |method: Method, path: &str, body: Value, who: &str, role: &str| {
+            let body_text = if method == Method::GET || method == Method::DELETE {
+                String::new()
+            } else {
+                body.to_string()
+            };
+            let (bare, query) = path.split_once('?').unwrap_or((path, ""));
+            nonce.set(nonce.get() + 1);
+            let n = format!("nonce-{:016}", nonce.get());
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let headers = signing::sign(
+                &pair,
+                who,
+                role,
+                t,
+                &n,
+                &principal::Bound {
+                    method: method.as_str(),
+                    path: bare,
+                    query,
+                    body: body_text.as_bytes(),
+                    token_id: &token_id,
+                },
+            );
+            let mut r = request(method, path, &body_text, false);
+            r.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {grant}").parse().unwrap(),
+            );
+            for (k, v) in headers {
+                r.headers_mut().insert(k, v.parse().unwrap());
+            }
+            r
+        };
+        let as_grant = |method: Method, path: &str, body: Value, secret: &str| {
+            let mut r = request(method, path, &body.to_string(), false);
+            r.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {secret}").parse().unwrap(),
+            );
+            r
+        };
+        let forks = format!("/v1/projects/qoh/engine-sessions/{sid}/forks");
+        let fork_body =
+            json!({"request_id":"f1","prompt":"Make the cards glow","provider":"claude"});
+        // Bob has no xinf connection yet.
+        let (status, refused) = call(
+            &app,
+            signed(
+                Method::POST,
+                &forks,
+                fork_body.clone(),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "gateway_required");
+        // Bob connects his own Xava Inference account (OAuth, PKCE).
+        let (status, connect) = call(
+            &app,
+            signed(
+                Method::POST,
+                "/v1/projects/qoh/gateway/connect",
+                json!({"return_to":"https://gamejam.example/room/jam?tab=agent"}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{connect}");
+        let authorize = url::Url::parse(connect["authorize_url"].as_str().unwrap()).unwrap();
+        assert!(
+            authorize
+                .as_str()
+                .starts_with(&format!("{}/oauth/authorize?", xinf.url))
+        );
+        let state = authorize
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .to_string();
+        // return_to must be on the app's origins.
+        let (status, _) = call(
+            &app,
+            signed(
+                Method::POST,
+                "/v1/projects/qoh/gateway/connect",
+                json!({"return_to":"https://evil.example/"}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Only the dashboard (owner token) forwards the callback.
+        let callback = json!({"state":state,"code":agent_forks::gateway::fake::CODE});
+        assert_eq!(
+            call(
+                &app,
+                as_grant(
+                    Method::POST,
+                    "/v1/gateway/xinf/callback",
+                    callback.clone(),
+                    &grant
+                )
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, back) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/gateway/xinf/callback",
+                &callback.to_string(),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{back}");
+        assert_eq!(
+            back["return_to"],
+            "https://gamejam.example/room/jam?tab=agent&xinf=connected"
+        );
+        let (status, gw) = call(
+            &app,
+            signed(
+                Method::GET,
+                "/v1/projects/qoh/gateway",
+                json!({}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{gw}");
+        assert_eq!(gw["connected"], true);
+        assert_eq!(gw["balance_usd"], "12.500000000");
+        assert!(!gw.to_string().contains("xat_") && !gw.to_string().contains("xrt_"));
+        // Carol is not connected: her own connection only.
+        let (_, carol_gw) = call(
+            &app,
+            signed(
+                Method::GET,
+                "/v1/projects/qoh/gateway",
+                json!({}),
+                "gj:jam:carol",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(carol_gw["connected"], false);
+        // Now Bob's fork starts.
+        let (status, created) = call(
+            &app,
+            signed(
+                Method::POST,
+                &forks,
+                fork_body.clone(),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+        let fork = created["fork"]["id"].as_str().unwrap().to_owned();
+        // Replayed, forged, unsigned-role and misplaced assertions are refused.
+        let replay = signed(
+            Method::POST,
+            &forks,
+            fork_body.clone(),
+            "gj:jam:bob",
+            "builder",
+        );
+        let headers = replay.headers().clone();
+        assert_eq!(call(&app, replay).await.0, StatusCode::ACCEPTED);
+        let mut again = as_grant(Method::POST, &forks, fork_body.clone(), &grant);
+        for name in principal::HEADERS {
+            again.headers_mut().insert(name, headers[name].clone());
+        }
+        assert_eq!(call(&app, again).await.0, StatusCode::UNAUTHORIZED);
+        let mut tampered = signed(
+            Method::POST,
+            &forks,
+            fork_body.clone(),
+            "gj:jam:bob",
+            "builder",
+        );
+        tampered
+            .headers_mut()
+            .insert(principal::HEADER, "gj:jam:carol".parse().unwrap());
+        assert_eq!(call(&app, tampered).await.0, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(
+            &app,
+            signed(
+                Method::POST,
+                &forks,
+                json!({"request_id":"v","prompt":"p","provider":"codex"}),
+                "gj:jam:dora",
+                "viewer",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut elsewhere = signed(
+            Method::GET,
+            "/v1/projects/qoh/engine-sessions",
+            json!({}),
+            "gj:jam:bob",
+            "builder",
+        );
+        elsewhere.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", "x".repeat(32)).parse().unwrap(),
+        );
+        assert_eq!(call(&app, elsewhere).await.0, StatusCode::BAD_REQUEST);
+        // A connection without a principal key cannot vouch.
+        let mut unvouched = signed(Method::GET, &forks, json!({}), "gj:jam:bob", "builder");
+        unvouched.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {plain}").parse().unwrap(),
+        );
+        assert_eq!(call(&app, unvouched).await.0, StatusCode::FORBIDDEN);
+        // The node receives the run with Bob's short-lived xinf access token.
+        let (status, polled) = call(&app, node_post("engine-poll", &token, fence.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{polled}");
+        let row = &polled["sessions"][0];
+        assert_eq!(row["dev"]["capture_on_save"], true);
+        let fork_row = row["forks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == fork.as_str())
+            .unwrap()
+            .clone();
+        let run_op = fork_row["ops"][0].clone();
+        assert_eq!(run_op["kind"], "run");
+        assert_eq!(run_op["secrets"]["gateway"]["base_url"], xinf.url);
+        let bearer = run_op["secrets"]["gateway"]["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(bearer.starts_with("xat_"));
+        assert!(!polled.to_string().contains("xrt_"));
+        let fork_fence = |extra: Value| {
+            let mut b = fence.clone();
+            b["fork"] = json!(fork);
+            b["generation"] = generation.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+        let head = "2".repeat(40);
+        for report in [
+            fork_fence(json!({"state":"idle","detail":{"base":base}})),
+            fork_fence(json!({"op_id":run_op["op_id"],"state":"running"})),
+            fork_fence(
+                json!({"op_id":run_op["op_id"],"state":"done","detail":{"head":head,"changed":[{"path":"unity-project/Assets/Scripts/Glow.cs","status":"A","mode":100644,"bytes":120}],"run":{"spent_usd":0.3,"requests":4,"exit":0}}}),
+            ),
+        ] {
+            let (status, reply) = call(&app, node_post("fork-report", &token, report)).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+        }
+        let mut events = fork_fence(
+            json!({"run_id":run_op["run"]["run_id"],"events":[{"kind":"text","data":{"text":format!("token {bearer}")}}]}),
+        );
+        events.as_object_mut().unwrap().remove("generation");
+        assert_eq!(
+            call(&app, node_post("fork-events", &token, events)).await.0,
+            StatusCode::OK
+        );
+        let diff = "diff --git a/unity-project/Assets/Scripts/Glow.cs b/unity-project/Assets/Scripts/Glow.cs\n--- /dev/null\n+++ b/unity-project/Assets/Scripts/Glow.cs\n@@ -0,0 +1 @@\n+class Glow {}\n";
+        assert_eq!(
+            call(
+                &app,
+                node_post(
+                    "fork-artifact",
+                    &token,
+                    fork_fence(json!({"head":head,"kind":"diff","body":diff}))
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // A stale node epoch is refused.
+        let mut stale = fork_fence(json!({"state":"idle"}));
+        stale["epoch"] = json!(0);
+        assert_eq!(
+            call(&app, node_post("fork-report", &token, stale)).await.0,
+            StatusCode::CONFLICT
+        );
+        // Bob reads his fork, its transcript (redacted) and its diff.
+        let (status, view) = call(
+            &app,
+            signed(
+                Method::GET,
+                &format!("{forks}/{fork}"),
+                json!({}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["changed"][0]["class"], "code");
+        let run_id = run_op["run"]["run_id"].as_str().unwrap();
+        let (_, transcript) = call(
+            &app,
+            signed(
+                Method::GET,
+                &format!("{forks}/{fork}/runs/{run_id}/events?after=0"),
+                json!({}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(transcript["events"][0]["data"]["text"], "token [redacted]");
+        let response = app
+            .clone()
+            .oneshot(signed(
+                Method::GET,
+                &format!("{forks}/{fork}/diff?limit=100000"),
+                json!({}),
+                "gj:jam:bob",
+                "builder",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/x-diff; charset=utf-8"
+        );
+        let text = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&text).contains("class Glow"));
+        // Carol cannot see Bob's fork beyond its claim.
+        let (status, _) = call(
+            &app,
+            signed(
+                Method::GET,
+                &format!("{forks}/{fork}"),
+                json!({}),
+                "gj:jam:carol",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, listed) = call(
+            &app,
+            signed(Method::GET, &forks, json!({}), "gj:jam:carol", "builder"),
+        )
+        .await;
+        assert_eq!(listed["forks"][0]["owner"]["name"], "Ada Lövel");
+        assert!(listed["forks"][0].get("head").is_none());
+        // Submit: code waits for the room owner; Bob cannot approve.
+        let (status, sub) = call(
+            &app,
+            signed(
+                Method::POST,
+                &format!("{forks}/{fork}/submit"),
+                json!({"request_id":"s1","message":"Glow","expected_head":head}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{sub}");
+        let sub_id = sub["submission"]["id"].as_str().unwrap().to_owned();
+        let (_, polled) = call(&app, node_post("engine-poll", &token, fence.clone())).await;
+        let snapshot = polled["sessions"][0]["forks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == fork.as_str())
+            .unwrap()["ops"][0]
+            .clone();
+        assert_eq!(snapshot["kind"], "snapshot");
+        call(
+            &app,
+            node_post(
+                "fork-report",
+                &token,
+                fork_fence(
+                    json!({"op_id":snapshot["op_id"],"state":"done","detail":{"head":head}}),
+                ),
+            ),
+        )
+        .await;
+        let approve =
+            format!("/v1/projects/qoh/engine-sessions/{sid}/submissions/{sub_id}/approve");
+        let (status, _) = call(
+            &app,
+            signed(
+                Method::POST,
+                &approve,
+                json!({"request_id":"a1","expected_fork_head":head}),
+                "gj:jam:bob",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // The owner's own grant (no principal headers) approves.
+        let (status, approved) = call(
+            &app,
+            as_grant(
+                Method::POST,
+                &approve,
+                json!({"request_id":"a1","expected_fork_head":head}),
+                &grant,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{approved}");
+        assert_eq!(approved["submission"]["state"], "merging");
+        // Dev status is readable by room principals.
+        let (status, dev) = call(
+            &app,
+            signed(
+                Method::GET,
+                &format!("/v1/projects/qoh/engine-sessions/{sid}/dev"),
+                json!({}),
+                "gj:jam:carol",
+                "viewer",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dev}");
+        assert_eq!(dev["head"], base);
+        // Query parameters only where a route takes them.
+        let (status, _) = call(
+            &app,
+            as_grant(Method::GET, &format!("{forks}?bogus=1"), json!({}), &grant),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, all) = call(
+            &app,
+            request(Method::GET, &format!("{forks}?all=1"), "", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all["forks"][0]["id"], fork.as_str());
+        // A pasted key instead of OAuth: write-only; then disconnect.
+        let (status, put) = call(
+            &app,
+            signed(
+                Method::PUT,
+                "/v1/projects/qoh/gateway",
+                json!({"key":"xk_live_carols_key_0123456789abcdef"}),
+                "gj:jam:carol",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        assert_eq!(put["kind"], "key");
+        assert!(!put.to_string().contains("xk_live_carols"));
+        let (status, gone) = call(
+            &app,
+            signed(
+                Method::DELETE,
+                "/v1/projects/qoh/gateway",
+                json!({}),
+                "gj:jam:carol",
+                "builder",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{gone}");
+        assert_eq!(gone["removed"], true);
+        // No bearer or refresh token reached the state directory.
+        let state_dir = c.root.clone();
+        for needle in ["xat_g1_", "xrt_g1_", "xk_live_carols"] {
+            assert!(
+                files_contain(&state_dir, needle).is_empty(),
+                "{needle} reached disk"
             );
         }
     }

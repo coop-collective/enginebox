@@ -81,6 +81,8 @@ export function consentPage(opts: {
   mayApprove?: boolean;
   /** Projects whose engine sessions the approver can grant as themselves (the `engine-sessions` scope). */
   engineProjects?: string[];
+  /** Projects whose agent forks the approver can grant as themselves (the `agent-forks` scope). */
+  forkProjects?: string[];
   error?: string;
 }) {
   const agentRuns = opts.agentRuns ?? true;
@@ -131,9 +133,20 @@ export function consentPage(opts: {
         `<span class="muted">as you: on your own engine machine with your own Unity account</span></label>`,
     )
     .join("");
-  const any = (showAgentRuns && (opts.workspaces.length > 0 || pools.length > 0 || repositoryProjects.length > 0)) || engineProjects.length > 0;
+  const forkProjects = opts.forkProjects ?? [];
+  const forkList = forkProjects
+    .map(
+      (project) =>
+        `<label class="ws"><input type="checkbox" name="agent_forks" value="${escape(project)}"> Let room members run their own agents on forks of your live engine sessions in project <code>${escape(project)}</code></label>`,
+    )
+    .join("");
+  const any =
+    (showAgentRuns && (opts.workspaces.length > 0 || pools.length > 0 || repositoryProjects.length > 0)) || engineProjects.length > 0 || forkProjects.length > 0;
   const engineNote = engineProjects.length
     ? ` For engine sessions it acts as you: it can start, read, renew and end only your own sessions in the projects you tick (including their live stream and its controls), and hand out watch-only access to their stream (for example to viewers of a public room), never anyone else's.`
+    : "";
+  const forkNote = forkProjects.length
+    ? ` For agent forks it acts as you too: room members it names run their own agents, paid from their own gateway connection, on forks of your sessions in the projects you tick; their changes reach your session only through the review rules, and only you approve code.`
     : "";
   const agentRunSections = showAgentRuns
     ? (pools.length ? `<fieldset><legend>${poolLegend}</legend>${poolList}</fieldset>` : "") +
@@ -153,8 +166,9 @@ export function consentPage(opts: {
       (opts.error ? `<p class="warn" role="alert">${escape(opts.error)}</p>` : "") +
       `<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escape(opts.request)}">` +
       (engineProjects.length ? `<fieldset><legend>Live engine sessions it may run as you, by project</legend>${engineList}</fieldset>` : "") +
+      (forkProjects.length ? `<fieldset><legend>Agent forks of your live engine sessions, by project</legend>${forkList}</fieldset>` : "") +
       agentRunSections +
-      `<p class="muted">${scopeNote}${engineNote} You can disconnect it at any time from the dashboard.</p>` +
+      `<p class="muted">${scopeNote}${engineNote}${forkNote} You can disconnect it at any time from the dashboard.</p>` +
       `<div class="actions"><button type="submit" name="action" value="deny">Deny</button><button class="primary" type="submit" name="action" value="approve"${any ? "" : " disabled"}>Allow access</button></div></form>`,
     { formTarget: redirect.origin },
   );
