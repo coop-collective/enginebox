@@ -485,6 +485,30 @@ pub fn tools() -> Vec<Value> {
             &["project", "name", "repo_profile", "requirement"],
         ),
         tool(
+            "automation_list",
+            "List a repository's automations: the .enginebox/automations/*.yml files on its default branch as Engine Box last read them, each with its triggers (UTC cron, push branches and paths, manual), model tier, runners, push branch prefix, next scheduled time, last run, or the validation error that keeps it from running.",
+            json!({"project":{"type":"string"},"name":{"type":"string"}}),
+            &["project", "name"],
+        ),
+        tool(
+            "automation_get",
+            "Read one repository automation and its recent runs (newest first): trigger, status, run id, pool, provider, model, the branch it may push and whether it was pushed, token usage and duration.",
+            json!({"project":{"type":"string"},"name":{"type":"string"},"automation":{"type":"string"}}),
+            &["project", "name", "automation"],
+        ),
+        tool(
+            "automation_runs",
+            "Read every recorded automation run of a repository, newest first.",
+            json!({"project":{"type":"string"},"name":{"type":"string"}}),
+            &["project", "name"],
+        ),
+        tool(
+            "automation_run",
+            "Run a repository automation now (needs write access to the project's repositories). The default branch is re-read first. A repeated key returns the same run instead of starting another; while the automation has an active run the request waits (concurrency: queue) or is skipped (concurrency: skip).",
+            json!({"project":{"type":"string"},"name":{"type":"string"},"automation":{"type":"string"},"key":{"type":"string","pattern":"^[A-Za-z0-9._:-]{1,128}$"}}),
+            &["project", "name", "automation"],
+        ),
+        tool(
             "catalog_apply",
             "Owner/admin: make the org's connections and profiles match a declarative catalog document (schema enginebox.catalog/v1; secret references only, never values). Idempotent. dry_run returns the diff without writing; prune deletes records the document does not mention. Audited.",
             json!({"document":{"type":"object"},"dry_run":{"type":"boolean"},"prune":{"type":"boolean"}}),
@@ -626,6 +650,40 @@ pub fn tool_request(name: &str, args: &Value) -> Result<(String, Option<Value>)>
                 "repo_requirements_get" => (format!("{base}/requirements"), None),
                 "repo_config_register" => (format!("{base}/agent-config"), Some(body)),
                 _ => (format!("{base}/requirements/propose"), Some(body)),
+            }
+        }
+        "automation_list" | "automation_get" | "automation_runs" | "automation_run" => {
+            let base = format!(
+                "/v1/projects/{}/repositories/{}",
+                storage_id(args, "project")?,
+                repository_name(field(args, "name")?)?
+            );
+            let automation = || -> Result<String> {
+                let id = field(args, "automation")?;
+                ensure!(
+                    (1..=48).contains(&id.len())
+                        && id.as_bytes()[0].is_ascii_alphanumeric()
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                    "Invalid automation ID"
+                );
+                Ok(id.to_owned())
+            };
+            match name {
+                "automation_list" => (format!("{base}/automations"), None),
+                "automation_runs" => (format!("{base}/automation-runs"), None),
+                "automation_get" => (format!("{base}/automations/{}", automation()?), None),
+                _ => {
+                    let mut body = json!({});
+                    if let Some(key) = args.get("key") {
+                        body["key"] = key.clone();
+                    }
+                    (
+                        format!("{base}/automations/{}/run", automation()?),
+                        Some(body),
+                    )
+                }
             }
         }
         "github_actions_secret_set" => {
@@ -1164,6 +1222,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, "/v1/projects/alpha/repositories/site/requirements");
+        let (path, body) = tool_request(
+            "automation_run",
+            &json!({"project":"alpha","name":"site","automation":"docs-steward","key":"k1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            "/v1/projects/alpha/repositories/site/automations/docs-steward/run"
+        );
+        assert_eq!(body.unwrap(), json!({"key":"k1"}));
+        let (path, body) = tool_request(
+            "automation_get",
+            &json!({"project":"alpha","name":"site","automation":"docs-steward"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (path.as_str(), body),
+            (
+                "/v1/projects/alpha/repositories/site/automations/docs-steward",
+                None
+            )
+        );
+        assert!(
+            tool_request(
+                "automation_get",
+                &json!({"project":"alpha","name":"site","automation":"../x"})
+            )
+            .is_err()
+        );
         // There is no approve tool: approval is an owner/admin action in the dashboard or API.
         assert!(tool_request("repo_requirement_approve", &json!({})).is_err());
         assert!(tool_request("profile_get", &json!({"profile":"Coder"})).is_err());
@@ -1307,7 +1394,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            58
+            62
         );
     }
     #[test]
