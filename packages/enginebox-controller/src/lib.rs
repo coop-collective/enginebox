@@ -1,5 +1,7 @@
 //! Authenticated fleet API, durable jobs and exclusive controller ownership.
 pub mod audit;
+mod automation_runs;
+pub mod automations;
 pub mod callbacks;
 pub mod catalog;
 pub mod ci;
@@ -78,6 +80,7 @@ struct Runtime {
     catalog: catalog::Catalog,
     repo_config: repo_config::RepoRequirements,
     generations: repo_generate::Generations,
+    automations: automation_runs::Engine,
     previews: previews::Previews,
     repositories: repositories::Repositories,
     tenancy: tenancy::Tenancy,
@@ -121,6 +124,10 @@ pub struct Controller {
     moq_api: Mutex<Option<String>>,
     /// Test harnesses stand in for Cloudflare's TURN API (turn.rs).
     turn_api: Mutex<Option<String>>,
+    /// Test harnesses stand in for git reads of automation files.
+    automation_source: Mutex<Option<Arc<dyn automation_runs::Source>>>,
+    /// Whether an automation sweep is running (sweeps never overlap).
+    automation_sweeping: std::sync::atomic::AtomicBool,
 }
 
 struct Admission(Arc<Controller>);
@@ -160,6 +167,8 @@ impl Controller {
             unity_login: Mutex::new(None),
             moq_api: Mutex::new(None),
             turn_api: Mutex::new(None),
+            automation_source: Mutex::new(None),
+            automation_sweeping: std::sync::atomic::AtomicBool::new(false),
         }))
     }
     /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
@@ -233,6 +242,10 @@ impl Controller {
             catalog,
             repo_config: repo_config::RepoRequirements::open(&self.root)?,
             generations: repo_generate::Generations::open(&self.root),
+            automations: automation_runs::Engine::new(
+                &self.root,
+                self.automation_source.lock().unwrap().clone(),
+            ),
             previews: match self.preview_api.lock().unwrap().clone() {
                 Some((api, host)) => previews::Previews::with_api(api, &host),
                 None => previews::Previews::from_env().unwrap_or_else(|error| {
@@ -365,6 +378,33 @@ impl Controller {
     pub fn set_moq_api_url(&self, url: &str) {
         *self.moq_api.lock().unwrap() = Some(url.to_owned());
     }
+    /// Stand in for git reads of automation files. Takes effect at the next activation.
+    #[doc(hidden)]
+    pub fn set_automation_source(&self, source: Arc<dyn automation_runs::Source>) {
+        *self.automation_source.lock().unwrap() = Some(source);
+    }
+    /// One automation sweep (docs/PROJECT-CONFIG.md, "Automations"): read
+    /// moved default branch heads, fire due schedules and pushes, settle runs.
+    /// Only the active owner sweeps, and a drain waits for a sweep to finish.
+    pub async fn automation_sweep(self: &Arc<Self>, now: chrono::DateTime<chrono::Utc>) {
+        use std::sync::atomic::Ordering;
+        let runtime = {
+            let mut g = self.gate.lock().unwrap();
+            if g.mode != Mode::Active {
+                return;
+            }
+            g.background += 1;
+            g.runtime.clone()
+        };
+        if let Some(runtime) = runtime
+            && !self.automation_sweeping.swap(true, Ordering::AcqRel)
+        {
+            let engine = runtime.automations.clone();
+            automation_runs::sweep(&runtime, &engine, now).await;
+            self.automation_sweeping.store(false, Ordering::Release);
+        }
+        self.gate.lock().unwrap().background -= 1;
+    }
     /// Stand in for Cloudflare's TURN API base. Takes effect at the next activation.
     #[doc(hidden)]
     pub fn set_turn_api_url(&self, url: &str) {
@@ -479,6 +519,15 @@ impl Controller {
                 })
                 .await;
                 this.gate.lock().unwrap().background -= 1;
+                // Automations sweep on their own task so a slow repository
+                // read never delays fleet reconciliation; sweeps never overlap.
+                if !this
+                    .automation_sweeping
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let sweeper = this.clone();
+                    tokio::spawn(async move { sweeper.automation_sweep(chrono::Utc::now()).await });
+                }
             }
         })
     }
@@ -707,6 +756,57 @@ fn service_allows(
         (&Method::GET, ["v1", "projects", project, "repositories", _, "previews", _]) => {
             token.repository_access(project).is_some()
         }
+        // Automations: any grant reads files and runs; a write grant runs
+        // one now or re-reads the files.
+        (&Method::GET, ["v1", "projects", project, "repositories", _, "automations"])
+        | (
+            &Method::GET,
+            [
+                "v1",
+                "projects",
+                project,
+                "repositories",
+                _,
+                "automations",
+                _,
+            ],
+        )
+        | (
+            &Method::GET,
+            [
+                "v1",
+                "projects",
+                project,
+                "repositories",
+                _,
+                "automation-runs",
+            ],
+        ) => token.repository_access(project).is_some(),
+        (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "repositories",
+                _,
+                "automations",
+                "refresh",
+            ],
+        )
+        | (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "repositories",
+                _,
+                "automations",
+                _,
+                "run",
+            ],
+        ) => token.repository_access(project) == Some(repositories::Access::Write),
         _ => false,
     }
 }
@@ -1394,6 +1494,40 @@ fn read(
             report["previews_configured"] = json!(runtime.previews.configured());
             report["generation"] = json!(generation(&runtime, org, project, name));
             Ok(report)
+        }
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "automations",
+        ] => {
+            let runtime = c.runtime()?;
+            automation_runs::list(&runtime, &runtime.automations, org, project, name)
+        }
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "automations",
+            id,
+        ] => {
+            let runtime = c.runtime()?;
+            automation_runs::get(&runtime, &runtime.automations, org, project, name, id)
+        }
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "automation-runs",
+        ] => {
+            let runtime = c.runtime()?;
+            automation_runs::runs(&runtime, &runtime.automations, org, project, name)
         }
         [
             "v1",
@@ -2276,6 +2410,40 @@ async fn write(
     {
         let runtime = c.runtime()?;
         return generate_config(&runtime, &org, &actor, &principal, project, name, body).await;
+    }
+    if let Some((project, name, id)) = match routed.as_slice() {
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "automations",
+            "refresh",
+        ] => Some((project.to_string(), name.to_string(), None)),
+        [
+            "v1",
+            "projects",
+            project,
+            "repositories",
+            name,
+            "automations",
+            id,
+            "run",
+        ] => Some((project.to_string(), name.to_string(), Some(id.to_string()))),
+        _ => None,
+    } {
+        let runtime = c.runtime()?;
+        return Ok(automation_runs::write(
+            &runtime,
+            &org,
+            &actor,
+            &project,
+            &name,
+            id.as_deref(),
+            &body,
+        )
+        .await);
     }
     if let [
         "v1",
@@ -3211,9 +3379,14 @@ async fn github_webhook(c: Arc<Controller>, request: Request<Body>) -> Response 
     };
     let result = admitted(admission, async move {
         blocking(move || {
-            c.runtime()?
-                .github
-                .webhook(&kind, &event, &signature, &body)
+            let runtime = c.runtime()?;
+            let value = runtime.github.webhook(&kind, &event, &signature, &body)?;
+            // A verified push re-reads that repository's automations at the
+            // next sweep and fires push triggers on other branches.
+            if kind == "repos" && event == "push" {
+                automation_push(&runtime, &body);
+            }
+            Ok(value)
         })
         .await
     })
@@ -3224,6 +3397,20 @@ async fn github_webhook(c: Arc<Controller>, request: Request<Body>) -> Response 
             StatusCode::BAD_REQUEST,
             "Webhook rejected; check signature, installation, payload and inbox capacity.",
         ),
+    }
+}
+
+/// Queue a verified GitHub push for the automation sweep.
+fn automation_push(runtime: &Runtime, body: &[u8]) {
+    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    let Some((full_name, mut event)) = automation_runs::github_push(&payload) else {
+        return;
+    };
+    if let Some(repository) = automation_runs::github_repository(runtime, &full_name) {
+        event.repository = repository;
+        runtime.automations.nudge(event);
     }
 }
 
@@ -6152,6 +6339,284 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    }
+
+    /// A stand-in repository for automation reads: a head commit, its files
+    /// and the paths changed since the previous head.
+    /// (head commit, files, paths changed since the previous head)
+    type FakeHead = (String, Vec<(String, String)>, Option<Vec<String>>);
+    #[derive(Default)]
+    struct FakeAutomationRepo {
+        head: Mutex<FakeHead>,
+        branches: Mutex<Vec<String>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    impl automation_runs::Source for FakeAutomationRepo {
+        fn read(
+            &self,
+            credential: &enginebox_agents::repository::Credential,
+            known: Option<&str>,
+        ) -> Result<Option<repo_source::Automations>> {
+            assert!(!credential.token.is_empty());
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (commit, files, changed) = self.head.lock().unwrap().clone();
+            if known == Some(commit.as_str()) {
+                return Ok(None);
+            }
+            Ok(Some(repo_source::Automations {
+                commit,
+                files,
+                changed: known.and(changed),
+            }))
+        }
+        fn branch_exists(
+            &self,
+            _: &enginebox_agents::repository::Credential,
+            branch: &str,
+        ) -> Result<bool> {
+            Ok(self.branches.lock().unwrap().iter().any(|b| b == branch))
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_automations_fire_once_per_trigger_and_record_their_runs() {
+        const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let (_temp, c) = setup();
+        let api = repositories::mock::FakeGateway::new(ACCOUNT, &["eb-alpha"]);
+        c.set_repository_transport(api.clone());
+        let source = Arc::new(FakeAutomationRepo::default());
+        let steward = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/automations/docs-steward.yml"),
+        )
+        .unwrap();
+        *source.head.lock().unwrap() = (
+            "a".repeat(40),
+            vec![
+                (".enginebox/automations/docs-steward.yml".into(), steward),
+                (
+                    ".enginebox/automations/broken.yml".into(),
+                    "prompt: x\nwhen: now\n".into(),
+                ),
+            ],
+            None,
+        );
+        c.set_automation_source(source.clone());
+        let app = router(c.clone());
+        queue_fixture(&c);
+        let post = |path: &str, body: Value| request(Method::POST, path, &body.to_string(), true);
+        let config = json!({"url":repositories::mock::URL,"namespace_prefix":"eb","secret":repositories::mock::SECRET}).to_string();
+        call(
+            &app,
+            request(
+                Method::PUT,
+                "/v1/repository-backends/artifacts-worker",
+                &config,
+                true,
+            ),
+        )
+        .await;
+        call(&app, post("/v1/pools", json!({"name":"alpha-w","project":"alpha","workspaces":[{"host_id":"worker","name":"ebox-p1"}]}))).await;
+        call(
+            &app,
+            post("/v1/projects/alpha/repositories", json!({"name":"site"})),
+        )
+        .await;
+        let base = "/v1/projects/alpha/repositories/site";
+
+        // Startup: the first sweep reads the files and fires nothing.
+        c.automation_sweep(at("2026-11-09T05:58:00Z")).await;
+        let (status, listed) = call(
+            &app,
+            request(Method::GET, &format!("{base}/automations"), "", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let automations = listed["automations"].as_array().unwrap();
+        assert_eq!(automations.len(), 2, "{listed}");
+        assert_eq!(automations[0]["id"], "broken");
+        assert_eq!(automations[0]["valid"], false);
+        assert!(
+            automations[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown key when")
+        );
+        assert_eq!(automations[1]["id"], "docs-steward");
+        assert_eq!(automations[1]["model"], json!({"tier":"basic"}));
+        assert_eq!(
+            automations[1]["next_scheduled_at"],
+            "2026-11-09T06:00:00+00:00"
+        );
+        assert!(automations[1]["last_run"].is_null());
+
+        // The Monday 06:00 UTC slot fires once, however many sweeps see it.
+        c.automation_sweep(at("2026-11-09T06:00:10Z")).await;
+        c.automation_sweep(at("2026-11-09T06:00:40Z")).await;
+        let (_, history) = call(
+            &app,
+            request(Method::GET, &format!("{base}/automation-runs"), "", true),
+        )
+        .await;
+        let runs = history["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1, "{history}");
+        let first = &runs[0];
+        assert_eq!(first["status"], "queued", "{first}");
+        assert_eq!(first["trigger"]["kind"], "schedule");
+        assert_eq!(first["provider"], "claude");
+        assert_eq!(first["model"], "haiku");
+        assert_eq!(first["pool"], "alpha-w");
+        assert_eq!(first["branch"], "automation/docs-steward/2026-11-09");
+        let run_id = first["run_id"].as_str().unwrap().to_owned();
+        let (_, native) = call(
+            &app,
+            request(
+                Method::GET,
+                &format!("/v1/pools/alpha-w/agent-runs/{run_id}"),
+                "",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(native["run"]["repository"], "alpha/site", "{native}");
+        let task = native["run"]["task"].as_str().unwrap();
+        // The run record keeps a short task summary; the full prompt is
+        // covered by automations::tests.
+        assert!(
+            task.starts_with("You are running the Engine Box automation \"Docs steward\""),
+            "{task}"
+        );
+
+        // Run now while that run is active: it waits (concurrency: queue);
+        // the same key replays the same firing.
+        let run_now = format!("{base}/automations/docs-steward/run");
+        assert_eq!(
+            call(&app, post(&run_now, json!({"prompt":"x"}))).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, manual) = call(&app, post(&run_now, json!({"key":"once-1"}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{manual}");
+        assert_eq!(manual["run"]["status"], "pending");
+        let (status, again) = call(&app, post(&run_now, json!({"key":"once-1"}))).await;
+        assert_eq!(
+            (status, again["replayed"].as_bool()),
+            (StatusCode::OK, Some(true))
+        );
+        assert_eq!(
+            call(
+                &app,
+                post(&format!("{base}/automations/broken/run"), json!({}))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+
+        // The first run ends (with its branch pushed); the waiting one starts.
+        source
+            .branches
+            .lock()
+            .unwrap()
+            .push("automation/docs-steward/2026-11-09".into());
+        call(
+            &app,
+            post(
+                &format!("/v1/pools/alpha-w/agent-runs/{run_id}/cancel"),
+                json!({}),
+            ),
+        )
+        .await;
+        c.automation_sweep(at("2026-11-09T06:01:30Z")).await;
+        let (_, detail) = call(
+            &app,
+            request(
+                Method::GET,
+                &format!("{base}/automations/docs-steward"),
+                "",
+                true,
+            ),
+        )
+        .await;
+        let runs = detail["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2, "{detail}");
+        assert_eq!(runs[1]["status"], "cancelled", "{detail}");
+        assert_eq!(runs[1]["branch_pushed"], true);
+        assert_eq!(runs[0]["trigger"]["kind"], "manual");
+        assert_eq!(runs[0]["status"], "queued", "{detail}");
+        assert_eq!(runs[0]["branch"], "automation/docs-steward/2026-11-09-2");
+
+        // A push to main touching docs/** fires; one touching only code does not.
+        let second = runs[0]["run_id"].as_str().unwrap().to_owned();
+        call(
+            &app,
+            post(
+                &format!("/v1/pools/alpha-w/agent-runs/{second}/cancel"),
+                json!({}),
+            ),
+        )
+        .await;
+        {
+            let mut head = source.head.lock().unwrap();
+            head.0 = "b".repeat(40);
+            head.2 = Some(vec!["src/main.rs".into()]);
+        }
+        c.automation_sweep(at("2026-11-09T06:10:00Z")).await;
+        // Repositories with push triggers are read at most once a minute.
+        let reads = source.reads.load(std::sync::atomic::Ordering::SeqCst);
+        c.automation_sweep(at("2026-11-09T06:10:20Z")).await;
+        assert_eq!(
+            source.reads.load(std::sync::atomic::Ordering::SeqCst),
+            reads
+        );
+        let (_, history) = call(
+            &app,
+            request(Method::GET, &format!("{base}/automation-runs"), "", true),
+        )
+        .await;
+        assert_eq!(history["runs"].as_array().unwrap().len(), 2, "{history}");
+        {
+            let mut head = source.head.lock().unwrap();
+            head.0 = "c".repeat(40);
+            head.2 = Some(vec!["docs/guide.md".into()]);
+        }
+        // A manual re-read keeps the old head, so the sweep still fires the push.
+        let (status, refreshed) = call(
+            &app,
+            post(&format!("{base}/automations/refresh"), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        c.automation_sweep(at("2026-11-09T06:20:00Z")).await;
+        let (_, history) = call(
+            &app,
+            request(Method::GET, &format!("{base}/automation-runs"), "", true),
+        )
+        .await;
+        let runs = history["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 3, "{history}");
+        assert_eq!(runs[0]["trigger"]["kind"], "push");
+        assert_eq!(runs[0]["trigger"]["commit"], "c".repeat(40));
+        assert_eq!(runs[0]["trigger"]["paths"], json!(["docs/guide.md"]));
+        assert_eq!(runs[0]["commit"], "c".repeat(40));
+
+        // Another org sees no such repository; a read-only service token cannot run one.
+        let (status, _) = call(
+            &app,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{base}/automations"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", "x".repeat(32)))
+                .header(tenancy::ORG_HEADER, "org_0123456789abcdef01234567")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

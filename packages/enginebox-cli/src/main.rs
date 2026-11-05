@@ -138,6 +138,12 @@ enum Commands {
         #[command(subcommand)]
         command: CatalogCommand,
     },
+    /// Repository automations: `.enginebox/automations/*.yml` on the default
+    /// branch, run by the controller (docs/PROJECT-CONFIG.md, "Automations").
+    Automations {
+        #[command(subcommand)]
+        command: AutomationCommand,
+    },
     /// Run a named fleet MCP tool with JSON arguments from stdin.
     Tool {
         name: String,
@@ -159,6 +165,25 @@ enum CatalogCommand {
         /// Also delete connections and profiles the file does not mention.
         #[arg(long)]
         prune: bool,
+    },
+}
+#[derive(Subcommand)]
+enum AutomationCommand {
+    /// List a repository's automations (REPOSITORY is <project>/<name>).
+    List { repository: String },
+    /// Show one automation and its recent runs.
+    Get {
+        repository: String,
+        automation: String,
+    },
+    /// Show every recorded run of the repository's automations.
+    Runs { repository: String },
+    /// Run an automation now; a repeated --key returns the same run.
+    Run {
+        repository: String,
+        automation: String,
+        #[arg(long)]
+        key: Option<String>,
     },
 }
 fn companion(binary: &str, args: &[String]) -> Result<()> {
@@ -310,6 +335,48 @@ fn main() -> Result<()> {
                 .fleet_host
                 .context("Set --fleet-host or ENGINEBOX_FLEET_HOST for ACP")?;
             return enginebox_cli::acp::run(enginebox_cli::FleetClient::from_env()?, host, options);
+        }
+        Commands::Automations { command } => {
+            let split = |r: &str| -> Result<(String, String)> {
+                let (project, name) = r
+                    .split_once('/')
+                    .context("REPOSITORY is <project>/<name>")?;
+                Ok((project.to_owned(), name.to_owned()))
+            };
+            let (tool, args) = match command {
+                AutomationCommand::List { repository } => {
+                    let (project, name) = split(&repository)?;
+                    ("automation_list", json!({"project":project,"name":name}))
+                }
+                AutomationCommand::Runs { repository } => {
+                    let (project, name) = split(&repository)?;
+                    ("automation_runs", json!({"project":project,"name":name}))
+                }
+                AutomationCommand::Get {
+                    repository,
+                    automation,
+                } => {
+                    let (project, name) = split(&repository)?;
+                    (
+                        "automation_get",
+                        json!({"project":project,"name":name,"automation":automation}),
+                    )
+                }
+                AutomationCommand::Run {
+                    repository,
+                    automation,
+                    key,
+                } => {
+                    let (project, name) = split(&repository)?;
+                    let mut args = json!({"project":project,"name":name,"automation":automation});
+                    if let Some(key) = key {
+                        args["key"] = json!(key);
+                    }
+                    ("automation_run", args)
+                }
+            };
+            let (path, body) = enginebox_cli::tool_request(tool, &args)?;
+            return output(enginebox_cli::FleetClient::from_env()?.request(&path, body)?);
         }
         Commands::Tool { name } => {
             let (path, body) = enginebox_cli::tool_request(&name, &input()?)?;

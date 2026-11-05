@@ -151,10 +151,235 @@ pub fn read(credential: &repository::Credential, known: Option<&str>) -> Result<
     })
 }
 
+/// The automation files at a default branch head and what changed since the
+/// commit the caller last read (docs/PROJECT-CONFIG.md, "Automations").
+#[derive(Debug, PartialEq)]
+pub struct Automations {
+    pub commit: String,
+    /// `(path, contents)` of each `.enginebox/automations/*.yml|yaml`.
+    pub files: Vec<(String, String)>,
+    /// Paths changed between the known commit and `commit`; None when there
+    /// was no known commit or it could not be fetched (a force push).
+    pub changed: Option<Vec<String>>,
+}
+
+/// Most changed paths read for push filters; more counts as "unknown".
+const MAX_CHANGED: usize = 5000;
+
+/// Read the default branch head's automation files when the head differs
+/// from `known` (None when it does not).
+pub fn read_automations(
+    credential: &repository::Credential,
+    known: Option<&str>,
+) -> Result<Option<Automations>> {
+    use crate::automations::{DIR, MAX_FILE_BYTES, MAX_FILES, id_of};
+    let dir = tempfile::tempdir().context("Could not create a scratch directory")?;
+    let env = git_env(credential, dir.path());
+    let branch = format!("refs/heads/{}", credential.default_branch);
+    let listed = ok(
+        git(
+            &env,
+            dir.path(),
+            &["ls-remote", "--", &credential.remote, &branch],
+        )?,
+        "ls-remote",
+    )?;
+    let Some(head) = listed.lines().find_map(|l| {
+        l.split_once('\t')
+            .filter(|(_, r)| *r == branch)
+            .map(|(s, _)| s.to_owned())
+    }) else {
+        bail!("The default branch has no commits");
+    };
+    if known == Some(head.as_str()) {
+        return Ok(None);
+    }
+    ok(git(&env, dir.path(), &["init", "-q"])?, "init")?;
+    ok(
+        git(
+            &env,
+            dir.path(),
+            &["remote", "add", "origin", &credential.remote],
+        )?,
+        "remote add",
+    )?;
+    ok(
+        git(
+            &env,
+            dir.path(),
+            &[
+                "fetch",
+                "-q",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-tags",
+                "origin",
+                &format!("+{branch}:refs/remotes/origin/head"),
+            ],
+        )?,
+        "fetch",
+    )?;
+    let commit = ok(
+        git(&env, dir.path(), &["rev-parse", "refs/remotes/origin/head"])?,
+        "rev-parse",
+    )?
+    .trim()
+    .to_owned();
+    let tree = git(
+        &env,
+        dir.path(),
+        &["ls-tree", "-z", "--full-tree", &commit, &format!("{DIR}/")],
+    )?;
+    let mut files = Vec::new();
+    if tree.exit_code == 0 {
+        for entry in tree.output.split('\0').filter(|e| !e.is_empty()) {
+            // `<mode> <type> <object>\t<path>`: regular files only.
+            let Some((meta, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            if !meta.starts_with("100644 blob") || id_of(path).is_none() {
+                continue;
+            }
+            ensure!(
+                files.len() < MAX_FILES,
+                "More than {MAX_FILES} automation files in {DIR}"
+            );
+            let object = format!("{commit}:{path}");
+            let size = ok(
+                git(&env, dir.path(), &["cat-file", "-s", &object])?,
+                "cat-file",
+            )?;
+            let text = if size.trim().parse::<usize>().unwrap_or(usize::MAX) > MAX_FILE_BYTES {
+                // Parsed as an error by the caller, without reading it.
+                format!(
+                    "# larger than {MAX_FILE_BYTES} bytes\n{}",
+                    "#".repeat(MAX_FILE_BYTES)
+                )
+            } else {
+                ok(git(&env, dir.path(), &["show", &object])?, "show")?
+            };
+            files.push((path.to_owned(), text));
+        }
+    }
+    let changed = known.and_then(|old| {
+        let valid = (40..=64).contains(&old.len()) && old.bytes().all(|b| b.is_ascii_hexdigit());
+        if !valid {
+            return None;
+        }
+        let fetched = git(
+            &env,
+            dir.path(),
+            &[
+                "fetch",
+                "-q",
+                "--depth=1",
+                "--filter=blob:none",
+                "--no-tags",
+                "origin",
+                old,
+            ],
+        )
+        .ok()?;
+        if fetched.exit_code != 0 {
+            return None;
+        }
+        let diff = git(
+            &env,
+            dir.path(),
+            &["diff", "--name-only", "-z", "--no-renames", old, &commit],
+        )
+        .ok()?;
+        if diff.exit_code != 0 || diff.output_truncated {
+            return None;
+        }
+        let paths: Vec<String> = diff
+            .output
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (paths.len() <= MAX_CHANGED).then_some(paths)
+    });
+    Ok(Some(Automations {
+        commit,
+        files,
+        changed,
+    }))
+}
+
+/// Whether `branch` exists on the remote.
+pub fn branch_exists(credential: &repository::Credential, branch: &str) -> Result<bool> {
+    ensure!(repository::valid_branch(branch), "Invalid branch");
+    let dir = tempfile::tempdir().context("Could not create a scratch directory")?;
+    let env = git_env(credential, dir.path());
+    let reference = format!("refs/heads/{branch}");
+    let listed = ok(
+        git(
+            &env,
+            dir.path(),
+            &["ls-remote", "--", &credential.remote, &reference],
+        )?,
+        "ls-remote",
+    )?;
+    Ok(listed
+        .lines()
+        .any(|l| l.split_once('\t').is_some_and(|(_, r)| r == reference)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn reads_automation_files_and_the_paths_a_push_changed() {
+        let t = tempfile::tempdir().unwrap();
+        let work = t.path().join("work");
+        std::fs::create_dir_all(work.join(".enginebox/automations")).unwrap();
+        std::fs::create_dir_all(work.join("docs")).unwrap();
+        sh(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("README"), "x").unwrap();
+        std::fs::write(
+            work.join(".enginebox/automations/tidy.yml"),
+            "prompt: tidy\non: {manual: true}\n",
+        )
+        .unwrap();
+        std::fs::write(work.join(".enginebox/automations/notes.txt"), "ignored").unwrap();
+        sh(&work, &["add", "."]);
+        sh(&work, &["commit", "-q", "-m", "one"]);
+        sh(t.path(), &["clone", "-q", "--bare", "work", "remote.git"]);
+        let remote = t.path().join("remote.git");
+        let cred = credential(&remote);
+
+        let first = read_automations(&cred, None).unwrap().unwrap();
+        assert_eq!(first.changed, None);
+        assert_eq!(
+            first.files,
+            vec![(
+                ".enginebox/automations/tidy.yml".to_owned(),
+                "prompt: tidy\non: {manual: true}\n".to_owned()
+            )]
+        );
+        assert_eq!(read_automations(&cred, Some(&first.commit)).unwrap(), None);
+
+        std::fs::write(work.join("docs/a.md"), "doc").unwrap();
+        sh(&work, &["add", "."]);
+        sh(&work, &["commit", "-q", "-m", "two"]);
+        sh(&work, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        let second = read_automations(&cred, Some(&first.commit))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.changed, Some(vec!["docs/a.md".to_owned()]));
+        assert_eq!(second.files.len(), 1);
+        // An unknown previous commit (history rewritten) leaves the paths unknown.
+        let third = read_automations(&cred, Some(&"0".repeat(40)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.changed, None);
+
+        assert!(branch_exists(&cred, "main").unwrap());
+        assert!(!branch_exists(&cred, "automation/x/2026-11-09").unwrap());
+    }
 
     fn sh(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")

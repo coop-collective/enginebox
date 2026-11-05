@@ -1,0 +1,27 @@
+# Copy to .enginebox/automations/docs-steward.yml on the default branch.
+# Engine Box reads it there and runs it; see docs/PROJECT-CONFIG.md, "Automations".
+name: Docs steward
+description: Keeps docs/ tidy and lists prose that contradicts the decisions in docs/decisions/.
+model: basic                 # tier: basic | standard | hard (or one provider's exact model)
+runners: [claude, codex]     # providers, in order of preference
+timeout-minutes: 30
+concurrency: queue           # one run at a time; a firing during a run waits (skip drops it)
+on:
+  schedule:
+    - cron: "0 6 * * 1"      # Mondays 06:00 UTC
+  push:
+    branches: [main]
+    paths: ["docs/**"]
+  manual: true               # "run now" (the default)
+push:
+  branch-prefix: automation/docs-steward/   # the run pushes automation/docs-steward/<date>
+prompt: |
+  Tidy the docs/ directory without changing what it says:
+  - fix broken relative links, headings out of order, stray whitespace and obvious typos;
+  - keep every file's meaning; do not delete content or rewrite decisions.
+  Then read every record in docs/decisions/ and list each place in docs/ (outside
+  docs/decisions/) whose prose contradicts a decision: the file and line, the sentence,
+  and the decision it contradicts. Write that list to docs/CONTRADICTIONS.md (replace
+  the file; write "No contradictions found." when there are none). Do not edit the
+  contradicting prose yourself.
+  Commit on the branch you were given and push it only if something changed.

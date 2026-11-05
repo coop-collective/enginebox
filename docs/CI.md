@@ -169,7 +169,10 @@ Both runners use a versioned JSON envelope:
 ```
 
 `event` is `merge`, `workflow_dispatch`, or `schedule`. These values identify the
-caller; the API does not create schedules or watch repositories. A merge publisher
+caller; the CI API does not create schedules or watch repositories. (Agent
+automations a repository defines in `.enginebox/automations/*.yml` are scheduled
+and triggered by the controller itself; see
+[PROJECT-CONFIG.md](PROJECT-CONFIG.md#automations).) A merge publisher
 should submit only after it has committed/published the intended merge result,
 using its exact SHA and a stable identity per event/job. Multiple jobs get separate
 identities. Deliver retries with identical content. Unknown fields are rejected.

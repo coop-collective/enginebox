@@ -296,6 +296,122 @@ read-only token source, and `deploy` / `CLOUDFLARE_API_TOKEN` → the deploy tok
 source. A pull request that changes `debug`'s qualifier to `write`, or adds a new
 requirement, gets nothing until someone approves it.
 
+## Automations
+
+A repository can define **automations**: agent sessions Engine Box runs on its
+own on a schedule, on pushes and on demand, with no outside caller. Each one is a
+YAML file in `.enginebox/automations/` on the repository's **default branch**.
+The format follows Gitstalk's `.gitstalk/automations/*.yml`. A complete example,
+the docs steward, is in
+[`examples/automations/docs-steward.yml`](../examples/automations/docs-steward.yml):
+
+```yaml
+name: Docs steward
+description: Keeps docs/ tidy and lists prose that contradicts docs/decisions/.
+model: basic
+runners: [claude, codex]
+timeout-minutes: 30
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths: ["docs/**"]
+push:
+  branch-prefix: automation/docs-steward/
+prompt: |
+  Tidy docs/ ... list each place whose prose contradicts a decision in docs/decisions/ ...
+```
+
+### Format
+
+The file name without `.yml`/`.yaml` is the automation's ID
+(`^[a-z0-9][a-z0-9-]{0,47}$`). A repository has at most 32 files of at most 32 KiB.
+Unknown keys anywhere are refused, as are YAML anchors and aliases, duplicate keys
+and more than one document.
+
+| Key | Meaning |
+|---|---|
+| `name`, `description` | Display text. `name` defaults to the ID. |
+| `prompt` | The task, up to 8000 bytes. |
+| `skill` | A skill the agent loads first (for example `docs-steward` or `plugin:skill`). An automation needs `prompt`, `skill` or both. |
+| `model` | A tier, `basic`, `standard` (default) or `hard`, or one provider's exact model (then `runners` lists exactly that provider). |
+| `profile` | A repository agent profile from `.enginebox/config.json`; the default profile when omitted. Its env and approved secret and MCP mappings apply as for any run on the repository, with run kind `automation`. |
+| `runners` | Providers in order of preference (`claude`, `codex`, `cursor`; default all three in that order). |
+| `on.schedule` | 1-10 entries `{cron: "m h dom mon dow"}`, five fields, **UTC**. `*`, `a`, `a-b`, `*/n`, `a-b/n` and lists; day of week 0-7 (0 and 7 are Sunday); when both day fields are restricted either may match. |
+| `on.push` | `branches` (names or globs; default: the default branch) and `paths` (globs: `**` crosses directories, `*` and `?` stay within one; default: any change). A push fires when one changed path matches. |
+| `on.manual` | `true` (default) allows "run now"; `false` turns it off. `on` needs at least one of the three. |
+| `concurrency` | One run at a time per automation. `queue` (default): a firing during a run waits, and a newer one replaces a waiting one. `skip`: it is recorded as skipped. |
+| `timeout-minutes` | 1-240, default 30. |
+| `push.branch-prefix` | The only branches the run may push, ending in `/`. Each run gets `<prefix><YYYY-MM-DD>` (then `-2`, `-3`... when an earlier run used the name). Without `push` the automation is read-only. A prefix that could name the default branch is refused at run time. |
+| `enabled` | `false` keeps the file listed but fires nothing. |
+
+Model tiers map per provider. Claude uses its aliases (`basic` → `haiku`,
+`standard` → `sonnet`, `hard` → `opus`). Codex and Cursor use the provider's default
+model unless the operator sets `ENGINEBOX_AUTOMATION_MODELS`, a JSON map
+`{"codex": {"basic": "<model>"}, ...}`, which also overrides the Claude aliases.
+
+### What the controller does
+
+- **Discovery.** The active controller reads each repository's default branch
+  head at activation and then polls it: every minute for a repository with push
+  triggers, every five minutes otherwise, at most 25 reads per sweep. It uses
+  the same short-lived read token and blobless shallow fetch as the config read,
+  and fetches the files only when the head moved. A GitHub `push` webhook to
+  `/v1/github/webhook/repos` (signature-checked as before) makes that repository
+  read at the next sweep. A file that does not validate is listed with its error
+  and never runs. Reading a repository the first time fires nothing.
+- **Firing.** Every 15 seconds the controller fires each schedule's latest due
+  minute once. A missed slot is caught up after a restart only if it is less than a
+  day old, and a newly added file never backfills. When the head moves, push
+  triggers on the default branch fire with the paths changed between the two heads
+  (`git diff` of the two commits; when the old commit cannot be fetched, as after a
+  force push, the paths count as unknown and the push fires). Pushes to other
+  branches come from the GitHub webhook only (its commit list; 20 or more commits
+  count as unknown paths), so hosted repositories trigger on their default branch
+  only. Pushes to an automation's own `branch-prefix` never fire it.
+- **Idempotency.** Each firing has a key derived from the repository, automation
+  and trigger (schedule slot, pushed commit, or the caller's `key` for run now). A
+  repeated sweep, webhook or request returns the recorded firing instead of
+  starting another, and the native run's `idempotency_key` carries the same key.
+- **Running.** A run starts in the first pool of the repository's project and
+  org, with `repository: <project>/<name>`, run kind `automation`, the file's
+  timeout, and the tier's model for the first runner the pool accepts (the next
+  runner is tried when a start is refused). The prompt is the controller's fixed
+  preamble (clone `$ENGINEBOX_REPO_REMOTE`, check out the commit that fired the
+  run, push only the given branch with a plain `git push`, never the default
+  branch, never force, never delete) followed by the file's task.
+- **History.** The controller keeps the last 200 firings per repository: trigger,
+  status (`pending`, `queued`, `running`, `succeeded`, `failed`, `cancelled`,
+  `skipped`, `refused`), run ID, pool, provider, model, commit, branch, whether
+  the branch exists once the run ends (`branch_pushed`), token usage and elapsed
+  time. Subscription runs carry token counts, not prices.
+- `ENGINEBOX_AUTOMATIONS=off` stops schedules and push triggers. Run now still
+  works.
+
+**Push limits are instructions, not credentials.** A repository run's token
+can write the whole repository, as for every other repository run. The branch
+prefix, the default-branch ban and the no-force rule are in the run's fixed
+prompt, and the controller records whether the expected branch appeared. Protect
+the default branch on the repository host (a GitHub branch protection rule or
+ruleset) when that matters. A file is in the default branch, so changing what an
+automation does takes a reviewed merge.
+
+### API, CLI and MCP
+
+| Route | Who | Purpose |
+|---|---|---|
+| `GET /v1/projects/{p}/repositories/{n}/automations` | owner; service tokens with a repository grant | files as last read (valid ones with triggers, next scheduled time and last run; invalid ones with their error) |
+| `GET …/automations/{id}` | same | one automation and its last 50 runs |
+| `GET …/automation-runs` | same | every recorded run, newest first |
+| `POST …/automations/{id}/run {key?}` | owner; service tokens with a **write** repository grant | run now (re-reads the default branch first); 202, or 200 with `replayed: true` for a repeated `key`; 409 when it could not start or `on.manual` is false |
+| `POST …/automations/refresh {}` | same | re-read the files now |
+
+`ebox automations list|runs <project>/<name>`, `ebox automations get <project>/<name> <id>`
+and `ebox automations run <project>/<name> <id> [--key K]` call these routes. The
+fleet MCP server has `automation_list`, `automation_get`, `automation_runs` and
+`automation_run`.
+
 ## Import and startup
 
 After a successful reviewed import, the controller queues dev bootstrap using
