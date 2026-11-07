@@ -355,6 +355,16 @@ fn official_authorization_urls_only() {
         )
         .is_none()
     );
+    // The full login's claude.ai page, with Anthropic's own callbacks only.
+    assert!(auth::authorization_url("claude","https://claude.ai/oauth/authorize?code=true&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&code_challenge_method=S256").is_some());
+    for url in [
+        "https://claude.ai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fevil.test%2Fcallback",
+        "https://claude.ai/cai/oauth/authorize?code=true",
+        "https://claude.com/oauth/authorize?code=true",
+        "https://claude.ai.evil.test/oauth/authorize?code=true",
+    ] {
+        assert!(auth::authorization_url("claude", url).is_none(), "{url}");
+    }
     assert!(
         auth::authorization_url(
             "cursor",

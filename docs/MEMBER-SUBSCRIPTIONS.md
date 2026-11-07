@@ -280,7 +280,42 @@ until released.
   member runs in a workspace that holds any, so a wrong template fails closed
   rather than falling back.
 
+## Claude full login and central refresh
+
+- **Sign-in.** A member's Claude subscription signs in with
+  `claude auth login --claudeai`, the interactive login, not `setup-token`. It
+  shows Anthropic's page (`claude.com/cai/oauth/authorize` or
+  `claude.ai/oauth/authorize`; the callback must be `platform.claude.com` or
+  `console.anthropic.com`) and takes the pasted code like setup-token does.
+- **What is stored.** `.claude/.credentials.json` in the credential's own home,
+  holding an access token that expires within hours and its refresh token.
+- **Verification.** A sign-in that leaves no refreshable login behind is
+  `unverified`, never stored as a long-lived token. A full login removes any
+  earlier setup token from that home.
+- **Setup-token fallback.** `ENGINEBOX_MEMBER_CLAUDE_SETUP_TOKEN=1` (an operator
+  fallback, on the supervisor allowlist) restores setup-token sign-in and lets
+  runs receive that one-year token. Without it, a setup-token-only credential
+  fails with "connect it again".
+- **Refresh.** At each run's admission, if less than the run's timeout plus
+  five minutes of access remain (at least 30 minutes), the controller renews the access centrally with the provider's own
+  client (`auth::refresh`, shared with controller accounts):
+  - Codex: `app-server account/read {refreshToken: true}`.
+  - Claude: `auth login --claudeai` with the refresh token in its environment.
+
+  This happens under the credential's own lease (shared with its sign-in), so
+  one member's concurrent runs serialise their reads and at most one refresh
+  runs per credential. The refresh token never leaves the home.
+- **Revoked refresh token.** If the provider rejects the refresh token, the
+  failure is recorded in the home (`refresh-failure.json`, keyed to the current
+  login). The member's credential shows `status: "reconnect"`, runs fail with
+  `credential_unavailable` without retrying the refresh, and a new sign-in
+  clears it.
+
+**Qualification still needed.** The PTY flow of `claude auth login --claudeai`
+(its page, prompt and credential file) is covered by a stand-in client in
+`credentials::tests`. It still has to be qualified against the real Claude Code
+release with a test account before the feature flag is turned on in production.
+
 ## Not yet in this release
 
-Claude full login with central refresh, encryption at rest, and usage reporting
-arrive in the following changes of this series.
+Encryption at rest and usage reporting arrive in the following changes.

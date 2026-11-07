@@ -212,6 +212,19 @@ fn refuse(status: u16, message: &str) -> anyhow::Error {
 
 pub const UNITY: &str = "unity";
 const MEMBER_DIR: &str = "member";
+/// In a credential's home: the provider rejected its refresh token, so the
+/// member must sign in again (`status: "reconnect"`).
+const REFRESH_FAILURE: &str = "refresh-failure.json";
+/// Refresh a member's access when less than this remains (design: 30 minutes),
+/// or less than the run's timeout plus five minutes, whichever is longer.
+const REFRESH_BEFORE_SECONDS: f64 = 1800.;
+
+/// `ENGINEBOX_MEMBER_CLAUDE_SETUP_TOKEN=1`: members' Claude subscriptions
+/// sign in with `claude setup-token` (a one-year token delivered to runs)
+/// instead of the full login. An operator fallback only.
+fn member_setup_token_fallback() -> bool {
+    std::env::var("ENGINEBOX_MEMBER_CLAUDE_SETUP_TOKEN").is_ok_and(|v| v == "1")
+}
 pub const UNITY_INVALID: &str =
     "Unity did not accept this email and password. Check them and save again.";
 pub const UNITY_TWO_FACTOR: &str = "This Unity account asks for two-factor sign-in, which Engine Box cannot answer with a password. Turn off two-factor sign-in for this Unity account in your Unity ID settings, then save again.";
@@ -638,14 +651,23 @@ impl Credentials {
         drop(sessions);
         let this = self.clone();
         let provider = record.provider.clone();
+        // A member's own Claude subscription signs in with the full login, so
+        // runs only ever receive a short-lived access token (refresh stays
+        // here). setup-token stays an explicit operator fallback.
+        let claude = if self.is_member_connected(id) && !member_setup_token_fallback() {
+            auth::ClaudeLogin::Full
+        } else {
+            auth::ClaudeLogin::SetupToken
+        };
         thread::spawn(move || {
-            let result = auth::login(
+            let result = auth::login_with(
                 &home,
                 &provider,
                 &exe,
                 &this.binaries,
                 rx,
                 &cancel,
+                claude,
                 |event| this.login_event(&session, event),
             );
             if result.is_err() {
@@ -671,6 +693,12 @@ impl Credentials {
             Some("input_required") => s.public["input_required"] = json!(true),
             Some("input_accepted") => s.public["input_required"] = json!(false),
             Some("result") => {
+                if event["reason"] == "completed" {
+                    // A fresh sign-in clears an earlier refresh failure.
+                    if let Ok(home) = self.home(&s.credential) {
+                        let _ = security::remove(&home, REFRESH_FAILURE);
+                    }
+                }
                 let state = match event["reason"].as_str() {
                     Some("completed") => "succeeded",
                     Some("cancelled") => "cancelled",
@@ -973,11 +1001,12 @@ impl Credentials {
     /// What a member sees of their own credential: no org, owner or sharing
     /// fields, and never a value.
     fn member_view(&self, c: &Credential) -> Value {
+        let reconnect = self.reconnect_needed(&c.id, &c.provider);
         json!({
             "id": c.id,
             "provider": c.provider,
             "label": c.label,
-            "status": c.status,
+            "status": if reconnect { json!("reconnect") } else { json!(c.status) },
             "created_at": c.created_at,
             "updated_at": c.updated_at,
             "connected_at": c.connected_at,
@@ -1224,8 +1253,8 @@ impl Credentials {
     /// credential only: the record must still exist, be connected, belong to
     /// `run.member` and be for `provider`. Access material only (a Codex
     /// `auth.json` with its refresh token removed, or Claude's access token).
-    /// It must cover the whole `timeout_seconds`; this release refuses
-    /// otherwise (central renewal first arrives with the full-login change).
+    /// It must cover the whole `timeout_seconds`: it is renewed centrally
+    /// first when it would not, and refused only when even fresh access cannot.
     pub fn member_material(
         &self,
         run: &enginebox_agents::queue::MemberRun,
@@ -1250,17 +1279,87 @@ impl Credentials {
             "The run's own credential is not connected; reconnect the subscription."
         );
         let home = self.home(&record.id)?;
-        let material = enginebox_agents::delegation::home_material(&home, provider)?.material;
-        let delegated = enginebox_agents::member::Delegated::from_material(provider, &material)?;
+        // One reader or refresher per credential at a time (and never during
+        // a sign-in): concurrent runs of one member wait for each other.
+        let lease = lease_waiting(&home, provider)?;
+        let delegated = self.read_member_material(&home, provider)?;
+        let now = chrono::Utc::now().timestamp() as f64;
+        let delegated = if delegated.expires_at.is_some_and(|at| {
+            at <= now + (timeout_seconds as f64 + 300.).max(REFRESH_BEFORE_SECONDS)
+        }) {
+            ensure!(
+                !self.needs_reconnect(&record.id),
+                "The subscription needs to be connected again."
+            );
+            if auth::refresh(&home, provider, &self.binaries, &lease).is_err() {
+                let digest = self.native_digest(&home, provider)?;
+                security::write_json(
+                    &home,
+                    REFRESH_FAILURE,
+                    &json!({"credential_digest":digest,"failed_at":chrono::Utc::now().timestamp()}),
+                )?;
+                anyhow::bail!("The subscription could not be renewed; connect it again.");
+            }
+            self.read_member_material(&home, provider)?
+        } else {
+            delegated
+        };
+        drop(lease);
         // The access must outlast the whole run: a native client keeps the
         // token it started with, so it cannot be renewed mid-run.
-        if let Some(at) = delegated.expires_at {
-            ensure!(
-                at > chrono::Utc::now().timestamp() as f64 + timeout_seconds as f64 + 60.,
-                "The subscription's access expires before this run's timeout; reconnect it or shorten the timeout."
-            );
-        }
+        ensure!(
+            delegated
+                .expires_at
+                .is_none_or(|at| at > now + timeout_seconds as f64 + 60.),
+            "The subscription's access expires before this run's timeout, even renewed; shorten the timeout."
+        );
         Ok(delegated)
+    }
+
+    /// The access material in a member credential's home: the full login's
+    /// access token (Claude) or ChatGPT tokens (Codex), refresh token removed.
+    /// A setup token only under the operator fallback.
+    fn read_member_material(
+        &self,
+        home: &Path,
+        provider: &str,
+    ) -> Result<enginebox_agents::member::Delegated> {
+        // The same reading as the controller's own accounts
+        // (delegation::home_material), with one member rule on top.
+        let read = enginebox_agents::delegation::home_material(home, provider)?;
+        ensure!(
+            !read.long_lived_token || member_setup_token_fallback(),
+            "This Claude subscription was connected with a long-lived token; connect it again."
+        );
+        enginebox_agents::member::Delegated::from_material(provider, &read.material)
+    }
+    fn native_digest(&self, home: &Path, provider: &str) -> Result<String> {
+        Ok(security::legacy_digest(
+            &security::read_json(home, enginebox_agents::delegation::native_file(provider))?
+                .unwrap_or(Value::Null),
+        ))
+    }
+    /// The provider refused this credential's refresh token since its last
+    /// sign-in: the member must connect it again.
+    pub fn needs_reconnect(&self, id: &str) -> bool {
+        let provider = match self.records.lock().unwrap().get(id) {
+            Some(record) => record.provider.clone(),
+            None => return false,
+        };
+        self.reconnect_needed(id, &provider)
+    }
+    /// [`Self::needs_reconnect`] without taking the records lock.
+    fn reconnect_needed(&self, id: &str, provider: &str) -> bool {
+        let Ok(home) = self.home(id) else {
+            return false;
+        };
+        security::read_json(&home, REFRESH_FAILURE)
+            .ok()
+            .flatten()
+            .is_some_and(|v| {
+                v["credential_digest"].as_str()
+                    == self.native_digest(&home, provider).ok().as_deref()
+            })
     }
 
     /// Tests: complete a sign-in by writing the provider's file into the
@@ -1310,6 +1409,22 @@ impl Credentials {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         out.into_iter().map(|(_, c)| c).collect()
+    }
+}
+
+/// The credential home's provider lease (shared with native sign-in),
+/// waiting up to 30 s for another reader, refresher or sign-in.
+fn lease_waiting(home: &Path, provider: &str) -> Result<security::Lease> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match security::Lease::acquire(
+            home,
+            &format!(".local/state/enginebox/auth-{provider}.lock"),
+        ) {
+            Ok(lease) => return Ok(lease),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(std::time::Duration::from_millis(200)),
+        }
     }
 }
 
@@ -1708,6 +1823,142 @@ mod tests {
         );
         c.member_login_input(ORG, ALICE, &id, &asking, &text)
             .unwrap();
+    }
+
+    /// A stand-in Claude Code: the full login prints Anthropic's page and
+    /// waits for the pasted code, then writes an access token that expires
+    /// in 10 minutes and a refresh token; a refresh with the good refresh
+    /// token renews the access; setup-token must never run.
+    #[cfg(unix)]
+    fn fake_claude(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("fake-claude");
+        let script = r#"#!/bin/sh
+if [ "$1" = --version ]; then echo '2.1.302 (Claude Code)'; exit 0; fi
+if [ "$1" = setup-token ]; then touch "$HOME/setup-token-ran"; exit 1; fi
+if [ "$1" = auth ] && [ "$2" = status ]; then printf '{"loggedIn":true,"authMethod":"claude.ai"}\n'; exit 0; fi
+creds="$CLAUDE_CONFIG_DIR/.credentials.json"
+if [ "$1" = auth ] && [ "$2" = login ] && [ -n "$CLAUDE_CODE_OAUTH_REFRESH_TOKEN" ]; then
+  [ "$CLAUDE_CODE_OAUTH_REFRESH_TOKEN" = rt-good-0123456789 ] || exit 1
+  printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-renewed-0123456789","refreshToken":"rt-good-0123456789","expiresAt":%s,"scopes":["user:inference"]}}' "$(( ($(date +%s) + 28800) * 1000 ))" > "$creds"
+  exit 0
+fi
+if [ "$1" = auth ] && [ "$2" = login ]; then
+  printf 'Open https://claude.ai/oauth/authorize?code=true&client_id=c&response_type=code&redirect_uri=https%%3A%%2F%%2Fconsole.anthropic.com%%2Foauth%%2Fcode%%2Fcallback&scope=user%%3Ainference&code_challenge=x&code_challenge_method=S256&state=s\n'
+  printf 'Paste code here if prompted > '
+  read code
+  [ "$code" = pasted-code-0123456789 ] || exit 1
+  printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-first-0123456789","refreshToken":"rt-good-0123456789","expiresAt":%s,"scopes":["user:inference"]}}' "$(( ($(date +%s) + 600) * 1000 ))" > "$creds"
+  echo 'Login successful.'
+  exit 0
+fi
+exit 2
+"#;
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        exe.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_members_claude_signs_in_fully_and_refreshes_centrally() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let exe = fake_claude(&root);
+        let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe)])).unwrap();
+        let id = c
+            .member_create(ORG, ALICE, &json!({"provider":"claude"}))
+            .unwrap()
+            .1["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let session = c.member_login(ORG, ALICE, &id).unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let poll = |want: &dyn Fn(&Value) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let v =
+                    c.member_login_status(ORG, ALICE, &id, &session).unwrap()["session"].clone();
+                if want(&v) {
+                    return v;
+                }
+                assert!(std::time::Instant::now() < deadline, "{v}");
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        };
+        let waiting = poll(&|v| v["input_required"] == true);
+        assert!(
+            waiting["authorization_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://claude.ai/oauth/authorize?")
+        );
+        c.member_login_input(
+            ORG,
+            ALICE,
+            &id,
+            &session,
+            &json!({"text":"pasted-code-0123456789"}),
+        )
+        .unwrap();
+        let done = poll(&|v| ["succeeded", "failed"].contains(&v["status"].as_str().unwrap_or("")));
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert!(!done.to_string().contains("sk-ant-oat01"));
+        let home = root.join(format!("agent-credentials/homes/{id}"));
+        assert!(
+            !home.join("setup-token-ran").exists(),
+            "never a setup token"
+        );
+        assert!(!home.join(enginebox_agents::delegation::TOKEN_FILE).exists());
+        // The access expires within 30 minutes: reading it renews it centrally,
+        // and the run gets only the renewed access token.
+        let run = enginebox_agents::queue::MemberRun {
+            member: ALICE.into(),
+            credential_id: id.clone(),
+        };
+        let delegated = c.member_material(&run, "claude", 600).unwrap();
+        assert_eq!(
+            delegated.content,
+            json!({"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-renewed-0123456789"})
+        );
+        assert!(delegated.expires_at.unwrap() > chrono::Utc::now().timestamp() as f64 + 3600.);
+        // A run longer than the renewed access is refused rather than
+        // running into an expired token.
+        assert!(c.member_material(&run, "claude", 36_000).is_err());
+        // Bob's run can never read it.
+        let bobs = enginebox_agents::queue::MemberRun {
+            member: BOB.into(),
+            credential_id: id.clone(),
+        };
+        assert!(c.member_material(&bobs, "claude", 600).is_err());
+        // The provider revokes the refresh token: the run fails, the
+        // credential says reconnect, and nothing falls back.
+        security::write_json(
+            &home,
+            ".claude/.credentials.json",
+            &json!({"claudeAiOauth":{"accessToken":"sk-ant-oat01-old-0123456789","refreshToken":"rt-revoked-0123456789",
+                "expiresAt":(chrono::Utc::now().timestamp() + 60) * 1000,"scopes":["user:inference"]}}),
+        )
+        .unwrap();
+        assert!(c.member_material(&run, "claude", 600).is_err());
+        assert!(c.needs_reconnect(&id));
+        assert_eq!(
+            c.member_list(ORG, ALICE)["credentials"][0]["status"],
+            "reconnect"
+        );
+        assert!(c.member_material(&run, "claude", 600).is_err());
+        // A setup token alone is refused without the operator fallback.
+        std::fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
+        security::write_json(
+            &home,
+            enginebox_agents::delegation::TOKEN_FILE,
+            &json!({"kind":"setup_token","value":"sk-ant-oat01-year-0123456789","expires_at":4102444800u64}),
+        )
+        .unwrap();
+        assert!(c.member_material(&run, "claude", 600).is_err());
     }
 
     fn with_unity() -> (tempfile::TempDir, Credentials, Arc<Mutex<Vec<String>>>) {

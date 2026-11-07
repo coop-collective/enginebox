@@ -75,6 +75,7 @@ fn main() -> Result<()> {
                     "ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS",
                     // Member subscriptions (docs/MEMBER-SUBSCRIPTIONS.md).
                     "ENGINEBOX_MEMBER_CREDENTIALS",
+                    "ENGINEBOX_MEMBER_CLAUDE_SETUP_TOKEN",
                     // Orgs and email sign-in (docs/ORGS.md).
                     "ENGINEBOX_IDENTITY_STATE_DIR",
                     "ENGINEBOX_OWNER_EMAIL",
