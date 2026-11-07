@@ -1225,6 +1225,7 @@ impl Credentials {
         &self,
         run: &enginebox_agents::queue::MemberRun,
         provider: &str,
+        timeout_seconds: u64,
     ) -> Result<enginebox_agents::member::Delegated> {
         let record = self
             .records
@@ -1255,10 +1256,12 @@ impl Credentials {
             )?,
         };
         let delegated = enginebox_agents::member::Delegated::from_material(provider, &material)?;
+        // The access must outlast the whole run: a native client keeps the
+        // token it started with, so it cannot be renewed mid-run.
         if let Some(at) = delegated.expires_at {
             ensure!(
-                at > chrono::Utc::now().timestamp() as f64 + 60.,
-                "The subscription's access has expired; reconnect it."
+                at > chrono::Utc::now().timestamp() as f64 + timeout_seconds as f64 + 60.,
+                "The subscription's access expires before this run's timeout; reconnect it or shorten the timeout."
             );
         }
         Ok(delegated)

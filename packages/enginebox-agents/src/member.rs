@@ -12,7 +12,7 @@
 //! delegated provider credential of its own (the controller's accounts, a
 //! settings override, a setup token), so the native CLI can only ever
 //! authenticate with the member's material.
-use crate::{native, profile, repository, security};
+use crate::{profile, repository, security};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,26 +112,41 @@ impl Delegated {
 }
 
 /// What the controller sends the guest for a member run: the ordinary run
-/// input of `mode` plus the material.
+/// input of `mode`, the member's key (a digest of their user ID, never the
+/// ID itself) and the material.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
     pub mode: String,
     pub input: Value,
+    pub member_key: String,
     pub credential: Delegated,
 }
 impl std::fmt::Debug for Envelope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Envelope")
             .field("mode", &self.mode)
+            .field("member_key", &self.member_key)
             .field("credential", &self.credential)
             .finish()
     }
 }
 
-/// Files and settings through which a native CLI would find credentials
-/// other than the run's own. Relative to the guest user's home.
-const DELEGATED_FILES: &[&str] = &[
+/// The guest-side key of a member: 64 hex characters naming their private
+/// session store, so one member's history never meets another's.
+pub fn member_key(member: &str) -> String {
+    security::digest(&Value::String(format!("enginebox-member:{member}")))
+}
+fn valid_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Files through which a native CLI would find credentials other than the
+/// run's own. Relative to the guest user's home.
+pub const DELEGATED_FILES: &[&str] = &[
     ".codex/auth.json",
     ".claude/.credentials.json",
     crate::delegation::TOKEN_FILE,
@@ -139,10 +154,63 @@ const DELEGATED_FILES: &[&str] = &[
     ".config/enginebox/agents/claude.json",
     ".config/enginebox/agents/cursor.env",
 ];
+/// Claude settings files that apply whatever the config directory is
+/// (managed policy), checked on every member run.
+const MANAGED_CLAUDE_SETTINGS: &[&str] = &[
+    "/etc/claude-code/managed-settings.json",
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+];
 
-/// Refuse a member run in a workspace whose home holds any other provider
-/// credential: no fallback to the controller's accounts or a settings override.
-pub fn require_credential_free(home: &Path) -> Result<()> {
+/// Claude settings that would authenticate as someone other than the member.
+fn claude_settings_override(settings: &Value) -> bool {
+    settings.get("apiKeyHelper").is_some()
+        || settings.get("awsAuthRefresh").is_some()
+        || settings.get("awsCredentialExport").is_some()
+        || settings["env"].as_object().is_some_and(|e| {
+            e.keys().any(|k| {
+                k.starts_with("ANTHROPIC_")
+                    || k.starts_with("CLAUDE_CODE_")
+                    || k.starts_with("CLAUDE_CONFIG")
+                    || k.starts_with("AWS_")
+                    || k.starts_with("GOOGLE_")
+                    || k.starts_with("VERTEX_")
+            })
+        })
+}
+/// Claude's state file (`.claude.json`) may hold an API key.
+fn claude_state_key(state: &Value) -> bool {
+    state.get("primaryApiKey").is_some() || state.get("customApiKeyResponses").is_some()
+}
+fn check_claude_state(path: &Path) -> Result<()> {
+    let Ok(raw) = std::fs::read(path) else {
+        return Ok(());
+    };
+    let state: Value = serde_json::from_slice(&raw)
+        .map_err(|_| anyhow::anyhow!("Unreadable Claude state; member runs refuse it."))?;
+    ensure!(
+        !claude_state_key(&state),
+        "Claude's state in this workspace holds an API key; member runs refuse it."
+    );
+    Ok(())
+}
+fn check_claude_settings(path: &Path) -> Result<()> {
+    let Ok(raw) = std::fs::read(path) else {
+        return Ok(());
+    };
+    // Unreadable or malformed settings could still be read by the CLI: refuse.
+    let settings: Value = serde_json::from_slice(&raw)
+        .map_err(|_| anyhow::anyhow!("Unreadable Claude settings; member runs refuse them."))?;
+    ensure!(
+        !claude_settings_override(&settings),
+        "Claude settings in this workspace override authentication; member runs refuse them."
+    );
+    Ok(())
+}
+
+/// Refuse a member run in a workspace whose home, managed policy or working
+/// tree holds any other provider credential or authentication override: no
+/// fallback to the controller's accounts, a key, a helper or a proxy.
+pub fn require_credential_free(home: &Path, cwd: &Path, workspace: &Path) -> Result<()> {
     for relative in DELEGATED_FILES {
         let path = security::safe_path(home, relative, false)?;
         ensure!(
@@ -150,23 +218,117 @@ pub fn require_credential_free(home: &Path) -> Result<()> {
             "This workspace holds delegated provider credentials; member runs need a credential-free workspace."
         );
     }
-    if let Some(settings) = security::read_json(home, ".claude/settings.json")? {
-        let env = settings["env"].as_object();
-        ensure!(
-            env.is_none_or(|e| !e.keys().any(|k| {
-                k.starts_with("ANTHROPIC_")
-                    || k.starts_with("CLAUDE_CODE_")
-                    || k == "CLAUDE_CONFIG_DIR"
-            })) && settings.get("apiKeyHelper").is_none(),
-            "This workspace's Claude settings override authentication; member runs need a credential-free workspace."
-        );
+    for relative in [".claude/settings.json", ".claude/settings.local.json"] {
+        check_claude_settings(&home.join(relative))?;
+    }
+    check_claude_state(&home.join(".claude.json"))?;
+    for managed in MANAGED_CLAUDE_SETTINGS {
+        check_claude_settings(Path::new(managed))?;
+    }
+    // Project and local settings from the run's directory up to the workspace.
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        for relative in [".claude/settings.json", ".claude/settings.local.json"] {
+            check_claude_settings(&d.join(relative))?;
+        }
+        if d == workspace {
+            break;
+        }
+        dir = d.parent().filter(|p| p.starts_with(workspace));
     }
     Ok(())
 }
 
+/// A member's own Claude settings or state file must not select a key,
+/// helper or proxy either.
+pub fn require_clean_claude_file(path: &Path) -> Result<()> {
+    if path.file_name().is_some_and(|n| n == ".claude.json") {
+        check_claude_state(path)
+    } else {
+        check_claude_settings(path)
+    }
+}
+
+/// What a member run carries into the native run: the material and the
+/// member's key.
+#[derive(Clone, Copy)]
+pub struct RunCredential<'a> {
+    pub credential: &'a Delegated,
+    pub member_key: &'a str,
+}
+
+/// Removes a member run's private directory when dropped, on every path.
+pub struct RunDirCleanup {
+    home: PathBuf,
+    id: String,
+}
+impl RunDirCleanup {
+    pub fn new(home: &Path, id: &str) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            id: id.to_owned(),
+        }
+    }
+}
+impl Drop for RunDirCleanup {
+    fn drop(&mut self) {
+        let _ = profile::remove_run_dir(&self.home, &self.id);
+    }
+}
+
+/// Codex configuration keys that select another provider, an API key or a
+/// bearer token instead of the member's ChatGPT login.
+const CODEX_FORBIDDEN_KEYS: &[&str] = &[
+    "model_providers",
+    "model_provider",
+    "preferred_auth_method",
+    "forced_login_method",
+    "experimental_bearer_token",
+    "env_key",
+    "http_headers",
+    "env_http_headers",
+    "chatgpt_base_url",
+    "openai_base_url",
+    "base_url",
+];
+fn codex_forbidden(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(t) => t
+            .iter()
+            .any(|(k, v)| CODEX_FORBIDDEN_KEYS.contains(&k.as_str()) || codex_forbidden(v)),
+        toml::Value::Array(a) => a.iter().any(codex_forbidden),
+        _ => false,
+    }
+}
+/// Refuse a Codex configuration that could authenticate as anyone but the
+/// member (another provider, an API key, a bearer token or base URL).
+pub fn check_codex_config(codex_home: &Path) -> Result<()> {
+    let Some(raw) = security::read_bytes(codex_home, "config.toml", security::LIMIT, false)? else {
+        return Ok(());
+    };
+    let config: toml::Value = toml::from_str(std::str::from_utf8(&raw)?)
+        .map_err(|_| anyhow::anyhow!("Unreadable Codex configuration; member runs refuse it."))?;
+    ensure!(
+        !codex_forbidden(&config),
+        "The Codex configuration selects another provider or key; member runs refuse it."
+    );
+    Ok(())
+}
+
+/// The member's own persistent store under the guest home (sessions,
+/// Claude's configuration directory), created private on first use.
+pub fn member_dir(home: &Path, key: &str, name: &str) -> Result<PathBuf> {
+    ensure!(valid_key(key), "Invalid member key.");
+    let relative = format!(".local/state/enginebox/members/{key}/{name}/placeholder");
+    security::safe_path(home, &relative, true)?;
+    let dir = home.join(format!(".local/state/enginebox/members/{key}/{name}"));
+    security::private_dir(&dir)?;
+    Ok(dir)
+}
+
 /// A run-private `CODEX_HOME` for a member run without a profile: the
-/// workspace's `config.toml` (if any) and a link to its session store, so
-/// settings and `resume` behave as in an ordinary run.
+/// workspace's `config.toml` (checked later), and the member's own session
+/// store, so `resume` works without touching anyone else's history.
 pub fn prepare_codex_home(home: &Path, run_id: &str) -> Result<PathBuf> {
     let root = profile::run_dir(home, run_id)?;
     security::safe_path(
@@ -182,14 +344,25 @@ pub fn prepare_codex_home(home: &Path, run_id: &str) -> Result<PathBuf> {
     {
         security::write_bytes(&root, "codex-home/config.toml", &config, security::LIMIT)?;
     }
-    #[cfg(unix)]
-    {
-        let sessions = home.join(".codex/sessions");
-        if std::fs::symlink_metadata(&sessions).is_ok_and(|m| m.is_dir()) {
-            std::os::unix::fs::symlink(&sessions, codex.join("sessions"))?;
-        }
-    }
     Ok(codex)
+}
+
+/// Point a member run's `CODEX_HOME` at the member's own session store
+/// (replacing a link to the workspace's shared one).
+pub fn link_member_sessions(codex_home: &Path, home: &Path, key: &str) -> Result<()> {
+    let sessions = member_dir(home, key, "codex-sessions")?;
+    let link = codex_home.join("sessions");
+    if std::fs::symlink_metadata(&link).is_ok() {
+        let meta = std::fs::symlink_metadata(&link)?;
+        ensure!(
+            meta.file_type().is_symlink(),
+            "Unexpected sessions directory."
+        );
+        std::fs::remove_file(&link)?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&sessions, &link)?;
+    Ok(())
 }
 
 /// Write the run's own Codex access file into its private `CODEX_HOME`.
@@ -203,26 +376,63 @@ pub fn write_codex_auth(codex_home: &Path, credential: &Delegated) -> Result<()>
     .context("Member material could not be written.")
 }
 
-/// Parse and check an envelope the guest received.
+/// Remove every delegated provider credential and authentication override
+/// from a guest home (`enginebox-guest transfer` `{"operation":"clear"}`),
+/// so the workspace can serve member runs.
+pub fn clear_delegated(home: &Path) -> Result<Value> {
+    security::absolute_existing(home)?;
+    let mut removed = 0;
+    for relative in DELEGATED_FILES {
+        let path = security::safe_path(home, relative, false)?;
+        if std::fs::symlink_metadata(&path).is_ok() {
+            security::remove(home, relative)?;
+            removed += 1;
+        }
+    }
+    if let Some(mut state) = security::read_json(home, ".claude.json")?
+        && claude_state_key(&state)
+    {
+        if let Some(o) = state.as_object_mut() {
+            o.remove("primaryApiKey");
+            o.remove("customApiKeyResponses");
+        }
+        security::write_json(home, ".claude.json", &state)?;
+        removed += 1;
+    }
+    for relative in [".claude/settings.json", ".claude/settings.local.json"] {
+        if let Some(mut settings) = security::read_json(home, relative)?
+            && claude_settings_override(&settings)
+        {
+            if let Some(o) = settings.as_object_mut() {
+                for key in ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"] {
+                    o.remove(key);
+                }
+            }
+            if let Some(env) = settings["env"].as_object_mut() {
+                env.retain(|k, _| {
+                    !(k.starts_with("ANTHROPIC_")
+                        || k.starts_with("CLAUDE_CODE_")
+                        || k.starts_with("CLAUDE_CONFIG")
+                        || k.starts_with("AWS_")
+                        || k.starts_with("GOOGLE_")
+                        || k.starts_with("VERTEX_"))
+                });
+            }
+            security::write_json(home, relative, &settings)?;
+            removed += 1;
+        }
+    }
+    Ok(serde_json::json!({"ok":true,"cleared":removed}))
+}
+
+/// Parse an envelope the guest received (the material is validated once,
+/// where it is used).
 pub fn parse(input: Value) -> Result<Envelope> {
     let envelope: Envelope = serde_json::from_value(input)?;
     ensure!(
         MODES.contains(&envelope.mode.as_str()),
         "Unsupported member run mode."
     );
-    envelope.credential.validate()?;
+    ensure!(valid_key(&envelope.member_key), "Invalid member key.");
     Ok(envelope)
-}
-
-/// The run request inside an envelope, for the provider check.
-pub fn request_of(envelope: &Envelope) -> Result<native::RunRequest> {
-    let request = match envelope.mode.as_str() {
-        "run" => native::RunRequest::parse(envelope.input.clone())?,
-        _ => native::RunRequest::parse(envelope.input["request"].clone())?,
-    };
-    ensure!(
-        request.provider == envelope.credential.provider,
-        "Member material is for another provider."
-    );
-    Ok(request)
 }

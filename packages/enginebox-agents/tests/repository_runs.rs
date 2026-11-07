@@ -67,7 +67,7 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
         },
         checkout: None,
     };
-    let out = native::execute_with_repository(&envelope, &home, &workspace, RUN).unwrap();
+    let out = native::execute_with_repository(&envelope, &home, &workspace, RUN, None).unwrap();
     assert_eq!(out.exit_code, 0, "{}", out.output);
     let secret = TOKEN.split_once("?expires=").unwrap().0;
     assert!(
@@ -107,9 +107,9 @@ fn a_repository_run_gets_a_header_scoped_to_its_remote_and_leaves_nothing_behind
     // A caller cannot replace git's config injection in a repository run.
     let mut injected = envelope.clone();
     injected.request.env = [("GIT_CONFIG_COUNT".to_owned(), "0".to_owned())].into();
-    assert!(native::execute_with_repository(&injected, &home, &workspace, RUN).is_err());
+    assert!(native::execute_with_repository(&injected, &home, &workspace, RUN, None).is_err());
     // Without a run ID the helper refuses.
-    assert!(native::execute_with_repository(&envelope, &home, &workspace, "bad").is_err());
+    assert!(native::execute_with_repository(&envelope, &home, &workspace, "bad", None).is_err());
     // An older helper's `run` refuses the envelope instead of running without it.
     assert!(native::RunRequest::parse(serde_json::to_value(&envelope).unwrap()).is_err());
 }
@@ -146,7 +146,7 @@ fn each_repository_run_gets_a_fresh_checkout_at_a_stable_path() {
     };
     let id = |c: char| c.to_string().repeat(32);
     let run = |c: char, e: repository::Envelope| {
-        native::execute_with_repository(&e, &home, &workspace, &id(c)).unwrap()
+        native::execute_with_repository(&e, &home, &workspace, &id(c), None).unwrap()
     };
     let stable = workspace.join("game");
     // Two runs in a row use the same path (so harness state keyed by cwd
@@ -205,11 +205,17 @@ fn each_repository_run_gets_a_fresh_checkout_at_a_stable_path() {
     // repository name.
     let mut injected = envelope(Some("game"));
     injected.request.env = [("ENGINEBOX_RUN_DIR".to_owned(), "/".to_owned())].into();
-    assert!(native::execute_with_repository(&injected, &home, &workspace, &id('f')).is_err());
+    assert!(native::execute_with_repository(&injected, &home, &workspace, &id('f'), None).is_err());
     for bad in ["../etc", "Game", "a/b", ""] {
         assert!(
-            native::execute_with_repository(&envelope(Some(bad)), &home, &workspace, &id('f'))
-                .is_err(),
+            native::execute_with_repository(
+                &envelope(Some(bad)),
+                &home,
+                &workspace,
+                &id('f'),
+                None
+            )
+            .is_err(),
             "{bad}"
         );
     }
@@ -389,8 +395,8 @@ fn codex_repository_runs_start_above_their_checkout_so_its_git_is_writable() {
         },
         checkout: Some("game".into()),
     };
-    let out =
-        native::execute_with_repository(&envelope, &home, &workspace, &"f".repeat(32)).unwrap();
+    let out = native::execute_with_repository(&envelope, &home, &workspace, &"f".repeat(32), None)
+        .unwrap();
     assert_eq!(out.exit_code, 0, "{}", out.output);
     assert!(
         out.output.contains(&format!(

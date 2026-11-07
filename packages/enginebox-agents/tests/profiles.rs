@@ -879,6 +879,7 @@ fn a_profile_run_gets_exactly_its_profile_and_leaves_nothing_behind() {
         &home,
         &workspace,
         RUN,
+        None,
     )
     .unwrap();
     assert_eq!(out.exit_code, 0);
@@ -917,6 +918,7 @@ fn a_profile_run_gets_exactly_its_profile_and_leaves_nothing_behind() {
         &home,
         &workspace,
         RUN,
+        None,
     )
     .unwrap();
     assert_eq!(out.exit_code, 0);
@@ -936,7 +938,14 @@ fn a_profile_run_gets_exactly_its_profile_and_leaves_nothing_behind() {
     assert!(!run_root.exists());
     // Without a run ID the helper refuses a profile run.
     assert!(
-        native::execute_profiled(&envelope("claude", json!({})), &home, &workspace, "bad").is_err()
+        native::execute_profiled(
+            &envelope("claude", json!({})),
+            &home,
+            &workspace,
+            "bad",
+            None
+        )
+        .is_err()
     );
 }
 

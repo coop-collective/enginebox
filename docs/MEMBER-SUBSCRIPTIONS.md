@@ -130,34 +130,69 @@ hold across the app's hourly token renewals. Any other field (`repository`,
   - Its workspaces never receive the controller's own provider accounts:
     attach and reconcile skip them.
 
+**Switching a pool.** `POST /v1/pools/{pool}/member-runs` is refused while
+the pool has queued or running runs (drain it first). Enabling forgets the
+pool's attachment receipts, so reconciliation never delivers the controller's
+accounts there again.
+
+**Preparation.** A member run never attaches the controller's accounts. Before
+each member run the workspace is cleared with `enginebox-guest
+clear-credentials`, which removes:
+- delegated provider files;
+- delegation markers and setup tokens;
+- Claude settings overrides (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `AWS_*`,
+  `GOOGLE_*`, `VERTEX_*`, `apiKeyHelper`);
+- `primaryApiKey` in `~/.claude.json`.
+
+The workspace's attachment receipt is dropped. A guest helper that predates
+member runs fails with `member_runs_unsupported`.
+
 **Delivery: per run, short-lived, removed at the end.**
-- At admission the controller reads the run's own credential again
-  (`Credentials::member_material`). The record must still exist, be connected,
-  belong to the run's member and be for the provider.
-- It sends access material only, never a refresh token:
+- **Admission check.** At admission the controller reads the run's own
+  credential again (`Credentials::member_material`). The record must still
+  exist, be connected, belong to the run's member and be for the provider.
+- **Lifetime.** The access must stay valid for the run's whole `timeout_seconds`
+  plus a minute. A native client keeps the token it started with, so it cannot
+  be re-keyed mid-run; a run whose timeout outlasts the access is refused with
+  `credential_unavailable`.
+- **Access material only, never a refresh token:**
   - Codex: an `auth.json` with `refresh_token: ""`.
   - Claude: the access token. Until the full-login change, a credential
     connected with `claude setup-token` delivers that token.
-- The material goes to the guest on stdin inside a `run-member` envelope (never
-  argv). A detached run's spooled input is deleted as soon as its worker reads it.
-- The guest:
-  1. refuses the run if the workspace holds any other provider credential
-     (`~/.codex/auth.json`, `~/.claude/.credentials.json`, a setup token, a
-     delegation marker, or `~/.claude/settings.json` with an `ANTHROPIC_*` or
-     `CLAUDE_CODE_*` env override or `apiKeyHelper`), so the native CLI can
-     authenticate only as the member;
-  2. writes Codex's file only to the run's private `CODEX_HOME`
-     (`~/.local/state/enginebox/agent-runs/profiles/<run>/codex-home`), or sets
-     `CLAUDE_CODE_OAUTH_TOKEN` only in the run's process environment;
-  3. scrubs the values from returned output;
-  4. removes the run directory when the run ends.
-- Callers still cannot set `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` or `CODEX_*`.
-- Queue entries, run records and details keep only the member and credential
-  IDs. An older controller cannot read a member run's queue entry and sets it
-  aside, so it never runs one on its own accounts.
-- A run whose credential is gone, disconnected or expired fails at admission
-  with launch reason `credential_unavailable`. A workspace whose guest helper
-  predates member runs fails with `member_runs_unsupported`.
+- **Transport.** The material goes to the guest on stdin inside a `run-member`
+  envelope, never in argv. A detached run never spools it: the guest helper
+  writes the rest of the request to its spool and passes the material to the
+  worker through a pipe.
+- **Guest checks.** The guest refuses the run if the CLI could authenticate any
+  other way:
+  - a delegated file;
+  - `~/.claude.json` `primaryApiKey`;
+  - an override in user, local, managed (`/etc/claude-code/managed-settings.json`)
+    or project settings (`.claude/settings[.local].json` from the working
+    directory up to the workspace root);
+  - a Codex `config.toml` naming another provider, an API key, a bearer token
+    or a base URL (`model_providers`, `model_provider`, `preferred_auth_method`,
+    `experimental_bearer_token`, `env_key`, `http_headers`, `*base_url`, at any
+    depth), or one that cannot be parsed.
+- **Where the material lives in the run:**
+  - Codex: only in the run's private `CODEX_HOME`.
+  - Claude: only in the run's environment, with `CLAUDE_CONFIG_DIR` set to the
+    member's own configuration directory.
+- **Session history.** Each member's session history is kept apart:
+  `~/.local/state/enginebox/members/<key>/` holds `codex-sessions` and the
+  `claude` directory, where `<key>` is a digest of the member's ID.
+- **Resume.** A session is resumed only by the member whose run started it.
+  Ordinary runs never resume a member's session.
+- **Redaction and cleanup.**
+  - The values are scrubbed from output by the guest, and again by the
+    controller before recording a result or a launch failure.
+  - The run directory is removed on every exit path.
+- **Callers** still cannot set `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` or `CODEX_*`.
+- **Stored state.** Queue entries, run records and details keep only the member
+  and credential IDs. An older controller cannot read a member run's queue entry
+  and sets it aside, so it never runs one on its own accounts.
+- **Named workspaces.** Named-workspace runs (`/v1/hosts/…/agent-runs`) cannot
+  target a member-runs pool's workspace.
 
 ## Not yet in this release
 

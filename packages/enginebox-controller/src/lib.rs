@@ -327,8 +327,8 @@ impl Controller {
         let member_credentials = runtime.credentials.clone();
         runtime
             .agents
-            .set_member_material(Arc::new(move |run, provider| {
-                member_credentials.member_material(run, provider)
+            .set_member_material(Arc::new(move |_run_id, run, provider, timeout| {
+                member_credentials.member_material(run, provider, timeout)
             }));
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -2630,7 +2630,13 @@ async fn write(
                 Ok(
                     match blocking(move || agents.cancel_member_run(&project, &member, &id)).await {
                         Ok(run) => (StatusCode::ACCEPTED, json!({"run": run})),
-                        Err(_) => (StatusCode::NOT_FOUND, json!({"error":"Unknown run."})),
+                        Err(e) if e.is::<enginebox_agents::service::UnknownRun>() => {
+                            (StatusCode::NOT_FOUND, json!({"error":"Unknown run."}))
+                        }
+                        Err(_) => (
+                            StatusCode::CONFLICT,
+                            json!({"error":"The run could not be cancelled now; read it and retry."}),
+                        ),
                     },
                 )
             }
@@ -2934,7 +2940,7 @@ async fn write(
             let enabled = body["enabled"]
                 .as_bool()
                 .context("enabled must be a boolean")?;
-            runtime.agents.pools().set_member_runs(pool, enabled)?
+            runtime.agents.set_member_runs(pool, enabled)?
         }
         ["v1", "pools", pool, "delete"] => {
             empty(&body)?;
@@ -3228,14 +3234,16 @@ async fn start_member_run(
     ) {
         Ok(id) => id,
         Err(error) => {
-            let status = error
-                .downcast_ref::<credentials::Refusal>()
-                .map_or(409, |r| r.status);
-            return refuse(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
-                "credential_required",
-                "Connect your own subscription for this provider first; runs never use anyone else's.",
-            );
+            return match error.downcast_ref::<credentials::Refusal>() {
+                Some(r) if r.status == 403 => {
+                    refuse(StatusCode::FORBIDDEN, "forbidden", &r.message)
+                }
+                _ => refuse(
+                    StatusCode::CONFLICT,
+                    "credential_required",
+                    "Connect your own subscription for this provider first; runs never use anyone else's.",
+                ),
+            };
         }
     };
     let run = enginebox_agents::queue::MemberRun {

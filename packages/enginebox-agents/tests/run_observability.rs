@@ -107,7 +107,7 @@ fn cancellation_targets_one_run_and_holds_lease_until_native_process_stops() {
     let request = native::RunRequest::parse(json!({"provider":"codex","prompt":"test"})).unwrap();
     let worker_home = home.clone();
     let worker = std::thread::spawn(move || {
-        native::execute_scoped(&request, &worker_home, &worker_home, Some(id)).unwrap()
+        native::execute_scoped(&request, &worker_home, &worker_home, Some(id), None).unwrap()
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !home.join("native-started").exists() {
@@ -149,7 +149,7 @@ fn cancellation_before_launch_prevents_native_inference() {
     let id = "33333333333333333333333333333333";
     native::request_cancel(&home, "codex", id).unwrap();
     let request = native::RunRequest::parse(json!({"provider":"codex","prompt":"test"})).unwrap();
-    let result = native::execute_scoped(&request, &home, &home, Some(id)).unwrap();
+    let result = native::execute_scoped(&request, &home, &home, Some(id), None).unwrap();
     assert_eq!(
         result.exit_code,
         enginebox_agents::process::CANCELLED_EXIT_CODE
@@ -174,7 +174,7 @@ fn cancellation_does_not_claim_success_while_detached_descendant_holds_lease() {
     let request = native::RunRequest::parse(json!({"provider":"codex","prompt":"test"})).unwrap();
     let worker_home = home.clone();
     let worker = std::thread::spawn(move || {
-        native::execute_scoped(&request, &worker_home, &worker_home, Some(id))
+        native::execute_scoped(&request, &worker_home, &worker_home, Some(id), None)
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !home.join("detached.pid").exists() {
