@@ -950,6 +950,8 @@ const REPOSITORY = "[a-z0-9][a-z0-9._-]{0,62}";
 const ENGINE_SESSION = "[a-f0-9]{32}";
 export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["GET", /^v1\/agent-runs$/],
+  // Provider-reported usage of the accounts runs use (the controller grants it to tokens holding agent_runs.start).
+  ["GET", /^v1\/usage\/accounts(?:\/(?:claude|codex|cursor|glm))?$/],
   ["GET", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}$`)],
   ["POST", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs$`)],
   ["POST", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}/cancel$`)],
