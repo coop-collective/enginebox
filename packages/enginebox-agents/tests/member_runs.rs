@@ -1105,3 +1105,169 @@ fn template_copies_keep_exec_bits_refresh_on_change_and_large_state_works() {
         .is_err()
     );
 }
+
+// ------------------------------------------------------------ isolation
+
+fn claude_reader(service: &AgentService) {
+    service.set_member_material(Arc::new(|_, run, _, _| {
+        Delegated::from_material(
+            "claude",
+            &json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":format!("sk-ant-oat01-{}-0123456789", run.member)}}),
+        )
+    }));
+}
+/// Holds every run until released; each run reports a session of its own.
+fn held_executor(service: &AgentService) -> Arc<(Mutex<bool>, std::sync::Condvar)> {
+    let gate: Arc<(Mutex<bool>, std::sync::Condvar)> = Arc::default();
+    let held = gate.clone();
+    service.set_run_executor(Arc::new(move |run: &AdmittedRun| {
+        let (open, changed) = &*held;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = changed.wait(open).unwrap();
+        }
+        // A session ID per run, derived from the run ID.
+        let id = &run.id;
+        let session = run.request.resume_id.clone().unwrap_or(format!(
+            "{}-{}-{}-{}-{}",
+            &id[0..8],
+            &id[8..12],
+            &id[12..16],
+            &id[16..20],
+            &id[20..32]
+        ));
+        Ok(
+            json!({"exit_code":0,"output":json!({"type":"result","session_id":session}).to_string(),
+            "timed_out":false,"output_truncated":false}),
+        )
+    }));
+    gate
+}
+fn release(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+}
+fn placed(service: &AgentService, id: &str) -> Option<String> {
+    service.get_pool_run("jam", id).unwrap()["name"]
+        .as_str()
+        .filter(|n| *n != "ebox-unplaced")
+        .map(str::to_owned)
+}
+
+#[test]
+fn a_workspace_serves_one_member_only_for_its_whole_life() {
+    let (_t, root) = root();
+    let service = service(&root);
+    service
+        .pools()
+        .put(
+            json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"h1","name":"ebox-m1"},{"host_id":"h1","name":"ebox-m2"}]}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    service.set_member_runs("jam", true).unwrap();
+    claude_reader(&service);
+    let gate = held_executor(&service);
+    let launch = |who: &str, cred: &str, extra: Value| {
+        let mut b = body("claude");
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        service.launch_pool("jam", b, "owner", member(who, cred))
+    };
+    let alice = launch(ALICE, ALICE_CRED, json!({})).unwrap().0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bob = launch(BOB, BOB_CRED, json!({})).unwrap().0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for("both placed", || {
+        placed(&service, &alice).is_some() && placed(&service, &bob).is_some()
+    });
+    let alice_ws = placed(&service, &alice).unwrap();
+    let bob_ws = placed(&service, &bob).unwrap();
+    assert_ne!(alice_ws, bob_ws);
+    release(&gate);
+    wait_for("both finished", || {
+        [&alice, &bob]
+            .iter()
+            .all(|id| service.get_pool_run("jam", id).unwrap()["status"] == "succeeded")
+    });
+    // Both workspaces are now free, yet each member only ever gets their own.
+    for _ in 0..3 {
+        for (who, cred, own) in [(ALICE, ALICE_CRED, &alice_ws), (BOB, BOB_CRED, &bob_ws)] {
+            let id = launch(who, cred, json!({})).unwrap().0["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            wait_for("placed", || placed(&service, &id).is_some());
+            assert_eq!(&placed(&service, &id).unwrap(), own, "{who}");
+        }
+    }
+    // A third member waits rather than reuse someone else's workspace.
+    let carol = "usr_cccccccccccccccccccccccc";
+    let waiting = launch(carol, "cccccccccccccccccccccccccccccccc", json!({}))
+        .unwrap()
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(placed(&service, &waiting).is_none());
+    // Alice cannot resume Bob's session (it would land on Bob's workspace).
+    let bob_session = service.get_pool_run("jam", &bob).unwrap()["native_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let crossed = launch(ALICE, ALICE_CRED, json!({"resume_id": bob_session}));
+    assert!(crossed.is_err(), "{crossed:?}");
+    // Bob can resume his own.
+    launch(BOB, BOB_CRED, json!({"resume_id": bob_session})).unwrap();
+    // A named-workspace run cannot reach a member's workspace.
+    assert!(
+        service
+            .launch_with(
+                "h1",
+                &alice_ws,
+                body("claude"),
+                "owner",
+                LaunchOptions::default()
+            )
+            .is_err()
+    );
+    // Bindings survive a restart.
+    let reopened = enginebox_agents::pools::Pools::open(&root).unwrap();
+    let ws = |name: &str| enginebox_agents::queue::Placement {
+        host_id: "h1".into(),
+        name: name.into(),
+    };
+    assert_eq!(
+        reopened.bound_member(&ws(&alice_ws)).as_deref(),
+        Some(ALICE)
+    );
+    assert_eq!(reopened.bound_member(&ws(&bob_ws)).as_deref(), Some(BOB));
+}
+
+#[test]
+fn a_deleted_workspace_is_unbound_and_its_successor_is_fresh() {
+    let (_t, root) = root();
+    let pools = enginebox_agents::pools::Pools::open(&root).unwrap();
+    pools
+        .put(
+            json!({"name":"jam","project":"qoh","template":"agents","autoscale":{"hosts":["h1"],"max_workspaces":2}}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    pools.set_member_runs("jam", true).unwrap();
+    let created = enginebox_agents::queue::Placement {
+        host_id: "h1".into(),
+        name: "ebox-jam-1".into(),
+    };
+    pools.add_created("jam", created.clone()).unwrap();
+    pools.bind_member(&created, ALICE).unwrap();
+    assert!(pools.bind_member(&created, BOB).is_err());
+    pools.remove_created("jam", &created).unwrap();
+    assert_eq!(pools.bound_member(&created), None);
+}

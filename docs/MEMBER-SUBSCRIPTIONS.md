@@ -220,8 +220,40 @@ member runs fails with `member_runs_unsupported`.
 - **Named workspaces.** Named-workspace runs (`/v1/hosts/…/agent-runs`) cannot
   target a member-runs pool's workspace.
 
+## Isolation between members
+
+Each workspace (Incus VM) of a member-runs pool serves **one member for its whole
+life**:
+- The first member run placed on a workspace binds it to that member
+  (`agent-member-bindings.json`). From then on only that member's runs are placed
+  there; other members' runs wait or get a new workspace from `autoscale`.
+- The binding ends only when the workspace is deleted: idle reclamation of a
+  created member deletes the VM and unbinds it, so its successor starts fresh
+  from the pool's credential-free template.
+- Therefore no two members ever share a UID, HOME, `/tmp`, work tree, session
+  history or leftover process, at the same time or one after the other.
+- A resume (`resume_id`) of another member's session is refused, because it
+  would land on that member's workspace.
+- A named-workspace run (`/v1/hosts/{h}/instances/{w}/agent-runs`) cannot target
+  a member-runs or member-bound workspace.
+- A member-runs pool uses fleet hosts only. A host that is a registered
+  personal or contributed machine (for example a room owner's PC) is refused
+  when the pool is designated and when it is replaced.
+
+Capacity follows from this: a pool needs one workspace per active member. Use
+`autoscale` with idle reclamation. Owner-listed workspaces stay bound to their
+first member until the owner deletes them.
+
+**Infrastructure the operator must provide** (not enforced by this code):
+- **Egress allowlist.** The design asks that member workspaces reach only the
+  provider APIs, package registries and Git remotes. Engine Box does not manage
+  Incus network ACLs yet; apply an ACL to the member-runs pool's network.
+- **A credential-free template.** Use a base template for member-runs pools, not
+  a private checkpoint that contains provider credentials. The guest refuses
+  member runs in a workspace that holds any, so a wrong template fails closed
+  rather than falling back.
+
 ## Not yet in this release
 
-Per-member workspace isolation, Claude full login with central refresh,
-encryption at rest, and usage reporting arrive in the following changes of this
-series.
+Claude full login with central refresh, encryption at rest, and usage reporting
+arrive in the following changes of this series.

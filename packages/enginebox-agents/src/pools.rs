@@ -23,6 +23,9 @@ const SESSIONS_FILE: &str = "agent-pool-sessions.json";
 /// (docs/MEMBER-SUBSCRIPTIONS.md). A file of its own, so pool records keep
 /// the format older releases read.
 const MEMBER_POOLS_FILE: &str = "agent-member-pools.json";
+/// Which member each member-runs workspace belongs to. A workspace runs one
+/// member's runs only, from its first member run until it is deleted.
+const MEMBER_BINDINGS_FILE: &str = "agent-member-bindings.json";
 const SESSIONS_LIMIT: usize = 2 * 1024 * 1024;
 const SIZES: [&str; 5] = ["minimum", "recommended", "small", "standard", "large"];
 /// Default idle time before a free member is frozen (paused, RAM kept).
@@ -309,6 +312,11 @@ pub struct Pools {
     pools: Arc<Mutex<BTreeMap<String, Pool>>>,
     sessions: Arc<Mutex<BTreeMap<String, SessionHome>>>,
     member_pools: Arc<Mutex<BTreeSet<String>>>,
+    /// `host/name` -> member (`usr_…`).
+    bindings: Arc<Mutex<BTreeMap<String, String>>>,
+}
+fn binding_key(workspace: &Placement) -> String {
+    format!("{}/{}", workspace.host_id, workspace.name)
 }
 impl Pools {
     pub fn open(root: &Path) -> Result<Self> {
@@ -350,7 +358,63 @@ impl Pools {
             pools: Arc::new(Mutex::new(pools)),
             sessions: Arc::new(Mutex::new(sessions)),
             member_pools: Arc::new(Mutex::new(member_pools)),
+            bindings: Arc::new(Mutex::new(
+                security::read_bytes(root, MEMBER_BINDINGS_FILE, SESSIONS_LIMIT, false)?
+                    .map(|raw| -> Result<BTreeMap<String, String>> {
+                        let v: Value = serde_json::from_slice(&raw)?;
+                        Ok(serde_json::from_value(v["bindings"].clone())?)
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+            )),
         })
+    }
+    /// The member a workspace belongs to, once a member run used it.
+    pub fn bound_member(&self, workspace: &Placement) -> Option<String> {
+        self.bindings
+            .lock()
+            .unwrap()
+            .get(&binding_key(workspace))
+            .cloned()
+    }
+    /// Every binding, for placement.
+    pub fn bindings(&self) -> BTreeMap<(String, String), String> {
+        self.bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, m)| {
+                let (h, n) = k.split_once('/')?;
+                Some(((h.to_owned(), n.to_owned()), m.clone()))
+            })
+            .collect()
+    }
+    /// Bind `workspace` to `member` for good (until it is deleted). Refuses
+    /// a workspace already bound to someone else.
+    pub fn bind_member(&self, workspace: &Placement, member: &str) -> Result<()> {
+        let mut bindings = self.bindings.lock().unwrap();
+        let key = binding_key(workspace);
+        match bindings.get(&key) {
+            Some(owner) if owner == member => Ok(()),
+            Some(_) => anyhow::bail!("This workspace belongs to another member."),
+            None => {
+                let mut next = bindings.clone();
+                next.insert(key, member.to_owned());
+                security::write_json(&self.root, MEMBER_BINDINGS_FILE, &json!({"bindings": next}))?;
+                *bindings = next;
+                Ok(())
+            }
+        }
+    }
+    fn unbind(&self, workspace: &Placement) -> Result<()> {
+        let mut bindings = self.bindings.lock().unwrap();
+        if bindings.contains_key(&binding_key(workspace)) {
+            let mut next = bindings.clone();
+            next.remove(&binding_key(workspace));
+            security::write_json(&self.root, MEMBER_BINDINGS_FILE, &json!({"bindings": next}))?;
+            *bindings = next;
+        }
+        Ok(())
     }
     /// Whether `pool` runs only members' own subscription runs.
     pub fn member_runs(&self, pool: &str) -> bool {
@@ -564,6 +628,8 @@ impl Pools {
             self.save(&next)?;
             *p = next;
         }
+        // The VM is deleted: whoever it belonged to, its successor is fresh.
+        self.unbind(member)?;
         let mut sessions = self.sessions.lock().unwrap();
         let before = sessions.len();
         sessions.retain(|_, s| !(s.host_id == member.host_id && s.name == member.name));

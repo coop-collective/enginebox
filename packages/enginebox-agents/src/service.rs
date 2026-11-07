@@ -2235,7 +2235,15 @@ impl AgentService {
                         host_id: host_id.clone(),
                         name: name.clone(),
                     })
-                    .is_none(),
+                    .is_none()
+                    && self
+                        .inner
+                        .pools
+                        .bound_member(&Placement {
+                            host_id: host_id.clone(),
+                            name: name.clone(),
+                        })
+                        .is_none(),
                 "This workspace runs only members' own subscription runs.",
             )?;
         }
@@ -2255,6 +2263,16 @@ impl AgentService {
         }
         if let Some(member) = &options.member {
             member.validate()?;
+            // A resume lands where its session is: only on the member's own workspace.
+            if let Target::Pool {
+                pinned: Some(p), ..
+            } = &target
+            {
+                crate::require(
+                    self.inner.pools.bound_member(p).as_deref() == Some(member.member.as_str()),
+                    "resume_id is not one of your sessions.",
+                )?;
+            }
             crate::require(
                 options.repository.is_none(),
                 "Member runs do not use hosted repositories in this release.",
@@ -2610,6 +2628,12 @@ impl AgentService {
             headroom_bytes: self.limits().run_memory_headroom_bytes,
             admitting: self.inner.admitting.load(Ordering::SeqCst)
                 && !self.inner.closed.load(Ordering::SeqCst),
+            members: sched
+                .entries
+                .values()
+                .filter_map(|q| Some((q.entry.id.clone(), q.entry.member.as_ref()?.member.clone())))
+                .collect(),
+            bindings: self.inner.pools.bindings(),
         });
         sched.waiting = plan.waiting;
         sched.cursor = plan.cursor;
@@ -3304,6 +3328,15 @@ impl AgentService {
             .entries
             .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("Queued run vanished."))?;
+        // A member run's workspace is that member's from now on (until it is
+        // deleted); an ordinary run never uses a member's workspace.
+        match &queued.entry.member {
+            Some(m) => self.inner.pools.bind_member(&placement, &m.member)?,
+            None => ensure!(
+                self.inner.pools.bound_member(&placement).is_none(),
+                "This workspace belongs to a member."
+            ),
+        }
         let request = native::RunRequest::parse(queued.entry.request.clone())?;
         if let Target::Pool { .. } = queued.entry.target {
             let (record, _) = new_run_entries(

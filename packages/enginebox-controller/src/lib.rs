@@ -2926,6 +2926,13 @@ async fn write(
         }
         ["v1", "pools"] => {
             stamp_org(&mut body, &org);
+            if let Some(name) = body["name"].as_str()
+                && runtime.agents.pools().member_runs(name)
+            {
+                let definition: enginebox_agents::pools::Pool =
+                    serde_json::from_value(body.clone())?;
+                ensure_no_personal_hosts(&runtime, &definition)?;
+            }
             let fleet = c.fleet.clone();
             if let Some(profile) = body.get("profile").and_then(Value::as_str) {
                 ensure!(runtime.profiles.exists(profile), "Unknown profile");
@@ -2940,6 +2947,9 @@ async fn write(
             let enabled = body["enabled"]
                 .as_bool()
                 .context("enabled must be a boolean")?;
+            if enabled && let Some(definition) = runtime.agents.pools().get(pool) {
+                ensure_no_personal_hosts(&runtime, &definition)?;
+            }
             runtime.agents.set_member_runs(pool, enabled)?
         }
         ["v1", "pools", pool, "delete"] => {
@@ -3152,6 +3162,25 @@ fn repository_reply(result: Result<Value>, ok: StatusCode) -> (StatusCode, Value
 enum RunTarget {
     Workspace(String, String),
     Pool(String),
+}
+
+/// A member-runs pool never places a member's run on someone's personal or
+/// contributed machine (the room owner's PC included): only fleet hosts.
+fn ensure_no_personal_hosts(runtime: &Runtime, pool: &enginebox_agents::pools::Pool) -> Result<()> {
+    let hosts = pool
+        .members()
+        .into_iter()
+        .map(|m| m.host_id)
+        .chain(pool.autoscale.iter().flat_map(|a| a.hosts.clone()));
+    for host in hosts {
+        if runtime.contributors.knows(&host) {
+            return Err(anyhow::Error::new(enginebox_agents::Rule(
+                "A member-runs pool uses fleet hosts only, never a personal or contributed machine."
+                    .into(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `POST /v1/projects/{p}/me/agent-runs` (docs/MEMBER-SUBSCRIPTIONS.md): a

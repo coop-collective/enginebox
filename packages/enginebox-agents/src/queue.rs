@@ -358,6 +358,10 @@ pub struct PlanInput<'a> {
     pub pools: BTreeMap<String, PoolState>,
     pub headroom_bytes: u64,
     pub admitting: bool,
+    /// Member runs (docs/MEMBER-SUBSCRIPTIONS.md): run id -> member.
+    pub members: BTreeMap<String, String>,
+    /// Workspaces bound to a member: only that member's runs go there.
+    pub bindings: BTreeMap<(String, String), String>,
 }
 
 /// Round-robin order: each principal's runs stay FIFO (by `seq`); principals
@@ -422,6 +426,15 @@ fn host_room(host_id: &str, state: Option<&HostState>, headroom: u64) -> Result<
 
 /// Decide which queued runs start now, which pool workspaces to create, and
 /// why every other run waits.
+/// Whether run `id` may use `workspace`: a member run only an unbound
+/// workspace or one bound to its own member; any other run only an unbound one.
+fn same_tenant(input: &PlanInput, id: &str, workspace: &(String, String)) -> bool {
+    match input.bindings.get(workspace) {
+        None => true,
+        Some(owner) => input.members.get(id) == Some(owner),
+    }
+}
+
 pub fn plan(mut input: PlanInput) -> Plan {
     let order = fair_order(input.candidates, input.cursor);
     let mut out = Plan {
@@ -443,6 +456,11 @@ pub fn plan(mut input: PlanInput) -> Plan {
             continue;
         }
         let decision: Result<Placement, String> = match &c.target {
+            Target::Workspace { host_id, name }
+                if !same_tenant(&input, &c.id, &(host_id.clone(), name.clone())) =>
+            {
+                Err(format!("workspace {name} belongs to a member"))
+            }
             Target::Workspace { host_id, name } => {
                 if input
                     .leases
@@ -457,6 +475,11 @@ pub fn plan(mut input: PlanInput) -> Plan {
                         }
                     })
                 }
+            }
+            Target::Pool {
+                pinned: Some(p), ..
+            } if !same_tenant(&input, &c.id, &(p.host_id.clone(), p.name.clone())) => {
+                Err(format!("workspace {} belongs to another member", p.name))
             }
             Target::Pool {
                 pinned: Some(p), ..
@@ -491,6 +514,10 @@ pub fn plan(mut input: PlanInput) -> Plan {
                     let mut fenced = Vec::new();
                     for m in &state.members {
                         let key = (m.host_id.clone(), m.name.clone());
+                        // One member per workspace: never another member's.
+                        if !same_tenant(&input, &c.id, &key) {
+                            continue;
+                        }
                         if input.busy_workspaces.contains(&key) {
                             if let Some(why) = input.uncertain.get(&key) {
                                 fenced.push(format!("{}: {why}", m.name));
@@ -548,6 +575,11 @@ pub fn plan(mut input: PlanInput) -> Plan {
                 input
                     .busy_workspaces
                     .insert((placement.host_id.clone(), placement.name.clone()));
+                if let Some(member) = input.members.get(&c.id).cloned() {
+                    input
+                        .bindings
+                        .insert((placement.host_id.clone(), placement.name.clone()), member);
+                }
                 out.cursor = Some(c.principal.clone());
                 out.admit.push((c.id.clone(), placement));
             }
@@ -649,6 +681,8 @@ mod tests {
             pools: BTreeMap::new(),
             headroom_bytes: GIB,
             admitting: true,
+            members: BTreeMap::new(),
+            bindings: BTreeMap::new(),
         }
     }
 
