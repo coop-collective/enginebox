@@ -366,6 +366,20 @@ fleet smoke and browser tests. A native runner canary proves registration and it
 own small test suite, not these additional capabilities. Keep the variable unset
 until that full qualification succeeds.
 
+The pinned [Ubuntu 24.04 Docker preparation recipe](../examples/ci/prepare-linux-docker.sh)
+runs as root **inside a new credential-free CI template clone**, never on the
+controller host or an assigned runner. It installs Docker 29.1.3, Compose 2.40.3,
+buildx 0.30.1 and git-lfs 3.4.1 from Ubuntu packages, enables the guest daemon and
+grants the non-root runner access through the guest's Docker group. It refuses a
+registered Actions installation and verifies non-root Docker/Compose and sudo.
+The Docker socket stays inside that disposable VM; do not mount a host socket.
+Record the package versions, then run `pnpm test:preparation:linux` and the full
+Linux workflow in a disposable child before routing production CI to the image.
+Remove qualification source and credentials, run `enginebox-host clean-base-check`
+and `enginebox-host reset-base-identity`, stop the new base and create its clean,
+stateless snapshot using the normal template procedure. Preserve the previous
+source/snapshot for rollback. Updating this recipe does not update any live image.
+
 Only runs on `main` use Engine Box: the `enginebox-ci` runner group accepts an allow-list of workflows at `refs/heads/main`, so pull-request runs stay on GitHub-hosted runners. Clearing a variable moves those jobs back to GitHub. Publish and deploy jobs stay
 GitHub-hosted. Windows and macOS jobs stay on GitHub because Engine Box has no
 Windows or macOS CI hosts.
