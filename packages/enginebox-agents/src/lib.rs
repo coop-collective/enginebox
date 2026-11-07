@@ -6,6 +6,7 @@ pub mod delegation;
 pub mod detached;
 pub mod launch_events;
 pub mod lifecycle;
+pub mod member;
 pub mod native;
 pub mod pools;
 pub mod process;

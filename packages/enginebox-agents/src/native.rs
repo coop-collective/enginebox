@@ -2,7 +2,11 @@ use crate::{process, security};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 pub const MAX_OUTPUT: usize = 262144;
 /// Longest native run: a day, so build and verify tasks are not cut off; callers still choose a timeout per run.
 pub const MAX_RUN_SECONDS: u64 = 86400;
@@ -515,7 +519,7 @@ pub fn execute_scoped(
     workspace: &Path,
     run_id: Option<&str>,
 ) -> Result<process::Output> {
-    execute_inner(r, home, workspace, run_id, None, None, None)
+    execute_inner(r, home, workspace, run_id, None, None, None, None)
 }
 
 /// Run under a profile: the envelope is re-validated here, its files are
@@ -534,6 +538,7 @@ pub fn execute_profiled(
         workspace,
         Some(run_id),
         Some((&envelope.block, &files)),
+        None,
         None,
         None,
     )
@@ -559,7 +564,65 @@ pub fn execute_with_repository(
         profile.map(|(p, files)| (&p.block, files)),
         Some(&envelope.repository),
         envelope.checkout.as_deref(),
+        None,
     )
+}
+
+/// A member's own-subscription run (docs/MEMBER-SUBSCRIPTIONS.md): the
+/// wrapped run, with the member's access material written only into this
+/// run's private directory or environment and removed when it ends. Refused
+/// in a workspace that holds any other provider credential.
+pub fn execute_member(
+    envelope: &crate::member::Envelope,
+    home: &Path,
+    workspace: &Path,
+    run_id: &str,
+) -> Result<process::Output> {
+    crate::member::request_of(envelope)?;
+    let credential = Some(&envelope.credential);
+    match envelope.mode.as_str() {
+        "run" => execute_inner(
+            &RunRequest::parse(envelope.input.clone())?,
+            home,
+            workspace,
+            Some(run_id),
+            None,
+            None,
+            None,
+            credential,
+        ),
+        "run-profile" => {
+            let inner: crate::profile::Envelope = serde_json::from_value(envelope.input.clone())?;
+            let files = inner.validate()?;
+            execute_inner(
+                &inner.request,
+                home,
+                workspace,
+                Some(run_id),
+                Some((&inner.block, &files)),
+                None,
+                None,
+                credential,
+            )
+        }
+        "run-repository" => {
+            let inner: crate::repository::Envelope =
+                serde_json::from_value(envelope.input.clone())?;
+            let files = inner.validate()?;
+            let profile = inner.profile.as_ref().zip(files.as_ref());
+            execute_inner(
+                &inner.request,
+                home,
+                workspace,
+                Some(run_id),
+                profile.map(|(p, files)| (&p.block, files)),
+                Some(&inner.repository),
+                inner.checkout.as_deref(),
+                credential,
+            )
+        }
+        _ => anyhow::bail!("Unsupported member run mode."),
+    }
 }
 
 type ProfileInput<'a> = (
@@ -567,6 +630,7 @@ type ProfileInput<'a> = (
     &'a BTreeMap<String, Vec<u8>>,
 );
 
+#[allow(clippy::too_many_arguments)]
 fn execute_inner(
     r: &RunRequest,
     home: &Path,
@@ -575,8 +639,19 @@ fn execute_inner(
     profile: Option<ProfileInput<'_>>,
     repository: Option<&crate::repository::Access>,
     checkout: Option<&str>,
+    credential: Option<&crate::member::Delegated>,
 ) -> Result<process::Output> {
     r.validate()?;
+    if let Some(credential) = credential {
+        ensure!(run_id.is_some(), "Member runs require a controller run ID.");
+        credential.validate()?;
+        ensure!(
+            credential.provider == r.provider,
+            "Member material is for another provider."
+        );
+        // No fallback: the CLI must find no credential but the member's.
+        crate::member::require_credential_free(home)?;
+    }
     ensure!(
         (profile.is_none() && repository.is_none()) || run_id.is_some(),
         "Profile and repository runs require a controller run ID."
@@ -711,6 +786,45 @@ fn execute_inner(
             run_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token);
         }
     }
+    if let (Some(credential), Some(id)) = (credential, run_id) {
+        let delivered = (|| -> Result<()> {
+            match r.provider.as_str() {
+                "codex" => {
+                    // The profile's CODEX_HOME, or a run-private one: never ~/.codex.
+                    let codex_home = match run_env.get("CODEX_HOME") {
+                        Some(path) => PathBuf::from(path),
+                        None => crate::member::prepare_codex_home(&home, id)?,
+                    };
+                    ensure!(
+                        codex_home.starts_with(crate::profile::run_dir(&home, id)?),
+                        "Member material belongs in the run's private directory."
+                    );
+                    crate::member::write_codex_auth(&codex_home, credential)?;
+                    run_env.insert(
+                        "CODEX_HOME".into(),
+                        codex_home
+                            .to_str()
+                            .ok_or_else(|| anyhow::anyhow!("Invalid run path."))?
+                            .into(),
+                    );
+                }
+                _ => {
+                    let token = credential.content["CLAUDE_CODE_OAUTH_TOKEN"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid member material."))?;
+                    run_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token.into());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = delivered {
+            let _ = crate::profile::remove_run_dir(&home, id);
+            return Err(error);
+        }
+        for (i, secret) in credential.secrets().into_iter().enumerate() {
+            redacted.insert(format!("ENGINEBOX_MEMBER_SECRET_{i}"), secret);
+        }
+    }
     if let (Some(access), Some(id)) = (repository, run_id) {
         let variables = crate::repository::materialize(&home, id, access)
             .and_then(|config| crate::repository::environment(access, &config));
@@ -764,7 +878,8 @@ fn execute_inner(
     if let Some(id) = run_id {
         // The writer lease still protects the native home while the helper cleans up.
         let _ = security::remove(&home, &cancel_path(id));
-        if profile.is_some() {
+        // A member run's material lives only in this directory.
+        if profile.is_some() || credential.is_some() {
             let _ = crate::profile::remove_run_dir(&home, id);
         }
         if repository.is_some() {

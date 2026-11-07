@@ -93,8 +93,74 @@ code, token or link. A connect that returns the member's existing credential is
 recorded with outcome `existing`. The member marker is removed last on delete; if
 that fails, the error is logged and the orphan is swept when the store opens.
 
+## Runs (acting as the token's member)
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /v1/projects/{p}/me/agent-runs` | `{provider, prompt, model?, timeout_seconds?, resume_id?, workdir?, env?, idempotency_key?, callback?, profile?, run_kind?, pool?, credential?}` | `202 {run}` (`run.member`, `run.credential_id`), `200` for a replayed key |
+| `GET /v1/projects/{p}/me/agent-runs` | | `200 {runs}`: the member's own runs in the project, newest first |
+| `GET /v1/projects/{p}/me/agent-runs/{id}` | | `200 {run}` |
+| `POST /v1/projects/{p}/me/agent-runs/{id}/cancel` | `{}` | `202 {run}` |
+
+The run view, `callback` and `idempotency_key` are those of
+[pool runs](FLEET.md#agent-runs-v2). Idempotency keys belong to the member, so they
+hold across the app's hourly token renewals. Any other field (`repository`,
+`repo_profile`, …) is refused (400).
+
+**Selection: own only, no fallback.**
+- `credential` is `{"own": true}` (the default) or `{"id": "<one of your own>"}`.
+- The controller takes the member's own connected personal credential for
+  `provider` in the token's org (`Credentials::member_select`).
+- If there is none, the answer is `409 {reason: "credential_required"}`, even
+  when a team account, an API key, another member's shared credential or the
+  controller's own accounts could serve the provider.
+- Naming another person's credential gets the same 409.
+
+**Placement.**
+- The run goes to `pool`, or the project's first **member-runs pool**.
+- The owner designates member-runs pools with
+  `POST /v1/pools/{pool}/member-runs {enabled}`; the designation is kept in
+  `agent-member-pools.json`, so pool records keep their format.
+- With no member-runs pool in the project, the answer is
+  `409 {reason: "no_member_pool"}`.
+- Pool isolation:
+  - Ordinary runs are refused on a member-runs pool.
+  - Member runs are refused anywhere else.
+  - A member-runs pool shares no workspace with another pool.
+  - Its workspaces never receive the controller's own provider accounts:
+    attach and reconcile skip them.
+
+**Delivery: per run, short-lived, removed at the end.**
+- At admission the controller reads the run's own credential again
+  (`Credentials::member_material`). The record must still exist, be connected,
+  belong to the run's member and be for the provider.
+- It sends access material only, never a refresh token:
+  - Codex: an `auth.json` with `refresh_token: ""`.
+  - Claude: the access token. Until the full-login change, a credential
+    connected with `claude setup-token` delivers that token.
+- The material goes to the guest on stdin inside a `run-member` envelope (never
+  argv). A detached run's spooled input is deleted as soon as its worker reads it.
+- The guest:
+  1. refuses the run if the workspace holds any other provider credential
+     (`~/.codex/auth.json`, `~/.claude/.credentials.json`, a setup token, a
+     delegation marker, or `~/.claude/settings.json` with an `ANTHROPIC_*` or
+     `CLAUDE_CODE_*` env override or `apiKeyHelper`), so the native CLI can
+     authenticate only as the member;
+  2. writes Codex's file only to the run's private `CODEX_HOME`
+     (`~/.local/state/enginebox/agent-runs/profiles/<run>/codex-home`), or sets
+     `CLAUDE_CODE_OAUTH_TOKEN` only in the run's process environment;
+  3. scrubs the values from returned output;
+  4. removes the run directory when the run ends.
+- Callers still cannot set `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` or `CODEX_*`.
+- Queue entries, run records and details keep only the member and credential
+  IDs. An older controller cannot read a member run's queue entry and sets it
+  aside, so it never runs one on its own accounts.
+- A run whose credential is gone, disconnected or expired fails at admission
+  with launch reason `credential_unavailable`. A workspace whose guest helper
+  predates member runs fails with `member_runs_unsupported`.
+
 ## Not yet in this release
 
-Run selection, per-run delivery, member-isolated placement, Claude full login,
-encryption at rest and usage reporting arrive in the following changes of this
-series; until then, connecting a subscription does not make any run use it.
+Per-member workspace isolation, Claude full login with central refresh,
+encryption at rest, and usage reporting arrive in the following changes of this
+series.

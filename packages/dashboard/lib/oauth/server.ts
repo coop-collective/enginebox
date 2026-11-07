@@ -1034,6 +1034,11 @@ export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials/${CREDENTIAL}/(?:login|delete)$`)],
   ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials/${CREDENTIAL}/sessions/${CREDENTIAL}$`)],
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials/${CREDENTIAL}/sessions/${CREDENTIAL}/(?:input|cancel)$`)],
+  // The member's own runs, which use only their own subscription.
+  ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/me/agent-runs$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/agent-runs$`)],
+  ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/me/agent-runs/${CREDENTIAL}$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/agent-runs/${CREDENTIAL}/cancel$`)],
 ];
 const ENGINE_ROUTE = new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions(?:/|$)`);
 const MEMBER_ROUTE = new RegExp(`^v1/projects/${PROJECT_ID}/me/`);

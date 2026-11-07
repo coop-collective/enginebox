@@ -92,6 +92,10 @@ pub const REASONS: &[&str] = &[
     "lease_probe_failed",
     // Waking a frozen or stopped pool member failed (lifecycle, #93). Written by placement; activation must read it.
     "workspace_wake_failed",
+    // A member run's own credential could not be read (docs/MEMBER-SUBSCRIPTIONS.md).
+    "credential_unavailable",
+    // A member run's guest helper predates member runs.
+    "member_runs_unsupported",
 ];
 pub fn valid_reason(reason: &str) -> bool {
     REASONS.contains(&reason)

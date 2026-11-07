@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// Spool root, relative to the guest user's home.
 pub const DIR: &str = ".local/state/enginebox/detached";
 /// Guest modes a detached run may use (the synchronous run modes).
-pub const MODES: &[&str] = &["run", "run-profile", "run-repository"];
+pub const MODES: &[&str] = &["run", "run-profile", "run-repository", "run-member"];
 const INPUT: &str = "input.json";
 const RECEIPT: &str = "receipt.json";
 const RESULT: &str = "result.json";

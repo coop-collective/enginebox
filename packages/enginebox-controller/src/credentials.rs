@@ -1182,6 +1182,103 @@ impl Credentials {
         self.delete(org, id)
     }
 
+    /// The credential a member run uses (docs/MEMBER-SUBSCRIPTIONS.md): the
+    /// member's **own** connected personal credential for `provider` in
+    /// `org`, the one named by `requested` when given. Nothing else is ever
+    /// eligible: no shared, team, key, controller or other member's
+    /// credential, and no fallback. None: `409 credential_required`.
+    pub fn member_select(
+        &self,
+        org: &str,
+        member: &str,
+        provider: &str,
+        requested: Option<&str>,
+    ) -> Result<String> {
+        if !valid_user(member) {
+            return Err(refuse(
+                403,
+                "Only a member's own subscription runs their prompts.",
+            ));
+        }
+        let own: Vec<String> = self
+            .candidates(org, provider, Some(member))
+            .into_iter()
+            .filter(|c| c.reason == "own" && c.kind == Kind::Personal)
+            .map(|c| c.id)
+            .collect();
+        let chosen = match requested {
+            Some(id) => own.into_iter().find(|c| c == id),
+            None => own.into_iter().next(),
+        };
+        chosen.ok_or_else(|| {
+            refuse(
+                409,
+                "credential_required: connect your own subscription for this provider first.",
+            )
+        })
+    }
+    /// A member run's access material, read at admission from the run's own
+    /// credential only: the record must still exist, be connected, belong to
+    /// `run.member` and be for `provider`. Access material only (a Codex
+    /// `auth.json` with its refresh token removed, or Claude's access token).
+    pub fn member_material(
+        &self,
+        run: &enginebox_agents::queue::MemberRun,
+        provider: &str,
+    ) -> Result<enginebox_agents::member::Delegated> {
+        let record = self
+            .records
+            .lock()
+            .unwrap()
+            .get(&run.credential_id)
+            .cloned()
+            .filter(|c| {
+                c.kind == Kind::Personal
+                    && c.owner_user_id.as_deref() == Some(run.member.as_str())
+                    && c.provider == provider
+            })
+            .context("The run's own credential is gone; reconnect the subscription.")?;
+        ensure!(
+            record.status == Status::Connected,
+            "The run's own credential is not connected; reconnect the subscription."
+        );
+        let home = self.home(&record.id)?;
+        let material = match security::read_json(&home, enginebox_agents::delegation::TOKEN_FILE)? {
+            // Claude's long-lived setup token (the sign-in `auth::login` runs).
+            Some(v) if provider == "claude" && security::token(&v["value"]) => {
+                json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":v["value"]},"expires_at":v["expires_at"]})
+            }
+            _ => enginebox_agents::delegation::material(
+                provider,
+                &security::read_json(&home, enginebox_agents::delegation::native_file(provider))?
+                    .unwrap_or(Value::Null),
+            )?,
+        };
+        let delegated = enginebox_agents::member::Delegated::from_material(provider, &material)?;
+        if let Some(at) = delegated.expires_at {
+            ensure!(
+                at > chrono::Utc::now().timestamp() as f64 + 60.,
+                "The subscription's access has expired; reconnect it."
+            );
+        }
+        Ok(delegated)
+    }
+
+    /// Tests: complete a sign-in by writing the provider's file into the
+    /// credential's home and marking it connected.
+    #[cfg(test)]
+    pub(crate) fn connect_for_test(&self, id: &str, provider_file: &Value) {
+        let home = self.home(id).unwrap();
+        let provider = self.records.lock().unwrap()[id].provider.clone();
+        security::write_json(
+            &home,
+            enginebox_agents::delegation::native_file(&provider),
+            provider_file,
+        )
+        .unwrap();
+        self.records.lock().unwrap().get_mut(id).unwrap().status = Status::Connected;
+    }
+
     /// The selection interface for runs (not called yet). Eligible connected
     /// credentials of `org` for `provider`, in priority order: the requesting
     /// member's own personal credentials, then personal credentials their

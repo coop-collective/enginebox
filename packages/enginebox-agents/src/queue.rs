@@ -176,6 +176,34 @@ pub enum EntryState {
     Finished,
 }
 
+/// A member's own-subscription run (docs/MEMBER-SUBSCRIPTIONS.md): the
+/// member it runs for and the one credential it may use. Only IDs; the
+/// credential's material is read at admission and never stored here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberRun {
+    pub member: String,
+    pub credential_id: String,
+}
+impl MemberRun {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.member.len() == 28
+                && self.member.starts_with("usr_")
+                && self.member[4..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && self.credential_id.len() == 32
+                && self
+                    .credential_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "Invalid member run."
+        );
+        Ok(())
+    }
+}
+
 /// One private queue file (`agent-run-queue/<id>.json`, mode 0600).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +237,11 @@ pub struct Entry {
     /// after a restart. Omitted when unset so older releases still read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_kind: Option<String>,
+    /// A member's own-subscription run. An older release cannot read the
+    /// field and sets the entry aside, so it never runs one on the
+    /// controller's accounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<MemberRun>,
 }
 impl Entry {
     pub fn validate(&self) -> Result<()> {
@@ -236,6 +269,13 @@ impl Entry {
         }
         if let Some(r) = &self.repository {
             crate::repository::parse_ref(r)?;
+        }
+        if let Some(m) = &self.member {
+            m.validate()?;
+            ensure!(
+                matches!(self.target, Target::Pool { .. }),
+                "A member run runs only in a pool."
+            );
         }
         if self.state == EntryState::Queued {
             RunRequest::parse(self.request.clone())?;

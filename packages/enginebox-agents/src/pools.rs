@@ -19,6 +19,10 @@ pub const MAX_POOLS: usize = 256;
 pub const MAX_MEMBERS: usize = 256;
 const MAX_SESSIONS: usize = 4096;
 const SESSIONS_FILE: &str = "agent-pool-sessions.json";
+/// Pools whose workspaces run only members' own subscription runs
+/// (docs/MEMBER-SUBSCRIPTIONS.md). A file of its own, so pool records keep
+/// the format older releases read.
+const MEMBER_POOLS_FILE: &str = "agent-member-pools.json";
 const SESSIONS_LIMIT: usize = 2 * 1024 * 1024;
 const SIZES: [&str; 5] = ["minimum", "recommended", "small", "standard", "large"];
 /// Default idle time before a free member is frozen (paused, RAM kept).
@@ -304,6 +308,7 @@ pub struct Pools {
     root: PathBuf,
     pools: Arc<Mutex<BTreeMap<String, Pool>>>,
     sessions: Arc<Mutex<BTreeMap<String, SessionHome>>>,
+    member_pools: Arc<Mutex<BTreeSet<String>>>,
 }
 impl Pools {
     pub fn open(root: &Path) -> Result<Self> {
@@ -329,12 +334,75 @@ impl Pools {
             })
             .transpose()?
             .unwrap_or_default();
+        let member_pools = security::read_bytes(root, MEMBER_POOLS_FILE, SESSIONS_LIMIT, false)?
+            .map(|raw| -> Result<BTreeSet<String>> {
+                let v: Value = serde_json::from_slice(&raw)?;
+                Ok(serde_json::from_value(v["pools"].clone())?)
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| pools.contains_key(p))
+            .collect();
         Ok(Self {
             dir,
             root: root.to_path_buf(),
             pools: Arc::new(Mutex::new(pools)),
             sessions: Arc::new(Mutex::new(sessions)),
+            member_pools: Arc::new(Mutex::new(member_pools)),
         })
+    }
+    /// Whether `pool` runs only members' own subscription runs.
+    pub fn member_runs(&self, pool: &str) -> bool {
+        self.member_pools.lock().unwrap().contains(pool)
+    }
+    /// The member-runs pool `workspace` belongs to, if any. Such a workspace
+    /// never receives the controller's own provider accounts.
+    pub fn member_pool_of(&self, workspace: &Placement) -> Option<String> {
+        // Lock order: pools before member_pools (as set_member_runs and put).
+        let member_pools = self.member_pools.lock().unwrap().clone();
+        self.pools
+            .lock()
+            .unwrap()
+            .values()
+            .find(|p| member_pools.contains(&p.name) && p.members().contains(workspace))
+            .map(|p| p.name.clone())
+    }
+    /// Member-runs pools of `project`, by name.
+    pub fn member_pools_in(&self, project: &str) -> Vec<String> {
+        let member_pools = self.member_pools.lock().unwrap().clone();
+        self.in_project(project)
+            .into_iter()
+            .filter(|p| member_pools.contains(&p.name))
+            .map(|p| p.name)
+            .collect()
+    }
+    /// `POST /v1/pools/{pool}/member-runs {enabled}` (owner): make a pool run
+    /// only members' own subscription runs, or ordinary runs again. A
+    /// member-runs pool shares no workspace with another pool.
+    pub fn set_member_runs(&self, pool: &str, enabled: bool) -> Result<Value> {
+        let pools = self.pools.lock().unwrap();
+        let definition = pools.get(pool).context("Unknown pool")?;
+        if enabled {
+            let members = definition.members();
+            crate::require(
+                !pools
+                    .values()
+                    .filter(|p| p.name != pool)
+                    .any(|p| p.members().iter().any(|m| members.contains(m))),
+                "A member-runs pool cannot share a workspace with another pool.",
+            )?;
+        }
+        let mut member_pools = self.member_pools.lock().unwrap();
+        let mut next = member_pools.clone();
+        if enabled {
+            next.insert(pool.to_owned());
+        } else {
+            next.remove(pool);
+        }
+        security::write_json(&self.root, MEMBER_POOLS_FILE, &json!({"pools": next}))?;
+        *member_pools = next;
+        Ok(json!({"pool": pool, "member_runs": enabled}))
     }
     fn save(&self, pool: &Pool) -> Result<()> {
         security::write_json(
@@ -395,6 +463,17 @@ impl Pools {
         }
         pool.updated_at = now;
         pool.validate(known_host).map_err(crate::rule)?;
+        {
+            let member_pools = self.member_pools.lock().unwrap();
+            let members = pool.members();
+            crate::require(
+                !pools.values().filter(|p| p.name != pool.name).any(|p| {
+                    (member_pools.contains(&p.name) || member_pools.contains(&pool.name))
+                        && p.members().iter().any(|m| members.contains(m))
+                }),
+                "A member-runs pool cannot share a workspace with another pool.",
+            )?;
+        }
         self.save(&pool)?;
         let public = pool.public();
         pools.insert(pool.name.clone(), pool);
@@ -433,6 +512,14 @@ impl Pools {
         ensure!(pools.contains_key(name), "Unknown pool");
         security::remove(&self.dir, &format!("{name}.json"))?;
         pools.remove(name);
+        drop(pools);
+        let mut member_pools = self.member_pools.lock().unwrap();
+        if member_pools.contains(name) {
+            let mut next = member_pools.clone();
+            next.remove(name);
+            security::write_json(&self.root, MEMBER_POOLS_FILE, &json!({"pools": next}))?;
+            *member_pools = next;
+        }
         Ok(())
     }
     /// Reserve the next member name for a workspace the pool will create.
