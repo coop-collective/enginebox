@@ -726,18 +726,11 @@ impl AgentService {
         Ok(security::legacy_digest(&v))
     }
     fn refresh_blocked(&self, p: &str) -> Result<bool> {
-        Ok(
-            security::read_json(&self.home(p)?, "refresh-failure.json")?.is_some_and(|v| {
-                v["credential_digest"] == self.credential_digest(p).unwrap_or_default()
-            }),
-        )
+        let digest = self.credential_digest(p).unwrap_or_default();
+        Ok(auth::refresh_rejected(&self.home(p)?, Some(&digest)))
     }
     fn record_refresh_failure(&self, p: &str) -> Result<()> {
-        security::write_json(
-            &self.home(p)?,
-            "refresh-failure.json",
-            &json!({"credential_digest":self.credential_digest(p)?,"failed_at":chrono::Utc::now().timestamp()}),
-        )
+        auth::record_refresh_rejected(&self.home(p)?, Some(&self.credential_digest(p)?))
     }
     pub fn status(&self) -> Result<Value> {
         let _pending = self.pending_guard()?;
@@ -1056,7 +1049,12 @@ impl AgentService {
         Ok(json!({"provider":p,"scope":"controller","status":"saved"}))
     }
     fn refresh(&self, p: &str, lease: &security::Lease) -> Result<()> {
-        auth::refresh(&self.home(p)?, p, &self.inner.binaries, lease)
+        Ok(auth::refresh(
+            &self.home(p)?,
+            p,
+            &self.inner.binaries,
+            lease,
+        )?)
     }
     fn transfer(&self, host: &Host, name: &str, request: &Value) -> Result<Value> {
         let command = guest_command(host, name, &["transfer".into()])?;

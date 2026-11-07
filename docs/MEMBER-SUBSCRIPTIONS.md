@@ -284,32 +284,48 @@ until released.
 
 - **Sign-in.** A member's Claude subscription signs in with
   `claude auth login --claudeai`, the interactive login, not `setup-token`. It
-  shows Anthropic's page (`claude.com/cai/oauth/authorize` or
-  `claude.ai/oauth/authorize`; the callback must be `platform.claude.com` or
-  `console.anthropic.com`) and takes the pasted code like setup-token does.
+  shows Anthropic's page and takes the pasted code like setup-token does. Page
+  and callback are allowed only as pairs:
+  - `claude.com/cai/oauth/authorize` with `platform.claude.com/oauth/code/callback`;
+  - `claude.ai/oauth/authorize` with `console.anthropic.com/oauth/code/callback`,
+    allowed only for the full login.
+- **Staging.** A member's sign-in runs in a staging home of its own
+  (`agent-credentials/signin/<id>`). Only when it completes is the result moved
+  into the credential's home, under its lease. Runs keep reading the current
+  login during a sign-in, and a sign-in never makes a run wait.
 - **What is stored.** `.claude/.credentials.json` in the credential's own home,
   holding an access token that expires within hours and its refresh token.
-- **Verification.** A sign-in that leaves no refreshable login behind is
-  `unverified`, never stored as a long-lived token. A full login removes any
-  earlier setup token from that home.
+- **Verification.** A sign-in is `unverified` (never stored) when:
+  - the client wrote no new credential;
+  - or it left no refreshable login behind.
+
+  A completed full login removes any earlier setup token; if that fails, the
+  sign-in fails.
 - **Setup-token fallback.** `ENGINEBOX_MEMBER_CLAUDE_SETUP_TOKEN=1` (an operator
   fallback, on the supervisor allowlist) restores setup-token sign-in and lets
   runs receive that one-year token. Without it, a setup-token-only credential
-  fails with "connect it again".
-- **Refresh.** At each run's admission, if less than the run's timeout plus
-  five minutes of access remain (at least 30 minutes), the controller renews the access centrally with the provider's own
-  client (`auth::refresh`, shared with controller accounts):
-  - Codex: `app-server account/read {refreshToken: true}`.
-  - Claude: `auth login --claudeai` with the refresh token in its environment.
-
-  This happens under the credential's own lease (shared with its sign-in), so
-  one member's concurrent runs serialise their reads and at most one refresh
-  runs per credential. The refresh token never leaves the home.
-- **Revoked refresh token.** If the provider rejects the refresh token, the
-  failure is recorded in the home (`refresh-failure.json`, keyed to the current
-  login). The member's credential shows `status: "reconnect"`, runs fail with
-  `credential_unavailable` without retrying the refresh, and a new sign-in
-  clears it.
+  shows `status: "reconnect"` and runs fail with "connect it again".
+- **Refresh.**
+  - **Too long to cover.** A run whose timeout is longer than a fresh login
+    lasts (Claude: 8 hours) is refused before any renewal.
+  - **When it renews.** At each run's admission, if less than the run's timeout
+    plus five minutes of access remain (at least 30 minutes), the controller
+    renews the access centrally with the provider's own client (`auth::refresh`,
+    shared with controller accounts):
+    - Codex: `app-server account/read {refreshToken: true}`.
+    - Claude: `auth login --claudeai` with the refresh token in its environment.
+  - **Lease.** This happens under the credential's own lease, so one member's
+    concurrent runs serialise their reads and at most one refresh runs per
+    credential. The refresh token never leaves the home.
+  - **Final check.** Coverage is re-checked with the current time after
+    renewal.
+- **Refused versus transient.**
+  - Only a refused grant marks the credential `reconnect`: `invalid_grant`, a
+    revoked, expired or reused refresh token, or a missing login (shared
+    helpers `auth::record_refresh_rejected` and `auth::refresh_rejected`).
+  - Network errors, rate limits, timeouts, a missing client or a busy lease fail
+    only that run, with "try again shortly".
+  - A new sign-in clears the marker.
 
 **Qualification still needed.** The PTY flow of `claude auth login --claudeai`
 (its page, prompt and credential file) is covered by a stand-in client in

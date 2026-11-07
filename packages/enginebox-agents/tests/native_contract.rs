@@ -355,15 +355,28 @@ fn official_authorization_urls_only() {
         )
         .is_none()
     );
-    // The full login's claude.ai page, with Anthropic's own callbacks only.
-    assert!(auth::authorization_url("claude","https://claude.ai/oauth/authorize?code=true&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&code_challenge_method=S256").is_some());
+    // The full login's claude.ai page, paired with its own callback only; the
+    // setup-token sign-in never shows it.
+    use auth::ClaudeLogin::{Full, SetupToken};
+    let ai = "https://claude.ai/oauth/authorize?code=true&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&code_challenge_method=S256";
+    assert!(auth::authorization_url_for("claude", ai, Full).is_some());
+    assert!(auth::authorization_url_for("claude", ai, SetupToken).is_none());
+    assert!(auth::authorization_url("claude", ai).is_none());
+    let com = "https://claude.com/cai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback";
+    assert!(auth::authorization_url_for("claude", com, Full).is_some());
     for url in [
+        // Pages and callbacks are never mixed.
+        "https://claude.ai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback",
+        "https://claude.com/cai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback",
         "https://claude.ai/oauth/authorize?code=true&redirect_uri=https%3A%2F%2Fevil.test%2Fcallback",
         "https://claude.ai/cai/oauth/authorize?code=true",
         "https://claude.com/oauth/authorize?code=true",
         "https://claude.ai.evil.test/oauth/authorize?code=true",
     ] {
-        assert!(auth::authorization_url("claude", url).is_none(), "{url}");
+        assert!(
+            auth::authorization_url_for("claude", url, Full).is_none(),
+            "{url}"
+        );
     }
     assert!(
         auth::authorization_url(
