@@ -86,6 +86,7 @@ pub(crate) struct Data {
     #[serde(default)]
     pub draining: bool,
 }
+type DispatchWaker = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct GitHub {
     pub(crate) config: Option<Config>,
@@ -98,6 +99,8 @@ pub struct GitHub {
     pub(crate) handed_off: Arc<AtomicBool>,
     /// Jobs whose worker outlived the previous owner, adopted on activation.
     pub(crate) adoptable: Arc<Mutex<Vec<String>>>,
+    admission_paused: Arc<AtomicBool>,
+    dispatch_waker: Arc<Mutex<Option<DispatchWaker>>>,
 }
 pub fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().context("Missing text field")
@@ -235,6 +238,8 @@ impl GitHub {
             pending: Arc::new(AtomicUsize::new(0)),
             handed_off: Arc::new(AtomicBool::new(false)),
             adoptable: Arc::new(Mutex::new(adoptable)),
+            admission_paused: Arc::new(AtomicBool::new(false)),
+            dispatch_waker: Arc::new(Mutex::new(None)),
         };
         if service.config.is_some() {
             service.save(&service.data.lock().unwrap())?;
@@ -253,6 +258,15 @@ impl GitHub {
             .as_ref()
             .context("GitHub is not configured")?
             .account_kind(kind)
+    }
+    /// The controller supplies a coalescing notification, never synchronous API work.
+    pub fn set_dispatch_waker(&self, wake: DispatchWaker) {
+        *self.dispatch_waker.lock().unwrap() = Some(wake);
+    }
+    fn wake_dispatch(&self) {
+        if let Some(wake) = self.dispatch_waker.lock().unwrap().clone() {
+            wake();
+        }
     }
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
