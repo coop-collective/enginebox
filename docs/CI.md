@@ -380,15 +380,20 @@ and `enginebox-host reset-base-identity`, stop the new base and create its clean
 stateless snapshot using the normal template procedure. Preserve the previous
 source/snapshot for rollback. Updating this recipe does not update any live image.
 
-Engine Box disables cloud-init in its prepared guests. Increasing an Incus root
-device alone therefore does not expand the guest partition/filesystem: qualification
-found a 30 GiB configured disk with only a 20 GiB usable root. The recipe installs
-a boot-time grow-only service for the qualified Ubuntu layout (`/dev/sda2`, ext4,
-with only the EFI and root partitions). It rejects other layouts and never formats
-a disk or re-enables cloud-init. Set the clone's root device size while stopped,
-then verify both `blockdev --getsize64 /dev/sda` and `df -h /` after boot, especially
-for a larger heavy-build pool. A configured disk allowance is not proof of usable
-filesystem capacity.
+Set the clone's root device size while stopped, then verify both
+`blockdev --getsize64 /dev/sda` and `df -h /` after boot. Qualification of a fresh
+60 GiB clone confirmed the expected filesystem capacity. A separately resized,
+already-booted test VM retained a 20 GiB filesystem on a 30 GiB block device until
+explicitly grown; that observation does not establish a production worker clone
+bug. A configured disk allowance alone is not proof of usable filesystem capacity.
+
+This dedicated CI recipe also installs an idempotent, grow-only boot guard for the
+qualified Ubuntu layout (`/dev/sda2`, ext4, with only the EFI and root partitions).
+It verifies the layout and keeps the filesystem expanded if a future prepared
+image or resize path leaves it smaller. It rejects other layouts and never formats
+a disk or re-enables cloud-init. In the fresh 60 GiB qualification its journal
+reported that the partition/filesystem were already expanded; no resizing speed
+or causality claim follows from that successful boot.
 
 Only runs on `main` use Engine Box: the `enginebox-ci` runner group accepts an allow-list of workflows at `refs/heads/main`, so pull-request runs stay on GitHub-hosted runners. Clearing a variable moves those jobs back to GitHub. Publish and deploy jobs stay
 GitHub-hosted. Windows and macOS jobs stay on GitHub because Engine Box has no
