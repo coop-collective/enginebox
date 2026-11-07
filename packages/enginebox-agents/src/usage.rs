@@ -91,6 +91,156 @@ pub fn normalize_codex(value: &Value, now: f64) -> Result<Value> {
     }
     Ok(result)
 }
+/// The credential a live usage read needs for one controller account, read
+/// from the provider's own native credential file (the same one its CLI
+/// uses). The secret never leaves the process: it is not serialized, and
+/// `Debug` redacts it. Non-secret facts the file carries (Claude's
+/// `subscriptionType` / `rateLimitTier`, ChatGPT's plan claim) are in `meta`.
+pub struct Credential {
+    pub provider: String,
+    /// `oauth` (Claude's subscription OAuth), `session` (Cursor's native
+    /// session JWT), `chatgpt` (Codex's ChatGPT tokens), `api_key` (a provider
+    /// key; GLM's coding plan key, or a key that cannot read a personal plan).
+    pub kind: &'static str,
+    secret: String,
+    /// ChatGPT's account id (the `ChatGPT-Account-Id` header) or Cursor's
+    /// user id (the dashboard session cookie's prefix); neither is a secret.
+    pub account_id: Option<String>,
+    /// Unix seconds when the secret expires, when the file says.
+    pub expires_at: Option<f64>,
+    pub meta: Value,
+}
+impl Credential {
+    pub fn new(provider: &str, kind: &'static str, secret: String) -> Self {
+        Self {
+            provider: provider.into(),
+            kind,
+            secret,
+            account_id: None,
+            expires_at: None,
+            meta: Value::Null,
+        }
+    }
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+    /// True when the secret is known to expire within `margin` seconds.
+    pub fn expired(&self, now: f64, margin: f64) -> bool {
+        self.expires_at.is_some_and(|e| e <= now + margin)
+    }
+}
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("provider", &self.provider)
+            .field("kind", &self.kind)
+            .field("secret", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+/// Claims of a JWT payload, unverified: read only for non-secret facts
+/// (expiry, ChatGPT plan type, the Cursor user id its dashboard session needs).
+pub fn jwt_claims(token: &str) -> Option<Value> {
+    use base64::Engine;
+    let part = token.split('.').nth(1)?;
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part.trim_end_matches('='))
+            .ok()?,
+    )
+    .ok()
+}
+/// The usage credential in a provider home (pure). `native` is the CLI's own
+/// credential file ([`crate::delegation::native_file`]); `saved` is the
+/// controller-token file (`CLAUDE_CODE_OAUTH_TOKEN` / `CURSOR_API_KEY`).
+pub fn credential_from_files(p: &str, native: &Value, saved: &Value) -> Option<Credential> {
+    let is_token = crate::security::token;
+    match p {
+        "claude" => {
+            let t = &native["claudeAiOauth"];
+            if is_token(&t["accessToken"]) {
+                let mut c = Credential::new(p, "oauth", t["accessToken"].as_str()?.into());
+                c.expires_at = t["expiresAt"].as_f64().map(|ms| ms / 1000.);
+                c.meta = json!({
+                    "subscription_type": t["subscriptionType"].as_str(),
+                    "rate_limit_tier": t["rateLimitTier"].as_str(),
+                    "scopes": t["scopes"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()),
+                });
+                return Some(c);
+            }
+            // A `claude setup-token` token (inference scope only).
+            is_token(&saved["value"]).then(|| {
+                let mut c = Credential::new(p, "oauth", saved["value"].as_str().unwrap_or_default().into());
+                c.expires_at = saved["expires_at"].as_f64();
+                c.meta = json!({"setup_token": true});
+                c
+            })
+        }
+        "codex" => {
+            if !native["OPENAI_API_KEY"].as_str().is_none_or(str::is_empty) {
+                return Some(Credential::new(p, "api_key", String::new()));
+            }
+            let t = &native["tokens"];
+            if !is_token(&t["access_token"]) {
+                return None;
+            }
+            let token = t["access_token"].as_str()?;
+            let mut c = Credential::new(p, "chatgpt", token.into());
+            c.account_id = t["account_id"]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+                .map(str::to_owned);
+            let access = jwt_claims(token).unwrap_or(Value::Null);
+            c.expires_at = access["exp"].as_f64();
+            let id = t["id_token"].as_str().and_then(jwt_claims).unwrap_or(Value::Null);
+            let claim = "https://api.openai.com/auth";
+            let auth = if id[claim].is_object() { &id[claim] } else { &access[claim] };
+            c.meta = json!({"plan_type": auth["chatgpt_plan_type"].as_str()});
+            Some(c)
+        }
+        _ => {
+            if is_token(&native["accessToken"]) {
+                let token = native["accessToken"].as_str()?;
+                let claims = jwt_claims(token).unwrap_or(Value::Null);
+                let mut c = Credential::new(p, "session", token.into());
+                c.expires_at = claims["exp"].as_f64();
+                // The dashboard's session cookie is `<user id>::<session JWT>`;
+                // the user id is the JWT subject after its `<idp>|` prefix.
+                let user = regex::Regex::new(r"^[A-Za-z0-9_\-]{1,128}$").ok()?;
+                c.account_id = claims["sub"]
+                    .as_str()
+                    .and_then(|s| s.rsplit('|').next())
+                    .filter(|s| user.is_match(s))
+                    .map(str::to_owned);
+                return Some(c);
+            }
+            is_token(&saved["value"]).then(|| Credential::new(p, "api_key", String::new()))
+        }
+    }
+}
+/// The Codex app-server's raw `account/rateLimits/read` reply (the source of
+/// the CLI's own `/status`), for the controller's usage poller.
+pub fn read_codex_raw_with_lease(
+    exe: &str,
+    env: &BTreeMap<String, String>,
+    lease: Option<&crate::security::Lease>,
+) -> Result<Value> {
+    crate::process::native_rpc_with_lease(
+        &[
+            exe.into(),
+            "-c".into(),
+            "cli_auth_credentials_store=\"file\"".into(),
+            "app-server".into(),
+        ],
+        env,
+        "account/rateLimits/read",
+        None,
+        12,
+        262144,
+        lease,
+    )
+}
 pub fn read_codex(exe: &str, env: &BTreeMap<String, String>) -> Result<Value> {
     read_codex_with_lease(exe, env, None)
 }
