@@ -323,6 +323,14 @@ impl Controller {
                 revoker.revoke_run_credential(reference, credential)
             }),
         );
+        // Member runs never go to a personal or contributed machine: one
+        // registered as a contributor node (by node ID or by its managed host
+        // binding) or assigned to an org other than the platform's.
+        let (contributors, tenancy) = (runtime.contributors.clone(), runtime.tenancy.clone());
+        runtime.agents.set_personal_host(Arc::new(move |host| {
+            contributors.contributed_host(host)
+                || tenancy.host_org(host) != enginebox_agents::pools::DEFAULT_ORG
+        }));
         // Member runs read only their own member's credential (docs/MEMBER-SUBSCRIPTIONS.md).
         let member_credentials = runtime.credentials.clone();
         runtime
@@ -2926,30 +2934,24 @@ async fn write(
         }
         ["v1", "pools"] => {
             stamp_org(&mut body, &org);
-            if let Some(name) = body["name"].as_str()
-                && runtime.agents.pools().member_runs(name)
-            {
-                let definition: enginebox_agents::pools::Pool =
-                    serde_json::from_value(body.clone())?;
-                ensure_no_personal_hosts(&runtime, &definition)?;
-            }
             let fleet = c.fleet.clone();
             if let Some(profile) = body.get("profile").and_then(Value::as_str) {
                 ensure!(runtime.profiles.exists(profile), "Unknown profile");
             }
+            // Member-runs pools are checked for personal hosts atomically.
             runtime
                 .agents
-                .pools()
-                .put(body, &|h| fleet.hosts().iter().any(|x| x.id == h))?
+                .put_pool(body, &|h| fleet.hosts().iter().any(|x| x.id == h))?
+        }
+        ["v1", "pools", pool, "member-runs", "release"] => {
+            let (agents, pool) = (runtime.agents.clone(), pool.to_string());
+            blocking(move || agents.release_member_workspace(&pool, &body)).await?
         }
         ["v1", "pools", pool, "member-runs"] => {
             keys(&body, &["enabled"], &["enabled"])?;
             let enabled = body["enabled"]
                 .as_bool()
                 .context("enabled must be a boolean")?;
-            if enabled && let Some(definition) = runtime.agents.pools().get(pool) {
-                ensure_no_personal_hosts(&runtime, &definition)?;
-            }
             runtime.agents.set_member_runs(pool, enabled)?
         }
         ["v1", "pools", pool, "delete"] => {
@@ -3162,25 +3164,6 @@ fn repository_reply(result: Result<Value>, ok: StatusCode) -> (StatusCode, Value
 enum RunTarget {
     Workspace(String, String),
     Pool(String),
-}
-
-/// A member-runs pool never places a member's run on someone's personal or
-/// contributed machine (the room owner's PC included): only fleet hosts.
-fn ensure_no_personal_hosts(runtime: &Runtime, pool: &enginebox_agents::pools::Pool) -> Result<()> {
-    let hosts = pool
-        .members()
-        .into_iter()
-        .map(|m| m.host_id)
-        .chain(pool.autoscale.iter().flat_map(|a| a.hosts.clone()));
-    for host in hosts {
-        if runtime.contributors.knows(&host) {
-            return Err(anyhow::Error::new(enginebox_agents::Rule(
-                "A member-runs pool uses fleet hosts only, never a personal or contributed machine."
-                    .into(),
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// `POST /v1/projects/{p}/me/agent-runs` (docs/MEMBER-SUBSCRIPTIONS.md): a
@@ -8296,5 +8279,86 @@ mod tests {
                 .0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn member_runs_pools_refuse_contributed_and_org_owned_hosts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("fleet.toml");
+        std::fs::write(
+            &config,
+            "schema_version=1\n[[hosts]]\nid='worker'\ntarget='unused-fixture-host'\n\
+             [[hosts]]\nid='contributed'\ntarget='unused-contributed-host'\nmanaged_registration=true\n",
+        )
+        .unwrap();
+        let c = Controller::new(&config, &temp.path().join("state"), "x".repeat(32)).unwrap();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let runtime = c.runtime().unwrap();
+        // A machine registered through managed host registration: matched by
+        // its host binding (not by its node ID).
+        let host = c
+            .fleet
+            .hosts()
+            .into_iter()
+            .find(|h| h.id == "contributed")
+            .unwrap();
+        runtime
+            .contributors
+            .issue_host(
+                &host,
+                enginebox_node_protocol::machine_id_hash("0123456789abcdef0123456789abcdef")
+                    .unwrap(),
+                enginebox_node_protocol::Budget {
+                    cpu: 4,
+                    memory_gib: 8,
+                    disk_gib: 64,
+                },
+            )
+            .unwrap();
+        let pool = |name: &str, host: &str| json!({"name":name,"project":"qoh","workspaces":[{"host_id":host,"name":format!("ebox-{name}")}]});
+        let put = |body: Value| {
+            call(
+                &app,
+                request(Method::POST, "/v1/pools", &body.to_string(), true),
+            )
+        };
+        let designate = |name: &str| {
+            let path = format!("/v1/pools/{name}/member-runs");
+            call(
+                &app,
+                request(Method::POST, &path, r#"{"enabled":true}"#, true),
+            )
+        };
+        assert_eq!(put(pool("given", "contributed")).await.0, StatusCode::OK);
+        let (status, refused) = designate("given").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("personal or contributed")
+        );
+        // A platform host is fine; adding a contributed host later is refused.
+        assert_eq!(put(pool("jam", "worker")).await.0, StatusCode::OK);
+        assert_eq!(designate("jam").await.0, StatusCode::OK);
+        let (status, _) = put(json!({"name":"jam","project":"qoh","workspaces":[
+            {"host_id":"worker","name":"ebox-jam"},{"host_id":"contributed","name":"ebox-c"}]}))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A host assigned to an org (someone's own machines) is refused too.
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/tenancy/hosts/worker/org",
+                r#"{"org_id":"org_0123456789abcdef01234567"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(put(pool("other", "worker")).await.0, StatusCode::OK);
+        assert_eq!(designate("other").await.0, StatusCode::BAD_REQUEST);
     }
 }

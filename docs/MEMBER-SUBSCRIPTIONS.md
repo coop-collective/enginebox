@@ -227,22 +227,49 @@ life**:
 - The first member run placed on a workspace binds it to that member
   (`agent-member-bindings.json`). From then on only that member's runs are placed
   there; other members' runs wait or get a new workspace from `autoscale`.
-- The binding ends only when the workspace is deleted: idle reclamation of a
-  created member deletes the VM and unbinds it, so its successor starts fresh
-  from the pool's credential-free template.
+- A member run prefers the member's own workspace (their state is there) over
+  an unbound one, whatever the VM states.
+- The binding is made when the run is durably admitted; a failed admission
+  rolls it back.
+- **Release.** The binding ends only when the workspace is wiped:
+  - Idle reclamation of a created member deletes the VM and unbinds it, so its
+    successor starts fresh from the pool's credential-free template.
+  - When member runs wait and every free workspace is bound to another member
+    in a pool already at `max_workspaces`, the scheduler deletes the
+    longest-idle bound created workspace, and autoscale creates a fresh one.
+    So N workspaces never serve only N members forever.
+  - The owner releases a workspace with `POST /v1/pools/{pool}/member-runs/release
+    {host_id, name, recreated?}`. A created workspace is deleted, and autoscale
+    makes a fresh one. A listed workspace is released only with
+    `recreated: true`, the owner's statement that it was wiped or recreated.
+    Releasing is refused while the workspace runs.
+  - Turning member runs off for a pool, or deleting it, is refused while any of
+    its workspaces is bound. Release them first.
+- **Upgrade from before bindings.** At start, a member-runs workspace that
+  served exactly one member becomes theirs. One that served several is
+  `tainted`: nobody's until the owner releases it. Resuming a session there is
+  refused with that reason.
 - Therefore no two members ever share a UID, HOME, `/tmp`, work tree, session
   history or leftover process, at the same time or one after the other.
 - A resume (`resume_id`) of another member's session is refused, because it
   would land on that member's workspace.
 - A named-workspace run (`/v1/hosts/{h}/instances/{w}/agent-runs`) cannot target
   a member-runs or member-bound workspace.
-- A member-runs pool uses fleet hosts only. A host that is a registered
-  personal or contributed machine (for example a room owner's PC) is refused
-  when the pool is designated and when it is replaced.
+- **Fleet hosts only.** A member-runs pool uses fleet hosts only. Refused are:
+  - a registered contributor node, matched by node ID or by its managed host
+    binding's `host_id` (a contributed machine whose owner has root);
+  - a host assigned to an org other than the platform org (someone's own
+    machines, such as a room owner's PC).
+
+  The check runs under the scheduler lock when a pool is designated or
+  replaced, and again for each member run at admission, so a host enrolled
+  later is caught.
+- A member run that waits because every workspace is someone else's says so:
+  "all are in use by other members".
 
 Capacity follows from this: a pool needs one workspace per active member. Use
-`autoscale` with idle reclamation. Owner-listed workspaces stay bound to their
-first member until the owner deletes them.
+`autoscale` with a sensible `max_workspaces`. Owner-listed workspaces stay bound
+until released.
 
 **Infrastructure the operator must provide** (not enforced by this code):
 - **Egress allowlist.** The design asks that member workspaces reach only the

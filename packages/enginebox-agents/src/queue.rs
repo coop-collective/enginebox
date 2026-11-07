@@ -330,6 +330,8 @@ pub struct Candidate {
     pub seq: u64,
     pub provider: String,
     pub target: Target,
+    /// A member run's member (docs/MEMBER-SUBSCRIPTIONS.md).
+    pub member: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -342,6 +344,10 @@ pub struct Plan {
     pub waiting: BTreeMap<String, (usize, String)>,
     /// The principal served last, where the next pass resumes the rotation.
     pub cursor: Option<String>,
+    /// Pools whose member runs wait only because every free workspace is
+    /// bound to another member (docs/MEMBER-SUBSCRIPTIONS.md): the
+    /// scheduler reclaims an idle one when the pool cannot grow.
+    pub member_blocked: BTreeMap<String, usize>,
 }
 
 pub struct PlanInput<'a> {
@@ -358,8 +364,6 @@ pub struct PlanInput<'a> {
     pub pools: BTreeMap<String, PoolState>,
     pub headroom_bytes: u64,
     pub admitting: bool,
-    /// Member runs (docs/MEMBER-SUBSCRIPTIONS.md): run id -> member.
-    pub members: BTreeMap<String, String>,
     /// Workspaces bound to a member: only that member's runs go there.
     pub bindings: BTreeMap<(String, String), String>,
 }
@@ -424,17 +428,21 @@ fn host_room(host_id: &str, state: Option<&HostState>, headroom: u64) -> Result<
     Ok(())
 }
 
-/// Decide which queued runs start now, which pool workspaces to create, and
-/// why every other run waits.
-/// Whether run `id` may use `workspace`: a member run only an unbound
+/// Whether run `c` may use `workspace`: a member run only an unbound
 /// workspace or one bound to its own member; any other run only an unbound one.
-fn same_tenant(input: &PlanInput, id: &str, workspace: &(String, String)) -> bool {
+fn same_tenant(input: &PlanInput, c: &Candidate, workspace: &(String, String)) -> bool {
     match input.bindings.get(workspace) {
         None => true,
-        Some(owner) => input.members.get(id) == Some(owner),
+        Some(owner) => c.member.as_ref() == Some(owner),
     }
 }
+/// Whether `workspace` is bound to run `c`'s own member.
+fn own_workspace(input: &PlanInput, c: &Candidate, workspace: &(String, String)) -> bool {
+    c.member.is_some() && input.bindings.get(workspace) == c.member.as_ref()
+}
 
+/// Decide which queued runs start now, which pool workspaces to create, and
+/// why every other run waits.
 pub fn plan(mut input: PlanInput) -> Plan {
     let order = fair_order(input.candidates, input.cursor);
     let mut out = Plan {
@@ -457,7 +465,7 @@ pub fn plan(mut input: PlanInput) -> Plan {
         }
         let decision: Result<Placement, String> = match &c.target {
             Target::Workspace { host_id, name }
-                if !same_tenant(&input, &c.id, &(host_id.clone(), name.clone())) =>
+                if !same_tenant(&input, c, &(host_id.clone(), name.clone())) =>
             {
                 Err(format!("workspace {name} belongs to a member"))
             }
@@ -478,7 +486,7 @@ pub fn plan(mut input: PlanInput) -> Plan {
             }
             Target::Pool {
                 pinned: Some(p), ..
-            } if !same_tenant(&input, &c.id, &(p.host_id.clone(), p.name.clone())) => {
+            } if !same_tenant(&input, c, &(p.host_id.clone(), p.name.clone())) => {
                 Err(format!("workspace {} belongs to another member", p.name))
             }
             Target::Pool {
@@ -508,14 +516,16 @@ pub fn plan(mut input: PlanInput) -> Plan {
             Target::Pool { pool, pinned: None } => match input.pools.get(pool) {
                 None => Err(format!("pool {pool} is not defined")),
                 Some(state) => {
-                    // (member, rank, free run slots on its host)
-                    let mut best: Option<(&Placement, u8, usize)> = None;
+                    // (member, own bound workspace first, rank, free run slots on its host)
+                    let mut best: Option<(&Placement, bool, u8, usize)> = None;
                     let mut host_reason = None;
                     let mut fenced = Vec::new();
+                    let mut others = 0;
                     for m in &state.members {
                         let key = (m.host_id.clone(), m.name.clone());
                         // One member per workspace: never another member's.
-                        if !same_tenant(&input, &c.id, &key) {
+                        if !same_tenant(&input, c, &key) {
+                            others += 1;
                             continue;
                         }
                         if input.busy_workspaces.contains(&key) {
@@ -530,23 +540,35 @@ pub fn plan(mut input: PlanInput) -> Plan {
                                 let h = h.unwrap();
                                 let free = h.max_runs - h.running;
                                 let rank = state.member_rank.get(&key).copied().unwrap_or(0);
-                                // A running member first, then frozen, then
-                                // stopped; among equals, the host with most room.
-                                if best.is_none_or(|(_, r, f)| {
-                                    (rank, std::cmp::Reverse(free)) < (r, std::cmp::Reverse(f))
+                                let own = own_workspace(&input, c, &key);
+                                // The member's own workspace first (its state
+                                // is there), then running, frozen, stopped;
+                                // among equals, the host with most room.
+                                if best.is_none_or(|(_, o, r, f)| {
+                                    (!own, rank, std::cmp::Reverse(free))
+                                        < (!o, r, std::cmp::Reverse(f))
                                 }) {
-                                    best = Some((m, rank, free));
+                                    best = Some((m, own, rank, free));
                                 }
                             }
                             Err(r) => host_reason = host_reason.or(Some(r)),
                         }
                     }
                     match best {
-                        Some((m, _, _)) => Ok(m.clone()),
+                        Some((m, _, _, _)) => Ok(m.clone()),
                         None => {
                             *pool_demand.entry(pool.clone()).or_default() += 1;
+                            if c.member.is_some() && others > 0 {
+                                *out.member_blocked.entry(pool.clone()).or_default() += 1;
+                            }
                             let mut reason = host_reason.unwrap_or_else(|| {
-                                format!("waiting for a free workspace in pool {pool}")
+                                if c.member.is_some() && others == state.members.len() {
+                                    format!(
+                                        "waiting for a workspace in pool {pool}: all are in use by other members"
+                                    )
+                                } else {
+                                    format!("waiting for a free workspace in pool {pool}")
+                                }
                             });
                             if !fenced.is_empty() {
                                 reason = format!("{reason} ({})", fenced.join("; "));
@@ -575,7 +597,7 @@ pub fn plan(mut input: PlanInput) -> Plan {
                 input
                     .busy_workspaces
                     .insert((placement.host_id.clone(), placement.name.clone()));
-                if let Some(member) = input.members.get(&c.id).cloned() {
+                if let Some(member) = c.member.clone() {
                     input
                         .bindings
                         .insert((placement.host_id.clone(), placement.name.clone()), member);
@@ -652,6 +674,7 @@ mod tests {
                 host_id: "h1".into(),
                 name: name.into(),
             },
+            member: None,
         }
     }
     fn roomy() -> HostLoad {
@@ -681,7 +704,6 @@ mod tests {
             pools: BTreeMap::new(),
             headroom_bytes: GIB,
             admitting: true,
-            members: BTreeMap::new(),
             bindings: BTreeMap::new(),
         }
     }
@@ -787,6 +809,7 @@ mod tests {
                 pool: "workers".into(),
                 pinned,
             },
+            member: None,
         }
     }
     fn member(host: &str, name: &str) -> Placement {
@@ -938,5 +961,63 @@ mod tests {
             p.waiting["r"].1,
             "workspace ebox-w1 busy (resume is pinned to it; execution uncertain; lease probe failed)"
         );
+    }
+    #[test]
+    fn a_member_run_prefers_its_own_bound_workspace() {
+        let mut c = pool_run("r1", 1, None);
+        c.member = Some("usr_aaaaaaaaaaaaaaaaaaaaaaaa".into());
+        let mut i = input(
+            std::slice::from_ref(&c),
+            vec![("h1", host(4, 0, Some(roomy())))],
+        );
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![
+                    member("h1", "m-free"),
+                    member("h1", "m-own"),
+                    member("h1", "m-bob"),
+                ],
+                // The unbound one is running, the member's own is stopped:
+                // the member's own still wins (its state is there).
+                max_workspaces: 3,
+                member_rank: BTreeMap::from([(("h1".into(), "m-own".into()), 2)]),
+                ..Default::default()
+            },
+        );
+        i.bindings.insert(
+            ("h1".into(), "m-own".into()),
+            "usr_aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        i.bindings.insert(
+            ("h1".into(), "m-bob".into()),
+            "usr_bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+        let first = plan(i);
+        assert_eq!(first.admit, vec![("r1".to_owned(), member("h1", "m-own"))]);
+        // With only other members' workspaces, the wait says so.
+        let mut i = input(
+            std::slice::from_ref(&c),
+            vec![("h1", host(4, 0, Some(roomy())))],
+        );
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![member("h1", "m-bob")],
+                max_workspaces: 1,
+                ..Default::default()
+            },
+        );
+        i.bindings.insert(
+            ("h1".into(), "m-bob".into()),
+            "usr_bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+        let blocked = plan(i);
+        assert!(
+            blocked.waiting["r1"]
+                .1
+                .contains("all are in use by other members")
+        );
+        assert_eq!(blocked.member_blocked["workers"], 1);
     }
 }
