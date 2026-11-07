@@ -46,8 +46,10 @@ read-modify-write with an atomic rename, and no network call happens under the l
    consent then offers only that project's pools, repositories and engine
    sessions, and the grant (and every access token minted for it) is restricted to
    that project. `scope` is space-separated: `agent-runs` (the default when
-   omitted: workspaces, pools and repositories), `engine-sessions` (below), or
-   `agent-runs engine-sessions`; any other value is `invalid_scope`. Clients that
+   omitted: workspaces, pools and repositories), `engine-sessions` (below),
+   `agent-credentials` ([member subscriptions](MEMBER-SUBSCRIPTIONS.md), only
+   when `ENGINEBOX_MEMBER_CREDENTIALS=1`), or several of them; any other value is
+   `invalid_scope`. Clients that
    send `scope=agent-runs`, or none, see exactly what they saw before.
 4. **Sign-in and consent.** The owner signs in (if needed) and sees the app's
    self-chosen name, its redirect host and client ID, then ticks the pools and the
@@ -103,6 +105,16 @@ with, and it stays the same across refreshes. A refresh response repeats
 7. **Use.** Call the agent-run routes on the public origin with
    `Authorization: Bearer <access_token>`. Refresh with
    `grant_type=refresh_token` before `expires_in` runs out.
+
+### Member subscriptions
+
+With `scope=agent-credentials`, "Connect and use your own AI subscriptions in
+project X" is a checkbox per project, offered only to a signed-in member, and any
+member may approve it because it acts only as them. The token carries
+`agent_credentials: [{project}]`, `member` and the operations
+`agent_credentials.manage|run`, and reaches only the `/v1/projects/{p}/me/…`
+routes. See [member subscriptions](MEMBER-SUBSCRIPTIONS.md) for the API and its
+isolation rules. `enginebox_grants` lists `{kind: "agent_credentials", project, member}`.
 
 ### Engine sessions
 
@@ -163,6 +175,7 @@ of [the engine-session API](ENGINE-SESSIONS.md#api-packagesenginebox-controllers
 | `POST /v1/projects/{project}/engine-sessions/{id}/watch-token` | `{}`; a short-lived subscribe-only token for public viewers |
 | `POST /v1/projects/{project}/engine-sessions/{id}/ice` | `{}`; relay-only TURN ICE servers for a world session (`engine_sessions.watch`) |
 | `POST /v1/projects/{project}/engine-sessions/{id}/peers[/{peer}/offer\|poll\|renew\|end]` | The WebRTC fallback for viewers whose network blocks QUIC (`engine_sessions.watch`; [details](ENGINE-SESSIONS.md#webrtc-fallback-packagesenginebox-controllersrcengine_sessionspeersrs-turnrs)) |
+| `GET\|POST /v1/projects/{project}/me/credentials[/{id}/login\|delete\|sessions/{s}[/input\|cancel]]` | The consenting member's own subscriptions (`agent-credentials`; [details](MEMBER-SUBSCRIPTIONS.md)) |
 | `GET /api/oauth/grants`, `POST /api/oauth/grants/{id}/revoke` | Owner-only (dashboard session): list and disconnect apps |
 
 The dashboard's **MCP** section includes Connected apps and grants: every live

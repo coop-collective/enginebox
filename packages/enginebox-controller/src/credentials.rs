@@ -22,6 +22,13 @@
 //! Unity when saved ([`crate::unity`]) and only ever used for its owner's own
 //! sessions ([`Credentials::unity_for`], [`Credentials::unity_access_token`]).
 //!
+//! A member may also connect their **own** subscriptions through an app they
+//! approved with the `agent-credentials` OAuth scope ([`Credentials::member_create`]
+//! and the other `member_*` methods; docs/MEMBER-SUBSCRIPTIONS.md). Those are
+//! ordinary personal credentials owned by the token's member, marked in
+//! `agent-credentials/member/<id>.json` so they can never be shared into org
+//! pools: they serve only their owner's own runs.
+//!
 //! Records live under `agent-credentials/<id>.json`, homes under
 //! `agent-credentials/homes/<id>/`, keys under `agent-credentials/keys/<id>.json`.
 //! Unity accounts live under `agent-credentials/unity/<id>.json` (a directory
@@ -177,6 +184,7 @@ fn refuse(status: u16, message: &str) -> anyhow::Error {
 }
 
 pub const UNITY: &str = "unity";
+const MEMBER_DIR: &str = "member";
 pub const UNITY_INVALID: &str =
     "Unity did not accept this email and password. Check them and save again.";
 pub const UNITY_TWO_FACTOR: &str = "This Unity account asks for two-factor sign-in, which Engine Box cannot answer with a password. Turn off two-factor sign-in for this Unity account in your Unity ID settings, then save again.";
@@ -189,6 +197,23 @@ pub struct Candidate {
     /// Why it is eligible: `own` (the requesting member's personal credential),
     /// `shared` (another member's, shared into org pools), `team` or `api_key`.
     pub reason: &'static str,
+}
+
+/// The providers a member may connect through an app: subscriptions with a
+/// native sign-in and a delegable access token.
+pub const MEMBER_PROVIDERS: &[&str] = &["claude", "codex"];
+
+/// A credential connected through a member's own app grant. Stored beside
+/// the record (`agent-credentials/member/<id>.json`, a directory older
+/// controllers do not read) so the record format is unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberMeta {
+    pub id: String,
+    pub org_id: String,
+    pub owner_user_id: String,
+    pub provider: String,
+    pub created_at: String,
 }
 
 struct Session {
@@ -206,6 +231,7 @@ pub struct Credentials {
     sessions: Arc<Mutex<BTreeMap<String, Session>>>,
     unity: Arc<Mutex<BTreeMap<String, UnityAccount>>>,
     unity_login: unity::Client,
+    member: Arc<Mutex<BTreeMap<String, MemberMeta>>>,
 }
 
 fn valid_user(id: &str) -> bool {
@@ -248,6 +274,7 @@ impl Credentials {
         security::private_dir(&records_dir.join("homes"))?;
         security::private_dir(&records_dir.join("keys"))?;
         state::private_dir(&records_dir.join(UNITY))?;
+        state::private_dir(&records_dir.join(MEMBER_DIR))?;
         let mut binaries = BTreeMap::new();
         let env = BTreeMap::from([(
             "PATH".to_owned(),
@@ -283,6 +310,19 @@ impl Credentials {
             );
             accounts.insert(account.id.clone(), account);
         }
+        let mut member = BTreeMap::new();
+        for path in state::json_files(&records_dir.join(MEMBER_DIR))? {
+            let meta: MemberMeta = serde_json::from_value(state::read_json(&path)?)?;
+            ensure!(
+                path.file_stem().and_then(|s| s.to_str()) == Some(meta.id.as_str())
+                    && valid_id(&meta.id),
+                "Invalid credential record"
+            );
+            // A marker whose record is gone (an interrupted delete) is dropped.
+            if records.contains_key(&meta.id) {
+                member.insert(meta.id.clone(), meta);
+            }
+        }
         Ok(Self {
             root: records_dir,
             binaries: Arc::new(binaries),
@@ -290,6 +330,7 @@ impl Credentials {
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             unity: Arc::new(Mutex::new(accounts)),
             unity_login: unity::Client::from_env(),
+            member: Arc::new(Mutex::new(member)),
         })
     }
     /// Use another Unity login endpoint (tests, or a configured stand-in).
@@ -435,6 +476,12 @@ impl Credentials {
     pub fn share(&self, org: &str, id: &str, body: &Value) -> Result<Value> {
         crate::keys(body, &["share"], &["share"])?;
         let share = body["share"].as_bool().context("share must be a boolean")?;
+        if self.member.lock().unwrap().contains_key(id) {
+            return Err(refuse(
+                400,
+                "A subscription connected through an app is used only by its owner's own runs; it is never shared.",
+            ));
+        }
         let mut records = self.records.lock().unwrap();
         let record = records
             .get_mut(id)
@@ -480,6 +527,10 @@ impl Credentials {
         }
         std::fs::remove_file(self.root.join(format!("{id}.json")))?;
         records.remove(id);
+        drop(sessions);
+        if self.member.lock().unwrap().remove(id).is_some() {
+            remove_if_present(&self.member_path(id))?;
+        }
         Ok(json!({"deleted": true}))
     }
     /// `POST /v1/credentials/{id}/login`: native sign-in into the credential's own home.
@@ -846,6 +897,218 @@ impl Credentials {
         }
     }
 
+    fn member_path(&self, id: &str) -> PathBuf {
+        self.root.join(MEMBER_DIR).join(format!("{id}.json"))
+    }
+    /// Whether `id` was connected through a member's own app grant.
+    pub fn is_member_connected(&self, id: &str) -> bool {
+        self.member.lock().unwrap().contains_key(id)
+    }
+    /// What a member sees of their own credential: no org, owner or sharing
+    /// fields, and never a value.
+    fn member_view(&self, c: &Credential) -> Value {
+        json!({
+            "id": c.id,
+            "provider": c.provider,
+            "label": c.label,
+            "status": c.status,
+            "created_at": c.created_at,
+            "updated_at": c.updated_at,
+            "connected_at": c.connected_at,
+        })
+    }
+    /// `member`'s own personal credential `id` in `org`. Anything else
+    /// (another member's, a team account, a key, another org's) is the same
+    /// 404, so a member cannot probe what exists.
+    pub fn member_owned(&self, org: &str, member: &str, id: &str) -> Result<Credential> {
+        self.get(org, id)
+            .filter(|c| {
+                valid_user(member)
+                    && c.kind == Kind::Personal
+                    && c.owner_user_id.as_deref() == Some(member)
+            })
+            .ok_or_else(|| refuse(404, "Unknown credential."))
+    }
+    /// `GET /v1/projects/{p}/me/credentials`: the member's own personal
+    /// credentials in `org`, and nobody else's.
+    pub fn member_list(&self, org: &str, member: &str) -> Value {
+        let records = self.records.lock().unwrap();
+        let rows: Vec<Value> = records
+            .values()
+            .filter(|c| {
+                c.org_id == org
+                    && c.kind == Kind::Personal
+                    && c.owner_user_id.as_deref() == Some(member)
+                    && MEMBER_PROVIDERS.contains(&c.provider.as_str())
+            })
+            .map(|c| self.member_view(c))
+            .collect();
+        json!({"credentials": rows})
+    }
+    /// `POST /v1/projects/{p}/me/credentials {provider, label?}`: the
+    /// member's own personal credential for `provider`, created when they
+    /// have none. Never shared (`share_with_org_pools` is not accepted and
+    /// stays false). Returns whether it was created.
+    pub fn member_create(&self, org: &str, member: &str, body: &Value) -> Result<(bool, Value)> {
+        if !body.is_object() {
+            return Err(refuse(400, "Body must be a JSON object."));
+        }
+        if body.as_object().is_some_and(|o| {
+            o.keys()
+                .any(|k| !["provider", "label"].contains(&k.as_str()))
+        }) {
+            return Err(refuse(
+                400,
+                "Only provider and label are accepted; a member's subscription is never shared and takes no key.",
+            ));
+        }
+        if !valid_user(member) || !pools::valid_org(org) {
+            return Err(refuse(
+                403,
+                "Only a member connects their own subscription.",
+            ));
+        }
+        let provider = body["provider"]
+            .as_str()
+            .filter(|p| MEMBER_PROVIDERS.contains(p))
+            .ok_or_else(|| refuse(400, "provider must be claude or codex"))?
+            .to_owned();
+        let label = match body.get("label") {
+            None | Some(Value::Null) => match provider.as_str() {
+                "claude" => "Claude subscription".to_owned(),
+                _ => "ChatGPT subscription".to_owned(),
+            },
+            Some(v) => v
+                .as_str()
+                .map(str::trim)
+                .filter(|l| valid_label(l))
+                .ok_or_else(|| refuse(400, "label must be 1-80 printable characters"))?
+                .to_owned(),
+        };
+        let mut records = self.records.lock().unwrap();
+        if let Some(existing) = records.values().find(|c| {
+            c.org_id == org
+                && c.kind == Kind::Personal
+                && c.provider == provider
+                && c.owner_user_id.as_deref() == Some(member)
+        }) {
+            return Ok((false, json!({"credential": self.member_view(existing)})));
+        }
+        if records.len() >= MAX_CREDENTIALS {
+            return Err(refuse(409, "Credential limit reached."));
+        }
+        let at = now();
+        let record = Credential {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            org_id: org.to_owned(),
+            provider: provider.clone(),
+            kind: Kind::Personal,
+            label,
+            owner_user_id: Some(member.to_owned()),
+            share_with_org_pools: false,
+            status: Status::Pending,
+            created_at: at.clone(),
+            updated_at: at.clone(),
+            connected_at: None,
+        };
+        let meta = MemberMeta {
+            id: record.id.clone(),
+            org_id: org.to_owned(),
+            owner_user_id: member.to_owned(),
+            provider,
+            created_at: at,
+        };
+        // Marker first: a crash between the two leaves a marker the next
+        // open drops, never a shareable record.
+        state::write_json(&self.member_path(&meta.id), &serde_json::to_value(&meta)?)?;
+        self.save(&record)?;
+        let view = self.member_view(&record);
+        self.member.lock().unwrap().insert(meta.id.clone(), meta);
+        records.insert(record.id.clone(), record);
+        Ok((true, json!({"credential": view})))
+    }
+    /// The parts of a sign-in a member's app may relay: the validated
+    /// provider link, the device code, whether a pasted code is awaited, and
+    /// the state. Never a credential value (the sign-in never stores one here).
+    fn member_session_view(public: &Value) -> Value {
+        let mut view = serde_json::Map::new();
+        for key in [
+            "id",
+            "credential_id",
+            "provider",
+            "status",
+            "input_required",
+            "message",
+            "expires_at",
+            "authorization_url",
+            "user_code",
+        ] {
+            if let Some(v) = public.get(key) {
+                view.insert(key.to_owned(), v.clone());
+            }
+        }
+        Value::Object(view)
+    }
+    /// `POST /v1/projects/{p}/me/credentials/{id}/login {}`.
+    pub fn member_login(&self, org: &str, member: &str, id: &str) -> Result<Value> {
+        self.member_owned(org, member, id)?;
+        Ok(json!({"session": Self::member_session_view(&self.start_login(org, id)?)}))
+    }
+    /// `GET /v1/projects/{p}/me/credentials/{id}/sessions/{session}`.
+    pub fn member_login_status(
+        &self,
+        org: &str,
+        member: &str,
+        id: &str,
+        session: &str,
+    ) -> Result<Value> {
+        self.member_owned(org, member, id)?;
+        let public = self
+            .login_status(org, id, session)
+            .map_err(|_| refuse(404, "Unknown sign-in."))?;
+        Ok(json!({"session": Self::member_session_view(&public)}))
+    }
+    /// `POST /v1/projects/{p}/me/credentials/{id}/sessions/{session}/input {text}`.
+    pub fn member_login_input(
+        &self,
+        org: &str,
+        member: &str,
+        id: &str,
+        session: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        self.member_owned(org, member, id)?;
+        self.session(org, id, session)
+            .map_err(|_| refuse(404, "Unknown sign-in."))?;
+        let public = self.login_input(org, id, session, body).map_err(|_| {
+            refuse(
+                400,
+                "This sign-in is not waiting for a valid authorization code",
+            )
+        })?;
+        Ok(json!({"session": Self::member_session_view(&public)}))
+    }
+    /// `POST /v1/projects/{p}/me/credentials/{id}/sessions/{session}/cancel {}`.
+    pub fn member_login_cancel(
+        &self,
+        org: &str,
+        member: &str,
+        id: &str,
+        session: &str,
+    ) -> Result<Value> {
+        self.member_owned(org, member, id)?;
+        let public = self
+            .login_cancel(org, id, session)
+            .map_err(|_| refuse(404, "Unknown sign-in."))?;
+        Ok(json!({"session": Self::member_session_view(&public)}))
+    }
+    /// `POST /v1/projects/{p}/me/credentials/{id}/delete {}`: the record,
+    /// its home (the provider's tokens) and any sign-in in progress.
+    pub fn member_delete(&self, org: &str, member: &str, id: &str) -> Result<Value> {
+        self.member_owned(org, member, id)?;
+        self.delete(org, id)
+    }
+
     /// The selection interface for runs (not called yet). Eligible connected
     /// credentials of `org` for `provider`, in priority order: the requesting
     /// member's own personal credentials, then personal credentials their
@@ -1021,6 +1284,112 @@ mod tests {
         assert!(c.candidates(OTHER, "codex", Some(ALICE)).is_empty());
         // Sharing is personal-only.
         assert!(c.share(ORG, &team, &json!({"share":true})).is_err());
+    }
+
+    #[test]
+    fn a_member_sees_and_changes_only_their_own_subscriptions() {
+        let (temp, c) = open();
+        let (created, alice) = c
+            .member_create(ORG, ALICE, &json!({"provider":"claude"}))
+            .unwrap();
+        assert!(created);
+        let alice = alice["credential"]["id"].as_str().unwrap().to_owned();
+        // One per provider: connecting again returns the same credential.
+        let (created, again) = c
+            .member_create(ORG, ALICE, &json!({"provider":"claude","label":"Mine"}))
+            .unwrap();
+        assert!(!created);
+        assert_eq!(again["credential"]["id"], alice.as_str());
+        let bob = c
+            .member_create(ORG, BOB, &json!({"provider":"claude"}))
+            .unwrap()
+            .1["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(alice, bob);
+        // An org team account and key are never a member's to see or use.
+        let team = c
+            .create(ORG, &json!({"provider":"claude","kind":"team","label":"t"}))
+            .unwrap()["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let listed = |member| {
+            c.member_list(ORG, member)["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(ALICE), vec![alice.clone()]);
+        assert_eq!(listed(BOB), vec![bob.clone()]);
+        assert!(
+            c.member_list(OTHER, ALICE)["credentials"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Bob cannot sign in to, poll, answer, cancel or delete Alice's (404,
+        // the same as an unknown ID), nor reach the team account.
+        for id in [&alice, &team] {
+            for result in [
+                c.member_login(ORG, BOB, id),
+                c.member_login_status(ORG, BOB, id, &"0".repeat(32)),
+                c.member_login_input(ORG, BOB, id, &"0".repeat(32), &json!({"text":"code"})),
+                c.member_login_cancel(ORG, BOB, id, &"0".repeat(32)),
+                c.member_delete(ORG, BOB, id),
+            ] {
+                assert_eq!(refusal(result.unwrap_err()).0, 404);
+            }
+        }
+        assert_eq!(
+            refusal(c.member_delete(OTHER, ALICE, &alice).unwrap_err()).0,
+            404
+        );
+        assert!(c.get(ORG, &alice).is_some());
+        // Never shareable, never a key, never another provider or owner.
+        assert!(c.share(ORG, &alice, &json!({"share":true})).is_err());
+        assert!(!c.get(ORG, &alice).unwrap().share_with_org_pools);
+        for bad in [
+            json!({"provider":"claude","share_with_org_pools":true}),
+            json!({"provider":"claude","key":"sk-0123456789"}),
+            json!({"provider":"claude","owner_user_id":BOB}),
+            json!({"provider":"cursor"}),
+            json!({"provider":"unity"}),
+            json!({"label":"x"}),
+        ] {
+            assert_eq!(
+                refusal(c.member_create(ORG, ALICE, &bad).unwrap_err()).0,
+                400,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            refusal(
+                c.member_create(ORG, "owner", &json!({"provider":"claude"}))
+                    .unwrap_err()
+            )
+            .0,
+            403
+        );
+        // The marker survives a restart, so the sharing lock does too.
+        let reopened =
+            Credentials::open(&temp.path().canonicalize().unwrap(), &BTreeMap::new()).unwrap();
+        assert!(reopened.is_member_connected(&alice));
+        assert!(reopened.share(ORG, &alice, &json!({"share":true})).is_err());
+        // Alice removes her own; Bob's stays.
+        c.member_delete(ORG, ALICE, &alice).unwrap();
+        assert!(c.get(ORG, &alice).is_none());
+        assert!(!c.is_member_connected(&alice));
+        assert!(
+            !temp
+                .path()
+                .join(format!("agent-credentials/member/{alice}.json"))
+                .exists()
+        );
+        assert!(c.get(ORG, &bob).is_some());
     }
 
     fn with_unity() -> (tempfile::TempDir, Credentials, Arc<Mutex<Vec<String>>>) {

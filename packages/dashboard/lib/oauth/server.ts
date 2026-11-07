@@ -27,6 +27,7 @@ import {
   withState,
   type AuthMethod,
   type Client,
+  type AgentCredentialsGrant,
   type EngineSessionsGrant,
   type Grant,
   type PoolGrant,
@@ -38,7 +39,12 @@ import {
 export const SCOPE = "agent-runs";
 /** Engine sessions acting as the consenting member (docs/ENGINE-SESSIONS.md). */
 export const ENGINE_SCOPE = "engine-sessions";
-export const SCOPES = [SCOPE, ENGINE_SCOPE];
+/** The consenting member's own AI subscriptions and the runs that use them (docs/MEMBER-SUBSCRIPTIONS.md). */
+export const CREDENTIALS_SCOPE = "agent-credentials";
+export const SCOPES = [SCOPE, ENGINE_SCOPE, CREDENTIALS_SCOPE];
+/** Member subscriptions are offered only when the controller has them on (`ENGINEBOX_MEMBER_CREDENTIALS=1`). */
+export const memberCredentialsEnabled = () => process.env.ENGINEBOX_MEMBER_CREDENTIALS === "1";
+const scopeAvailable = (scope: string) => !hasScope(scope, CREDENTIALS_SCOPE) || memberCredentialsEnabled();
 /**
  * A requested scope: space-separated names from SCOPES, normalized (deduplicated, in SCOPES order). Absent:
  * `agent-runs`, as before engine sessions. Null when a name is unknown or the value is empty.
@@ -211,7 +217,7 @@ export async function register(request: Request) {
   if (!Array.isArray(responseTypes) || responseTypes.length !== 1 || responseTypes[0] !== "code")
     throw new OAuthError("invalid_client_metadata", "response_types must be [\"code\"].");
   const registeredScope = body.scope === undefined ? SCOPE : typeof body.scope === "string" ? parseScope(body.scope) : null;
-  if (registeredScope === null) throw new OAuthError("invalid_client_metadata", `Scopes are ${SCOPES.join(" and ")}.`);
+  if (registeredScope === null) throw new OAuthError("invalid_client_metadata", `Scopes are ${SCOPES.join(", ")}.`);
   const name = body.client_name === undefined ? "Unnamed app" : body.client_name;
   if (typeof name !== "string" || !name.trim() || name.length > 100 || !printable(name))
     throw new OAuthError("invalid_client_metadata", "client_name must be 1-100 printable characters.");
@@ -292,6 +298,7 @@ function render(
       agentRuns: hasScope(extra.scope, SCOPE),
       mayApprove: user?.may_approve ?? false,
       engineProjects: engineProjectsFor(user, extra.scope, listed),
+      credentialProjects: credentialProjectsFor(user, extra.scope, listed),
       error: extra.error,
     });
     if (extra.setCookie) response.headers.append("Set-Cookie", extra.setCookie);
@@ -307,6 +314,10 @@ type Grantable = { workspaces: Workspace[]; pools: Pool[]; projects: string[]; e
 /** Engine-session projects `user` may grant as themselves: only a real member, and only when the app asked for the scope. */
 function engineProjectsFor(user: User | null, scope: string | undefined, listed: Grantable) {
   return user && MEMBER_ID.test(user.id) && hasScope(scope, ENGINE_SCOPE) ? listed.engineProjects : [];
+}
+/** Projects whose member subscriptions `user` may grant as themselves: only a real member, only when asked and enabled. */
+function credentialProjectsFor(user: User | null, scope: string | undefined, listed: Grantable) {
+  return user && MEMBER_ID.test(user.id) && hasScope(scope, CREDENTIALS_SCOPE) && memberCredentialsEnabled() ? listed.engineProjects : [];
 }
 async function grantable(project: string | null | undefined, org: string): Promise<Grantable | null> {
   const [workspaces, pools, view] = await Promise.allSettled([grantableWorkspaces(), grantablePools(), tenancy()]);
@@ -366,9 +377,10 @@ export async function authorize(request: Request) {
   const challenge = params.get("code_challenge") ?? "";
   if (params.get("code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge))
     return fail("invalid_request", "PKCE is required: send a code_challenge with code_challenge_method=S256.");
-  // `agent-runs` (the default), `engine-sessions`, or both.
+  // `agent-runs` (the default), `engine-sessions`, `agent-credentials`, or several.
   const scope = parseScope(params.get("scope"));
-  if (scope === null) return fail("invalid_scope", `Scopes are ${SCOPES.join(" and ")}.`);
+  if (scope === null) return fail("invalid_scope", `Scopes are ${SCOPES.join(", ")}.`);
+  if (!scopeAvailable(scope)) return fail("invalid_scope", "Member subscriptions (agent-credentials) are not enabled on this Engine Box.");
   const resource = params.get("resource") ?? "";
   if (!sameResource(resource)) return fail("invalid_target", `resource must be ${resourceId()}.`);
   // Optional: the app asks for one project's pools; the grant is then restricted to that project.
@@ -463,14 +475,22 @@ export async function authorizePost(request: Request) {
     chosenRepositories.push({ project: repoProject, access: value });
   }
   const chosenEngine: EngineSessionsGrant[] = [...new Set(form.getAll("engine_sessions"))].map((p) => ({ project: p }));
+  const chosenCredentials: AgentCredentialsGrant[] = [...new Set(form.getAll("agent_credentials"))].map((p) => ({ project: p }));
+  const memberTargets = chosenEngine.length + chosenCredentials.length;
   const agentRunTargets = chosen.length + chosenPools.length + chosenRepositories.length;
-  if (!agentRunTargets && !chosenEngine.length)
-    return again(hasScope(scope, SCOPE) ? "Select at least one workspace or pool, or a project's repositories." : "Select at least one project's engine sessions.");
+  if (!agentRunTargets && !memberTargets)
+    return again(
+      hasScope(scope, SCOPE)
+        ? "Select at least one workspace or pool, or a project's repositories."
+        : hasScope(scope, ENGINE_SCOPE)
+          ? "Select at least one project's engine sessions."
+          : "Select at least one project for your AI subscriptions.",
+    );
   // Agent runs and repositories are the org's to hand out; engine sessions act only as the approver.
   if (agentRunTargets && !user.may_approve)
     return errorPage("Connecting an app to agent runs or repositories needs the admin or owner role in your organization. Ask an admin to approve it.", 403);
   if (agentRunTargets && !hasScope(scope, SCOPE)) return again("The app did not ask to run agents or use repositories.");
-  if (chosen.length > MAX_GRANT_WORKSPACES || agentRunTargets + chosenEngine.length > MAX_GRANT_TARGETS)
+  if (chosen.length > MAX_GRANT_WORKSPACES || agentRunTargets + memberTargets > MAX_GRANT_TARGETS)
     return again("Select fewer workspaces, pools and projects.");
   const available = await grantable(project, user.org_id);
   if (!available) return errorPage("Engine Box could not list your workspaces or pools. Check that the fleet service is running.", 503);
@@ -479,6 +499,10 @@ export async function authorizePost(request: Request) {
   const engineProjects = engineProjectsFor(user, scope, available);
   if (chosenEngine.some((e) => !PROJECT.test(e.project) || !engineProjects.includes(e.project)))
     return again("A selected project's engine sessions are not available.");
+  // Subscriptions act only as the approver: a real member who asked for the scope, on an Engine Box that has it on.
+  const credentialProjects = credentialProjectsFor(user, scope, available);
+  if (chosenCredentials.some((c) => !PROJECT.test(c.project) || !credentialProjects.includes(c.project)))
+    return again("A selected project's subscriptions are not available.");
   const workspaces: WorkspaceGrant[] = [];
   for (const value of chosen) {
     const workspace = available.workspaces.find((w) => `${w.host}/${w.instance}` === value);
@@ -507,7 +531,9 @@ export async function authorizePost(request: Request) {
     if (unknown.length) return again(`Unknown profile: ${unknown.join(", ")}.`);
   }
   // What was granted, not merely asked for.
-  const granted = SCOPES.filter((n) => (n === SCOPE ? agentRunTargets > 0 : chosenEngine.length > 0)).join(" ");
+  const granted = SCOPES.filter((n) =>
+    n === SCOPE ? agentRunTargets > 0 : n === ENGINE_SCOPE ? chosenEngine.length > 0 : chosenCredentials.length > 0,
+  ).join(" ");
   const code = `${CODE_PREFIX}${randomToken()}`;
   const ok = withState((state, now) => {
     const index = state.pending.findIndex((p) => p.id_hash === pending.id_hash);
@@ -526,6 +552,7 @@ export async function authorizePost(request: Request) {
       pools,
       repositories: chosenRepositories,
       ...(chosenEngine.length ? { engine_sessions: chosenEngine } : {}),
+      ...(chosenCredentials.length ? { agent_credentials: chosenCredentials } : {}),
       project,
       expires_at: now + CODE_SECONDS * 1000,
       used_at: null,
@@ -591,9 +618,10 @@ function authenticateClient(request: Request, form: URLSearchParams, state: Stat
  * whose repositories it may use (`{kind: "repositories", project, access}`,
  * `access` "read" or "write"), and per project whose engine sessions it may run
  * as the consenting member (`{kind: "engine_sessions", project, member}`,
- * `member` that member's user ID).
+ * `member` that member's user ID), and per project where it manages and runs
+ * with the consenting member's own subscriptions (`{kind: "agent_credentials", project, member}`).
  */
-export function grantsView(grant: Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions"> & { user_id?: string }) {
+export function grantsView(grant: Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions" | "agent_credentials"> & { user_id?: string }) {
   return [
     ...grant.workspaces.map((w) => ({ kind: "workspace" as const, host: w.host, instance: w.instance, profiles: w.profiles })),
     ...(grant.pools ?? []).map((p) => ({
@@ -605,9 +633,10 @@ export function grantsView(grant: Pick<Grant, "workspaces" | "pools" | "reposito
     })),
     ...(grant.repositories ?? []).map((r) => ({ kind: "repositories" as const, project: r.project, access: r.access })),
     ...(grant.engine_sessions ?? []).map((e) => ({ kind: "engine_sessions" as const, project: e.project, member: grant.user_id })),
+    ...(grant.agent_credentials ?? []).map((c) => ({ kind: "agent_credentials" as const, project: c.project, member: grant.user_id })),
   ];
 }
-type GrantShape = Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions" | "user_id" | "scope">;
+type GrantShape = Pick<Grant, "workspaces" | "pools" | "repositories" | "engine_sessions" | "agent_credentials" | "user_id" | "scope">;
 function tokenResponse(minted: Minted, refresh: string, grant: GrantShape, callbackSecret?: string) {
   return oauthJson({
     access_token: minted.secret,
@@ -708,7 +737,7 @@ export async function token(request: Request) {
   const grantType = form.get("grant_type");
   const resource = form.get("resource");
   if (resource !== null && !sameResource(resource)) throw new OAuthError("invalid_target", `resource must be ${resourceId()}.`);
-  if (form.get("scope") !== null && parseScope(form.get("scope")) === null) throw new OAuthError("invalid_scope", `Scopes are ${SCOPES.join(" and ")}.`);
+  if (form.get("scope") !== null && parseScope(form.get("scope")) === null) throw new OAuthError("invalid_scope", `Scopes are ${SCOPES.join(", ")}.`);
   try {
     if (grantType === "authorization_code") return await exchangeCode(request, form);
     if (grantType === "refresh_token") return await refresh(request, form);
@@ -749,12 +778,13 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
   const pools = record.pools ?? [];
   const repositories = record.repositories ?? [];
   const engine = record.engine_sessions ?? [];
+  const credentials = record.agent_credentials ?? [];
   const callbackSecret = randomToken(32);
   let minted: Minted;
   try {
     minted = await mintAccessToken(
       grantId,
-      { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project, org_id: record.org_id, ...engineGrant(record) },
+      { workspaces: record.workspaces, pools, repositories, callback_secret: callbackSecret, project: record.project, org_id: record.org_id, ...memberGrant(record) },
       ACCESS_TOKEN_SECONDS,
     );
   } catch (error) {
@@ -779,6 +809,7 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
       pools,
       repositories,
       ...(engine.length ? { engine_sessions: engine } : {}),
+      ...(credentials.length ? { agent_credentials: credentials } : {}),
       callback_secret: callbackSecret,
       project: record.project ?? null,
       created_at: now,
@@ -795,18 +826,25 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
     return true;
   });
   if (!stored) throw new OAuthError("invalid_grant", "The authorization code was already used; its tokens are revoked.");
-  return tokenResponse(minted, refreshToken, { workspaces: record.workspaces, pools, repositories, engine_sessions: engine, user_id: record.user_id, scope: record.scope }, callbackSecret);
+  return tokenResponse(minted, refreshToken, { workspaces: record.workspaces, pools, repositories, engine_sessions: engine, agent_credentials: credentials, user_id: record.user_id, scope: record.scope }, callbackSecret);
 }
 
 /**
- * The engine-session part of a token: the consented projects and the member it acts as. A member who has
- * left the grant's org (or was removed) is refused, which ends the connection at refresh.
+ * The member parts of a token (engine sessions, subscriptions): the consented projects and the member they
+ * act as. A member who has left the grant's org (or was removed) is refused, which ends the connection at
+ * refresh. Subscriptions also end when the Engine Box turns them off.
  */
-function engineGrant(grant: { engine_sessions?: EngineSessionsGrant[]; user_id: string; org_id?: string }) {
+function memberGrant(grant: { engine_sessions?: EngineSessionsGrant[]; agent_credentials?: AgentCredentialsGrant[]; user_id: string; org_id?: string }) {
   const engine = grant.engine_sessions ?? [];
-  if (!engine.length) return {};
-  if (!stillMember(grant.user_id, grant.org_id ?? DEFAULT_ORG)) throw new GrantRefused("The member who consented to engine sessions is no longer in this organization.");
-  return { engine_sessions: engine, member: grant.user_id };
+  const credentials = grant.agent_credentials ?? [];
+  if (!engine.length && !credentials.length) return {};
+  if (!stillMember(grant.user_id, grant.org_id ?? DEFAULT_ORG)) throw new GrantRefused("The member who consented is no longer in this organization.");
+  if (credentials.length && !memberCredentialsEnabled()) throw new GrantRefused("Member subscriptions are not enabled on this Engine Box.");
+  return {
+    ...(engine.length ? { engine_sessions: engine } : {}),
+    ...(credentials.length ? { agent_credentials: credentials } : {}),
+    member: grant.user_id,
+  };
 }
 
 function sha256b64(value: string) {
@@ -849,7 +887,7 @@ async function refresh(request: Request, form: URLSearchParams) {
         callback_secret: grant.callback_secret,
         project: grant.project,
         org_id: grant.org_id,
-        ...engineGrant(grant),
+        ...memberGrant(grant),
       },
       ACCESS_TOKEN_SECONDS,
     );
@@ -948,6 +986,8 @@ const PROJECT_ID = "[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?";
 const REPOSITORY = "[a-z0-9][a-z0-9._-]{0,62}";
 /** The controller's engine-session IDs. */
 const ENGINE_SESSION = "[a-f0-9]{32}";
+/** The controller's credential and sign-in IDs. */
+const CREDENTIAL = "[a-f0-9]{32}";
 export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["GET", /^v1\/agent-runs$/],
   ["GET", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}$`)],
@@ -973,8 +1013,15 @@ export const RESOURCE_ROUTES: [string, RegExp][] = [
   // The WebRTC fallback for viewers whose network blocks QUIC: open a peer, then offer/poll/renew/end it.
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/peers$`)],
   ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions/${ENGINE_SESSION}/peers/[a-f0-9]{32}/(?:offer|poll|renew|end)$`)],
+  // Member subscriptions (the `agent-credentials` scope): the consenting member's own credentials only.
+  ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials/${CREDENTIAL}/(?:login|delete)$`)],
+  ["GET", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials/${CREDENTIAL}/sessions/${CREDENTIAL}$`)],
+  ["POST", new RegExp(`^v1/projects/${PROJECT_ID}/me/credentials/${CREDENTIAL}/sessions/${CREDENTIAL}/(?:input|cancel)$`)],
 ];
 const ENGINE_ROUTE = new RegExp(`^v1/projects/${PROJECT_ID}/engine-sessions(?:/|$)`);
+const MEMBER_ROUTE = new RegExp(`^v1/projects/${PROJECT_ID}/me/`);
 
 function challenge(error?: string, description?: string, scope = SCOPE) {
   const parts = [`resource_metadata="${resourceMetadataUrl()}"`];
@@ -1050,7 +1097,7 @@ export async function resourceProxy(request: Request, segments: string[]) {
       "WWW-Authenticate": challenge(
         "insufficient_scope",
         "The token is not granted that operation on that workspace, pool or project.",
-        ENGINE_ROUTE.test(path) ? ENGINE_SCOPE : SCOPE,
+        ENGINE_ROUTE.test(path) ? ENGINE_SCOPE : MEMBER_ROUTE.test(path) ? CREDENTIALS_SCOPE : SCOPE,
       ),
     });
   // A full run queue answers 429 with Retry-After; clients need it to wait rather than back off blindly.
@@ -1086,6 +1133,8 @@ export function listGrants(request: Request) {
         repositories: (g.repositories ?? []).map((r) => ({ project: r.project, access: r.access })),
         // Acts as the approving member (approver_id) in the grant's org.
         engine_sessions: (g.engine_sessions ?? []).map((e) => ({ project: e.project })),
+        // The approving member's own subscriptions, in the grant's org.
+        agent_credentials: (g.agent_credentials ?? []).map((c) => ({ project: c.project })),
         approver_id: g.user_id,
         project: g.project ?? null,
         created_at: new Date(g.created_at).toISOString(),

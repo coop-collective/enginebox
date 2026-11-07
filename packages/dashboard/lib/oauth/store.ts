@@ -31,6 +31,12 @@ export type RepositoryGrant = { project: string; access: "read" | "write" };
  * account, and only that member's sessions (and their stream blocks) are visible.
  */
 export type EngineSessionsGrant = { project: string };
+/**
+ * Consented member subscriptions in one project (docs/MEMBER-SUBSCRIPTIONS.md), acting as the consenting
+ * member (the grant's `user_id`, in its org): connect, list and remove only that member's own Claude or
+ * ChatGPT subscription, and run that member's prompts with it, never anyone else's.
+ */
+export type AgentCredentialsGrant = { project: string };
 
 export type Client = {
   client_id: string;
@@ -72,6 +78,8 @@ export type Code = {
   repositories?: RepositoryGrant[];
   /** Absent in state written before engine-session grants existed. */
   engine_sessions?: EngineSessionsGrant[];
+  /** Absent unless the member consented to the `agent-credentials` scope. */
+  agent_credentials?: AgentCredentialsGrant[];
   /** Restricts the grant's pools to one project (absent or null: no restriction). */
   project?: string | null;
   expires_at: number;
@@ -97,6 +105,8 @@ export type Grant = {
   repositories?: RepositoryGrant[];
   /** Absent in state written before engine-session grants existed. Acts as `user_id` in `org_id`. */
   engine_sessions?: EngineSessionsGrant[];
+  /** Absent unless the member consented to the `agent-credentials` scope. Acts as `user_id` in `org_id`. */
+  agent_credentials?: AgentCredentialsGrant[];
   /**
    * HMAC key the controller signs this grant's run callbacks with. Passed to
    * every access token minted for the grant, returned to the client once at

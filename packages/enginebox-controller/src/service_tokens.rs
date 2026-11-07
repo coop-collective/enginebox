@@ -44,6 +44,15 @@ pub enum Operation {
     /// member's ready sessions.
     #[serde(rename = "engine_sessions.watch")]
     EngineWatch,
+    /// The member's own AI subscriptions (docs/MEMBER-SUBSCRIPTIONS.md):
+    /// list, connect with the provider's native sign-in, and remove. Only
+    /// with an [`AgentCredentialsGrant`] on the project and a [`Token::member`].
+    #[serde(rename = "agent_credentials.manage")]
+    CredentialsManage,
+    /// Start, read, list and cancel the member's own runs, which use only
+    /// the member's own subscription.
+    #[serde(rename = "agent_credentials.run")]
+    CredentialsRun,
 }
 impl Operation {
     pub fn engine(self) -> bool {
@@ -55,6 +64,14 @@ impl Operation {
                 | Self::EngineEnd
                 | Self::EngineWatch
         )
+    }
+    /// Member-subscription operations (they act as the token's member).
+    pub fn credentials(self) -> bool {
+        matches!(self, Self::CredentialsManage | Self::CredentialsRun)
+    }
+    /// Operations that act as the token's member rather than for the app.
+    pub fn member_scoped(self) -> bool {
+        self.engine() || self.credentials()
     }
 }
 
@@ -74,6 +91,15 @@ pub struct RepositoryGrant {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineSessionsGrant {
+    pub project: String,
+}
+
+/// The member's own AI subscriptions in one project, acting as the token's
+/// [`Token::member`]: their personal credentials (never anyone else's) and
+/// runs that use only those credentials.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCredentialsGrant {
     pub project: String,
 }
 
@@ -124,10 +150,14 @@ pub struct Token {
     /// releases still read the record.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub engine_sessions: BTreeSet<EngineSessionsGrant>,
-    /// The member (`usr_…`) engine-session grants act as: the user who
-    /// consented. Set exactly when `engine_sessions` is not empty.
+    /// The member (`usr_…`) engine-session and agent-credential grants act
+    /// as: the user who consented. Set exactly when either is not empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<String>,
+    /// Agent-credential grants, one per project. Omitted when empty so older
+    /// releases still read the record.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agent_credentials: BTreeSet<AgentCredentialsGrant>,
 }
 impl std::fmt::Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,6 +229,19 @@ impl Token {
         }
         self.member.as_deref()
     }
+    /// The member an agent-credential `operation` on `project` acts as, when
+    /// this token holds that operation and a grant on the project (inside
+    /// its project restriction if it has one). Never the owner.
+    pub fn credentials_member(&self, operation: Operation, project: &str) -> Option<&str> {
+        if !operation.credentials()
+            || !self.operations.contains(&operation)
+            || self.project.as_deref().is_some_and(|p| p != project)
+            || !self.agent_credentials.iter().any(|g| g.project == project)
+        {
+            return None;
+        }
+        self.member.as_deref().filter(|m| m.starts_with("usr_"))
+    }
     pub fn sees(&self, host_id: &str, name: &str) -> bool {
         self.scopes
             .iter()
@@ -226,6 +269,7 @@ impl Token {
             "repositories":self.repositories,
             "engine_sessions":self.engine_sessions,
             "member":self.member,
+            "agent_credentials":self.agent_credentials,
             "org_id":self.org(),
             "has_callback_secret":self.callback_secret.is_some(),
             "active":self.revoked_at.is_none() && !self.expired(now),
@@ -258,9 +302,12 @@ pub struct MintRequest {
     pub org_id: Option<String>,
     #[serde(default)]
     pub engine_sessions: Vec<EngineSessionsGrant>,
-    /// The member engine-session grants act as; required with them.
+    /// The member engine-session and agent-credential grants act as;
+    /// required with them.
     #[serde(default)]
     pub member: Option<String>,
+    #[serde(default)]
+    pub agent_credentials: Vec<AgentCredentialsGrant>,
 }
 
 use enginebox_node_protocol::service_token::{secret_hash, valid_id};
@@ -322,7 +369,8 @@ impl ServiceTokens {
             (!request.scopes.is_empty()
                 || !request.pools.is_empty()
                 || !request.repositories.is_empty()
-                || !request.engine_sessions.is_empty())
+                || !request.engine_sessions.is_empty()
+                || !request.agent_credentials.is_empty())
                 && request.scopes.len() <= MAX_SCOPES,
             "scopes must name 1-256 workspaces, or pools, repositories or engine sessions at least one grant"
         );
@@ -341,20 +389,52 @@ impl ServiceTokens {
                     == request.engine_sessions.len(),
             "engine_sessions must name at most 256 distinct projects"
         );
-        // Engine-session grants act as exactly one member, never as the owner.
         ensure!(
-            request.engine_sessions.is_empty() == request.member.is_none()
+            request.agent_credentials.len() <= MAX_SCOPES
+                && request
+                    .agent_credentials
+                    .iter()
+                    .all(|g| enginebox_agents::pools::valid_project(&g.project))
+                && request
+                    .agent_credentials
+                    .iter()
+                    .map(|g| &g.project)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == request.agent_credentials.len(),
+            "agent_credentials must name at most 256 distinct projects"
+        );
+        // Engine-session and agent-credential grants act as exactly one
+        // member, never as the owner.
+        let member_grants =
+            !request.engine_sessions.is_empty() || !request.agent_credentials.is_empty();
+        ensure!(
+            member_grants != request.member.is_none()
                 && request
                     .member
                     .as_deref()
                     .is_none_or(|m| { m != "owner" && crate::audit::valid_actor(m) }),
-            "member must name the user engine_sessions act as, and only with engine_sessions"
+            "member must name the user engine_sessions or agent_credentials act as, and only with them"
+        );
+        // A member's own subscriptions are only ever theirs: an org member, never a service actor.
+        ensure!(
+            request.agent_credentials.is_empty()
+                || request
+                    .member
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("usr_")),
+            "agent_credentials act as a member user (usr_…)"
         );
         let engine_operations = request.operations.iter().any(|o| o.engine());
         let engine_grants = !request.engine_sessions.is_empty();
         ensure!(
             engine_operations == engine_grants,
             "engine_sessions operations need an engine_sessions grant, and the grant needs them"
+        );
+        let credential_operations = request.operations.iter().any(|o| o.credentials());
+        ensure!(
+            credential_operations != request.agent_credentials.is_empty(),
+            "agent_credentials operations need an agent_credentials grant, and the grant needs them"
         );
         ensure!(
             request.repositories.len() <= MAX_SCOPES
@@ -387,8 +467,16 @@ impl ServiceTokens {
             ensure!(
                 !request.pools.is_empty()
                     || !request.repositories.is_empty()
-                    || !request.engine_sessions.is_empty(),
-                "project restricts pool, repository and engine-session grants; name at least one"
+                    || !request.engine_sessions.is_empty()
+                    || !request.agent_credentials.is_empty(),
+                "project restricts pool, repository, engine-session and agent-credential grants; name at least one"
+            );
+            ensure!(
+                request
+                    .agent_credentials
+                    .iter()
+                    .all(|g| &g.project == project),
+                "Every agent-credential grant must name the token's project"
             );
             ensure!(
                 request.repositories.iter().all(|g| &g.project == project),
@@ -431,7 +519,7 @@ impl ServiceTokens {
         // A repository-only token (for example read-only indexing) needs no
         // agent-run operation; any workspace or pool grant does.
         ensure!(
-            request.operations.iter().any(|o| !o.engine())
+            request.operations.iter().any(|o| !o.member_scoped())
                 || (request.scopes.is_empty() && request.pools.is_empty()),
             "operations must name at least one agent-run operation"
         );
@@ -488,6 +576,7 @@ impl ServiceTokens {
             org_id: request.org_id,
             engine_sessions: request.engine_sessions.into_iter().collect(),
             member: request.member,
+            agent_credentials: request.agent_credentials.into_iter().collect(),
         };
         self.save(&token)?;
         let public = token.public();
@@ -613,6 +702,7 @@ mod tests {
             org_id: None,
             engine_sessions: vec![],
             member: None,
+            agent_credentials: vec![],
         }
     }
     #[test]
@@ -970,6 +1060,7 @@ mod tests {
                     org_id: None,
                     engine_sessions: BTreeSet::new(),
                     member: None,
+                    agent_credentials: BTreeSet::new(),
                 };
                 tokens.save(&token).unwrap();
                 map.insert(id, token);

@@ -73,6 +73,8 @@ fn main() -> Result<()> {
                     "ENGINEBOX_NODE_PUBLIC_ORIGIN",
                     "ENGINEBOX_OAUTH_STATE_DIR",
                     "ENGINEBOX_OAUTH_REFRESH_GRACE_SECONDS",
+                    // Member subscriptions (docs/MEMBER-SUBSCRIPTIONS.md).
+                    "ENGINEBOX_MEMBER_CREDENTIALS",
                     // Orgs and email sign-in (docs/ORGS.md).
                     "ENGINEBOX_IDENTITY_STATE_DIR",
                     "ENGINEBOX_OWNER_EMAIL",

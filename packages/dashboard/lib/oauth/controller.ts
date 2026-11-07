@@ -1,11 +1,13 @@
 import { config, HttpError } from "../server";
 import type { Fleet } from "../types";
-import type { EngineSessionsGrant, PoolGrant, RepositoryGrant, WorkspaceGrant } from "./store";
+import type { AgentCredentialsGrant, EngineSessionsGrant, PoolGrant, RepositoryGrant, WorkspaceGrant } from "./store";
 
 /** Every agent-run operation; the `agent-runs` scope grants exactly these. */
 export const AGENT_RUN_OPERATIONS = ["agent_runs.start", "agent_runs.get", "agent_runs.list", "agent_runs.cancel"];
 /** Every engine-session operation; the `engine-sessions` scope grants exactly these, on the consented projects. */
 export const ENGINE_SESSION_OPERATIONS = ["engine_sessions.start", "engine_sessions.get", "engine_sessions.renew", "engine_sessions.end", "engine_sessions.watch"];
+/** Every member-subscription operation; the `agent-credentials` scope grants exactly these, on the consented projects. */
+export const AGENT_CREDENTIAL_OPERATIONS = ["agent_credentials.manage", "agent_credentials.run"];
 
 async function call(path: string, init: { method: string; body?: unknown }) {
   const { apiUrl, apiToken } = config();
@@ -39,7 +41,9 @@ export type TokenGrant = {
   org_id?: string | null;
   /** Engine-session projects; the token acts as `member` there. */
   engine_sessions?: EngineSessionsGrant[];
-  /** The consenting member (`usr_…`); required with `engine_sessions`. */
+  /** The member's own subscriptions in these projects; the token acts as `member` there. */
+  agent_credentials?: AgentCredentialsGrant[];
+  /** The consenting member (`usr_…`); required with `engine_sessions` or `agent_credentials`. */
   member?: string;
 };
 
@@ -52,24 +56,32 @@ export async function mintAccessToken(grantId: string, grant: TokenGrant, ttlSec
   const profiles = [...new Set(grant.workspaces.flatMap((w) => w.profiles))].sort();
   const repositories = grant.repositories ?? [];
   const engine = grant.engine_sessions ?? [];
-  if (engine.length && !grant.member) throw new GrantRefused("Engine sessions need the member who consented.");
-  // An engine-session-only grant holds no agent-run operation; every other grant keeps them all, as before.
-  const agentRuns = !engine.length || grant.workspaces.length > 0 || grant.pools.length > 0 || repositories.length > 0;
+  const credentials = grant.agent_credentials ?? [];
+  if ((engine.length || credentials.length) && !grant.member) throw new GrantRefused("Member grants need the member who consented.");
+  // A member-only grant (engine sessions, subscriptions) holds no agent-run operation; every other grant keeps them all, as before.
+  const memberOnly = engine.length > 0 || credentials.length > 0;
+  const agentRuns = !memberOnly || grant.workspaces.length > 0 || grant.pools.length > 0 || repositories.length > 0;
   const response = await call("v1/service-tokens", {
     method: "POST",
     body: {
       label: `oauth grant ${grantId}`,
       scopes: grant.workspaces.map((w) => ({ host_id: w.host, name: w.instance })),
-      operations: [...(agentRuns ? AGENT_RUN_OPERATIONS : []), ...(engine.length ? ENGINE_SESSION_OPERATIONS : [])],
+      operations: [
+        ...(agentRuns ? AGENT_RUN_OPERATIONS : []),
+        ...(engine.length ? ENGINE_SESSION_OPERATIONS : []),
+        ...(credentials.length ? AGENT_CREDENTIAL_OPERATIONS : []),
+      ],
       expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
       // Optional fields only when used, so older controllers keep accepting workspace-only grants.
       ...(profiles.length ? { profiles } : {}),
       ...(grant.pools.length ? { pools: grant.pools.map((p) => p.pool) } : {}),
       ...(repositories.length ? { repositories: repositories.map((r) => ({ project: r.project, access: r.access })) } : {}),
-      ...(engine.length ? { engine_sessions: engine.map((e) => ({ project: e.project })), member: grant.member } : {}),
+      ...(engine.length ? { engine_sessions: engine.map((e) => ({ project: e.project })) } : {}),
+      ...(credentials.length ? { agent_credentials: credentials.map((c) => ({ project: c.project })) } : {}),
+      ...(memberOnly ? { member: grant.member } : {}),
       ...(grant.callback_secret ? { callback_secret: grant.callback_secret } : {}),
       // Restricts the pool, repository and engine-session grants to one project; the controller re-checks it on every request.
-      ...(grant.project && (grant.pools.length || repositories.length || engine.length) ? { project: grant.project } : {}),
+      ...(grant.project && (grant.pools.length || repositories.length || engine.length || credentials.length) ? { project: grant.project } : {}),
       ...(grant.org_id && grant.org_id !== "default" ? { org_id: grant.org_id } : {}),
     },
   });

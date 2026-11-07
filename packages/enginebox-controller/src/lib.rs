@@ -121,6 +121,9 @@ pub struct Controller {
     moq_api: Mutex<Option<String>>,
     /// Test harnesses stand in for Cloudflare's TURN API (turn.rs).
     turn_api: Mutex<Option<String>>,
+    /// Member subscriptions (docs/MEMBER-SUBSCRIPTIONS.md): off unless
+    /// `ENGINEBOX_MEMBER_CREDENTIALS=1` at start.
+    member_credentials: std::sync::atomic::AtomicBool,
 }
 
 struct Admission(Arc<Controller>);
@@ -160,7 +163,20 @@ impl Controller {
             unity_login: Mutex::new(None),
             moq_api: Mutex::new(None),
             turn_api: Mutex::new(None),
+            member_credentials: std::sync::atomic::AtomicBool::new(
+                std::env::var("ENGINEBOX_MEMBER_CREDENTIALS").is_ok_and(|v| v == "1"),
+            ),
         }))
+    }
+    /// Turn member subscriptions on or off (tests; production reads
+    /// `ENGINEBOX_MEMBER_CREDENTIALS` at start).
+    pub fn set_member_credentials(&self, enabled: bool) {
+        self.member_credentials
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn member_credentials_enabled(&self) -> bool {
+        self.member_credentials
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
     /// Install a usage sink (a managed deployment's metering). Takes effect at the next activation.
     pub fn with_usage_sink(self: &Arc<Self>, sink: Arc<dyn metering::UsageSink>) -> Arc<Self> {
@@ -630,6 +646,73 @@ fn service_engine_member(
     token.engine_member(operation, project).map(str::to_owned)
 }
 
+/// Member-subscription routes (docs/MEMBER-SUBSCRIPTIONS.md): the
+/// agent-credential operation and project each needs. They act only as the
+/// token's own member, on that member's own personal credentials.
+fn member_credential_route<'a>(
+    method: &Method,
+    parts: &[&'a str],
+) -> Option<(service_tokens::Operation, &'a str)> {
+    use service_tokens::Operation;
+    match (method, parts) {
+        (&Method::GET, ["v1", "projects", project, "me", "credentials"])
+        | (&Method::POST, ["v1", "projects", project, "me", "credentials"])
+        | (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "me",
+                "credentials",
+                _,
+                "login" | "delete",
+            ],
+        )
+        | (
+            &Method::GET,
+            [
+                "v1",
+                "projects",
+                project,
+                "me",
+                "credentials",
+                _,
+                "sessions",
+                _,
+            ],
+        )
+        | (
+            &Method::POST,
+            [
+                "v1",
+                "projects",
+                project,
+                "me",
+                "credentials",
+                _,
+                "sessions",
+                _,
+                "input" | "cancel",
+            ],
+        ) => Some((Operation::CredentialsManage, project)),
+        _ => None,
+    }
+}
+
+/// The member a member-subscription request acts as: the user who consented
+/// to the token's grant, never a header. None for the owner token, a token
+/// without that grant, or another route.
+fn subscription_member(principal: &Principal, method: &Method, parts: &[&str]) -> Option<String> {
+    let Principal::Service(token) = principal else {
+        return None;
+    };
+    let (operation, project) = member_credential_route(method, parts)?;
+    token
+        .credentials_member(operation, project)
+        .map(str::to_owned)
+}
+
 fn service_allows(
     token: &service_tokens::Token,
     method: &Method,
@@ -641,6 +724,9 @@ fn service_allows(
     // Engine sessions: the token's own member's sessions in a granted project.
     if let Some((operation, project)) = engine_session_route(method, &parts) {
         return token.engine_member(operation, project).is_some();
+    }
+    if let Some((operation, project)) = member_credential_route(method, &parts) {
+        return token.credentials_member(operation, project).is_some();
     }
     let pool_ok =
         |operation, pool: &str| token.allows_pool(operation, pool, project_of(pool).as_deref());
@@ -805,6 +891,22 @@ async fn handle(State(controller): State<Arc<Controller>>, request: Request<Body
             .ok()
             .and_then(|r| r.agents.pools().project_of(pool))
     };
+    {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if member_credential_route(&method, &parts).is_some() {
+            if !controller.member_credentials_enabled() {
+                return error(StatusCode::NOT_FOUND, "Unknown endpoint.");
+            }
+            // The owner manages credentials on /v1/credentials; these routes
+            // act only as the member an app's grant names.
+            if matches!(principal, Principal::Owner) {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "Member subscription routes act only as the member who approved the app.",
+                );
+            }
+        }
+    }
     if let Principal::Service(token) = &principal
         && !service_allows(token, &method, &path, &project_of)
     {
@@ -1297,6 +1399,18 @@ fn read(
         }
         ["v1", "agents"] => c.runtime()?.agents.status(),
         ["v1", "tenancy"] => Ok(c.runtime()?.tenancy.view()),
+        ["v1", "projects", _, "me", "credentials", ..] => {
+            let member = subscription_member(principal, &Method::GET, &s)
+                .context("Member subscription routes act only as a member")?;
+            let credentials = c.runtime()?.credentials;
+            match s.as_slice() {
+                [.., "me", "credentials"] => Ok(credentials.member_list(org, &member)),
+                [.., "credentials", id, "sessions", session] => {
+                    credentials.member_login_status(org, &member, id, session)
+                }
+                _ => anyhow::bail!("Unknown endpoint"),
+            }
+        }
         ["v1", "credentials"] => Ok(c.runtime()?.credentials.list(org)),
         ["v1", "credentials", id, "sessions", session] => {
             c.runtime()?.credentials.login_status(org, id, session)
@@ -1850,6 +1964,114 @@ fn preview_write(
     (status, value)
 }
 
+/// `POST /v1/projects/{p}/me/credentials[/{id}/login|delete|sessions/{s}/input|cancel]`
+/// (docs/MEMBER-SUBSCRIPTIONS.md): a member's own subscription, acting as
+/// `member` from the token. Audited as `credential.member_*` keyed by the
+/// member, with the provider and outcome only: a pasted code, a token or a
+/// sign-in link never reaches the audit log.
+fn member_credential_write(
+    runtime: &Runtime,
+    org: &str,
+    member: &str,
+    rest: &[String],
+    body: &Value,
+) -> (StatusCode, Value) {
+    let credentials = &runtime.credentials;
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let (action, target, result): (&str, String, Result<(StatusCode, Value)>) =
+        match rest.as_slice() {
+            ["credentials"] => (
+                "credential.member_connect",
+                body["provider"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(16)
+                    .collect(),
+                credentials
+                    .member_create(org, member, body)
+                    .map(|(created, v)| {
+                        (
+                            if created {
+                                StatusCode::CREATED
+                            } else {
+                                StatusCode::OK
+                            },
+                            v,
+                        )
+                    }),
+            ),
+            ["credentials", id, "login"] => (
+                "credential.member_login",
+                id.to_string(),
+                empty(body)
+                    .and_then(|()| credentials.member_login(org, member, id))
+                    .map(|v| (StatusCode::ACCEPTED, v)),
+            ),
+            ["credentials", id, "delete"] => (
+                "credential.member_delete",
+                id.to_string(),
+                empty(body)
+                    .and_then(|()| credentials.member_delete(org, member, id))
+                    .map(|v| (StatusCode::OK, v)),
+            ),
+            ["credentials", id, "sessions", session, "input"] => (
+                "credential.member_login_input",
+                id.to_string(),
+                credentials
+                    .member_login_input(org, member, id, session, body)
+                    .map(|v| (StatusCode::OK, v)),
+            ),
+            ["credentials", id, "sessions", session, "cancel"] => (
+                "credential.member_login_cancel",
+                id.to_string(),
+                empty(body)
+                    .and_then(|()| credentials.member_login_cancel(org, member, id, session))
+                    .map(|v| (StatusCode::OK, v)),
+            ),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"Unknown member subscription operation."}),
+                );
+            }
+        };
+    let target = match &result {
+        Ok((_, v)) => v["credential"]["id"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or(target),
+        Err(_) => target,
+    };
+    runtime.catalog.audit.record(
+        org,
+        member,
+        action,
+        &target,
+        result.is_ok(),
+        match &result {
+            Ok((_, v)) => {
+                let pick = |k: &str| v["credential"].get(k).or(v["session"].get(k)).cloned();
+                json!({"provider": pick("provider"), "status": pick("status")})
+            }
+            Err(_) => json!({}),
+        },
+    );
+    match result {
+        Ok(reply) => reply,
+        Err(error) => match error.downcast_ref::<credentials::Refusal>() {
+            Some(refusal) => (
+                StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::BAD_REQUEST),
+                json!({"error": refusal.message}),
+            ),
+            None => (
+                StatusCode::BAD_REQUEST,
+                json!({"error": catalog::message(&error)}),
+            ),
+        },
+    }
+}
+
 /// `POST /v1/credentials {provider: "unity", …}` (save, `id` none) and
 /// `POST /v1/credentials/{id}/update` (docs/ORGS.md, "Unity accounts"): a
 /// member's Unity account, checked with Unity before it is stored. Audited as
@@ -2351,6 +2573,22 @@ async fn write(
                 &body,
                 owner,
                 service,
+            ))
+        })
+        .await;
+    }
+    if let ["v1", "projects", _, "me", "credentials", ..] = routed.as_slice() {
+        let Some(member) = subscription_member(&principal, &Method::POST, &routed) else {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                json!({"error":"Member subscription routes act only as the member who approved the app."}),
+            ));
+        };
+        let runtime = c.runtime()?;
+        let rest: Vec<String> = parts[4..].to_vec();
+        return blocking(move || {
+            Ok(member_credential_write(
+                &runtime, &org, &member, &rest, &body,
             ))
         })
         .await;
@@ -7426,5 +7664,169 @@ mod tests {
                 "a relay token reached disk"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn member_subscription_routes_act_only_as_the_tokens_member() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        const BOB: &str = "usr_bbbbbbbbbbbbbbbbbbbbbbbb";
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let grant = |member: &str, project: &str| {
+            json!({"label":"gamejam member","scopes":[],"operations":["agent_credentials.manage"],
+                "agent_credentials":[{"project":project}],"member":member,"project":project})
+        };
+        let (_, alice) = mint(&app, grant(ALICE, "qoh")).await;
+        let (_, bob) = mint(&app, grant(BOB, "qoh")).await;
+        let (_, elsewhere) = mint(&app, grant(ALICE, "other")).await;
+        // Malformed grants are refused at mint: no member, the owner, a
+        // non-user actor, an operation without the grant, a grant without it.
+        for bad in [
+            json!({"label":"x","scopes":[],"operations":["agent_credentials.manage"],"agent_credentials":[{"project":"qoh"}]}),
+            grant("owner", "qoh"),
+            grant("service-token:x", "qoh"),
+            json!({"label":"x","scopes":[],"operations":["agent_credentials.manage"],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":[],"agent_credentials":[{"project":"qoh"}],"member":ALICE}),
+            json!({"label":"x","scopes":[],"operations":["agent_credentials.manage"],"agent_credentials":[{"project":"qoh"}],"member":ALICE,"project":"other"}),
+        ] {
+            let (status, refused) = call(
+                &app,
+                request(Method::POST, "/v1/service-tokens", &bad.to_string(), true),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {refused}");
+        }
+        let route = "/v1/projects/qoh/me/credentials";
+        // Off unless ENGINEBOX_MEMBER_CREDENTIALS=1.
+        c.set_member_credentials(false);
+        assert_eq!(
+            call(&app, bearer(Method::GET, route, "", &alice)).await.0,
+            StatusCode::NOT_FOUND
+        );
+        c.set_member_credentials(true);
+        let (status, created) = call(
+            &app,
+            bearer(Method::POST, route, r#"{"provider":"claude"}"#, &alice),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["credential"]["id"].as_str().unwrap().to_owned();
+        assert!(created["credential"].get("owner_user_id").is_none());
+        // Owned by Alice, never shared, in the token's org.
+        let record = c
+            .runtime()
+            .unwrap()
+            .credentials
+            .get("default", &id)
+            .unwrap();
+        assert_eq!(record.owner_user_id.as_deref(), Some(ALICE));
+        assert!(!record.share_with_org_pools);
+        // A caller-set actor or org header never changes who the token acts as.
+        let mut spoofed = bearer(Method::POST, route, r#"{"provider":"codex"}"#, &bob);
+        spoofed
+            .headers_mut()
+            .insert(catalog::ACTOR_HEADER, ALICE.parse().unwrap());
+        let (status, bobs) = call(&app, spoofed).await;
+        assert_eq!(status, StatusCode::CREATED, "{bobs}");
+        let bobs = bobs["credential"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            c.runtime()
+                .unwrap()
+                .credentials
+                .get("default", &bobs)
+                .unwrap()
+                .owner_user_id
+                .as_deref(),
+            Some(BOB)
+        );
+        let (_, listed) = call(&app, bearer(Method::GET, route, "", &alice)).await;
+        assert_eq!(listed["credentials"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["credentials"][0]["id"], id.as_str());
+        // Bob cannot reach Alice's credential through any route.
+        let session = "0".repeat(32);
+        for (method, path, body) in [
+            (Method::POST, format!("{route}/{id}/login"), "{}"),
+            (Method::POST, format!("{route}/{id}/delete"), "{}"),
+            (Method::GET, format!("{route}/{id}/sessions/{session}"), ""),
+            (
+                Method::POST,
+                format!("{route}/{id}/sessions/{session}/input"),
+                r#"{"text":"code"}"#,
+            ),
+            (
+                Method::POST,
+                format!("{route}/{id}/sessions/{session}/cancel"),
+                "{}",
+            ),
+        ] {
+            let (status, body) = call(&app, bearer(method.clone(), &path, body, &bob)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} {body}");
+        }
+        // Another project's grant, the owner token, and every other route are refused.
+        assert_eq!(
+            call(&app, bearer(Method::GET, route, "", &elsewhere))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(&app, request(Method::GET, route, "", true)).await.0,
+            StatusCode::FORBIDDEN
+        );
+        for (method, path) in [
+            (Method::GET, "/v1/credentials".to_owned()),
+            (Method::POST, format!("/v1/credentials/{id}/share")),
+            (Method::POST, format!("/v1/credentials/{id}/login")),
+            (Method::GET, "/v1/agent-runs".to_owned()),
+            (Method::GET, "/v1/projects/qoh/engine-sessions".to_owned()),
+        ] {
+            assert_eq!(
+                call(&app, bearer(method, &path, "{}", &alice)).await.0,
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+        // Alice deletes her own; Bob's stays.
+        let (status, _) = call(
+            &app,
+            bearer(Method::POST, &format!("{route}/{id}/delete"), "{}", &alice),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            c.runtime()
+                .unwrap()
+                .credentials
+                .get("default", &id)
+                .is_none()
+        );
+        assert!(
+            c.runtime()
+                .unwrap()
+                .credentials
+                .get("default", &bobs)
+                .is_some()
+        );
+        // Audited under the member who acted.
+        let audit = std::fs::read_to_string(c.root.join("audit/events.jsonl")).unwrap();
+        let events: Vec<Value> = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|e: &Value| {
+                e["action"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with("credential.member_"))
+            })
+            .collect();
+        assert!(events.iter().any(|e| e["actor"] == ALICE
+            && e["action"] == "credential.member_connect"
+            && e["target"] == id.as_str()));
+        assert!(events.iter().any(|e| e["actor"] == ALICE
+            && e["action"] == "credential.member_delete"
+            && e["outcome"] == "applied"));
+        assert!(events.iter().any(|e| e["actor"] == BOB
+            && e["action"] == "credential.member_delete"
+            && e["outcome"] == "refused"));
     }
 }

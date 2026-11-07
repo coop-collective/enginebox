@@ -49,6 +49,7 @@ export type FakeToken = {
   project?: string;
   repositories?: { project: string; access: "read" | "write" }[];
   engine_sessions?: { project: string }[];
+  agent_credentials?: { project: string }[];
   member?: string;
 };
 export type FakePool = { name: string; description: string; profile: string | null; members: { host_id: string; name: string }[]; project?: string };
@@ -108,8 +109,11 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           return reply({ error: "Every repository grant must name the token's project" }, 400);
         if (body.project && (body.engine_sessions ?? []).some((r: { project: string }) => r.project !== body.project))
           return reply({ error: "Every engine-session grant must name the token's project" }, 400);
-        if (!(body.engine_sessions ?? []).length !== !body.member || (body.member && !/^usr_[a-f0-9]{24}$/.test(body.member)))
-          return reply({ error: "member must name the user engine_sessions act as, and only with engine_sessions" }, 400);
+        if (body.project && (body.agent_credentials ?? []).some((r: { project: string }) => r.project !== body.project))
+          return reply({ error: "Every agent-credential grant must name the token's project" }, 400);
+        const memberGrants = (body.engine_sessions ?? []).length + (body.agent_credentials ?? []).length;
+        if (!memberGrants !== !body.member || (body.member && !/^usr_[a-f0-9]{24}$/.test(body.member)))
+          return reply({ error: "member must name the user engine_sessions or agent_credentials act as, and only with them" }, 400);
         const id = randomBytes(16).toString("hex");
         const secret = `ebst_${id}.${randomBytes(32).toString("hex")}`;
         tokens.set(id, {
@@ -125,6 +129,7 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
           project: body.project,
           repositories: body.repositories,
           engine_sessions: body.engine_sessions,
+          agent_credentials: body.agent_credentials,
           member: body.member,
         });
         return reply({ token: { id, expires_at: body.expires_at }, secret, secret_shown_once: true }, 201);
@@ -163,6 +168,14 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
       if (parts[5] === "watch-token") return reply({ token: "watch-jwt", expires_in: 1800, namespace: `eb-${session.id}` });
       if (parts[5] === "ice") return reply({ ice_servers: [{ urls: ["turns:turn.cloudflare.com:443?transport=tcp"], username: "u", credential: "turn-secret" }], ice_transport_policy: "relay", expires_at: 1 });
       return reply(method === "GET" ? { ...session, stream: { audience: { token: "subscribe-jwt" }, control: { control_key: "k".repeat(64) } } } : session);
+    }
+    if (parts[1] === "projects" && parts[3] === "me") {
+      // The controller acts as the token's member on their own credentials only.
+      if (!held.member || !held.operations.includes("agent_credentials.manage") || !(held.agent_credentials ?? []).some((c) => c.project === parts[2]))
+        return reply({ error: "This service token is not granted that operation on that workspace." }, 403);
+      if (method === "GET" && parts.length === 5) return reply({ credentials: [] });
+      if (method === "POST" && parts.length === 5) return reply({ credential: { id: "c".repeat(32), provider: body?.provider, status: "pending" } }, 201);
+      return reply({ session: { id: "d".repeat(32), credential_id: parts[5], status: "waiting", input_required: false } }, 202);
     }
     if (parts[1] === "projects" && parts[3] === "repositories") {
       const access = (held.repositories ?? []).find((r) => r.project === parts[2])?.access;
