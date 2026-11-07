@@ -1787,6 +1787,21 @@ impl AgentService {
         let (pool, _) = self.owned_member_run(project, member, id)?;
         self.cancel_pool_run(&pool, id)
     }
+    /// Every unfinished member run of `member` using credential
+    /// `credential_id`: the IDs and pools to cancel when it is removed.
+    pub fn active_member_runs(&self, member: &str, credential_id: &str) -> Vec<(String, String)> {
+        let sched = self.inner.sched.lock().unwrap();
+        sched
+            .entries
+            .values()
+            .filter_map(|q| {
+                let m = q.entry.member.as_ref()?;
+                let pool = q.entry.pool()?;
+                (m.member == member && m.credential_id == credential_id)
+                    .then(|| (q.entry.id.clone(), pool.to_owned()))
+            })
+            .collect()
+    }
     /// Who started runs on native session `session`: `Some(member)` for a
     /// member run, `None` for an ordinary one. Empty when no run used it.
     fn session_members(&self, session: &str) -> BTreeSet<Option<String>> {
@@ -5029,6 +5044,18 @@ pub fn callback_payload(record: &Value, detail: Option<&Value>) -> Value {
         "created_at":run["created_at"],
         "started_at":run["started_at"],
         "finished_at":run["finished_at"],
+        // Tokens as the native client reported them (`scope` says run or
+        // session total) and wall time, for the app's usage ledger.
+        "usage":{
+            "tokens_in":run["usage"]["input_tokens"],
+            "tokens_out":run["usage"]["output_tokens"],
+            "tokens_cached":run["usage"]["cached_input_tokens"],
+            "scope":run["usage"]["scope"],
+        },
+        "elapsed_seconds":run["elapsed_seconds"],
+        // A member's own-subscription run: whose, and which credential (IDs only).
+        "member":detail.and_then(|d| d["member"].as_str()),
+        "credential_id":detail.and_then(|d| d["credential_id"].as_str()),
     })
 }
 /// A member run that is not the caller's (or does not exist): answered as 404.

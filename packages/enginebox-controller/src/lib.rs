@@ -346,8 +346,16 @@ impl Controller {
         let member_credentials = runtime.credentials.clone();
         runtime
             .agents
-            .set_member_material(Arc::new(move |_run_id, run, provider, timeout| {
-                member_credentials.member_material(run, provider, timeout)
+            .set_member_material(Arc::new(move |run_id, run, provider, timeout| {
+                member_credentials.member_material_for(run_id, run, provider, timeout)
+            }));
+        // Member credential events (used, refreshed, reconnect needed) reach
+        // the audit log keyed by the member, never with values.
+        let audit = runtime.catalog.audit.clone();
+        runtime
+            .credentials
+            .set_event_sink(Arc::new(move |org, member, action, id, ok, detail| {
+                audit.record(org, member, action, id, ok, detail)
             }));
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
@@ -2061,7 +2069,11 @@ fn member_credential_write(
                 id.to_string(),
                 empty(body)
                     .and_then(|()| credentials.member_delete(org, member, id))
-                    .map(|v| (StatusCode::OK, v)),
+                    .map(|mut v| {
+                        // Removing a subscription stops every run still using it.
+                        v["cancelled_runs"] = json!(cancel_credential_runs(runtime, member, id));
+                        (StatusCode::OK, v)
+                    }),
             ),
             ["credentials", id, "sessions", session, "input"] => (
                 "credential.member_login_input",
@@ -3038,7 +3050,19 @@ async fn write(
         ["v1", "credentials", id, "delete"] => {
             empty(&body)?;
             let unity = runtime.credentials.unity_get(&org, id).is_some();
-            let deleted = runtime.credentials.delete(&org, id)?;
+            let owner = runtime
+                .credentials
+                .get(&org, id)
+                .and_then(|c| c.owner_user_id);
+            let mut deleted = runtime.credentials.delete(&org, id)?;
+            // An admin removing a member's subscription stops its runs too.
+            if let Some(owner) = owner {
+                let (agents_runtime, id) = (runtime.clone(), id.to_string());
+                deleted["cancelled_runs"] = json!(
+                    blocking(move || Ok(cancel_credential_runs(&agents_runtime, &owner, &id)))
+                        .await?
+                );
+            }
             if unity {
                 runtime.catalog.audit.record(
                     &org,
@@ -3175,6 +3199,18 @@ fn repository_reply(result: Result<Value>, ok: StatusCode) -> (StatusCode, Value
 enum RunTarget {
     Workspace(String, String),
     Pool(String),
+}
+
+/// Cancel every unfinished member run of `member` that uses credential `id`
+/// (queued runs never start; running ones are stopped). Returns their IDs.
+fn cancel_credential_runs(runtime: &Runtime, member: &str, id: &str) -> Vec<String> {
+    runtime
+        .agents
+        .active_member_runs(member, id)
+        .into_iter()
+        .filter(|(run, pool)| runtime.agents.cancel_pool_run(pool, run).is_ok())
+        .map(|(run, _)| run)
+        .collect()
 }
 
 /// `POST /v1/projects/{p}/me/agent-runs` (docs/MEMBER-SUBSCRIPTIONS.md): a
@@ -8373,5 +8409,130 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(put(pool("other", "worker")).await.0, StatusCode::OK);
         assert_eq!(designate("other").await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn removing_a_subscription_stops_its_runs_and_every_use_is_audited() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.set_credentials_key(sealed::Kek::from_bytes([3; 32]));
+        c.activate().unwrap();
+        c.set_member_credentials(true);
+        let runtime = c.runtime().unwrap();
+        let (_, alice) = mint(
+            &app,
+            json!({"label":"gamejam member","scopes":[],
+                "operations":["agent_credentials.manage","agent_credentials.run"],
+                "agent_credentials":[{"project":"qoh"}],"member":ALICE,"project":"qoh",
+                "callback_secret":"c".repeat(40)}),
+        )
+        .await;
+        let pool = json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"worker","name":"ebox-m1"}]});
+        call(
+            &app,
+            request(Method::POST, "/v1/pools", &pool.to_string(), true),
+        )
+        .await;
+        call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools/jam/member-runs",
+                r#"{"enabled":true}"#,
+                true,
+            ),
+        )
+        .await;
+        let (_, made) = call(
+            &app,
+            bearer(
+                Method::POST,
+                "/v1/projects/qoh/me/credentials",
+                r#"{"provider":"claude"}"#,
+                &alice,
+            ),
+        )
+        .await;
+        let id = made["credential"]["id"].as_str().unwrap().to_owned();
+        runtime.credentials.connect_for_test(
+            &id,
+            &json!({"claudeAiOauth":{"accessToken":"sk-ant-oat01-alice-0123456789","refreshToken":"rt-0123456789",
+                "expiresAt":4102444800000u64,"scopes":["user:inference"]}}),
+        );
+        let agents = runtime.agents.clone();
+        let finished: Arc<Mutex<Vec<Value>>> = Arc::default();
+        {
+            let finished = finished.clone();
+            agents.set_finish_hook(Arc::new(move |f| finished.lock().unwrap().push(f.payload)));
+            agents.set_run_executor(Arc::new(|_| {
+                Ok(json!({"exit_code":0,"output":"{\"type\":\"result\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":0,\"output_tokens\":7}}","timed_out":false,"output_truncated":false}))
+            }));
+        }
+        let up = |online: bool| {
+            agents.set_measure_hook(Arc::new(move |_| {
+                anyhow::ensure!(online, "fixture host is offline");
+                Ok(enginebox_agents::queue::HostLoad {
+                    cpu_total: 64,
+                    reserve_cpu: 2,
+                    memory_available_bytes: 1 << 40,
+                    reserve_memory_bytes: 1 << 30,
+                })
+            }));
+        };
+        let runs = "/v1/projects/qoh/me/agent-runs";
+        let start = r#"{"provider":"claude","prompt":"jump","callback":{"url":"https://hooks.example.com/runs"}}"#;
+        // A run that finishes: its callback carries usage, the member and the credential.
+        up(true);
+        let (_, done) = call(&app, bearer(Method::POST, runs, start, &alice)).await;
+        let done = done["run"]["id"].as_str().unwrap().to_owned();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while finished.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let payload = finished.lock().unwrap()[0].clone();
+        assert_eq!(payload["run_id"], done.as_str());
+        assert_eq!(payload["member"], ALICE);
+        assert_eq!(payload["credential_id"], id.as_str());
+        assert_eq!(payload["usage"]["tokens_in"], 15);
+        assert_eq!(payload["usage"]["tokens_out"], 7);
+        assert_eq!(payload["usage"]["tokens_cached"], 5);
+        assert!(!payload.to_string().contains("sk-ant-oat01"));
+        // A queued run (its host is offline) when Alice removes her subscription.
+        up(false);
+        let (_, queued) = call(&app, bearer(Method::POST, runs, start, &alice)).await;
+        let queued = queued["run"]["id"].as_str().unwrap().to_owned();
+        let (status, removed) = call(
+            &app,
+            bearer(
+                Method::POST,
+                &format!("/v1/projects/qoh/me/credentials/{id}/delete"),
+                "{}",
+                &alice,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{removed}");
+        assert_eq!(removed["cancelled_runs"], json!([queued]));
+        let (_, current) = call(
+            &app,
+            bearer(Method::GET, &format!("{runs}/{queued}"), "", &alice),
+        )
+        .await;
+        assert_eq!(current["run"]["status"], "cancelled");
+        // Audited by member: the use by the finished run, never a value.
+        let audit = std::fs::read_to_string(c.root.join("audit/events.jsonl")).unwrap();
+        assert!(!audit.contains("sk-ant-oat01") && !audit.contains("rt-0123456789"));
+        let used: Vec<Value> = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|e| e["action"] == "credential.member_used")
+            .collect();
+        assert_eq!(used.len(), 1);
+        assert_eq!(used[0]["actor"], ALICE);
+        assert_eq!(used[0]["target"], id.as_str());
+        assert_eq!(used[0]["detail"]["run_id"], done.as_str());
+        assert_eq!(used[0]["outcome"], "applied");
     }
 }

@@ -386,6 +386,68 @@ it means every member reconnects.
 **Scope.** Only members' own subscriptions are sealed. Controller accounts,
 team accounts and API keys keep the existing 0600 files.
 
-## Not yet in this release
+## Audit, revocation and usage
 
-Usage reporting and revocation of running runs arrive in the following change.
+**Audit.** Every event is recorded in `audit/events.jsonl` with the member as
+actor, the credential ID as target, and no value:
+- `credential.member_connect|login|login_input|login_cancel|delete` (the member's
+  own actions);
+- `credential.member_used` (`detail.run_id`, the outcome);
+- `credential.member_refreshed`;
+- `credential.member_reconnect_needed`.
+
+**Revocation.**
+- When a member removes a subscription, every unfinished run that uses it is
+  cancelled: queued runs never start and running ones are stopped. The reply
+  lists them in `cancelled_runs`. An admin removing it on `/v1/credentials/{id}/delete`
+  does the same.
+- The credential's home (the tokens) is deleted at once.
+- Tell the member to also revoke at the provider: Claude account → sessions, or
+  ChatGPT → Security → sign out of all devices.
+- A member who leaves the org loses the app's token at its next refresh.
+  Their stored credential stays until they or an admin remove it.
+
+**Usage.** Run callbacks (`agent_run.finished`) now also carry:
+- `usage`: `{tokens_in, tokens_out, tokens_cached, scope}` as the
+  native client reported it (`scope` is `run` for Claude, `session_total` for
+  Codex);
+- `elapsed_seconds`;
+- for member runs, `member` and `credential_id`.
+
+## Not implemented (open)
+
+- **Continuation across expiry (E7).** Admission guarantees at least 30 minutes
+  of access, and longer when the provider grants it (Claude's full-login access
+  token lasts hours). A run that outlives its access token fails on the
+  provider's 401; Engine Box does not yet restart it with `resume_id` and fresh
+  material.
+- **Plan-limit pause (E7).** A provider quota rejection ends the run as
+  `failed`; there is no `paused {reason: "plan_limit", resets_at}` yet.
+- **"My computer" (E10).** Sign-in on, and runs restricted to, a member's own
+  enrolled node are not implemented. Member-runs pools refuse personal nodes
+  altogether.
+- **Machine time** (`machine_seconds`, `machine_class`) is not in callbacks;
+  `elapsed_seconds` is wall time of the run.
+- **Account hints.** `account{plan, email_hint}` is not in the session JSON.
+
+## Prompt-injection exfiltration
+
+A prompt-injected agent runs with the member's access token in its own process
+environment or `CODEX_HOME`, so it can read that token.
+
+What limits the damage:
+- The token is short-lived (Claude full login: hours; Codex access token),
+  only the member's own, and never a refresh token.
+- The token is scrubbed from returned output (best effort; an agent can encode
+  it).
+- The agent's workspace is the member's own VM. It cannot reach other members'
+  workspaces or the controller's homes, and nothing it leaves behind meets
+  another member.
+- No long-lived token is ever delivered, unless the operator turns on the
+  setup-token fallback.
+
+What remains open:
+- No egress allowlist is enforced by Engine Box (operator setup).
+- A stolen access token works from anywhere until it expires.
+- Engine Box cannot revoke a single access token at the provider; disconnecting
+  stops future runs only.

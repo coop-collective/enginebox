@@ -276,7 +276,12 @@ pub struct Credentials {
     /// The key-encryption key for members' sealed homes (sealed.rs). Member
     /// subscriptions are refused without one.
     kek: Option<sealed::Kek>,
+    events: Arc<Mutex<Option<EventSink>>>,
 }
+
+/// Where member credential events go (the controller's audit log):
+/// (org, member, action, credential ID, ok, detail without values).
+pub type EventSink = Arc<dyn Fn(&str, &str, &str, &str, bool, Value) + Send + Sync>;
 
 fn valid_user(id: &str) -> bool {
     id.len() == 28
@@ -377,6 +382,7 @@ impl Credentials {
             unity: Arc::new(Mutex::new(accounts)),
             unity_login: unity::Client::from_env(),
             member: Arc::new(Mutex::new(member)),
+            events: Arc::new(Mutex::new(None)),
             kek: match sealed::Kek::from_env(root) {
                 Ok(kek) => kek,
                 Err(error) => {
@@ -434,6 +440,42 @@ impl Credentials {
             self.sweep();
         }
         self
+    }
+    /// Send member credential events (used, refreshed, reconnect needed) here.
+    pub fn set_event_sink(&self, sink: EventSink) {
+        *self.events.lock().unwrap() = Some(sink);
+    }
+    fn event(&self, record: &Credential, action: &str, ok: bool, detail: Value) {
+        let sink = self.events.lock().unwrap().clone();
+        if let (Some(sink), Some(member)) = (sink, record.owner_user_id.as_deref()) {
+            sink(&record.org_id, member, action, &record.id, ok, detail);
+        }
+    }
+    /// [`Self::member_material`] for run `run_id`, audited: the credential
+    /// was used by that run (or could not be), and whether it was renewed.
+    pub fn member_material_for(
+        &self,
+        run_id: &str,
+        run: &enginebox_agents::queue::MemberRun,
+        provider: &str,
+        timeout_seconds: u64,
+    ) -> Result<enginebox_agents::member::Delegated> {
+        let result = self.member_material(run, provider, timeout_seconds);
+        if let Some(record) = self
+            .records
+            .lock()
+            .unwrap()
+            .get(&run.credential_id)
+            .cloned()
+        {
+            self.event(
+                &record,
+                "credential.member_used",
+                result.is_ok(),
+                json!({"run_id": run_id, "provider": provider, "run_member": run.member}),
+            );
+        }
+        result
     }
     fn require_kek(&self) -> Result<sealed::Kek> {
         self.kek.clone().ok_or_else(|| {
@@ -1478,6 +1520,12 @@ impl Credentials {
                 // Only a refused grant means the member must sign in again.
                 Err(auth::RefreshError::Rejected) => {
                     auth::record_refresh_rejected(&home, None)?;
+                    self.event(
+                        &record,
+                        "credential.member_reconnect_needed",
+                        true,
+                        json!({"provider": provider}),
+                    );
                     anyhow::bail!(
                         "The provider refused the stored login; connect the subscription again."
                     );
@@ -1488,6 +1536,12 @@ impl Credentials {
                     )
                 }
             }
+            self.event(
+                &record,
+                "credential.member_refreshed",
+                true,
+                json!({"provider": provider}),
+            );
             self.sealed_material(&kek, &record.id, &home, provider)?
         };
         drop(lease);
