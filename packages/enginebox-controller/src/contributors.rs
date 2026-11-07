@@ -432,6 +432,18 @@ impl Contributors {
                     .is_some_and(|h| equal(h, &secret_hash(token)))
         })
     }
+    /// True when `host_id` is someone's contributed or personal machine: a
+    /// registered (not revoked) node with that ID, or one whose managed host
+    /// binding names that fleet host (as [`Self::assert_host`] matches).
+    pub fn contributed_host(&self, host_id: &str) -> bool {
+        self.nodes.lock().unwrap().values().any(|n| {
+            !n.revoked
+                && (n.id == host_id
+                    || n.host_binding
+                        .as_ref()
+                        .is_some_and(|b| b.host_id == host_id))
+        })
+    }
     /// True for a registered (not revoked) node ID: an org can own it (docs/ORGS.md).
     pub fn knows(&self, id: &str) -> bool {
         self.nodes

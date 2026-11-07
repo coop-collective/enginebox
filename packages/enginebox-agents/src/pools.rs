@@ -23,6 +23,9 @@ const SESSIONS_FILE: &str = "agent-pool-sessions.json";
 /// (docs/MEMBER-SUBSCRIPTIONS.md). A file of its own, so pool records keep
 /// the format older releases read.
 const MEMBER_POOLS_FILE: &str = "agent-member-pools.json";
+/// Which member each member-runs workspace belongs to. A workspace runs one
+/// member's runs only, from its first member run until it is deleted.
+const MEMBER_BINDINGS_FILE: &str = "agent-member-bindings.json";
 const SESSIONS_LIMIT: usize = 2 * 1024 * 1024;
 const SIZES: [&str; 5] = ["minimum", "recommended", "small", "standard", "large"];
 /// Default idle time before a free member is frozen (paused, RAM kept).
@@ -309,6 +312,21 @@ pub struct Pools {
     pools: Arc<Mutex<BTreeMap<String, Pool>>>,
     sessions: Arc<Mutex<BTreeMap<String, SessionHome>>>,
     member_pools: Arc<Mutex<BTreeSet<String>>>,
+    /// (host, workspace) -> member (`usr_…`, or [`TAINTED`]).
+    bindings: Arc<Mutex<BTreeMap<(String, String), String>>>,
+}
+/// A member-runs workspace that served more than one member before
+/// bindings existed: nobody's until the owner releases (recreates) it.
+pub const TAINTED: &str = "tainted";
+fn binding_key(workspace: &Placement) -> (String, String) {
+    (workspace.host_id.clone(), workspace.name.clone())
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Binding {
+    host_id: String,
+    name: String,
+    member: String,
 }
 impl Pools {
     pub fn open(root: &Path) -> Result<Self> {
@@ -350,7 +368,115 @@ impl Pools {
             pools: Arc::new(Mutex::new(pools)),
             sessions: Arc::new(Mutex::new(sessions)),
             member_pools: Arc::new(Mutex::new(member_pools)),
+            bindings: Arc::new(Mutex::new(
+                security::read_bytes(root, MEMBER_BINDINGS_FILE, SESSIONS_LIMIT, false)?
+                    .map(|raw| -> Result<Vec<Binding>> {
+                        let v: Value = serde_json::from_slice(&raw)?;
+                        Ok(serde_json::from_value(v["bindings"].clone())?)
+                    })
+                    .transpose()?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| ((b.host_id, b.name), b.member))
+                    .collect(),
+            )),
         })
+    }
+    /// The member a workspace belongs to, once a member run used it.
+    pub fn bound_member(&self, workspace: &Placement) -> Option<String> {
+        self.bindings
+            .lock()
+            .unwrap()
+            .get(&binding_key(workspace))
+            .cloned()
+    }
+    /// Every binding, for placement.
+    pub fn bindings(&self) -> BTreeMap<(String, String), String> {
+        self.bindings.lock().unwrap().clone()
+    }
+    fn save_bindings(&self, next: &BTreeMap<(String, String), String>) -> Result<()> {
+        let rows: Vec<Binding> = next
+            .iter()
+            .map(|((host_id, name), member)| Binding {
+                host_id: host_id.clone(),
+                name: name.clone(),
+                member: member.clone(),
+            })
+            .collect();
+        security::write_json(&self.root, MEMBER_BINDINGS_FILE, &json!({"bindings": rows}))
+    }
+    /// Bind `workspace` to `member` for good (until it is deleted). Refuses
+    /// a workspace bound to someone else. True when newly bound (so a failed
+    /// admission can roll it back).
+    pub fn bind_member(&self, workspace: &Placement, member: &str) -> Result<bool> {
+        let mut bindings = self.bindings.lock().unwrap();
+        match bindings.get(&binding_key(workspace)) {
+            Some(owner) if owner == member => Ok(false),
+            Some(_) => anyhow::bail!("This workspace belongs to another member."),
+            None => {
+                let mut next = bindings.clone();
+                next.insert(binding_key(workspace), member.to_owned());
+                self.save_bindings(&next)?;
+                *bindings = next;
+                Ok(true)
+            }
+        }
+    }
+    /// Undo a binding this admission made (only if still `member`'s).
+    pub fn unbind_member(&self, workspace: &Placement, member: &str) -> Result<()> {
+        let mut bindings = self.bindings.lock().unwrap();
+        if bindings.get(&binding_key(workspace)).map(String::as_str) == Some(member) {
+            let mut next = bindings.clone();
+            next.remove(&binding_key(workspace));
+            self.save_bindings(&next)?;
+            *bindings = next;
+        }
+        Ok(())
+    }
+    /// Mark an unbound workspace [`TAINTED`] (it served several members
+    /// before bindings existed).
+    pub fn taint(&self, workspace: &Placement) -> Result<()> {
+        let mut bindings = self.bindings.lock().unwrap();
+        if !bindings.contains_key(&binding_key(workspace)) {
+            let mut next = bindings.clone();
+            next.insert(binding_key(workspace), TAINTED.into());
+            self.save_bindings(&next)?;
+            *bindings = next;
+        }
+        Ok(())
+    }
+    fn unbind(&self, workspace: &Placement) -> Result<()> {
+        let mut bindings = self.bindings.lock().unwrap();
+        if bindings.contains_key(&binding_key(workspace)) {
+            let mut next = bindings.clone();
+            next.remove(&binding_key(workspace));
+            self.save_bindings(&next)?;
+            *bindings = next;
+        }
+        Ok(())
+    }
+    /// The owner confirms a listed workspace was wiped or recreated: it is
+    /// nobody's again. (Created members are released by deleting them.)
+    pub fn release_listed(&self, pool: &str, workspace: &Placement) -> Result<()> {
+        let listed = self
+            .get(pool)
+            .is_some_and(|p| p.workspaces.contains(workspace));
+        crate::require(
+            listed,
+            "Only a workspace the owner listed in this pool is released this way.",
+        )?;
+        self.unbind(workspace)
+    }
+    /// Whether any of `pool`'s workspaces is bound (or tainted).
+    pub fn has_bound_members(&self, pool: &str) -> bool {
+        let Some(definition) = self.get(pool) else {
+            return false;
+        };
+        let bindings = self.bindings.lock().unwrap();
+        definition
+            .members()
+            .iter()
+            .any(|m| bindings.contains_key(&binding_key(m)))
     }
     /// Whether `pool` runs only members' own subscription runs.
     pub fn member_runs(&self, pool: &str) -> bool {
@@ -381,6 +507,11 @@ impl Pools {
     /// only members' own subscription runs, or ordinary runs again. A
     /// member-runs pool shares no workspace with another pool.
     pub fn set_member_runs(&self, pool: &str, enabled: bool) -> Result<Value> {
+        // Turning it off would hand members' workspaces to ordinary runs.
+        crate::require(
+            enabled || !self.has_bound_members(pool),
+            "Release the pool's member workspaces first (POST /v1/pools/{pool}/member-runs/release).",
+        )?;
         let pools = self.pools.lock().unwrap();
         let definition = pools.get(pool).context("Unknown pool")?;
         if enabled {
@@ -508,6 +639,11 @@ impl Pools {
     }
     pub fn delete(&self, name: &str) -> Result<()> {
         ensure!(valid_name(name), "Invalid pool name");
+        // Its workspaces would outlive it still holding members' state.
+        crate::require(
+            !self.has_bound_members(name),
+            "Release the pool's member workspaces first (POST /v1/pools/{pool}/member-runs/release).",
+        )?;
         let mut pools = self.pools.lock().unwrap();
         ensure!(pools.contains_key(name), "Unknown pool");
         security::remove(&self.dir, &format!("{name}.json"))?;
@@ -564,6 +700,8 @@ impl Pools {
             self.save(&next)?;
             *p = next;
         }
+        // The VM is deleted: whoever it belonged to, its successor is fresh.
+        self.unbind(member)?;
         let mut sessions = self.sessions.lock().unwrap();
         let before = sessions.len();
         sessions.retain(|_, s| !(s.host_id == member.host_id && s.name == member.name));

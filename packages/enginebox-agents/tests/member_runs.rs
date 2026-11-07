@@ -1105,3 +1105,296 @@ fn template_copies_keep_exec_bits_refresh_on_change_and_large_state_works() {
         .is_err()
     );
 }
+
+// ------------------------------------------------------------ isolation
+
+fn claude_reader(service: &AgentService) {
+    service.set_member_material(Arc::new(|_, run, _, _| {
+        Delegated::from_material(
+            "claude",
+            &json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":format!("sk-ant-oat01-{}-0123456789", run.member)}}),
+        )
+    }));
+}
+/// Holds every run until released; each run reports a session of its own.
+fn held_executor(service: &AgentService) -> Arc<(Mutex<bool>, std::sync::Condvar)> {
+    let gate: Arc<(Mutex<bool>, std::sync::Condvar)> = Arc::default();
+    let held = gate.clone();
+    service.set_run_executor(Arc::new(move |run: &AdmittedRun| {
+        let (open, changed) = &*held;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = changed.wait(open).unwrap();
+        }
+        // A session ID per run, derived from the run ID.
+        let id = &run.id;
+        let session = run.request.resume_id.clone().unwrap_or(format!(
+            "{}-{}-{}-{}-{}",
+            &id[0..8],
+            &id[8..12],
+            &id[12..16],
+            &id[16..20],
+            &id[20..32]
+        ));
+        Ok(
+            json!({"exit_code":0,"output":json!({"type":"result","session_id":session}).to_string(),
+            "timed_out":false,"output_truncated":false}),
+        )
+    }));
+    gate
+}
+fn release(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+}
+fn placed(service: &AgentService, id: &str) -> Option<String> {
+    service.get_pool_run("jam", id).unwrap()["name"]
+        .as_str()
+        .filter(|n| *n != "ebox-unplaced")
+        .map(str::to_owned)
+}
+
+#[test]
+fn a_workspace_serves_one_member_only_for_its_whole_life() {
+    let (_t, root) = root();
+    let service = service(&root);
+    service
+        .pools()
+        .put(
+            json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"h1","name":"ebox-m1"},{"host_id":"h1","name":"ebox-m2"}]}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    service.set_member_runs("jam", true).unwrap();
+    claude_reader(&service);
+    let gate = held_executor(&service);
+    let launch = |who: &str, cred: &str, extra: Value| {
+        let mut b = body("claude");
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        service.launch_pool("jam", b, "owner", member(who, cred))
+    };
+    let alice = launch(ALICE, ALICE_CRED, json!({})).unwrap().0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bob = launch(BOB, BOB_CRED, json!({})).unwrap().0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for("both placed", || {
+        placed(&service, &alice).is_some() && placed(&service, &bob).is_some()
+    });
+    let alice_ws = placed(&service, &alice).unwrap();
+    let bob_ws = placed(&service, &bob).unwrap();
+    assert_ne!(alice_ws, bob_ws);
+    release(&gate);
+    wait_for("both finished", || {
+        [&alice, &bob]
+            .iter()
+            .all(|id| service.get_pool_run("jam", id).unwrap()["status"] == "succeeded")
+    });
+    // Both workspaces are now free, yet each member only ever gets their own.
+    for _ in 0..3 {
+        for (who, cred, own) in [(ALICE, ALICE_CRED, &alice_ws), (BOB, BOB_CRED, &bob_ws)] {
+            let id = launch(who, cred, json!({})).unwrap().0["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            wait_for("placed", || placed(&service, &id).is_some());
+            assert_eq!(&placed(&service, &id).unwrap(), own, "{who}");
+        }
+    }
+    // A third member waits rather than reuse someone else's workspace.
+    let carol = "usr_cccccccccccccccccccccccc";
+    let waiting = launch(carol, "cccccccccccccccccccccccccccccccc", json!({}))
+        .unwrap()
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(placed(&service, &waiting).is_none());
+    // Alice cannot resume Bob's session (it would land on Bob's workspace).
+    let bob_session = service.get_pool_run("jam", &bob).unwrap()["native_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let crossed = launch(ALICE, ALICE_CRED, json!({"resume_id": bob_session}));
+    assert!(crossed.is_err(), "{crossed:?}");
+    // Bob can resume his own.
+    launch(BOB, BOB_CRED, json!({"resume_id": bob_session})).unwrap();
+    // A named-workspace run cannot reach a member's workspace.
+    assert!(
+        service
+            .launch_with(
+                "h1",
+                &alice_ws,
+                body("claude"),
+                "owner",
+                LaunchOptions::default()
+            )
+            .is_err()
+    );
+    // Bindings survive a restart.
+    let reopened = enginebox_agents::pools::Pools::open(&root).unwrap();
+    let ws = |name: &str| enginebox_agents::queue::Placement {
+        host_id: "h1".into(),
+        name: name.into(),
+    };
+    assert_eq!(
+        reopened.bound_member(&ws(&alice_ws)).as_deref(),
+        Some(ALICE)
+    );
+    assert_eq!(reopened.bound_member(&ws(&bob_ws)).as_deref(), Some(BOB));
+}
+
+#[test]
+fn a_deleted_workspace_is_unbound_and_its_successor_is_fresh() {
+    let (_t, root) = root();
+    let pools = enginebox_agents::pools::Pools::open(&root).unwrap();
+    pools
+        .put(
+            json!({"name":"jam","project":"qoh","template":"agents","autoscale":{"hosts":["h1"],"max_workspaces":2}}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    pools.set_member_runs("jam", true).unwrap();
+    let created = enginebox_agents::queue::Placement {
+        host_id: "h1".into(),
+        name: "ebox-jam-1".into(),
+    };
+    pools.add_created("jam", created.clone()).unwrap();
+    pools.bind_member(&created, ALICE).unwrap();
+    assert!(pools.bind_member(&created, BOB).is_err());
+    pools.remove_created("jam", &created).unwrap();
+    assert_eq!(pools.bound_member(&created), None);
+}
+
+fn quick_executor(service: &AgentService) {
+    service.set_run_executor(Arc::new(|run: &AdmittedRun| {
+        let id = &run.id;
+        let session = run.request.resume_id.clone().unwrap_or(format!(
+            "{}-{}-{}-{}-{}",
+            &id[0..8],
+            &id[8..12],
+            &id[12..16],
+            &id[16..20],
+            &id[20..32]
+        ));
+        Ok(
+            json!({"exit_code":0,"output":json!({"type":"result","session_id":session}).to_string(),
+            "timed_out":false,"output_truncated":false}),
+        )
+    }));
+}
+fn run_and_wait(service: &AgentService, who: &str, cred: &str) -> String {
+    let id = service
+        .launch_pool("jam", body("claude"), "owner", member(who, cred))
+        .unwrap()
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for("the run", || {
+        service.get_pool_run("jam", &id).unwrap()["status"] == "succeeded"
+    });
+    id
+}
+
+#[test]
+fn a_full_pool_recreates_an_idle_members_workspace_for_a_waiting_member() {
+    let (_t, root) = root();
+    let service = service(&root);
+    service.set_create_hook(Arc::new(|_, _, _, _| Ok(())));
+    let deleted: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = deleted.clone();
+    service.set_delete_hook(Arc::new(move |_, name| {
+        log.lock().unwrap().push(name.to_owned());
+        Ok(())
+    }));
+    service
+        .pools()
+        .put(
+            json!({"name":"jam","project":"qoh","template":"agents","min_workspaces":0,
+                "autoscale":{"hosts":["h1"],"max_workspaces":1}}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    service.set_member_runs("jam", true).unwrap();
+    claude_reader(&service);
+    quick_executor(&service);
+    let alice = run_and_wait(&service, ALICE, ALICE_CRED);
+    let first = placed(&service, &alice).unwrap();
+    // The pool is at its limit and its only workspace is Alice's: Bob's run
+    // gets a fresh workspace instead of waiting forever.
+    let bob = run_and_wait(&service, BOB, BOB_CRED);
+    let second = placed(&service, &bob).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(*deleted.lock().unwrap(), vec![first.clone()]);
+    let pools = enginebox_agents::pools::Pools::open(&root).unwrap();
+    let ws = |name: &str| enginebox_agents::queue::Placement {
+        host_id: "h1".into(),
+        name: name.into(),
+    };
+    assert_eq!(pools.bound_member(&ws(&first)), None);
+    assert_eq!(pools.bound_member(&ws(&second)).as_deref(), Some(BOB));
+}
+
+#[test]
+fn bound_workspaces_are_released_explicitly_and_legacy_shared_ones_are_tainted() {
+    let (_t, root) = root();
+    let service = service(&root);
+    service
+        .pools()
+        .put(
+            json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"h1","name":"ebox-m1"}]}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    service.set_member_runs("jam", true).unwrap();
+    claude_reader(&service);
+    quick_executor(&service);
+    let alice = run_and_wait(&service, ALICE, ALICE_CRED);
+    let ws = enginebox_agents::queue::Placement {
+        host_id: "h1".into(),
+        name: "ebox-m1".into(),
+    };
+    // Turning member runs off or deleting the pool would hand Alice's
+    // workspace to someone else: refused until it is released.
+    wait_for("idle", || service.pools().bound_member(&ws).is_some());
+    assert!(service.set_member_runs("jam", false).is_err());
+    assert!(service.delete_pool("jam").is_err());
+    // A listed workspace is released only once the owner says it was wiped.
+    let release = |recreated: bool| {
+        service.release_member_workspace(
+            "jam",
+            &json!({"host_id":"h1","name":"ebox-m1","recreated":recreated}),
+        )
+    };
+    assert!(release(false).is_err());
+    wait_for("the release", || release(true).is_ok());
+    assert_eq!(service.pools().bound_member(&ws), None);
+    // Simulate a workspace shared before bindings existed: Bob runs there
+    // too, then the bindings file is lost (an upgrade from before #134).
+    let _bob = run_and_wait(&service, BOB, BOB_CRED);
+    std::fs::remove_file(root.join("agent-member-bindings.json")).unwrap();
+    let alice_session = service.get_pool_run("jam", &alice).unwrap()["native_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(service);
+    let service = self::service(&root);
+    claude_reader(&service);
+    assert_eq!(
+        service.pools().bound_member(&ws).as_deref(),
+        Some(enginebox_agents::pools::TAINTED)
+    );
+    let mut resume = body("claude");
+    resume["resume_id"] = json!(alice_session);
+    let refused = service
+        .launch_pool("jam", resume, "owner", member(ALICE, ALICE_CRED))
+        .unwrap_err();
+    assert!(refused.to_string().contains("several members"), "{refused}");
+}

@@ -61,6 +61,11 @@ struct Inner {
     /// controller started (or since their pool was designated): cleared again
     /// only when an attachment receipt reappears.
     member_cleared: Mutex<BTreeSet<(String, String)>>,
+    /// Whether a host is someone's own or contributed machine (the
+    /// controller's contributors and tenancy); never used for member runs.
+    personal_host: Mutex<Option<PersonalHost>>,
+    /// Replaces deleting a member workspace's VM (tests only).
+    delete_vm: Mutex<Option<DeleteHook>>,
     /// Callback targets and keys of runs still in flight. Memory only: the
     /// key never reaches a record, and a restart ends delivery for that run.
     callbacks: Mutex<BTreeMap<String, Callback>>,
@@ -170,6 +175,10 @@ pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential
 pub type MemberMaterial = Arc<
     dyn Fn(&str, &queue::MemberRun, &str, u64) -> Result<crate::member::Delegated> + Send + Sync,
 >;
+/// Deletes a workspace VM (host, name): replaces the fleet in tests.
+pub type DeleteHook = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
+/// Whether a host is a personal or contributed machine (docs/MEMBER-SUBSCRIPTIONS.md).
+pub type PersonalHost = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// Revokes a run's repository token when the run ends (best effort).
 pub type RepositoryRevoke = Arc<dyn Fn(&str, &repository::Credential) + Send + Sync>;
 /// Probes a workspace's native session lease for a provider: `Ok(true)` when
@@ -586,6 +595,8 @@ impl AgentService {
                 status_cache: Mutex::new(BTreeMap::new()),
                 receipt_lock: Mutex::new(()),
                 member_cleared: Mutex::new(BTreeSet::new()),
+                personal_host: Mutex::new(None),
+                delete_vm: Mutex::new(None),
                 callbacks: Mutex::new(callbacks),
                 finish_hook: Mutex::new(None),
                 queue_root,
@@ -623,6 +634,49 @@ impl AgentService {
                 adoptable: Mutex::new(adoptable),
             }),
         })
+        .and_then(|service| {
+            service.migrate_member_bindings()?;
+            Ok(service)
+        })
+    }
+    /// Member runs from before workspace bindings existed: a member-runs
+    /// workspace that served exactly one member becomes theirs; one that
+    /// served several is [`pools::TAINTED`] until the owner releases
+    /// (recreates) it, so no member inherits another's home, /tmp or
+    /// sessions. Runs once per start; bound workspaces are left as they are.
+    fn migrate_member_bindings(&self) -> Result<()> {
+        let bindings = self.inner.pools.bindings();
+        let mut served: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        {
+            let records = self.inner.records.lock().unwrap();
+            let details = self.inner.details.lock().unwrap();
+            for (id, record) in records.iter() {
+                let Some(member) = details.get(id).and_then(|d| d["member"].as_str()) else {
+                    continue;
+                };
+                let key = (
+                    record["host_id"].as_str().unwrap_or("").to_owned(),
+                    record["name"].as_str().unwrap_or("").to_owned(),
+                );
+                served.entry(key).or_default().insert(member.to_owned());
+            }
+        }
+        for ((host_id, name), members) in served {
+            if bindings.contains_key(&(host_id.clone(), name.clone())) {
+                continue;
+            }
+            let workspace = Placement { host_id, name };
+            if self.inner.pools.member_pool_of(&workspace).is_none() {
+                continue;
+            }
+            match members.into_iter().collect::<Vec<_>>().as_slice() {
+                [only] => {
+                    self.inner.pools.bind_member(&workspace, only)?;
+                }
+                _ => self.inner.pools.taint(&workspace)?,
+            }
+        }
+        Ok(())
     }
     fn pending_guard(&self) -> Result<Pending> {
         ensure!(
@@ -1122,6 +1176,116 @@ impl AgentService {
         );
         Ok(())
     }
+    /// Install the personal-host check (the controller's contributors and tenancy).
+    pub fn set_personal_host(&self, hook: PersonalHost) {
+        *self.inner.personal_host.lock().unwrap() = Some(hook);
+    }
+    /// Replace deleting member workspaces' VMs (tests).
+    pub fn set_delete_hook(&self, hook: DeleteHook) {
+        *self.inner.delete_vm.lock().unwrap() = Some(hook);
+    }
+    fn delete_vm(&self, host: &str, name: &str) -> Result<()> {
+        let hook = self.inner.delete_vm.lock().unwrap().clone();
+        match hook {
+            Some(delete) => delete(host, name),
+            None => self
+                .inner
+                .fleet
+                .scheduler_action(host, name, "delete")
+                .map(|_| ()),
+        }
+    }
+    fn personal(&self, host: &str) -> bool {
+        let hook = self.inner.personal_host.lock().unwrap().clone();
+        hook.is_some_and(|h| h(host))
+    }
+    fn require_fleet_hosts(&self, pool: &pools::Pool) -> Result<()> {
+        let hosts = pool
+            .members()
+            .into_iter()
+            .map(|m| m.host_id)
+            .chain(pool.autoscale.iter().flat_map(|a| a.hosts.clone()));
+        for host in hosts {
+            crate::require(
+                !self.personal(&host),
+                "A member-runs pool uses fleet hosts only, never a personal or contributed machine.",
+            )?;
+        }
+        Ok(())
+    }
+    /// `POST /v1/pools`: create or replace a pool. A member-runs pool's hosts
+    /// are checked under the scheduler lock, atomically with designation.
+    pub fn put_pool(&self, body: Value, known_host: &dyn Fn(&str) -> bool) -> Result<Value> {
+        let _sched = self.inner.sched.lock().unwrap();
+        if let Some(name) = body["name"].as_str()
+            && self.inner.pools.member_runs(name)
+        {
+            let definition: pools::Pool = serde_json::from_value(body.clone())?;
+            self.require_fleet_hosts(&definition)?;
+        }
+        self.inner.pools.put(body, known_host)
+    }
+    /// `POST /v1/pools/{pool}/member-runs/release {host_id, name, recreated?}`
+    /// (owner): free a member-bound (or tainted) workspace for anyone. A
+    /// workspace the pool created is deleted, so autoscale makes a fresh one;
+    /// a listed workspace is released only when the owner states it was
+    /// wiped or recreated (`recreated: true`).
+    pub fn release_member_workspace(&self, pool: &str, body: &Value) -> Result<Value> {
+        let workspace: Placement = serde_json::from_value(json!({
+            "host_id": body["host_id"], "name": body["name"]
+        }))?;
+        crate::require(
+            body.as_object().is_some_and(|o| {
+                o.keys()
+                    .all(|k| ["host_id", "name", "recreated"].contains(&k.as_str()))
+            }),
+            "Only host_id, name and recreated are accepted.",
+        )?;
+        let definition = self
+            .inner
+            .pools
+            .get(pool)
+            .ok_or_else(|| crate::rule(anyhow::anyhow!("Unknown pool.")))?;
+        crate::require(
+            definition.members().contains(&workspace),
+            "That workspace is not in this pool.",
+        )?;
+        let key = (workspace.host_id.clone(), workspace.name.clone());
+        {
+            let mut sched = self.inner.sched.lock().unwrap();
+            crate::require(
+                !self.busy_members(&sched).contains(&key),
+                "That workspace is running a member's run; release it when idle.",
+            )?;
+            sched.holding.insert(key.clone());
+        }
+        let result = if definition.created.contains(&workspace) {
+            self.delete_vm(&workspace.host_id, &workspace.name)
+                .and_then(|_| self.inner.pools.remove_created(pool, &workspace))
+                .map(|_| "recreated")
+        } else if body["recreated"] == true {
+            self.inner
+                .pools
+                .release_listed(pool, &workspace)
+                .map(|_| "released")
+        } else {
+            Err(crate::rule(anyhow::anyhow!(
+                "Wipe or recreate this listed workspace first, then release it with recreated: true."
+            )))
+        };
+        {
+            let mut sched = self.inner.sched.lock().unwrap();
+            sched.holding.remove(&key);
+            if result.is_ok() {
+                sched.vm_states.remove(&key);
+                sched.idle_since.remove(&key);
+                sched.dirty = true;
+            }
+        }
+        self.inner.member_cleared.lock().unwrap().remove(&key);
+        self.inner.wake.notify_all();
+        Ok(json!({"pool":pool,"host_id":workspace.host_id,"name":workspace.name,"result":result?}))
+    }
     /// `POST /v1/pools/{pool}/member-runs {enabled}`: designate a pool for
     /// members' own-subscription runs, or ordinary runs again. Refused while
     /// the pool has queued or running runs (drain first). Enabling stops
@@ -1136,6 +1300,9 @@ impl AgentService {
                 .any(|q| q.entry.state != EntryState::Finished && q.entry.pool() == Some(pool)),
             "Drain the pool's queued and running runs before changing member runs.",
         )?;
+        if enabled && let Some(definition) = self.inner.pools.get(pool) {
+            self.require_fleet_hosts(&definition)?;
+        }
         let changed = self.inner.pools.set_member_runs(pool, enabled)?;
         drop(sched);
         if let Some(definition) = self.inner.pools.get(pool) {
@@ -2235,7 +2402,15 @@ impl AgentService {
                         host_id: host_id.clone(),
                         name: name.clone(),
                     })
-                    .is_none(),
+                    .is_none()
+                    && self
+                        .inner
+                        .pools
+                        .bound_member(&Placement {
+                            host_id: host_id.clone(),
+                            name: name.clone(),
+                        })
+                        .is_none(),
                 "This workspace runs only members' own subscription runs.",
             )?;
         }
@@ -2255,6 +2430,21 @@ impl AgentService {
         }
         if let Some(member) = &options.member {
             member.validate()?;
+            // A resume lands where its session is: only on the member's own workspace.
+            if let Target::Pool {
+                pinned: Some(p), ..
+            } = &target
+            {
+                let owner = self.inner.pools.bound_member(p);
+                crate::require(
+                    owner.as_deref() != Some(pools::TAINTED),
+                    "This session's workspace served several members before isolation; ask the owner to release it (it cannot be resumed).",
+                )?;
+                crate::require(
+                    owner.as_deref() == Some(member.member.as_str()),
+                    "resume_id is not one of your sessions.",
+                )?;
+            }
             crate::require(
                 options.repository.is_none(),
                 "Member runs do not use hosted repositories in this release.",
@@ -2597,6 +2787,7 @@ impl AgentService {
                 seq: q.entry.seq,
                 provider: q.entry.provider().to_owned(),
                 target: q.entry.target.clone(),
+                member: q.entry.member.as_ref().map(|m| m.member.clone()),
             })
             .collect();
         let plan = queue::plan(queue::PlanInput {
@@ -2610,6 +2801,7 @@ impl AgentService {
             headroom_bytes: self.limits().run_memory_headroom_bytes,
             admitting: self.inner.admitting.load(Ordering::SeqCst)
                 && !self.inner.closed.load(Ordering::SeqCst),
+            bindings: self.inner.pools.bindings(),
         });
         sched.waiting = plan.waiting;
         sched.cursor = plan.cursor;
@@ -2643,7 +2835,78 @@ impl AgentService {
                 *sched.creating.entry(pool.clone()).or_default() += 1;
                 self.spawn_create(pool, host);
             }
+            // Members waiting while every free workspace is bound to another
+            // member, in a pool that cannot grow: recreate the longest-idle
+            // bound workspace so N workspaces never serve only N members.
+            for pool in plan.member_blocked.keys() {
+                self.reclaim_for_members(&mut sched, pool);
+            }
         }
+    }
+    /// Delete (and so unbind) the longest-idle created workspace of `pool`
+    /// bound to a member, when the pool is at its size limit and nothing is
+    /// being created; autoscale then creates a fresh one. The caller holds
+    /// `sched`.
+    fn reclaim_for_members(&self, sched: &mut Sched, pool: &str) {
+        let Some(definition) = self.inner.pools.get(pool) else {
+            return;
+        };
+        let creating = sched.creating.get(pool).copied().unwrap_or(0);
+        if creating > 0
+            || definition.autoscale.is_none()
+            || definition.members().len() < definition.max_workspaces()
+        {
+            return;
+        }
+        let busy = self.busy_members(sched);
+        let bindings = self.inner.pools.bindings();
+        let Some(victim) = definition
+            .created
+            .iter()
+            .filter(|m| {
+                let key = (m.host_id.clone(), m.name.clone());
+                bindings.contains_key(&key) && !busy.contains(&key)
+            })
+            // Longest idle first (by the lifecycle's idle clock; a workspace
+            // it has not timed yet counts as just idle).
+            .map(|m| {
+                let idle = sched
+                    .idle_since
+                    .get(&(m.host_id.clone(), m.name.clone()))
+                    .map(Instant::elapsed)
+                    .unwrap_or_default();
+                (idle, m.clone())
+            })
+            .max_by_key(|(idle, _)| *idle)
+            .map(|(_, m)| m)
+        else {
+            return;
+        };
+        let key = (victim.host_id.clone(), victim.name.clone());
+        sched.holding.insert(key.clone());
+        let this = self.clone();
+        let pool = pool.to_owned();
+        thread::spawn(move || {
+            let result = this
+                .delete_vm(&victim.host_id, &victim.name)
+                .and_then(|_| this.inner.pools.remove_created(&pool, &victim));
+            this.lifecycle_event(
+                &pool,
+                &victim,
+                "workspace_reclaimed",
+                "member_demand",
+                result.as_ref().err(),
+            );
+            let mut sched = this.inner.sched.lock().unwrap();
+            sched.holding.remove(&key);
+            if result.is_ok() {
+                sched.vm_states.remove(&key);
+                sched.idle_since.remove(&key);
+            }
+            sched.dirty = true;
+            drop(sched);
+            this.inner.wake.notify_all();
+        });
     }
     /// Whether this service owns the fleet and admits work. A draining or
     /// drained controller keeps its scheduler thread but must not freeze,
@@ -3304,30 +3567,60 @@ impl AgentService {
             .entries
             .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("Queued run vanished."))?;
-        let request = native::RunRequest::parse(queued.entry.request.clone())?;
-        if let Target::Pool { .. } = queued.entry.target {
-            let (record, _) = new_run_entries(
-                id,
-                &placement.host_id,
-                &placement.name,
-                &request,
-                &queued.entry.principal,
-            );
-            let mut record = record;
-            record["created_at"] = json!(queued.entry.created_at);
-            self.save_record(&record)?;
-            self.inner
-                .records
-                .lock()
-                .unwrap()
-                .insert(id.to_owned(), record);
+        // A member run's workspace is that member's from now on (until it is
+        // deleted); an ordinary run never uses a member's workspace. A binding
+        // this admission makes is rolled back if the admission fails.
+        let bound = match &queued.entry.member {
+            Some(m) => self
+                .inner
+                .pools
+                .bind_member(&placement, &m.member)?
+                .then(|| m.member.clone()),
+            None => {
+                ensure!(
+                    self.inner.pools.bound_member(&placement).is_none(),
+                    "This workspace belongs to a member."
+                );
+                None
+            }
+        };
+        let durable = (|| -> Result<()> {
+            let request = native::RunRequest::parse(queued.entry.request.clone())?;
+            if let Target::Pool { .. } = queued.entry.target {
+                let (record, _) = new_run_entries(
+                    id,
+                    &placement.host_id,
+                    &placement.name,
+                    &request,
+                    &queued.entry.principal,
+                );
+                let mut record = record;
+                record["created_at"] = json!(queued.entry.created_at);
+                self.save_record(&record)?;
+                self.inner
+                    .records
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_owned(), record);
+            }
+            let mut admitted = queued.entry.clone();
+            admitted.state = EntryState::Admitted;
+            admitted.placement = Some(placement.clone());
+            // Env values leave the queue file once the run is handed to its worker.
+            strip_env(&mut admitted.request);
+            self.save_entry(&admitted)
+        })();
+        if let Err(error) = durable {
+            if let Some(member) = bound {
+                let _ = self.inner.pools.unbind_member(&placement, &member);
+            }
+            return Err(error);
         }
+        let request = native::RunRequest::parse(queued.entry.request.clone())?;
         let mut admitted = queued.entry.clone();
         admitted.state = EntryState::Admitted;
         admitted.placement = Some(placement.clone());
-        // Env values leave the queue file once the run is handed to its worker.
         strip_env(&mut admitted.request);
-        self.save_entry(&admitted)?;
         queued.entry = admitted;
         let resolved = queued.resolved.take();
         let queue_wait_ms = chrono::DateTime::parse_from_rfc3339(&queued.entry.created_at)
@@ -3452,7 +3745,12 @@ impl AgentService {
                 name: run.name.clone(),
             })
             .is_some();
-        if member_pool != run.member.is_some() || member_workspace != run.member.is_some() {
+        // A host enrolled as someone's machine after the pool was set up.
+        let personal = run.member.is_some() && self.personal(&run.host_id);
+        if member_pool != run.member.is_some()
+            || member_workspace != run.member.is_some()
+            || personal
+        {
             let failure = LaunchFailure::new(
                 Stage::Place,
                 "pool_unavailable",
