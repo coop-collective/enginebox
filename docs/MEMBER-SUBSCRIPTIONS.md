@@ -135,9 +135,10 @@ the pool has queued or running runs (drain it first). Enabling forgets the
 pool's attachment receipts, so reconciliation never delivers the controller's
 accounts there again.
 
-**Preparation.** A member run never attaches the controller's accounts. Before
-each member run the workspace is cleared with `enginebox-guest
-clear-credentials`, which removes:
+**Preparation.** A member run never attaches the controller's accounts. The
+workspace is cleared with `enginebox-guest clear-credentials` before its first
+member run after the controller starts or the pool is designated, and again
+whenever an attachment receipt reappears. Clearing removes:
 - delegated provider files;
 - delegation markers and setup tokens;
 - Claude settings overrides (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `AWS_*`,
@@ -152,7 +153,8 @@ member runs fails with `member_runs_unsupported`.
   credential again (`Credentials::member_material`). The record must still
   exist, be connected, belong to the run's member and be for the provider.
 - **Lifetime.** The access must stay valid for the run's whole `timeout_seconds`
-  plus a minute. A native client keeps the token it started with, so it cannot
+  plus a minute, checked when it is read and again right before dispatch (after
+  any host-lock wait, wake or preparation). A native client keeps the token it started with, so it cannot
   be re-keyed mid-run; a run whose timeout outlasts the access is refused with
   `credential_unavailable`.
 - **Access material only, never a refresh token:**
@@ -170,7 +172,8 @@ member runs fails with `member_runs_unsupported`.
   - an override in user, local, managed (`/etc/claude-code/managed-settings.json`)
     or project settings (`.claude/settings[.local].json` from the working
     directory up to the workspace root);
-  - a Codex configuration naming another provider, an API key, a bearer token
+  - a Codex system or managed configuration (`/etc/codex/config.toml`,
+    `/etc/codex/managed_config.toml`) or any other configuration naming another provider, an API key, a bearer token
     or a base URL. This covers the run's `CODEX_HOME/config.toml` and every
     project `.codex/config.toml` from the working directory up to the workspace
     root. The keys are `model_providers`, `model_provider`,
@@ -192,6 +195,9 @@ member runs fails with `member_runs_unsupported`.
     `agents`, `commands`, `plugins`, `output-styles`, and from `~/.claude.json`
     the user MCP servers and onboarding flags.
   - Never copied: credentials, sessions, history or project data.
+  - Copies keep execute bits (owner-only) and are refreshed only when the
+    template changes (a digest of paths, sizes and times). Codex links each run
+    to the member's own cached copy. `.claude.json` is read within 16 MiB.
 - **Session history.** Each member's session history is kept apart:
   `~/.local/state/enginebox/members/<key>/` holds `codex-sessions` and the
   `claude` directory, where `<key>` is a digest of the member's ID.

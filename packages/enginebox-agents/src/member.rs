@@ -12,7 +12,7 @@
 //! delegated provider credential of its own (the controller's accounts, a
 //! settings override, a setup token), so the native CLI can only ever
 //! authenticate with the member's material.
-use crate::{profile, repository, security};
+use crate::{profile, security};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,9 +21,13 @@ use std::path::{Path, PathBuf};
 /// The guest mode for member runs.
 pub const GUEST_MODE: &str = "run-member";
 /// The modes a member envelope may wrap.
-pub const MODES: &[&str] = &["run", "run-profile", "run-repository"];
-/// A repository envelope plus the material.
-pub const MAX_ENVELOPE_BYTES: usize = repository::MAX_ENVELOPE_BYTES + 65536;
+/// (Hosted repositories are not offered to member runs in this release.)
+pub const MODES: &[&str] = &["run", "run-profile"];
+/// A profile envelope plus the material.
+pub const MAX_ENVELOPE_BYTES: usize = profile::MAX_ENVELOPE_BYTES + 65536;
+/// Claude's state file (`.claude.json`) grows with use; read and rewrite it
+/// within this bound rather than the 64 KiB private-file default.
+pub const CLAUDE_STATE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Short-lived access material for one run of one member's own credential.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -208,12 +212,32 @@ const CLAUDE_STATE_KEYS: &[&str] = &["primaryApiKey", "customApiKeyResponses"];
 fn claude_state_key(state: &Value) -> bool {
     CLAUDE_STATE_KEYS.iter().any(|k| state.get(k).is_some())
 }
+/// Read a `.claude.json` within [`CLAUDE_STATE_LIMIT`] (none when absent).
+fn read_claude_state(path: &Path) -> Result<Option<Value>> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    ensure!(
+        meta.is_file() && meta.len() <= CLAUDE_STATE_LIMIT as u64,
+        "Claude's state file is not a regular file within 16 MiB; member runs refuse it."
+    );
+    let raw = std::fs::read(path)?;
+    Ok(Some(serde_json::from_slice(&raw).map_err(|_| {
+        anyhow::anyhow!("Unreadable Claude state; member runs refuse it.")
+    })?))
+}
+fn write_claude_state(root: &Path, state: &Value) -> Result<()> {
+    security::write_bytes(
+        root,
+        ".claude.json",
+        &serde_json::to_vec(state)?,
+        CLAUDE_STATE_LIMIT,
+    )
+}
 fn check_claude_state(path: &Path) -> Result<()> {
-    let Ok(raw) = std::fs::read(path) else {
+    let Some(state) = read_claude_state(path)? else {
         return Ok(());
     };
-    let state: Value = serde_json::from_slice(&raw)
-        .map_err(|_| anyhow::anyhow!("Unreadable Claude state; member runs refuse it."))?;
     ensure!(
         !claude_state_key(&state),
         "Claude's state in this workspace holds an API key; member runs refuse it."
@@ -303,6 +327,9 @@ impl Drop for RunDirCleanup {
     }
 }
 
+/// System and managed Codex configuration, which applies to every run.
+const MANAGED_CODEX_CONFIG: &[&str] = &["/etc/codex/config.toml", "/etc/codex/managed_config.toml"];
+
 /// Codex configuration keys that select another provider, an API key, a
 /// bearer token or an endpoint instead of the member's ChatGPT login. They
 /// are refused at the top level and in `profiles.*`, where Codex reads its
@@ -358,6 +385,9 @@ fn check_codex_file(path: &Path) -> Result<()> {
 /// `.codex/config.toml` from the working directory up to the workspace root.
 pub fn check_codex_config(codex_home: &Path, cwd: &Path, workspace: &Path) -> Result<()> {
     check_codex_file(&codex_home.join("config.toml"))?;
+    for managed in MANAGED_CODEX_CONFIG {
+        check_codex_file(Path::new(managed))?;
+    }
     let mut dir = Some(cwd);
     while let Some(d) = dir {
         check_codex_file(&d.join(".codex/config.toml"))?;
@@ -392,6 +422,53 @@ pub fn copy_template(from: &Path, to: &Path, entries: &[&str]) -> Result<()> {
     }
     Ok(())
 }
+/// A digest of the template entries' paths, sizes and modification times.
+fn template_digest(from: &Path, entries: &[&str]) -> String {
+    fn walk(path: &Path, rel: &str, out: &mut Vec<Value>) {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.is_dir() {
+            let mut names: Vec<_> = std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            names.sort();
+            for name in names {
+                walk(
+                    &path.join(&name),
+                    &format!("{rel}/{}", name.to_string_lossy()),
+                    out,
+                );
+            }
+        } else if meta.is_file() {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64);
+            out.push(serde_json::json!([rel, meta.len(), mtime]));
+        }
+    }
+    let mut out = vec![];
+    for name in entries {
+        walk(&from.join(name), name, &mut out);
+    }
+    security::digest(&Value::Array(out))
+}
+/// [`copy_template`] only when the template changed since the last copy
+/// into `to` (a digest of paths, sizes and times kept in `to`).
+pub fn sync_template(from: &Path, to: &Path, entries: &[&str]) -> Result<()> {
+    const MARKER: &str = ".enginebox-template";
+    let digest = template_digest(from, entries);
+    if security::read_bytes(to, MARKER, 128, false)?.is_some_and(|d| d == digest.as_bytes()) {
+        return Ok(());
+    }
+    copy_template(from, to, entries)?;
+    security::write_bytes(to, MARKER, digest.as_bytes(), 128)
+}
 fn copy_tree(
     source: &Path,
     target: &Path,
@@ -423,8 +500,9 @@ fn copy_tree(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = meta.permissions().mode() & 0o700;
-            std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode.max(0o600)))?;
+            // Owner-only, keeping execute bits (hooks, scripts).
+            let mode = (meta.permissions().mode() & 0o700) | 0o600;
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))?;
         }
     }
     Ok(())
@@ -464,15 +542,16 @@ const CLAUDE_STATE_TEMPLATE: &[&str] = &[
 /// own `.claude.json`. The member's sessions in it are kept.
 pub fn prepare_claude_config(home: &Path, key: &str) -> Result<PathBuf> {
     let config = member_dir(home, key, "claude")?;
-    copy_template(&home.join(".claude"), &config, CLAUDE_TEMPLATE)?;
+    sync_template(&home.join(".claude"), &config, CLAUDE_TEMPLATE)?;
     if let Some(mut settings) = security::read_json(&config, "settings.json")?
         && strip_claude_overrides(&mut settings)
     {
         security::write_json(&config, "settings.json", &settings)?;
     }
-    let mut state = security::read_json(&config, ".claude.json")?.unwrap_or(serde_json::json!({}));
+    let mut state =
+        read_claude_state(&config.join(".claude.json"))?.unwrap_or(serde_json::json!({}));
     ensure!(state.is_object(), "Invalid member Claude state.");
-    if let Some(template) = security::read_json(home, ".claude.json")? {
+    if let Some(template) = read_claude_state(&home.join(".claude.json"))? {
         for key in CLAUDE_STATE_TEMPLATE {
             if let Some(v) = template.get(*key) {
                 state[*key] = v.clone();
@@ -484,7 +563,7 @@ pub fn prepare_claude_config(home: &Path, key: &str) -> Result<PathBuf> {
             o.remove(*key);
         }
     }
-    security::write_json(&config, ".claude.json", &state)?;
+    write_claude_state(&config, &state)?;
     Ok(config)
 }
 
@@ -500,9 +579,11 @@ pub fn member_dir(home: &Path, key: &str, name: &str) -> Result<PathBuf> {
 }
 
 /// A run-private `CODEX_HOME` for a member run without a profile: the
-/// workspace's `config.toml` (checked later), and the member's own session
-/// store, so `resume` works without touching anyone else's history.
-pub fn prepare_codex_home(home: &Path, run_id: &str) -> Result<PathBuf> {
+/// workspace's `config.toml` (checked later) and links to the member's own
+/// copy of the template's setup (instructions, prompts, skills, rules,
+/// plugins), refreshed only when the template changes. Never auth, sessions
+/// or history.
+pub fn prepare_codex_home(home: &Path, run_id: &str, key: &str) -> Result<PathBuf> {
     let root = profile::run_dir(home, run_id)?;
     security::safe_path(
         home,
@@ -517,7 +598,14 @@ pub fn prepare_codex_home(home: &Path, run_id: &str) -> Result<PathBuf> {
     {
         security::write_bytes(&root, "codex-home/config.toml", &config, security::LIMIT)?;
     }
-    copy_template(&home.join(".codex"), &codex, CODEX_TEMPLATE)?;
+    let cache = member_dir(home, key, "codex-template")?;
+    sync_template(&home.join(".codex"), &cache, CODEX_TEMPLATE)?;
+    #[cfg(unix)]
+    for name in CODEX_TEMPLATE {
+        if std::fs::symlink_metadata(cache.join(name)).is_ok() {
+            std::os::unix::fs::symlink(cache.join(name), codex.join(name))?;
+        }
+    }
     Ok(codex)
 }
 
@@ -563,7 +651,7 @@ pub fn clear_delegated(home: &Path) -> Result<Value> {
             removed += 1;
         }
     }
-    if let Some(mut state) = security::read_json(home, ".claude.json")?
+    if let Some(mut state) = read_claude_state(&home.join(".claude.json"))?
         && claude_state_key(&state)
     {
         if let Some(o) = state.as_object_mut() {
@@ -571,7 +659,7 @@ pub fn clear_delegated(home: &Path) -> Result<Value> {
                 o.remove(*key);
             }
         }
-        security::write_json(home, ".claude.json", &state)?;
+        write_claude_state(home, &state)?;
         removed += 1;
     }
     for relative in [".claude/settings.json", ".claude/settings.local.json"] {

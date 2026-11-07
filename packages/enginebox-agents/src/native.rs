@@ -601,13 +601,6 @@ pub fn execute_member(
             run_id,
             member,
         ),
-        "run-repository" => execute_with_repository(
-            &serde_json::from_value(input)?,
-            home,
-            workspace,
-            run_id,
-            member,
-        ),
         _ => anyhow::bail!("Unsupported member run mode."),
     }
 }
@@ -665,8 +658,10 @@ fn execute_inner(
         &format!(".local/state/enginebox/agent-runs/{}.lock", r.provider),
     )?;
     // A member run's private directory (and its material) goes on every
-    // exit from here, success or failure, while the writer lease is held.
-    let _member_cleanup = credential
+    // exit from here, success or failure: early returns drop it while the
+    // writer lease is still held, and the normal path drops it explicitly
+    // before the lease is released below.
+    let member_cleanup = credential
         .zip(run_id)
         .map(|(_, id)| crate::member::RunDirCleanup::new(&home, id));
     // A repository run works in a freshly emptied checkout at a stable path
@@ -790,7 +785,7 @@ fn execute_inner(
                     // The profile's CODEX_HOME, or a run-private one: never ~/.codex.
                     let codex_home = match run_env.get("CODEX_HOME") {
                         Some(path) => PathBuf::from(path),
-                        None => crate::member::prepare_codex_home(&home, id)?,
+                        None => crate::member::prepare_codex_home(&home, id, member.member_key)?,
                     };
                     ensure!(
                         codex_home.starts_with(crate::profile::run_dir(&home, id)?),
@@ -902,6 +897,7 @@ fn execute_inner(
     // A per-run fallback checkout is removed here, under the writer lease;
     // the stable checkout stays until the next run empties it.
     drop(work);
+    drop(member_cleanup);
     drop(lease);
     let result = result.map(|mut output| {
         if !redacted.is_empty() {

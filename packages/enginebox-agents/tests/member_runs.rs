@@ -815,6 +815,11 @@ fn a_session_is_resumed_only_by_the_member_who_started_it() {
     wait_for("Bob's run", || {
         service.get_pool_run("jam", &bob).unwrap()["status"] == "succeeded"
     });
+    // Finished runs do not block changing the pool's mode (once the run has
+    // released its slot, just after it is recorded).
+    wait_for("the pool to be idle", || {
+        service.set_member_runs("jam", true).is_ok()
+    });
     // A pool cannot switch while it has work; it is idle now.
     let resume = |who: &str, cred: &str| {
         let mut b = body("claude");
@@ -1018,4 +1023,85 @@ fn claude_reader_for_admission(service: &AgentService) {
             &json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-x-0123456789"}}),
         )
     }));
+}
+
+#[cfg(unix)]
+#[test]
+fn template_copies_keep_exec_bits_refresh_on_change_and_large_state_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    let (from, to) = (root.join("from"), root.join("to"));
+    security::private_dir(&from).unwrap();
+    security::private_dir(&to).unwrap();
+    security::write_bytes(&from, "skills/hook.sh", b"#!/bin/sh\n", 65536).unwrap();
+    std::fs::set_permissions(
+        from.join("skills/hook.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    member::sync_template(&from, &to, &["skills"]).unwrap();
+    let mode = std::fs::metadata(to.join("skills/hook.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "owner-only, executable");
+    // Unchanged template: not copied again (a local edit survives).
+    std::fs::write(to.join("skills/hook.sh"), "edited").unwrap();
+    member::sync_template(&from, &to, &["skills"]).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(to.join("skills/hook.sh")).unwrap(),
+        "edited"
+    );
+    // Changed template: copied again.
+    security::write_bytes(&from, "skills/new.md", b"new", 65536).unwrap();
+    member::sync_template(&from, &to, &["skills"]).unwrap();
+    assert!(to.join("skills/new.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(to.join("skills/hook.sh")).unwrap(),
+        "#!/bin/sh\n"
+    );
+    // A realistic .claude.json (well over 64 KiB) is read and merged.
+    let g = guest("claude");
+    let big: Vec<String> = (0..4000)
+        .map(|i| format!("entry-{i}-{}", "x".repeat(40)))
+        .collect();
+    security::write_bytes(
+        &g.home,
+        ".claude.json",
+        &serde_json::to_vec(
+            &json!({"mcpServers":{"browser":{"command":"playwright-mcp"}},"tipsHistory":big}),
+        )
+        .unwrap(),
+        member::CLAUDE_STATE_LIMIT,
+    )
+    .unwrap();
+    assert!(
+        std::fs::metadata(g.home.join(".claude.json"))
+            .unwrap()
+            .len()
+            > 65536
+    );
+    native::execute_member(
+        &envelope("claude", claude_material()),
+        &g.home,
+        &g.workspace,
+        RUN,
+    )
+    .unwrap();
+    let config = g.home.join(format!(
+        ".local/state/enginebox/members/{}/claude",
+        member::member_key(ALICE)
+    ));
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(config.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(state["mcpServers"]["browser"]["command"], "playwright-mcp");
+    // Hosted repositories are not a member run mode in this release.
+    assert!(
+        member::parse(
+            json!({"mode":"run-repository","input":{},"member_key":member::member_key(ALICE),
+            "credential":claude_material()})
+        )
+        .is_err()
+    );
 }

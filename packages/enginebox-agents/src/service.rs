@@ -57,6 +57,10 @@ struct Inner {
     usage: usage::Cache,
     status_cache: Mutex<BTreeMap<String, (std::time::Instant, Value)>>,
     receipt_lock: Mutex<()>,
+    /// Member-runs workspaces cleared of delegated credentials since this
+    /// controller started (or since their pool was designated): cleared again
+    /// only when an attachment receipt reappears.
+    member_cleared: Mutex<BTreeSet<(String, String)>>,
     /// Callback targets and keys of runs still in flight. Memory only: the
     /// key never reaches a record, and a restart ends delivery for that run.
     callbacks: Mutex<BTreeMap<String, Callback>>,
@@ -160,11 +164,9 @@ pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential
 /// Reads a member run's access material at admission (docs/MEMBER-SUBSCRIPTIONS.md):
 /// (run ID, the member run, provider, the run's timeout in seconds). Only
 /// that member's own credential, valid for the whole timeout (a native
-/// client cannot be re-keyed mid-run), renewed first when the controller
-/// has central refresh for it; refused when even fresh access cannot cover
-/// the run. Refreshed
-/// by the controller when it is close to expiry. Never another's, never a
-/// controller account.
+/// client cannot be re-keyed mid-run); refused otherwise. (Central renewal
+/// before refusing arrives with the Claude full-login change.) Never
+/// another's, never a controller account.
 pub type MemberMaterial = Arc<
     dyn Fn(&str, &queue::MemberRun, &str, u64) -> Result<crate::member::Delegated> + Send + Sync,
 >;
@@ -583,6 +585,7 @@ impl AgentService {
                 usage: usage::Cache::default(),
                 status_cache: Mutex::new(BTreeMap::new()),
                 receipt_lock: Mutex::new(()),
+                member_cleared: Mutex::new(BTreeSet::new()),
                 callbacks: Mutex::new(callbacks),
                 finish_hook: Mutex::new(None),
                 queue_root,
@@ -659,23 +662,7 @@ impl AgentService {
             !home.join("pending-adoption.json").exists(),
             "Finish pending controller adoption first."
         );
-        if let Some(v) = security::read_json(&home, delegation::TOKEN_FILE)?
-            && security::token(&v["value"])
-            && ["claude", "cursor"].contains(&p)
-        {
-            let key = if p == "claude" {
-                "CLAUDE_CODE_OAUTH_TOKEN"
-            } else {
-                "CURSOR_API_KEY"
-            };
-            return Ok(
-                json!({"kind":"environment","content":{key:v["value"]},"expires_at":v["expires_at"]}),
-            );
-        }
-        delegation::material(
-            p,
-            &security::read_json(&home, delegation::native_file(p))?.unwrap_or(Value::Null),
-        )
+        Ok(delegation::home_material(&home, p)?.material)
     }
     fn credential_digest(&self, p: &str) -> Result<String> {
         let home = self.home(p)?;
@@ -1143,11 +1130,21 @@ impl AgentService {
     pub fn set_member_runs(&self, pool: &str, enabled: bool) -> Result<Value> {
         let sched = self.inner.sched.lock().unwrap();
         crate::require(
-            !sched.entries.values().any(|q| q.entry.pool() == Some(pool)),
+            !sched
+                .entries
+                .values()
+                .any(|q| q.entry.state != EntryState::Finished && q.entry.pool() == Some(pool)),
             "Drain the pool's queued and running runs before changing member runs.",
         )?;
         let changed = self.inner.pools.set_member_runs(pool, enabled)?;
         drop(sched);
+        if let Some(definition) = self.inner.pools.get(pool) {
+            // A (re)designated pool's workspaces are cleared before their next run.
+            let mut cleared = self.inner.member_cleared.lock().unwrap();
+            for member in definition.members() {
+                cleared.remove(&(member.host_id.clone(), member.name.clone()));
+            }
+        }
         if enabled && let Some(definition) = self.inner.pools.get(pool) {
             let _lock = self.inner.receipt_lock.lock().unwrap();
             for member in definition.members() {
@@ -3656,6 +3653,29 @@ impl AgentService {
             });
         match prepared {
             Ok((host, guest_current)) => {
+                // The host lock, wake and preparation may have taken a while:
+                // the member's access must still cover the whole run.
+                if let Some(credential) = &run.member_credential
+                    && credential.expires_at.is_some_and(|at| {
+                        at <= chrono::Utc::now().timestamp() as f64
+                            + run.request.timeout_seconds as f64
+                            + 60.
+                    })
+                {
+                    let failure = LaunchFailure::new(
+                        Stage::Delegate,
+                        "credential_unavailable",
+                        "The member's access no longer covers the run after preparation.",
+                    );
+                    self.launch_failed(
+                        run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                    return;
+                }
                 self.note_start(&run.id, woke, started.elapsed());
                 let request = run.request.clone();
                 // Checkouts need a guest helper from this release; an older
@@ -3883,8 +3903,19 @@ impl AgentService {
                     "The workspace's guest helper predates member runs; update enginebox-guest.",
                 ));
             }
-            self.clear_workspace(&host, host_id, name)
-                .map_err(|e| LaunchFailure::from_error(Stage::Delegate, "delegation_failed", &e))?;
+            let key = (host_id.to_owned(), name.to_owned());
+            let receipt = self
+                .inner
+                .root
+                .join("attachments")
+                .join(format!("{}.json", receipt_key(host_id, name)))
+                .exists();
+            if receipt || !self.inner.member_cleared.lock().unwrap().contains(&key) {
+                self.clear_workspace(&host, host_id, name).map_err(|e| {
+                    LaunchFailure::from_error(Stage::Delegate, "delegation_failed", &e)
+                })?;
+                self.inner.member_cleared.lock().unwrap().insert(key);
+            }
             return Ok((host, guest_current));
         }
         let attached = self

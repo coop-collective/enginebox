@@ -85,7 +85,7 @@ fn a_member_run_prepares_a_real_workspace_without_the_controllers_accounts() {
 shift
 if [ "$1" = enginebox-host ]; then
   case "$2" in
-    inventory) printf '%s' '{inventory}' ;;
+    inventory) [ -e "{slow}" ] && sleep 3; printf '%s' '{inventory}' ;;
     lock) echo locked; cat >/dev/null ;;
     *) exit 3 ;;
   esac
@@ -101,6 +101,7 @@ if [ "$1" = incus ]; then
   cd "$cwd" || exit 5
   if [ "$1" = /usr/local/bin/enginebox-guest ]; then
     shift
+    [ "$1" = clear-credentials ] && echo cleared >> "{clears}"
     HOME="$home" exec '{guest}' "$@"
   fi
   HOME="$home" exec "$@"
@@ -108,6 +109,8 @@ fi
 exit 4
 "#,
             inventory = inventory,
+            slow = root.join("slow").display(),
+            clears = root.join("clears").display(),
             guest = guest
         ),
     );
@@ -158,11 +161,20 @@ exit 4
         )
         .unwrap();
     service.set_member_runs("jam", true).unwrap();
-    service.set_member_material(Arc::new(|_, run, provider, _| {
+    // Long-lived access unless `short` is set: then it barely covers the run
+    // when read, and no longer once a slow preparation is over.
+    let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let short_access = short.clone();
+    service.set_member_material(Arc::new(move |_, run, provider, timeout| {
         anyhow::ensure!(run.member == ALICE && provider == "claude");
+        let expires = if short_access.load(std::sync::atomic::Ordering::SeqCst) {
+            chrono::Utc::now().timestamp() + timeout as i64 + 62
+        } else {
+            chrono::Utc::now().timestamp() + 86_400
+        };
         Delegated::from_material(
             "claude",
-            &json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":ALICE_TOKEN}}),
+            &json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":ALICE_TOKEN},"expires_at":expires}),
         )
     }));
     // An ordinary run cannot reach the member-runs workspace directly.
@@ -245,6 +257,67 @@ exit 4
         }
     }
     let _: Value = run;
+    let launch = || {
+        service
+            .launch_pool(
+                "jam",
+                json!({"provider":"claude","prompt":"again","timeout_seconds":60}),
+                "owner",
+                LaunchOptions {
+                    member: Some(MemberRun {
+                        member: ALICE.into(),
+                        credential_id: ALICE_CRED.into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let finish = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let run = service.get_pool_run("jam", id).unwrap();
+            if !["queued", "running"].contains(&run["status"].as_str().unwrap_or("")) {
+                return run;
+            }
+            assert!(Instant::now() < deadline, "{run}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let clears = || {
+        std::fs::read_to_string(root.join("clears"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    assert_eq!(clears(), 1);
+    // The workspace was cleared once; the next run does not clear it again.
+    assert_eq!(finish(&launch())["status"], "succeeded");
+    assert_eq!(clears(), 1);
+    // A reappearing attachment receipt makes the next run clear it again.
+    use sha2::Digest;
+    let receipt = format!("{:x}", sha2::Sha256::digest("h1:ebox-m1"));
+    security::write_json(
+        &controller.join("agents/attachments"),
+        &format!("{receipt}.json"),
+        &json!({"host_id":"h1","name":"ebox-m1","providers":["claude"]}),
+    )
+    .unwrap();
+    assert_eq!(finish(&launch())["status"], "succeeded");
+    assert_eq!(clears(), 2);
+    // Access that covered the run when read but not after a slow preparation
+    // is checked again right before dispatch: the run never starts.
+    short.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(root.join("slow"), "").unwrap();
+    std::fs::remove_file(home.join(".seen")).unwrap();
+    let late = finish(&launch());
+    assert_eq!(late["status"], "failed", "{late}");
+    assert_eq!(late["failure"]["reason"], "credential_unavailable");
+    assert!(!home.join(".seen").exists(), "the CLI never started");
 }
 
 fn walk(dir: &Path) -> Vec<std::path::PathBuf> {

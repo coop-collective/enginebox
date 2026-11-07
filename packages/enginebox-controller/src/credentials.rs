@@ -1221,6 +1221,8 @@ impl Credentials {
     /// credential only: the record must still exist, be connected, belong to
     /// `run.member` and be for `provider`. Access material only (a Codex
     /// `auth.json` with its refresh token removed, or Claude's access token).
+    /// It must cover the whole `timeout_seconds`; this release refuses
+    /// otherwise (central renewal first arrives with the full-login change).
     pub fn member_material(
         &self,
         run: &enginebox_agents::queue::MemberRun,
@@ -1244,17 +1246,7 @@ impl Credentials {
             "The run's own credential is not connected; reconnect the subscription."
         );
         let home = self.home(&record.id)?;
-        let material = match security::read_json(&home, enginebox_agents::delegation::TOKEN_FILE)? {
-            // Claude's long-lived setup token (the sign-in `auth::login` runs).
-            Some(v) if provider == "claude" && security::token(&v["value"]) => {
-                json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":v["value"]},"expires_at":v["expires_at"]})
-            }
-            _ => enginebox_agents::delegation::material(
-                provider,
-                &security::read_json(&home, enginebox_agents::delegation::native_file(provider))?
-                    .unwrap_or(Value::Null),
-            )?,
-        };
+        let material = enginebox_agents::delegation::home_material(&home, provider)?.material;
         let delegated = enginebox_agents::member::Delegated::from_material(provider, &material)?;
         // The access must outlast the whole run: a native client keeps the
         // token it started with, so it cannot be renewed mid-run.
