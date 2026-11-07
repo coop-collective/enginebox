@@ -25,6 +25,7 @@ pub mod storage;
 pub mod tenancy;
 pub mod turn;
 pub mod unity;
+pub mod usage_accounts;
 mod workspaces;
 
 use anyhow::{Context, Result, ensure};
@@ -84,6 +85,8 @@ struct Runtime {
     usage: Arc<dyn metering::UsageSink>,
     credentials: credentials::Credentials,
     engine_sessions: engine_sessions::EngineSessions,
+    /// Live provider subscription usage per account (usage_accounts.rs).
+    usage_accounts: usage_accounts::UsageAccounts,
     /// Cloudflare's API base for per-session MoQ relays (moq.rs).
     moq_api: String,
     /// Cloudflare Realtime's API base for TURN credentials (turn.rs).
@@ -249,6 +252,7 @@ impl Controller {
             },
             tenancy: tenancy::Tenancy::open(&self.root)?,
             engine_sessions: engine_sessions::EngineSessions::open(&self.root)?,
+            usage_accounts: usage_accounts::UsageAccounts::open(&self.root)?,
             moq_api: self
                 .moq_api
                 .lock()
@@ -510,6 +514,10 @@ impl Controller {
                 if let Err(e) = controller.fleet.reconcile() {
                     errors.push(format!("fleet: {e:#}"));
                 }
+                // Provider usage polls run on their own thread when due.
+                if let Some(r) = &runtime {
+                    r.usage_accounts.tick(Arc::new(r.agents.clone()));
+                }
                 if let Some(r) = runtime
                     && let Err(e) = r.agents.reconcile()
                 {
@@ -685,6 +693,15 @@ fn service_allows(
         |operation, pool: &str| token.allows_pool(operation, pool, project_of(pool).as_deref());
     match (method, parts.as_slice()) {
         (&Method::GET, ["v1", "agent-runs"]) => token.operations.contains(&Operation::List),
+        // Provider-reported usage of the controller's accounts (the platform
+        // org's): a platform-org token that may start runs runs on these
+        // accounts, so it may read how much of them is left (numbers only; no
+        // credential or person is in it). Other orgs' tokens may not.
+        (&Method::GET, ["v1", "usage", "accounts"])
+        | (&Method::GET, ["v1", "usage", "accounts", _]) => {
+            token.operations.contains(&Operation::Start)
+                && token.org() == enginebox_agents::pools::DEFAULT_ORG
+        }
         (&Method::GET, ["v1", "hosts", host, "instances", name, "agent-runs", _]) => {
             token.allows(Operation::Get, host, name)
         }
@@ -1503,6 +1520,10 @@ fn read(
         ["v1", "agents", provider, "usage"] => {
             Ok(json!({"usage":c.runtime()?.agents.usage(provider)?}))
         }
+        // The stored provider-reported usage per account (usage_accounts.rs):
+        // no provider is contacted on a read.
+        ["v1", "usage", "accounts"] => Ok(c.runtime()?.usage_accounts.list()),
+        ["v1", "usage", "accounts", provider] => c.runtime()?.usage_accounts.get(provider),
         ["v1", "agents", provider, "sessions", session] => {
             Ok(json!({"session":c.runtime()?.agents.session(provider,session)?}))
         }
@@ -2601,6 +2622,28 @@ async fn write(
                 .flatten()
             });
             json!({"job":runtime.jobs.submit_project(host,&operation,&name,project.as_deref(),move||plan.execute())?})
+        }
+        // Owner only (service tokens are never granted a POST here): read every
+        // account now, at most once a minute each.
+        ["v1", "usage", "accounts", "refresh"] => {
+            empty(&body)?;
+            let accounts = runtime.usage_accounts.clone();
+            let agents = runtime.agents.clone();
+            let read =
+                blocking(move || Ok(accounts.poll(&agents, chrono::Utc::now().timestamp(), true)))
+                    .await?;
+            let mut list = runtime.usage_accounts.list();
+            list["read"] = json!(read);
+            list
+        }
+        // Owner only: the GLM Coding Plan key, write-only (never returned).
+        ["v1", "usage", "accounts", "glm", "key"] => {
+            keys(&body, &["key", "region"], &["key"])?;
+            runtime.usage_accounts.set_glm_key(&body)?
+        }
+        ["v1", "usage", "accounts", "glm", "key", "delete"] => {
+            empty(&body)?;
+            runtime.usage_accounts.delete_glm_key()?
         }
         ["v1", "agents", provider, "login"] => {
             empty(&body)?;
@@ -3762,6 +3805,114 @@ mod tests {
     }
     const RUNS_A: &str = "/v1/hosts/worker/instances/ebox-a/agent-runs";
     const RUNS_B: &str = "/v1/hosts/worker/instances/ebox-b/agent-runs";
+
+    #[tokio::test]
+    async fn usage_accounts_are_readable_by_tokens_that_may_start_runs_and_managed_by_the_owner_only()
+     {
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        let (_, runner) = mint(&app, json!({"label":"ideator","scopes":[{"host_id":"worker","name":"ebox-a"}],
+            "operations":["agent_runs.start","agent_runs.get","agent_runs.list","agent_runs.cancel"]})).await;
+        let (_, reader) = mint(
+            &app,
+            json!({"label":"watcher","scopes":[{"host_id":"worker","name":"ebox-a"}],
+            "operations":["agent_runs.get","agent_runs.list"]}),
+        )
+        .await;
+        // The owner and a token that may start runs read every account.
+        for token in [None, Some(runner.as_str())] {
+            let req = |path: &str| match token {
+                Some(t) => bearer(Method::GET, path, "", t),
+                None => request(Method::GET, path, "", true),
+            };
+            let (status, list) = call(&app, req("/v1/usage/accounts")).await;
+            assert_eq!(status, StatusCode::OK, "{list}");
+            let providers: Vec<_> = list["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["provider"].clone())
+                .collect();
+            assert_eq!(providers, vec!["claude", "codex", "cursor", "glm"]);
+            assert!(
+                list["accounts"][0]["plan"].is_object()
+                    && list["accounts"][0]["credits"].is_object()
+            );
+            let (status, one) = call(&app, req("/v1/usage/accounts/codex")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(one["account"]["provider"], "codex");
+        }
+        // Another org's token may not read the platform org's accounts.
+        let (_, tenant) = mint(&app, json!({"label":"tenant","org_id":format!("org_{}", "a".repeat(24)),"scopes":[{"host_id":"worker","name":"ebox-a"}],
+            "operations":["agent_runs.start"]})).await;
+        assert_eq!(
+            call(&app, bearer(Method::GET, "/v1/usage/accounts", "", &tenant))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        // A token without agent_runs.start may not; nor may any token manage
+        // the accounts or reach the owner's native usage observation.
+        for (method, path, body, token) in [
+            (Method::GET, "/v1/usage/accounts", "", reader.as_str()),
+            (Method::GET, "/v1/usage/accounts/codex", "", reader.as_str()),
+            (
+                Method::POST,
+                "/v1/usage/accounts/refresh",
+                "{}",
+                runner.as_str(),
+            ),
+            (
+                Method::POST,
+                "/v1/usage/accounts/glm/key",
+                r#"{"key":"zai-0123456789abcdef"}"#,
+                runner.as_str(),
+            ),
+            (
+                Method::POST,
+                "/v1/usage/accounts/glm/key/delete",
+                "{}",
+                runner.as_str(),
+            ),
+            (Method::GET, "/v1/agents/codex/usage", "", runner.as_str()),
+        ] {
+            assert_eq!(
+                call(&app, bearer(method.clone(), path, body, token))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+        }
+        // The owner saves the GLM key write-only; nothing returns it.
+        let (status, saved) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/usage/accounts/glm/key",
+                r#"{"key":"zai-0123456789abcdef.SECRETKEY"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let (_, list) = call(&app, bearer(Method::GET, "/v1/usage/accounts", "", &runner)).await;
+        assert!(
+            !saved.to_string().contains("SECRETKEY") && !list.to_string().contains("SECRETKEY")
+        );
+        let (status, _) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/usage/accounts/glm/key/delete",
+                "{}",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn service_tokens_reach_only_granted_agent_run_operations_on_their_workspaces() {

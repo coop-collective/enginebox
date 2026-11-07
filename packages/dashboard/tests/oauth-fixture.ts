@@ -145,6 +145,8 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     const sees = (h: string, n: string) => held.scopes.some((s) => s.host_id === h && s.name === n);
     if (url.pathname === "/v1/agent-runs")
       return held.operations.includes("agent_runs.list") ? reply({ runs: [] }) : reply({ error: "This service token is not granted that operation on that workspace." }, 403);
+    if (method === "GET" && /^\/v1\/usage\/accounts(?:\/[a-z]+)?$/.test(url.pathname))
+      return held.operations.includes("agent_runs.start") ? reply({ accounts: [{ provider: "codex", status: "ok" }] }) : reply({ error: "This service token is not granted that operation on that workspace." }, 403);
     if (parts[1] === "projects" && parts[3] === "engine-sessions") {
       // The controller acts as the token's member; sessions of other members are unknown to it.
       const operation = method === "GET" ? "get" : parts.length === 4 ? "start" : parts[5] === "watch-token" || parts[5] === "ice" ? "watch" : parts[5];

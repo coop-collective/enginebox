@@ -194,6 +194,13 @@ test("consent needs sign-in, a same-origin form and a real workspace; profiles a
   assert.match(await again.text(), /expired or was already used/);
 });
 
+test("an access token reads the provider-reported usage of the accounts its runs use, and nothing else under /v1/usage", async (t) => {
+  const { tokens } = await connect(t);
+  for (const path of ["v1/usage/accounts", "v1/usage/accounts/codex"]) assert.equal((await call(path, tokens.access_token)).status, 200, path);
+  for (const [path, method] of [["v1/usage/accounts/openai", "GET"], ["v1/usage/accounts/refresh", "POST"], ["v1/usage/accounts/glm/key", "POST"]] as const)
+    assert.equal((await call(path, tokens.access_token, method, method === "POST" ? {} : undefined)).status, 404, path);
+});
+
 test("access tokens are scoped service tokens minted on the controller for the consented workspaces", async (t) => {
   const { controller, tokens } = await connect(t);
   const minted = [...controller.tokens.values()];

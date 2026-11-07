@@ -1,0 +1,20 @@
+{
+ "customerBalance": 0,
+ "individualMembershipType": "free",
+ "isOnBillableAuto": true,
+ "isOnStudentPlan": false,
+ "isTeamMember": true,
+ "isYearlyPlan": false,
+ "lastPaymentFailed": false,
+ "membershipType": "enterprise",
+ "paymentRecoveryAction": null,
+ "pendingCancellationDate": null,
+ "studentDiscountApplied": false,
+ "subscriptionStatus": "active",
+ "teamId": 0,
+ "teamMembershipType": "SELF_SERVE",
+ "trialEligible": false,
+ "trialLengthDays": 7,
+ "trialWasCancelled": false,
+ "verifiedStudent": false
+}

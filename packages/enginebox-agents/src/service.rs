@@ -838,6 +838,36 @@ impl AgentService {
             )
         }))
     }
+    /// The controller account's usage credential for `p` (the controller's
+    /// usage poller), read under the provider lease so a concurrent native
+    /// refresh never yields a torn file. None: no account is connected.
+    pub fn usage_credential(&self, p: &str) -> Result<Option<usage::Credential>> {
+        crate::provider(p)?;
+        let _pending = self.pending_guard()?;
+        let _lease = self.provider_lock(p)?;
+        let home = self.home(p)?;
+        if home.join("pending-adoption.json").exists() {
+            return Ok(None);
+        }
+        let native = security::read_json(&home, delegation::native_file(p))?.unwrap_or(Value::Null);
+        let saved = security::read_json(&home, delegation::TOKEN_FILE)?.unwrap_or(Value::Null);
+        Ok(usage::credential_from_files(p, &native, &saved))
+    }
+    /// The Codex app-server's raw `account/rateLimits/read` reply for the
+    /// controller's ChatGPT account (the CLI's own `/status` source). The
+    /// native client may refresh its own tokens while answering, so it runs
+    /// under the provider lease like every native observation.
+    pub fn codex_rate_limits(&self) -> Result<Value> {
+        let p = "codex";
+        let _pending = self.pending_guard()?;
+        let lease = self.provider_lock(p)?;
+        let home = self.home(p)?;
+        let exe = self.inner.binaries[p].clone().ok_or_else(|| {
+            anyhow::anyhow!("Install the native Codex client to read account usage.")
+        })?;
+        let env = auth::controller_environment(&home, &self.inner.binaries)?;
+        usage::read_codex_raw_with_lease(&exe, &env, Some(&lease))
+    }
     pub fn start(&self, p: &str) -> Result<Value> {
         crate::provider(p)?;
         let home = self.home(p)?;
