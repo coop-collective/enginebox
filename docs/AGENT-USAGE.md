@@ -20,6 +20,21 @@ Offline validation covers malformed/missing fields, duplicate multi-bucket views
 | Claude Code | Native status-line JSON; interactive `/usage` | Five-hour/seven-day usage and resets when supplied; local session statistics separately | Provider usage link implemented; native observation ingestion remains planned |
 | Cursor Agent | Enterprise Admin API; personal dashboard | Enterprise spending/activity where authorized; personal remaining allowance in provider dashboard | Provider usage links implemented; no personal balance API claimed |
 
+## Live account usage poller
+
+Added 2026-11-07 at the owner's request ("this need to be dynamic"): plan, windows, resets, credits and extra usage are read from each provider with the controller account's own CLI credential, not typed in. Implementation and endpoint citations: `packages/enginebox-controller/src/usage_accounts.rs`. Redacted live replies are in `packages/enginebox-controller/tests/fixtures/usage/`.
+
+| Provider | Endpoint (credential) | Live fields | Not reported |
+| --- | --- | --- | --- |
+| Claude | `GET api.anthropic.com/api/oauth/usage` and `/api/oauth/profile` (the subscription OAuth token in `.claude/.credentials.json`; needs `user:profile`, so a setup-token is reported unavailable) | plan (`organization_type`), tier (`rate_limit_tier`), subscription status, 5-hour and weekly utilization with resets, per-model weekly limits, extra usage on/off, extra-usage spend and monthly cap (minor units), spend limit reached | price, prepaid balance unless `spend.balance` is set, auto-reload unless set |
+| Codex | `GET chatgpt.com/backend-api/wham/usage` (ChatGPT access token + `ChatGPT-Account-Id`), falling back to the app-server's `account/rateLimits/read` when the token is expired or refused | plan, every reported window with used % and reset, credit balance, credits on (`has_credits`), spend-control limit | price, overage spend |
+| Cursor | `POST cursor.com/api/dashboard/get-current-period-usage`, `GET /api/usage-summary`, `GET /api/auth/stripe` (the cursor-agent session JWT as the dashboard cookie) | membership and team tier, subscription status, the current allowance's used % and reset (weekly on the live account), Auto/API pool %, included dollars and limit, on-demand on/off, spend and limit, customer balance | price |
+| GLM | `GET api.z.ai/api/monitor/usage/quota/limit` (a Coding Plan key saved with `POST /v1/usage/accounts/glm/key`) | plan level, 5-hour and weekly token windows (%, used, limit, reset), monthly tool-call quota | everything until a key is saved; no GLM account is connected today |
+
+Schedule: every 5 minutes while the account has queued or running runs, every 30 otherwise, and right after one of its runs ends (60 s minimum gap). Errors back off from 5 minutes to 2 hours and honor `Retry-After`; a failed read keeps the last good reading marked `stale`. Tokens are read under the provider lease and are never stored, logged or returned.
+
+Caveat: the Cursor and Claude endpoints are the ones the providers' own dashboard and CLI use. They are not documented public APIs, and earlier guidance here said not to call undocumented Cursor endpoints with the browser session token. The owner overrode that on 2026-11-07, so these reads may break without notice. A broken read shows as `error` or `stale` and is never replaced by a guess.
+
 ## Codex
 
 The official app-server exposes `account/rateLimits/read` and `account/rateLimits/updated`. Returned windows contain `usedPercent`, `windowDurationMins`, and `resetsAt`; prefer `rateLimitsByLimitId` when present. Optional `credits` represents workspace credit details; optional reset credits are a different resource. `account/usage/read` returns token-activity summaries and daily buckets, not remaining monetary credit. All optional fields can be absent. [Official app-server account methods](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt).
