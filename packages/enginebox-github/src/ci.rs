@@ -201,24 +201,46 @@ impl GitHub {
                 ) || j["created_at"].as_u64().unwrap_or(0) + 7 * 86400 > api::now()
             });
             ensure!(data.jobs.len() < 256, "CI inbox is full; inspect receipts");
-            data.jobs.insert(key,json!({"id":id,"pool":pool.id,"repository_id":repo_id,"repository":selected.full_name,"run_id":payload["workflow_job"]["run_id"],"status":if action=="queued" {"queued"} else {"claimed_elsewhere"},"github_status":action,"created_at":api::now()}));
+            data.jobs.insert(key,json!({"id":id,"pool":pool.id,"repository_id":repo_id,"repository":selected.full_name,"run_id":payload["workflow_job"]["run_id"],"status":if action=="queued" {"queued"} else {"claimed_elsewhere"},"github_status":action,"created_at":api::now(),"timings":{"demand_received_at_ms":now_ms()}}));
         }
         self.save(&data)?;
+        drop(data);
+        self.wake_dispatch();
         Ok(json!({"accepted":true}))
     }
     pub fn set_draining(&self, draining: bool) -> Result<Value> {
         let mut data = self.data.lock().unwrap();
         data.draining = draining;
         self.save(&data)?;
+        drop(data);
+        if !draining {
+            self.wake_dispatch();
+        }
         Ok(json!({"draining":draining,"active_runners":self.pending()}))
     }
-    /// Called only while the controller is active. Running workers are part of its drain barrier.
+    /// Periodic recovery remains separate from prompt, bounded admission.
     pub fn tick(&self) -> Result<()> {
+        self.dispatch()?;
+        let recovery_allowed = !self.data.lock().unwrap().draining
+            && !self.admission_paused.load(Ordering::SeqCst)
+            && !self.handed_off.load(Ordering::SeqCst);
+        if let Some(config) = &self.config
+            && recovery_allowed
+        {
+            self.reconcile_uncertain(config);
+        }
+        Ok(())
+    }
+    /// API calls and worker operations run on bounded job threads after admission.
+    pub fn dispatch(&self) -> Result<()> {
         let Some(config) = &self.config else {
             return Ok(());
         };
         let mut data = self.data.lock().unwrap();
-        if data.draining {
+        if data.draining
+            || self.admission_paused.load(Ordering::SeqCst)
+            || self.handed_off.load(Ordering::SeqCst)
+        {
             return Ok(());
         }
         for pool in &config.pools {
@@ -249,6 +271,11 @@ impl GitHub {
             for key in keys {
                 let job = data.jobs.get_mut(&key).unwrap();
                 job["status"] = json!("running");
+                if let Some(timings) = job["timings"].as_object_mut() {
+                    timings.remove("jit_created_at_ms");
+                    timings.remove("worker_started_at_ms");
+                }
+                job["timings"]["dispatch_started_at_ms"] = json!(now_ms());
                 job.as_object_mut().unwrap().remove("capacity_retry_at");
                 self.save(&data)?;
                 self.pending.fetch_add(1, Ordering::SeqCst);
@@ -266,6 +293,9 @@ impl GitHub {
                         return;
                     }
                     let mut data = this.data.lock().unwrap();
+                    if this.handed_off.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let job = data.jobs.get_mut(&key).unwrap();
                     match outcome {
                         Ok(result) => {
@@ -282,12 +312,19 @@ impl GitHub {
                     if this.save(&data).is_err() {
                         job_persistence_failure(&mut data, &key);
                     }
+                    drop(data);
+                    this.wake_dispatch();
                 });
             }
         }
-        drop(data);
-        self.reconcile_uncertain(config);
         Ok(())
+    }
+    pub fn pause_admission(&self) {
+        self.admission_paused.store(true, Ordering::SeqCst);
+    }
+    pub fn resume_admission(&self) {
+        self.admission_paused.store(false, Ordering::SeqCst);
+        self.wake_dispatch();
     }
     /// This owner hands state to the next controller: worker threads stop
     /// writing, and live workers are left for the next owner to adopt.
@@ -343,6 +380,8 @@ impl GitHub {
                 if this.save(&data).is_err() {
                     job_persistence_failure(&mut data, &key);
                 }
+                drop(data);
+                this.wake_dispatch();
             });
         }
     }
@@ -390,6 +429,8 @@ impl GitHub {
             if self.save(&data).is_err() {
                 job_persistence_failure(&mut data, &key);
             }
+            drop(data);
+            self.wake_dispatch();
         }
     }
     /// `Some(worker result)` when the job was provably over and its VM reclaimed.
@@ -522,6 +563,7 @@ impl GitHub {
         {
             let mut data = self.data.lock().unwrap();
             let job = data.jobs.get_mut(key).unwrap();
+            job["timings"]["jit_created_at_ms"] = json!(now_ms());
             job["runner_id"] = json!(runner_id);
             job["runner_name"] = json!(runner_name);
             self.save(&data)?;
@@ -563,6 +605,7 @@ impl GitHub {
         {
             let mut data = self.data.lock().unwrap();
             let job = data.jobs.get_mut(key).unwrap();
+            job["timings"]["worker_started_at_ms"] = json!(now_ms());
             job["worker_pid"] = json!(child.id());
             job["worker_program"] = json!(pool.worker[0]);
             job["worker_output"] = json!(out.display().to_string());
@@ -654,6 +697,12 @@ impl GitHub {
             json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued", "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64(),"capacity_wait":capacity_wait}),
         )
     }
+}
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 /// How long an uncertain job waits between reconciliation attempts.
 const RECONCILE_INTERVAL: u64 = 600;
@@ -773,6 +822,83 @@ fn job_persistence_failure(data: &mut crate::Data, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dispatch_preserves_drain_capacity_and_uncertainty_fences() {
+        let (_root, g) = crate::tests::service();
+        let demand = json!({"id":99,"pool":"linux","repository_id":101,"repository":"fixture/private","run_id":44,"status":"queued","github_status":"queued"});
+        for fence in [
+            "paused",
+            "draining",
+            "running",
+            "uncertain",
+            "capacity_retry",
+            "handed_off",
+        ] {
+            {
+                let mut data = g.data.lock().unwrap();
+                data.jobs.clear();
+                data.jobs.insert("2-99".into(), demand.clone());
+                data.draining = fence == "draining";
+                if matches!(fence, "running" | "uncertain") {
+                    data.jobs
+                        .insert("2-98".into(), json!({"pool":"linux","status":fence}));
+                }
+                if fence == "capacity_retry" {
+                    data.jobs.get_mut("2-99").unwrap()["capacity_retry_at"] =
+                        json!(api::now() + 60);
+                }
+            }
+            g.admission_paused
+                .store(fence == "paused", Ordering::SeqCst);
+            g.handed_off.store(fence == "handed_off", Ordering::SeqCst);
+            g.dispatch().unwrap();
+            assert_eq!(
+                g.data.lock().unwrap().jobs["2-99"]["status"],
+                "queued",
+                "bypassed {fence}"
+            );
+        }
+    }
+    #[test]
+    fn concurrent_dispatch_claims_only_one_slot_and_notifies_after_completion() {
+        let (_root, g) = crate::tests::service();
+        let (wake, received) = std::sync::mpsc::channel();
+        g.set_dispatch_waker(Arc::new(move || {
+            let _ = wake.send(());
+        }));
+        for id in [98, 99] {
+            g.data.lock().unwrap().jobs.insert(format!("2-{id}"), json!({"id":id,"pool":"linux","repository_id":101,"repository":"fixture/private","run_id":44,"status":"queued","github_status":"queued"}));
+        }
+        // No account means the sole admitted attempt fails closed before API/worker use.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| g.dispatch().unwrap());
+            }
+        });
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let data = g.data.lock().unwrap();
+        assert_eq!(
+            data.jobs
+                .values()
+                .filter(|j| j["status"] == "uncertain")
+                .count(),
+            1
+        );
+        assert_eq!(
+            data.jobs
+                .values()
+                .filter(|j| j["status"] == "queued")
+                .count(),
+            1
+        );
+        assert!(
+            data.jobs
+                .values()
+                .find(|j| j["status"] == "uncertain")
+                .unwrap()["timings"]["dispatch_started_at_ms"]
+                .is_u64()
+        );
+    }
     #[test]
     fn capacity_wait_never_accepts_an_ambiguous_or_started_allocation() {
         let clean = json!({"status":"waiting_capacity","allocation_started":false,"cleaned":true});
