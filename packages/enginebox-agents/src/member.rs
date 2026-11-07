@@ -82,7 +82,9 @@ impl Delegated {
                 ensure!(
                     self.kind == "environment"
                         && self.content.as_object().is_some_and(|o| {
-                            o.len() == 1 && security::token(&o["CLAUDE_CODE_OAUTH_TOKEN"])
+                            o.len() == 1
+                                && o.get("CLAUDE_CODE_OAUTH_TOKEN")
+                                    .is_some_and(security::token)
                         }),
                     "Member material must be a Claude access token."
                 );
@@ -161,25 +163,50 @@ const MANAGED_CLAUDE_SETTINGS: &[&str] = &[
     "/Library/Application Support/ClaudeCode/managed-settings.json",
 ];
 
+/// Claude settings keys that run a helper to obtain credentials.
+const CLAUDE_AUTH_SETTINGS: &[&str] = &["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"];
+/// Environment variable prefixes in Claude settings that select another
+/// credential, endpoint, cloud or configuration directory.
+const CLAUDE_AUTH_ENV_PREFIXES: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_CODE_",
+    "CLAUDE_CONFIG",
+    "AWS_",
+    "GOOGLE_",
+    "VERTEX_",
+];
+fn claude_auth_env(key: &str) -> bool {
+    CLAUDE_AUTH_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
+}
 /// Claude settings that would authenticate as someone other than the member.
 fn claude_settings_override(settings: &Value) -> bool {
-    settings.get("apiKeyHelper").is_some()
-        || settings.get("awsAuthRefresh").is_some()
-        || settings.get("awsCredentialExport").is_some()
-        || settings["env"].as_object().is_some_and(|e| {
-            e.keys().any(|k| {
-                k.starts_with("ANTHROPIC_")
-                    || k.starts_with("CLAUDE_CODE_")
-                    || k.starts_with("CLAUDE_CONFIG")
-                    || k.starts_with("AWS_")
-                    || k.starts_with("GOOGLE_")
-                    || k.starts_with("VERTEX_")
-            })
-        })
+    CLAUDE_AUTH_SETTINGS
+        .iter()
+        .any(|k| settings.get(k).is_some())
+        || settings["env"]
+            .as_object()
+            .is_some_and(|e| e.keys().any(|k| claude_auth_env(k)))
 }
+/// Remove what [`claude_settings_override`] refuses; true when anything was.
+fn strip_claude_overrides(settings: &mut Value) -> bool {
+    if !claude_settings_override(settings) {
+        return false;
+    }
+    if let Some(o) = settings.as_object_mut() {
+        for key in CLAUDE_AUTH_SETTINGS {
+            o.remove(*key);
+        }
+    }
+    if let Some(env) = settings["env"].as_object_mut() {
+        env.retain(|k, _| !claude_auth_env(k));
+    }
+    true
+}
+/// `.claude.json` keys holding an API key.
+const CLAUDE_STATE_KEYS: &[&str] = &["primaryApiKey", "customApiKeyResponses"];
 /// Claude's state file (`.claude.json`) may hold an API key.
 fn claude_state_key(state: &Value) -> bool {
-    state.get("primaryApiKey").is_some() || state.get("customApiKeyResponses").is_some()
+    CLAUDE_STATE_KEYS.iter().any(|k| state.get(k).is_some())
 }
 fn check_claude_state(path: &Path) -> Result<()> {
     let Ok(raw) = std::fs::read(path) else {
@@ -276,13 +303,17 @@ impl Drop for RunDirCleanup {
     }
 }
 
-/// Codex configuration keys that select another provider, an API key or a
-/// bearer token instead of the member's ChatGPT login.
+/// Codex configuration keys that select another provider, an API key, a
+/// bearer token or an endpoint instead of the member's ChatGPT login. They
+/// are refused at the top level and in `profiles.*`, where Codex reads its
+/// model provider and authentication; MCP server tables (`mcp_servers.*`)
+/// may use headers, keys and URLs of their own.
 const CODEX_FORBIDDEN_KEYS: &[&str] = &[
     "model_providers",
     "model_provider",
     "preferred_auth_method",
     "forced_login_method",
+    "forced_chatgpt_workspace_id",
     "experimental_bearer_token",
     "env_key",
     "http_headers",
@@ -290,29 +321,171 @@ const CODEX_FORBIDDEN_KEYS: &[&str] = &[
     "chatgpt_base_url",
     "openai_base_url",
     "base_url",
+    "api_key",
 ];
-fn codex_forbidden(value: &toml::Value) -> bool {
-    match value {
-        toml::Value::Table(t) => t
-            .iter()
-            .any(|(k, v)| CODEX_FORBIDDEN_KEYS.contains(&k.as_str()) || codex_forbidden(v)),
-        toml::Value::Array(a) => a.iter().any(codex_forbidden),
-        _ => false,
-    }
+fn codex_table_forbidden(table: &toml::Table) -> bool {
+    table
+        .keys()
+        .any(|k| CODEX_FORBIDDEN_KEYS.contains(&k.as_str()) || k.ends_with("_base_url"))
 }
-/// Refuse a Codex configuration that could authenticate as anyone but the
-/// member (another provider, an API key, a bearer token or base URL).
-pub fn check_codex_config(codex_home: &Path) -> Result<()> {
-    let Some(raw) = security::read_bytes(codex_home, "config.toml", security::LIMIT, false)? else {
+fn codex_forbidden(config: &toml::Table) -> bool {
+    codex_table_forbidden(config)
+        || config
+            .get("profiles")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|profiles| {
+                profiles
+                    .values()
+                    .any(|p| p.as_table().is_none_or(codex_table_forbidden))
+            })
+}
+fn check_codex_file(path: &Path) -> Result<()> {
+    let Ok(raw) = std::fs::read(path) else {
         return Ok(());
     };
-    let config: toml::Value = toml::from_str(std::str::from_utf8(&raw)?)
-        .map_err(|_| anyhow::anyhow!("Unreadable Codex configuration; member runs refuse it."))?;
+    let config: toml::Table = std::str::from_utf8(&raw)
+        .ok()
+        .and_then(|text| toml::from_str(text).ok())
+        .ok_or_else(|| anyhow::anyhow!("Unreadable Codex configuration; member runs refuse it."))?;
     ensure!(
         !codex_forbidden(&config),
         "The Codex configuration selects another provider or key; member runs refuse it."
     );
     Ok(())
+}
+/// Refuse a Codex configuration that could authenticate as anyone but the
+/// member: the run's own `CODEX_HOME/config.toml` and every project
+/// `.codex/config.toml` from the working directory up to the workspace root.
+pub fn check_codex_config(codex_home: &Path, cwd: &Path, workspace: &Path) -> Result<()> {
+    check_codex_file(&codex_home.join("config.toml"))?;
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        check_codex_file(&d.join(".codex/config.toml"))?;
+        if d == workspace {
+            break;
+        }
+        dir = d.parent().filter(|p| p.starts_with(workspace));
+    }
+    Ok(())
+}
+
+/// Copy the workspace template's native client setup (instructions, skills,
+/// prompts, agents, plugins, commands, rules) from `from` into a member's
+/// private directory `to`, never credentials, sessions or history. Regular
+/// files and directories only (links are skipped), bounded in size.
+pub fn copy_template(from: &Path, to: &Path, entries: &[&str]) -> Result<()> {
+    let mut budget: u64 = 256 * 1024 * 1024;
+    for name in entries {
+        let source = from.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&source) else {
+            continue;
+        };
+        let target = to.join(name);
+        if std::fs::symlink_metadata(&target)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        {
+            std::fs::remove_dir_all(&target)?;
+        } else if std::fs::symlink_metadata(&target).is_ok() {
+            std::fs::remove_file(&target)?;
+        }
+        copy_tree(&source, &target, &meta, &mut budget)?;
+    }
+    Ok(())
+}
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    meta: &std::fs::Metadata,
+    budget: &mut u64,
+) -> Result<()> {
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        security::private_dir(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            copy_tree(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                &meta,
+                budget,
+            )?;
+        }
+    } else if meta.is_file() {
+        ensure!(
+            meta.len() <= *budget,
+            "The template's client setup is too large to copy."
+        );
+        *budget -= meta.len();
+        std::fs::copy(source, target)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o700;
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode.max(0o600)))?;
+        }
+    }
+    Ok(())
+}
+/// What of `~/.codex` a member's `CODEX_HOME` gets (besides `config.toml`).
+pub const CODEX_TEMPLATE: &[&str] = &[
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "prompts",
+    "skills",
+    "rules",
+    "plugins",
+];
+/// What of `~/.claude` a member's `CLAUDE_CONFIG_DIR` gets.
+pub const CLAUDE_TEMPLATE: &[&str] = &[
+    "CLAUDE.md",
+    "settings.json",
+    "skills",
+    "agents",
+    "commands",
+    "plugins",
+    "output-styles",
+];
+/// `.claude.json` keys a member's configuration takes from the template:
+/// user MCP servers and onboarding, never keys or project history.
+const CLAUDE_STATE_TEMPLATE: &[&str] = &[
+    "mcpServers",
+    "hasCompletedOnboarding",
+    "lastOnboardingVersion",
+    "theme",
+    "bypassPermissionsModeAccepted",
+];
+
+/// A member's Claude configuration directory with the template's setup:
+/// copied from `~/.claude` (settings stripped of any authentication
+/// override) and the template's user MCP servers merged into the member's
+/// own `.claude.json`. The member's sessions in it are kept.
+pub fn prepare_claude_config(home: &Path, key: &str) -> Result<PathBuf> {
+    let config = member_dir(home, key, "claude")?;
+    copy_template(&home.join(".claude"), &config, CLAUDE_TEMPLATE)?;
+    if let Some(mut settings) = security::read_json(&config, "settings.json")?
+        && strip_claude_overrides(&mut settings)
+    {
+        security::write_json(&config, "settings.json", &settings)?;
+    }
+    let mut state = security::read_json(&config, ".claude.json")?.unwrap_or(serde_json::json!({}));
+    ensure!(state.is_object(), "Invalid member Claude state.");
+    if let Some(template) = security::read_json(home, ".claude.json")? {
+        for key in CLAUDE_STATE_TEMPLATE {
+            if let Some(v) = template.get(*key) {
+                state[*key] = v.clone();
+            }
+        }
+    }
+    if let Some(o) = state.as_object_mut() {
+        for key in CLAUDE_STATE_KEYS {
+            o.remove(*key);
+        }
+    }
+    security::write_json(&config, ".claude.json", &state)?;
+    Ok(config)
 }
 
 /// The member's own persistent store under the guest home (sessions,
@@ -344,6 +517,7 @@ pub fn prepare_codex_home(home: &Path, run_id: &str) -> Result<PathBuf> {
     {
         security::write_bytes(&root, "codex-home/config.toml", &config, security::LIMIT)?;
     }
+    copy_template(&home.join(".codex"), &codex, CODEX_TEMPLATE)?;
     Ok(codex)
 }
 
@@ -393,31 +567,17 @@ pub fn clear_delegated(home: &Path) -> Result<Value> {
         && claude_state_key(&state)
     {
         if let Some(o) = state.as_object_mut() {
-            o.remove("primaryApiKey");
-            o.remove("customApiKeyResponses");
+            for key in CLAUDE_STATE_KEYS {
+                o.remove(*key);
+            }
         }
         security::write_json(home, ".claude.json", &state)?;
         removed += 1;
     }
     for relative in [".claude/settings.json", ".claude/settings.local.json"] {
         if let Some(mut settings) = security::read_json(home, relative)?
-            && claude_settings_override(&settings)
+            && strip_claude_overrides(&mut settings)
         {
-            if let Some(o) = settings.as_object_mut() {
-                for key in ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"] {
-                    o.remove(key);
-                }
-            }
-            if let Some(env) = settings["env"].as_object_mut() {
-                env.retain(|k, _| {
-                    !(k.starts_with("ANTHROPIC_")
-                        || k.starts_with("CLAUDE_CODE_")
-                        || k.starts_with("CLAUDE_CONFIG")
-                        || k.starts_with("AWS_")
-                        || k.starts_with("GOOGLE_")
-                        || k.starts_with("VERTEX_"))
-                });
-            }
             security::write_json(home, relative, &settings)?;
             removed += 1;
         }

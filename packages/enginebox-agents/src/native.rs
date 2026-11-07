@@ -798,7 +798,7 @@ fn execute_inner(
                     );
                     // Only the member's ChatGPT login: no other provider,
                     // key or bearer token in the configuration.
-                    crate::member::check_codex_config(&codex_home)?;
+                    crate::member::check_codex_config(&codex_home, &cwd, &workspace)?;
                     // The member's own session history, never the workspace's.
                     crate::member::link_member_sessions(&codex_home, &home, member.member_key)?;
                     crate::member::write_codex_auth(&codex_home, credential)?;
@@ -815,10 +815,10 @@ fn execute_inner(
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("Invalid member material."))?;
                     run_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), token.into());
-                    // The member's own configuration directory: their
-                    // sessions, and no user settings or state file (with any
-                    // key or helper) from the shared home.
-                    let config = crate::member::member_dir(&home, member.member_key, "claude")?;
+                    // The member's own configuration directory: their own
+                    // sessions plus the template's setup (instructions, skills, agents,
+                    // plugins, user MCP servers), never its keys or history.
+                    let config = crate::member::prepare_claude_config(&home, member.member_key)?;
                     for relative in [".claude.json", "settings.json", "settings.local.json"] {
                         crate::member::require_clean_claude_file(&config.join(relative))?;
                     }
@@ -891,8 +891,8 @@ fn execute_inner(
     if let Some(id) = run_id {
         // The writer lease still protects the native home while the helper cleans up.
         let _ = security::remove(&home, &cancel_path(id));
-        // A member run's material lives only in this directory.
-        if profile.is_some() || credential.is_some() {
+        // A member run's directory goes with its cleanup guard.
+        if profile.is_some() {
             let _ = crate::profile::remove_run_dir(&home, id);
         }
         if repository.is_some() {

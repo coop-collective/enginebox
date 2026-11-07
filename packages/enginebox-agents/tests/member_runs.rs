@@ -331,6 +331,41 @@ fn a_member_run_never_falls_back_to_a_workspace_credential() {
                 .exists()
         );
     }
+    // A project configuration in the working tree is checked the same way.
+    let g = guest("codex");
+    security::write_bytes(
+        &g.workspace,
+        ".codex/config.toml",
+        b"model_provider = \"proxy\"\n",
+        65536,
+    )
+    .unwrap();
+    assert!(
+        native::execute_member(
+            &envelope("codex", codex_material()),
+            &g.home,
+            &g.workspace,
+            RUN
+        )
+        .is_err()
+    );
+    assert!(!g.home.join(".seen").exists());
+    // MCP servers may carry headers, keys and URLs of their own.
+    let g = guest("codex");
+    security::write_bytes(
+        &g.home,
+        ".codex/config.toml",
+        b"model = \"gpt-5\"\n[mcp_servers.docs]\nurl = \"https://mcp.example\"\nbase_url = \"https://mcp.example\"\nhttp_headers = { X = \"y\" }\nenv_http_headers = { Authorization = \"DOCS_TOKEN\" }\nenv_key = \"DOCS\"\n",
+        65536,
+    )
+    .unwrap();
+    native::execute_member(
+        &envelope("codex", codex_material()),
+        &g.home,
+        &g.workspace,
+        RUN,
+    )
+    .unwrap();
     // A harmless configuration is kept.
     let g = guest("codex");
     security::write_bytes(&g.home, ".codex/config.toml", b"model = \"gpt-5\"\n", 65536).unwrap();
@@ -814,4 +849,173 @@ fn a_session_is_resumed_only_by_the_member_who_started_it() {
         .launch_pool("jam", body("claude"), "owner", member(BOB, BOB_CRED))
         .unwrap();
     assert!(service.set_member_runs("jam", false).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn member_runs_keep_the_templates_client_setup_but_never_its_keys() {
+    // Codex: skills and instructions are copied into the run's CODEX_HOME.
+    let g = guest("codex");
+    security::write_bytes(&g.home, ".codex/AGENTS.md", b"house rules", 65536).unwrap();
+    security::write_bytes(&g.home, ".codex/skills/build/SKILL.md", b"skill", 65536).unwrap();
+    security::write_bytes(
+        &g.home,
+        ".codex/history.jsonl",
+        b"someone else's history",
+        65536,
+    )
+    .unwrap();
+    let script = g.home.join(".local/bin/codex");
+    let mut body = std::fs::read_to_string(&script).unwrap();
+    body.push_str("ls \"$CODEX_HOME\" \"$CODEX_HOME/skills\" >>\"$HOME/.seen\"\n");
+    std::fs::write(&script, body).unwrap();
+    native::execute_member(
+        &envelope("codex", codex_material()),
+        &g.home,
+        &g.workspace,
+        RUN,
+    )
+    .unwrap();
+    let seen = std::fs::read_to_string(g.home.join(".seen")).unwrap();
+    assert!(
+        seen.contains("AGENTS.md") && seen.contains("build"),
+        "{seen}"
+    );
+    assert!(!seen.contains("history.jsonl"), "{seen}");
+    // Claude: settings, skills and user MCP servers reach the member's
+    // configuration directory; keys and helpers do not.
+    let g = guest("claude");
+    security::write_json(
+        &g.home,
+        ".claude/settings.json",
+        &json!({"permissions":{"allow":["Bash(ls:*)"]},"env":{"KEEP":"1"}}),
+    )
+    .unwrap();
+    security::write_bytes(&g.home, ".claude/skills/build/SKILL.md", b"skill", 65536).unwrap();
+    security::write_json(
+        &g.home,
+        ".claude.json",
+        &json!({"mcpServers":{"browser":{"command":"playwright-mcp"}},"projects":{"/x":{"history":["secret prompt"]}}}),
+    )
+    .unwrap();
+    native::execute_member(
+        &envelope("claude", claude_material()),
+        &g.home,
+        &g.workspace,
+        RUN,
+    )
+    .unwrap();
+    let config = g.home.join(format!(
+        ".local/state/enginebox/members/{}/claude",
+        member::member_key(ALICE)
+    ));
+    assert!(config.join("skills/build/SKILL.md").is_file());
+    assert_eq!(
+        security::read_json(&config, "settings.json")
+            .unwrap()
+            .unwrap(),
+        json!({"permissions":{"allow":["Bash(ls:*)"]},"env":{"KEEP":"1"}})
+    );
+    let state = security::read_json(&config, ".claude.json")
+        .unwrap()
+        .unwrap();
+    assert_eq!(state["mcpServers"]["browser"]["command"], "playwright-mcp");
+    assert!(
+        state.get("projects").is_none(),
+        "no one else's project history"
+    );
+}
+
+#[test]
+fn a_key_never_replays_a_run_on_another_credential() {
+    let (_t, root) = root();
+    let service = service(&root);
+    service
+        .pools()
+        .put(
+            json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"h1","name":"ebox-m1"}]}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    service.set_member_runs("jam", true).unwrap();
+    let keyed = |cred: &str| {
+        let mut o = member(ALICE, cred);
+        o.idempotency_key = Some("prompt-1".into());
+        o
+    };
+    let first = service
+        .launch_pool("jam", body("claude"), "owner", keyed(ALICE_CRED))
+        .unwrap()
+        .0;
+    assert_eq!(first["credential_id"], ALICE_CRED);
+    let replay = service
+        .launch_pool("jam", body("claude"), "owner", keyed(ALICE_CRED))
+        .unwrap();
+    assert!(replay.1);
+    assert_eq!(replay.0["id"], first["id"]);
+    assert!(
+        service
+            .launch_pool(
+                "jam",
+                body("claude"),
+                "owner",
+                keyed("cccccccccccccccccccccccccccccccc")
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn a_designation_changed_behind_the_queue_fails_the_run_at_admission() {
+    let (_t, root) = root();
+    let service = service(&root);
+    service.set_measure_hook(Arc::new(|_| anyhow::bail!("host offline")));
+    service
+        .pools()
+        .put(
+            json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"h1","name":"ebox-m1"}]}),
+            &|h| h == "h1",
+        )
+        .unwrap();
+    service.set_member_runs("jam", true).unwrap();
+    claude_reader_for_admission(&service);
+    let started: Arc<Mutex<usize>> = Arc::default();
+    let count = started.clone();
+    service.set_run_executor(Arc::new(move |_| {
+        *count.lock().unwrap() += 1;
+        Ok(json!({"exit_code":0,"output":"{}","timed_out":false,"output_truncated":false}))
+    }));
+    let id = service
+        .launch_pool("jam", body("claude"), "owner", member(ALICE, ALICE_CRED))
+        .unwrap()
+        .0["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Changed underneath (not through the service, which refuses while queued).
+    service.pools().set_member_runs("jam", false).unwrap();
+    service.set_measure_hook(Arc::new(|_| {
+        Ok(HostLoad {
+            cpu_total: 64,
+            reserve_cpu: 2,
+            memory_available_bytes: 256 << 30,
+            reserve_memory_bytes: 4 << 30,
+        })
+    }));
+    wait_for("the run to fail", || {
+        service.get_pool_run("jam", &id).unwrap()["status"] == "failed"
+    });
+    assert_eq!(*started.lock().unwrap(), 0);
+    assert_eq!(
+        service.get_pool_run("jam", &id).unwrap()["failure"]["reason"],
+        "pool_unavailable"
+    );
+}
+fn claude_reader_for_admission(service: &AgentService) {
+    service.set_member_material(Arc::new(|_, _, _, _| {
+        Delegated::from_material(
+            "claude",
+            &json!({"kind":"environment","content":{"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-x-0123456789"}}),
+        )
+    }));
 }

@@ -159,7 +159,10 @@ pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
 pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential> + Send + Sync>;
 /// Reads a member run's access material at admission (docs/MEMBER-SUBSCRIPTIONS.md):
 /// (run ID, the member run, provider, the run's timeout in seconds). Only
-/// that member's own credential, valid for at least the timeout; refreshed
+/// that member's own credential, valid for the whole timeout (a native
+/// client cannot be re-keyed mid-run), renewed first when the controller
+/// has central refresh for it; refused when even fresh access cannot cover
+/// the run. Refreshed
 /// by the controller when it is close to expiry. Never another's, never a
 /// controller account.
 pub type MemberMaterial = Arc<
@@ -306,6 +309,11 @@ fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOpti
     // Added only when set, so digests stored before run kinds still match.
     if let Some(kind) = &options.run_kind {
         value["run_kind"] = json!(kind);
+    }
+    // A member run's key never replays a run on another credential.
+    if let Some(member) = &options.member {
+        value["member"] = json!(member.member);
+        value["credential_id"] = json!(member.credential_id);
     }
     security::digest(&value)
 }
@@ -1645,6 +1653,11 @@ impl AgentService {
             }
         };
         view["pool"] = json!(pool);
+        // A member run says whose it is and which credential it uses (IDs).
+        if let Some(member) = detail.get("member") {
+            view["member"] = member.clone();
+            view["credential_id"] = detail["credential_id"].clone();
+        }
         queue::decorate(&mut view, waiting.as_ref());
         Ok(view)
     }
@@ -1672,11 +1685,8 @@ impl AgentService {
     /// credential it uses (IDs only). Another member's run, or a run of
     /// another project, is [`UnknownRun`].
     pub fn get_member_run(&self, project: &str, member: &str, id: &str) -> Result<Value> {
-        let (pool, credential) = self.owned_member_run(project, member, id)?;
-        let mut view = self.get_pool_run(&pool, id)?;
-        view["member"] = json!(member);
-        view["credential_id"] = json!(credential);
-        Ok(view)
+        let (pool, _) = self.owned_member_run(project, member, id)?;
+        self.get_pool_run(&pool, id)
     }
     /// A member's own runs in `project`, newest first (at most 200).
     pub fn list_member_runs(&self, project: &str, member: &str) -> Value {
@@ -2220,12 +2230,6 @@ impl AgentService {
                 "idempotency_key must be 1-128 characters of A-Z a-z 0-9 . _ : -"
             );
         }
-        // Member runs (docs/MEMBER-SUBSCRIPTIONS.md) only on member-runs
-        // pools, and member-runs pools only for member runs.
-        let member_pool = match &target {
-            Target::Pool { pool, .. } => self.inner.pools.member_runs(pool),
-            Target::Workspace { .. } => false,
-        };
         if let Target::Workspace { host_id, name } = &target {
             crate::require(
                 self.inner
@@ -2254,15 +2258,9 @@ impl AgentService {
         }
         if let Some(member) = &options.member {
             member.validate()?;
-            crate::require(member_pool, "Member runs run only on a member-runs pool.")?;
             crate::require(
                 options.repository.is_none(),
                 "Member runs do not use hosted repositories in this release.",
-            )?;
-        } else {
-            crate::require(
-                !member_pool,
-                "This pool runs only members' own subscription runs.",
             )?;
         }
         let request_digest = idempotency_request_digest(&request, &options);
@@ -2274,6 +2272,21 @@ impl AgentService {
             None => started_by.to_owned(),
         };
         let mut sched = self.inner.sched.lock().unwrap();
+        // Member runs (docs/MEMBER-SUBSCRIPTIONS.md) only on member-runs
+        // pools, and member-runs pools only for member runs. Read under the
+        // scheduler lock, which a designation change also takes.
+        let member_pool = match &target {
+            Target::Pool { pool, .. } => self.inner.pools.member_runs(pool),
+            Target::Workspace { .. } => false,
+        };
+        crate::require(
+            member_pool == options.member.is_some(),
+            if member_pool {
+                "This pool runs only members' own subscription runs."
+            } else {
+                "Member runs run only on a member-runs pool."
+            },
+        )?;
         if let Some(key) = &options.idempotency_key
             && let Some(id) = self.replay(
                 &scoped_key_digest(&key_scope, &target, key),
@@ -3428,6 +3441,29 @@ impl AgentService {
         template: Option<String>,
     ) {
         let started = Instant::now();
+        // The pool's member-runs designation is checked again at admission,
+        // in both directions: a run never starts on the wrong kind of pool.
+        let member_pool = run
+            .pool
+            .as_deref()
+            .is_some_and(|p| self.inner.pools.member_runs(p));
+        let member_workspace = self
+            .inner
+            .pools
+            .member_pool_of(&Placement {
+                host_id: run.host_id.clone(),
+                name: run.name.clone(),
+            })
+            .is_some();
+        if member_pool != run.member.is_some() || member_workspace != run.member.is_some() {
+            let failure = LaunchFailure::new(
+                Stage::Place,
+                "pool_unavailable",
+                "The pool's member-runs designation changed; the run did not start.",
+            );
+            self.launch_failed(&run, template.as_deref(), None, &failure, started);
+            return;
+        }
         if let Err(error) = self.inner.fleet.assert_admission(&run.host_id) {
             let failure = LaunchFailure::new(
                 Stage::Place,
@@ -3630,22 +3666,6 @@ impl AgentService {
                     .filter(|_| run.repository_access.is_some() && guest_current)
                     .and_then(|r| repository::parse_ref(r).ok())
                     .map(|(_, name)| name);
-                // Member runs need this release's guest helper (`run-member`).
-                if run.member.is_some() && !guest_current {
-                    let failure = LaunchFailure::new(
-                        Stage::Bootstrap,
-                        "member_runs_unsupported",
-                        "The workspace's guest helper predates member runs; update enginebox-guest.",
-                    );
-                    self.launch_failed(
-                        run,
-                        template.as_deref(),
-                        resolved.as_ref(),
-                        &failure,
-                        started,
-                    );
-                    return;
-                }
                 // A guest helper from this release runs it detached.
                 if let Err(failure) = self.run_worker_detachable(
                     host,

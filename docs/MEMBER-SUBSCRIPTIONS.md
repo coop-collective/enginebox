@@ -170,14 +170,28 @@ member runs fails with `member_runs_unsupported`.
   - an override in user, local, managed (`/etc/claude-code/managed-settings.json`)
     or project settings (`.claude/settings[.local].json` from the working
     directory up to the workspace root);
-  - a Codex `config.toml` naming another provider, an API key, a bearer token
-    or a base URL (`model_providers`, `model_provider`, `preferred_auth_method`,
-    `experimental_bearer_token`, `env_key`, `http_headers`, `*base_url`, at any
-    depth), or one that cannot be parsed.
+  - a Codex configuration naming another provider, an API key, a bearer token
+    or a base URL. This covers the run's `CODEX_HOME/config.toml` and every
+    project `.codex/config.toml` from the working directory up to the workspace
+    root. The keys are `model_providers`, `model_provider`,
+    `preferred_auth_method`, `forced_login_method`, `experimental_bearer_token`,
+    `env_key`, `http_headers`, `env_http_headers`, `api_key` and `*base_url`;
+    they are refused at the top level and in `profiles.*`, while MCP server
+    tables (`mcp_servers.*`) keep their own headers, keys and URLs. A
+    configuration that cannot be parsed is also refused.
 - **Where the material lives in the run:**
   - Codex: only in the run's private `CODEX_HOME`.
   - Claude: only in the run's environment, with `CLAUDE_CONFIG_DIR` set to the
     member's own configuration directory.
+- **Template setup.** Member runs keep the workspace template's client setup;
+  copies are bounded and links are skipped.
+  - Codex: `CODEX_HOME` gets `config.toml`, `AGENTS.md`, `prompts`, `skills`,
+    `rules` and `plugins`.
+  - Claude: the member's configuration directory gets `CLAUDE.md`,
+    `settings.json` (with authentication overrides stripped), `skills`,
+    `agents`, `commands`, `plugins`, `output-styles`, and from `~/.claude.json`
+    the user MCP servers and onboarding flags.
+  - Never copied: credentials, sessions, history or project data.
 - **Session history.** Each member's session history is kept apart:
   `~/.local/state/enginebox/members/<key>/` holds `codex-sessions` and the
   `claude` directory, where `<key>` is a digest of the member's ID.
@@ -187,6 +201,12 @@ member runs fails with `member_runs_unsupported`.
   - The values are scrubbed from output by the guest, and again by the
     controller before recording a result or a launch failure.
   - The run directory is removed on every exit path.
+- **Idempotency.** A member run's idempotency digest includes the member and
+  credential, so a key never replays a run on another credential. Run views
+  name the run's own `member` and `credential_id`.
+- **Designation re-check.** The pool's designation is read under the scheduler
+  lock at acceptance and checked again at admission. A run on the wrong kind of
+  pool fails with `pool_unavailable`.
 - **Callers** still cannot set `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` or `CODEX_*`.
 - **Stored state.** Queue entries, run records and details keep only the member
   and credential IDs. An older controller cannot read a member run's queue entry

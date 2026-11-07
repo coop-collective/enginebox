@@ -3196,8 +3196,8 @@ async fn start_member_run(
         None | Some(Value::Null) => None,
         Some(c) if c == json!({"own": true}) => None,
         Some(c) => match c.as_object() {
-            Some(o) if o.len() == 1 && o["id"].as_str().is_some() => {
-                Some(o["id"].as_str().unwrap().to_owned())
+            Some(o) if o.len() == 1 && o.get("id").and_then(Value::as_str).is_some() => {
+                o.get("id").and_then(Value::as_str).map(str::to_owned)
             }
             _ => {
                 return refuse(
@@ -3250,7 +3250,7 @@ async fn start_member_run(
         member: member.to_owned(),
         credential_id: credential_id.clone(),
     };
-    let (status, mut reply) = start_run(
+    let (status, reply) = start_run(
         runtime,
         RunTarget::Pool(pool),
         body,
@@ -3259,10 +3259,8 @@ async fn start_member_run(
         Some(run),
     )
     .await?;
-    if reply.get("run").is_some() {
-        reply["run"]["member"] = json!(member);
-        reply["run"]["credential_id"] = json!(credential_id);
-    }
+    // The run view names its own member and credential (a replay returns
+    // the original run's, never the one just selected).
     Ok((status, reply))
 }
 
@@ -8243,6 +8241,16 @@ mod tests {
                 );
             }
         }
+        // A one-key credential object without an ID is a 400, never a panic.
+        let odd = r#"{"provider":"claude","prompt":"x","credential":{"own":false}}"#;
+        let (status, refused) = call(&app, bearer(Method::POST, runs, odd, &alice)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["reason"], "invalid_request");
+        let odd = r#"{"provider":"claude","prompt":"x","credential":{"id":7}}"#;
+        assert_eq!(
+            call(&app, bearer(Method::POST, runs, odd, &alice)).await.0,
+            StatusCode::BAD_REQUEST
+        );
         // Unknown fields are refused rather than ignored.
         let extra = r#"{"provider":"claude","prompt":"x","repository":"qoh/game"}"#;
         assert_eq!(
