@@ -73,6 +73,8 @@ Each org keeps its own agent accounts (`GET/POST /v1/credentials`, acting org fr
 
 Members see team accounts, keys (metadata only), their own personal accounts and others' shared ones; admins see all metadata and can remove any credential. The controller-scope accounts (`GET /v1/agents`) remain the platform org's team accounts.
 
+A member can also connect their own Claude or ChatGPT subscription through an app they approved with the `agent-credentials` OAuth scope; such a credential is personal, owned by them and can never be shared (see [member subscriptions](MEMBER-SUBSCRIPTIONS.md)).
+
 Runs do not select from these yet. `credentials::Credentials::candidates(org, provider, member)` is the selection interface the credential-pool work will call: connected credentials of the org for the provider, in order: the requesting member's own personal accounts, then personal accounts their owners shared, then team accounts, then API keys. An org pool run without a member skips unshared personal accounts. Usage events already carry `credential_id`.
 
 ### Unity accounts

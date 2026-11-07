@@ -23,6 +23,8 @@ type Credential = {
   kind: "personal" | "team" | "api_key";
   owner_user_id: string | null;
   share_with_org_pools: boolean;
+  /** Connected through a member's own app grant: only ever used by that member's own runs, never shared. */
+  is_member_connected?: boolean;
 };
 
 async function controller(path: string, who: Principal, method: string, body?: unknown) {
@@ -59,6 +61,7 @@ const visible = (who: Principal, c: Credential) =>
 function mayManage(who: Principal, c: Credential, action: "login" | "share" | "delete" | "update") {
   if (c.provider === "unity") return c.owner_user_id === who.user_id || (action === "delete" && atLeast(who, "admin"));
   if (action === "update") return false;
+  if (action === "share" && c.is_member_connected) return false;
   if (c.kind === "personal") return c.owner_user_id === who.user_id || (action === "delete" && atLeast(who, "admin"));
   return action !== "share" && atLeast(who, "admin");
 }
@@ -126,6 +129,7 @@ export async function credentials(request: Request, segments: string[]) {
     return forward(`v1/credentials/${id}/login`, "POST", {});
   }
   if (action === "share" && !session) {
+    if (credential.is_member_connected) throw new HttpError(403, "A subscription connected through an app is used only by its owner's own runs; it is never shared.");
     if (!mayManage(who, credential, "share")) throw new HttpError(403, "Only its owner decides whether a personal subscription is shared.");
     const body = await bodyJson(request);
     if (typeof body?.share !== "boolean") throw new HttpError(400, "Send {share: true|false}.");

@@ -12,6 +12,8 @@ type Credential = {
   label: string;
   owner_user_id: string | null;
   share_with_org_pools: boolean;
+  /** Connected through an app for its owner's own runs: never shared. */
+  is_member_connected?: boolean;
   status: "pending" | "connected" | "failed" | "unverified";
   has_key: boolean;
   connected_at: string | null;
@@ -116,7 +118,7 @@ export function CredentialsPanel() {
                   <td>{kindLabel[c.kind]}</td>
                   <td>{c.status === "connected" ? (c.kind === "api_key" ? "Key stored" : "Connected") : c.status === "failed" ? "Sign-in failed" : c.status === "unverified" ? "Saved, not verified" : "Not connected"}</td>
                   <td>
-                    {unity ? "Owner's sessions only" : c.kind === "personal" ? (
+                    {unity ? "Owner's sessions only" : c.is_member_connected ? "Owner's own runs only (app)" : c.kind === "personal" ? (
                       mine ? (
                         <label>
                           <input type="checkbox" checked={c.share_with_org_pools} disabled={!!busy} onChange={(e) => act(`share:${c.id}`, () => post(`/api/credentials/${c.id}/share`, { share: e.target.checked }))} /> Share
