@@ -348,13 +348,23 @@ The optional [GitHub account and Actions service](GITHUB-ACTIONS.md) adds separa
 
 ## This repository's own CI on Engine Box
 
-The Linux jobs in `verify.yml`, `native-gpu-node.yml` (package and controller
-preview), `release.yml` (x86_64 package) and the Docker jobs (`linux-image`,
-`linux-node`) take their runner from repository variables and fall back to
+The Linux jobs take their runner from repository variables and fall back to
 GitHub-hosted `ubuntu-24.04` when unset:
 
-- `ENGINEBOX_LINUX_RUNNER`: for example `{"group":"enginebox-ci","labels":"enginebox-linux"}`
-- `ENGINEBOX_LINUX_DOCKER_RUNNER`: the same, once the CI template provides Docker
+- `ENGINEBOX_LINUX_RUNNER`: `native-gpu-node.yml` (package and controller preview)
+  and `release.yml` (x86_64 package); for example
+  `{"group":"enginebox-ci","labels":"enginebox-linux"}`.
+- `ENGINEBOX_LINUX_DOCKER_RUNNER`: `verify.yml`, `linux-image` and `linux-node`;
+  set only after the CI template provides Docker and Docker Compose usable by
+  the non-root runner inside its disposable VM. Full verification needs Docker
+  for the protected dependency handoff fixture and Compose for fleet smoke.
+  `verify.yml` checks both prerequisites before installing/building the workspace.
+
+Before enabling full Linux verification, qualify that exact template with the
+complete `verify.yml` Linux job, including preparation proof, toolchain downloads,
+fleet smoke and browser tests. A native runner canary proves registration and its
+own small test suite, not these additional capabilities. Keep the variable unset
+until that full qualification succeeds.
 
 Only runs on `main` use Engine Box: the `enginebox-ci` runner group accepts an allow-list of workflows at `refs/heads/main`, so pull-request runs stay on GitHub-hosted runners. Clearing a variable moves those jobs back to GitHub. Publish and deploy jobs stay
 GitHub-hosted. Windows and macOS jobs stay on GitHub because Engine Box has no
