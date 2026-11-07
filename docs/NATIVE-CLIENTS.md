@@ -3,7 +3,7 @@
 Engine Box installs the providers' original terminal applications inside a private
 Ubuntu 24.04 workspace. It does not replace their agent loops, forward model
 requests, or turn subscription allowances into independent worker balances.
-The owner runs `codex`, `claude`, or `agent` in the guest terminal. Controller-level
+The owner runs `codex`, `claude`, or `cursor-agent` (`agent` remains an accepted alias) in the guest terminal. GLM uses `ZCode.app` on macOS, not a Linux guest binary. Controller-level
 Agent Access connects an owner's accounts and delivers supported access material
 to that owner's assigned private workspaces; refresh ownership stays central.
 
@@ -32,13 +32,13 @@ The native commands remain available directly inside a workspace:
 ```sh
 codex login --device-auth
 claude auth login --claudeai
-NO_OPEN_BROWSER=1 agent login
+NO_OPEN_BROWSER=1 cursor-agent login
 ```
 
 Open the provider's displayed URL in your local browser. Codex device login must
 be enabled by the account/workspace; its documentation also describes SSH callback
 forwarding. Check status with `codex login status`, `claude auth status`, or
-`agent status`. Status output can identify the account; keep it out of public logs.
+`cursor-agent status --format json`. Status output can identify the account; keep it out of public logs. GLM is signed in with `zcode login` on a host that has `ZCode.app`; Engine Box does not proxy that flow.
 [Codex authentication](https://developers.openai.com/codex/auth),
 [Claude authentication](https://code.claude.com/docs/en/authentication),
 [Cursor authentication](https://cursor.com/docs/cli/reference/authentication).

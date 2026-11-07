@@ -21,6 +21,7 @@ fn rejects_unsafe_prompts_workdirs_and_resume() {
         json!({"provider":"codex","prompt":"x","workdir":"../other"}),
         json!({"provider":"claude","prompt":"x","resume_id":"latest"}),
         json!({"provider":"cursor","prompt":"x","timeout_seconds":0}),
+        json!({"provider":"glm","prompt":"x","resume_id":"adee2503-cabd-443e-9cef-0f0a5beb2f1a"}),
         json!({"provider":"codex","prompt":"x","timeout_seconds":native::MAX_RUN_SECONDS + 1}),
         json!({"provider":"codex","prompt":"x","model":"--dangerously-bypass"}),
         json!({"provider":"claude","prompt":"x","extra":true}),
@@ -70,8 +71,14 @@ fn native_cli_contract_preserves_exact_resume_and_sandbox() {
             );
         }
         if p == "cursor" {
-            assert!(args.windows(2).any(|x| x == ["--sandbox", "enabled"]));
-            assert_eq!(args[args.len() - 2..], ["--", "hello"]);
+            assert_eq!(args[1], "-p");
+            assert_eq!(args[2], "hello");
+            assert!(
+                args.windows(2)
+                    .any(|x| x == ["--output-format", "stream-json"])
+            );
+            assert!(!args.iter().any(|s| s == "--sandbox" || s == "--trust"));
+            assert!(!args.contains(&"--".into()));
         }
         if p == "claude" {
             // acceptEdits alone still denies Python/test commands in a headless
@@ -715,4 +722,194 @@ fn handoff_usage_never_advertises_stale_credit_as_current_allowance() {
         observation["usage"]["allowance_windows"][0]["remaining_percentage"],
         70
     );
+}
+
+#[test]
+fn glm_resume_and_usage_follow_the_zcode_contract() {
+    let r = native::RunRequest::parse(json!({
+        "provider":"glm",
+        "prompt":"hello",
+        "resume_id":"sess_abc123",
+        "model":"glm-4.7"
+    }))
+    .unwrap();
+    assert_eq!(r.resume_id.as_deref(), Some("sess_abc123"));
+    assert!(native::native_command(&r, "unused")[1..].is_empty());
+    let cursor = usage::unavailable("cursor", None);
+    assert_eq!(cursor["status"], "unavailable");
+    assert_eq!(cursor["usage_url"], "https://cursor.com/dashboard");
+    let glm = usage::unavailable("glm", None);
+    assert_eq!(glm["status"], "unavailable");
+    assert_eq!(glm["usage_url"], "https://z.ai/manage-apikey/billing");
+    assert!(glm["detail"].as_str().unwrap().contains("Z.ai"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_preflight_requires_authenticated_status_and_injects_api_key_only_into_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, root) = temp();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    security::safe_path(&home, ".local/bin/cursor-agent", true).unwrap();
+    let exe = home.join(".local/bin/cursor-agent");
+    std::fs::write(
+        &exe,
+        b"#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"preflight_key=${CURSOR_API_KEY:-unset}\" >>\"$HOME/.seen\"; echo '2026.10.22-27dcf5f'; exit 0; fi\nif [ \"$1\" = status ]; then echo \"status_key=${CURSOR_API_KEY:-unset}\" >>\"$HOME/.seen\"; echo '{\"isAuthenticated\":true}'; exit 0; fi\necho \"run_key=${CURSOR_API_KEY:-unset}\" >>\"$HOME/.seen\"\nprintf '{\"type\":\"result\",\"result\":\"ok\",\"usage\":{\"input_tokens\":9,\"output_tokens\":3}}\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let token = "cursor-key-fixture";
+    security::write_bytes(
+        &home,
+        ".config/enginebox/agents/cursor.env",
+        format!("export CURSOR_API_KEY='{token}'\n").as_bytes(),
+        65536,
+    )
+    .unwrap();
+    let env = native::environment(&home).unwrap();
+    assert!(!env.contains_key("CURSOR_API_KEY"));
+    let req = native::RunRequest::parse(json!({"provider":"cursor","prompt":"hello"})).unwrap();
+    let out = native::execute(&req, &home, &workspace).unwrap();
+    assert_eq!(out.exit_code, 0);
+    let seen = std::fs::read_to_string(home.join(".seen")).unwrap();
+    assert!(seen.contains("preflight_key=unset"), "{seen}");
+    assert!(seen.contains(&format!("status_key={token}")), "{seen}");
+    assert!(seen.contains(&format!("run_key={token}")), "{seen}");
+    assert_eq!(
+        enginebox_agents::run_details::token_usage("cursor", &out.output)["input_tokens"],
+        9
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_preflight_rejects_unauthenticated_cli() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, root) = temp();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    security::safe_path(&home, ".local/bin/cursor-agent", true).unwrap();
+    let exe = home.join(".local/bin/cursor-agent");
+    std::fs::write(
+        &exe,
+        b"#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2026.10.22-27dcf5f'; exit 0; fi\nif [ \"$1\" = status ]; then echo '{\"isAuthenticated\":false}'; exit 0; fi\necho should-not-run >>\"$HOME/.seen\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let req = native::RunRequest::parse(json!({"provider":"cursor","prompt":"hello"})).unwrap();
+    let err = native::execute(&req, &home, &workspace)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not authenticated"), "{err}");
+    assert!(!home.join(".seen").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn glm_without_zcode_reports_unavailable() {
+    let _guard = enginebox_agents::glm::tests_env_lock();
+    let previous = std::env::var_os(enginebox_agents::glm::APP_ENV);
+    unsafe {
+        std::env::remove_var(enginebox_agents::glm::APP_ENV);
+    }
+    let (_t, root) = temp();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    let req = native::RunRequest::parse(json!({"provider":"glm","prompt":"hello"})).unwrap();
+    let err = native::execute(&req, &home, &workspace)
+        .unwrap_err()
+        .to_string();
+    if previous.is_none() {
+        assert!(
+            err.contains("ZCode.app") || err.contains("zcode login"),
+            "{err}"
+        );
+    }
+    if let Some(value) = previous {
+        unsafe {
+            std::env::set_var(enginebox_agents::glm::APP_ENV, value);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn glm_launch_strips_competing_env_and_parses_zcode_events() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = enginebox_agents::glm::tests_env_lock();
+    let previous = std::env::var_os(enginebox_agents::glm::APP_ENV);
+    let (_t, root) = temp();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    security::private_dir(&home).unwrap();
+    security::private_dir(&workspace).unwrap();
+    let app = root.join("ZCode.app");
+    for relative in [
+        "Contents/MacOS/ZCode",
+        "Contents/Resources/glm/zcode.cjs",
+        "Contents/Resources/config/provider/zcode-builtin.json",
+    ] {
+        let path = app.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if relative.ends_with("ZCode") {
+            std::fs::write(
+                &path,
+                b"#!/bin/sh\necho \"electron=${ELECTRON_RUN_AS_NODE:-}\" >>\"$HOME/.glm-seen\"\necho \"anthropic=${ANTHROPIC_API_KEY:-}\" >>\"$HOME/.glm-seen\"\necho \"glm=${GLM_API_KEY:-}\" >>\"$HOME/.glm-seen\"\necho \"args=$*\" >>\"$HOME/.glm-seen\"\nprintf '{\"type\":\"session.created\",\"session_id\":\"sess_abc\"}\\n{\"type\":\"part.delta\",\"delta\":{\"text\":\"Hi\"}}\\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\\n{\"type\":\"result\",\"result\":\"Hi\",\"session_id\":\"sess_abc\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}\\n'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        } else {
+            std::fs::write(&path, b"fixture").unwrap();
+        }
+    }
+    security::write_json(
+        &home,
+        ".zcode/v2/credentials.json",
+        &json!({"account-provider:account:zai-individual-coding-plan:identity":{"present":true}}),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var(enginebox_agents::glm::APP_ENV, app.as_os_str());
+    }
+    let req = native::RunRequest::parse(json!({
+        "provider":"glm",
+        "prompt":"hello",
+        "model":"glm-4.7",
+        "env":{"ANTHROPIC_API_KEY":"sk-ant-secret"}
+    }));
+    assert!(req.is_err());
+    let req =
+        native::RunRequest::parse(json!({"provider":"glm","prompt":"hello","model":"glm-4.7"}))
+            .unwrap();
+    let result = native::execute(&req, &home, &workspace);
+    if let Some(value) = previous {
+        unsafe {
+            std::env::set_var(enginebox_agents::glm::APP_ENV, value);
+        }
+    } else {
+        unsafe {
+            std::env::remove_var(enginebox_agents::glm::APP_ENV);
+        }
+    }
+    let out = result.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(native::session_id(&out.output).as_deref(), Some("sess_abc"));
+    assert_eq!(
+        enginebox_agents::run_details::token_usage("glm", &out.output)["input_tokens"],
+        2
+    );
+    let log = std::fs::read_to_string(home.join(".glm-seen")).unwrap();
+    assert!(log.contains("electron=1"), "{log}");
+    assert!(log.contains("anthropic="), "{log}");
+    assert!(!log.contains("sk-ant"), "{log}");
+    assert!(log.contains("--output-format stream-json"), "{log}");
+    assert!(log.contains("--mode yolo"), "{log}");
+    assert!(!log.contains("--model"), "{log}");
 }

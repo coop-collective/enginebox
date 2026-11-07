@@ -1,5 +1,5 @@
 use crate::{process, security};
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path, time::Duration};
@@ -56,6 +56,7 @@ const DENIED_ENV: &[&str] = &[
     "NODE_TLS_REJECT_UNAUTHORIZED",
     "DEBUG",
     "SSH_AUTH_SOCK",
+    "ELECTRON_RUN_AS_NODE",
 ];
 const DENIED_ENV_PREFIXES: &[&str] = &[
     "LD_",
@@ -70,6 +71,8 @@ const DENIED_ENV_PREFIXES: &[&str] = &[
     "XDG_",
     "NPM_CONFIG_",
     "RUST_",
+    "GLM_",
+    "ZCODE_",
 ];
 /// True when a caller may set this variable for one native run.
 pub fn env_key_allowed(key: &str) -> bool {
@@ -169,7 +172,7 @@ impl RunRequest {
         );
         if let Some(id) = &self.resume_id {
             ensure!(
-                security::exact_uuid(id),
+                enginebox_core::providers::valid_resume_id(&self.provider, id),
                 "Resume requires the exact native session ID."
             );
         }
@@ -220,11 +223,20 @@ pub fn redact(output: &str, env: &BTreeMap<String, String>) -> String {
     out
 }
 pub fn binary(provider: &str) -> &str {
-    match provider {
-        "codex" => "codex",
-        "claude" => "claude",
-        _ => "agent",
-    }
+    enginebox_core::providers::get(provider)
+        .map(|p| {
+            if p.binary.is_empty() {
+                "zcode"
+            } else {
+                p.binary
+            }
+        })
+        .unwrap_or("agent")
+}
+pub fn find_provider_binary(provider: &str, env: &BTreeMap<String, String>) -> Option<String> {
+    enginebox_core::providers::binary_names(provider)
+        .into_iter()
+        .find_map(|name| find_binary(name, env))
 }
 pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
     let mut args = vec![exe.to_string()];
@@ -268,29 +280,25 @@ pub fn native_command(r: &RunRequest, exe: &str) -> Vec<String> {
                 args.extend(["--resume".into(), id.clone()]);
             }
         }
-        _ => {
-            args.extend(
-                [
-                    "-p",
-                    "--output-format",
-                    "stream-json",
-                    "--trust",
-                    "--sandbox",
-                    "enabled",
-                ]
-                .map(str::to_owned),
-            );
+        "cursor" => {
+            args.extend([
+                "-p".into(),
+                r.prompt.clone(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ]);
             if let Some(id) = &r.resume_id {
                 args.extend(["--resume".into(), id.clone()]);
             }
         }
+        _ => {}
     }
-    if let Some(model) = &r.model {
+    if matches!(r.provider.as_str(), "codex" | "claude" | "cursor")
+        && let Some(model) = &r.model
+    {
         args.extend(["--model".into(), model.clone()]);
     }
-    if r.provider == "cursor" {
-        args.extend(["--".into(), r.prompt.clone()]);
-    } else if r.provider == "codex" {
+    if r.provider == "codex" {
         args.push("-".into());
     }
     args
@@ -436,25 +444,52 @@ pub fn environment(home: &Path) -> Result<BTreeMap<String, String>> {
     .map(|(k, v)| (k.into(), v))
     .collect();
     e.insert("LOGNAME".into(), e["USER"].clone());
-    if let Some(raw) = security::read_bytes(
-        Path::new(home),
-        ".config/enginebox/agents/cursor.env",
-        65536,
-        true,
-    )? {
-        let raw = String::from_utf8(raw)?;
-        let token = raw
-            .trim()
-            .strip_prefix("export CURSOR_API_KEY=")
-            .ok_or_else(|| anyhow::anyhow!("Invalid delegated credential."))?;
-        let token = unquote(token)?;
-        ensure!(
-            security::token(&Value::String(token.clone())),
-            "Invalid delegated credential."
-        );
-        e.insert("CURSOR_API_KEY".into(), token);
-    }
     Ok(e)
+}
+/// Cursor API key from the controller-written secret file. Injected into the
+/// cursor-agent process environment only, never the shared native environment.
+pub fn cursor_api_key(home: &Path) -> Result<Option<String>> {
+    let Some(raw) = security::read_bytes(home, ".config/enginebox/agents/cursor.env", 65536, true)?
+    else {
+        return Ok(None);
+    };
+    let raw = String::from_utf8(raw)?;
+    let token = raw
+        .trim()
+        .strip_prefix("export CURSOR_API_KEY=")
+        .ok_or_else(|| anyhow::anyhow!("Invalid delegated credential."))?;
+    let token = unquote(token)?;
+    ensure!(
+        security::token(&Value::String(token.clone())),
+        "Invalid delegated credential."
+    );
+    Ok(Some(token))
+}
+pub fn cursor_preflight(exe: &str, env: &BTreeMap<String, String>, cwd: &Path) -> Result<()> {
+    let out = crate::process::bounded(
+        &[
+            exe.into(),
+            "status".into(),
+            "--format".into(),
+            "json".into(),
+        ],
+        Some(env),
+        Some(cwd),
+        b"",
+        Duration::from_secs(10),
+        65536,
+        None,
+    )?;
+    ensure!(
+        !out.timed_out && !out.output_truncated,
+        "cursor-agent status did not complete."
+    );
+    let value: Value = serde_json::from_str(out.output.trim()).unwrap_or(Value::Null);
+    ensure!(
+        out.exit_code == 0 && value["isAuthenticated"] == true,
+        "cursor-agent is not authenticated. Connect Cursor or set CURSOR_API_KEY in the controller secret store."
+    );
+    Ok(())
 }
 fn unquote(s: &str) -> Result<String> {
     if s.starts_with('\'') && s.ends_with('\'') {
@@ -496,7 +531,8 @@ pub fn verify_client(
     let pat = match provider {
         "codex" => r"^codex-cli [0-9]+\.[0-9]+\.[0-9]+[^\r\n]*$",
         "claude" => r"^[0-9]+\.[0-9]+\.[0-9]+ \(Claude Code\)$",
-        _ => r"^(Cursor Agent )?20[0-9]{2}\.[0-9]{2}\.[0-9]{2}-[a-zA-Z0-9]+$",
+        "cursor" => r"^(Cursor Agent )?20[0-9]{2}\.[0-9]{2}\.[0-9]{2}-[a-zA-Z0-9]+$",
+        _ => bail!("Native client version check is not defined for this provider."),
     };
     ensure!(
         regex::Regex::new(pat)?.is_match(version),
@@ -655,9 +691,17 @@ fn execute_inner(
     if r.provider == "codex" {
         ensure_package_caches(&home);
     }
-    let exe = find_binary(binary(&r.provider), &env)
-        .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
-    verify_client(&exe, &r.provider, &env, &cwd)?;
+    let exe = if r.provider == "glm" {
+        None
+    } else {
+        Some(
+            find_provider_binary(&r.provider, &env)
+                .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?,
+        )
+    };
+    if let Some(exe) = &exe {
+        verify_client(exe, &r.provider, &env, &cwd)?;
+    }
     // The version preflight uses only Engine Box's environment; caller variables
     // reach the native run alone and can never replace a controlled variable.
     let caller_env = match profile {
@@ -679,11 +723,37 @@ fn execute_inner(
         );
         run_env.insert(key.clone(), value.clone());
     }
-    let mut argv = native_command_with_config(r, &exe, &home, &cwd);
     let mut redacted = caller_env.clone();
+    if r.provider == "cursor"
+        && let Some(token) = cursor_api_key(&home)?
+    {
+        redacted.insert("CURSOR_API_KEY".into(), token.clone());
+        run_env.insert("CURSOR_API_KEY".into(), token);
+    }
+    if r.provider == "cursor" {
+        let exe = exe
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
+        cursor_preflight(exe, &run_env, &cwd)?;
+    }
+    let mut argv = if r.provider == "glm" {
+        let app = crate::glm::preflight(&home)?;
+        crate::glm::apply_run_env(&mut run_env, &app, &home, r.model.as_deref())?;
+        crate::glm::command(&app, r, &cwd)?
+    } else {
+        let exe = exe
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
+        native_command_with_config(r, exe, &home, &cwd)
+    };
     if let (Some((block, files)), Some(id)) = (profile, run_id) {
         let materialized = crate::profile::materialize(&home, id, &r.provider, block, files)?;
-        argv = crate::profile::command(r, &exe, block, &materialized)?;
+        if r.provider != "glm" {
+            let exe = exe
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Native client is not installed."))?;
+            argv = crate::profile::command(r, exe, block, &materialized)?;
+        }
         if let Some(codex_home) = &materialized.codex_home {
             run_env.insert(
                 "CODEX_HOME".into(),
@@ -749,7 +819,7 @@ fn execute_inner(
         &argv,
         Some(&run_env),
         Some(&cwd),
-        if r.provider == "cursor" {
+        if matches!(r.provider.as_str(), "cursor" | "glm") {
             b""
         } else {
             r.prompt.as_bytes()
@@ -778,6 +848,9 @@ fn execute_inner(
     let result = result.map(|mut output| {
         if !redacted.is_empty() {
             output.output = redact(&output.output, &redacted);
+        }
+        if r.provider == "glm" && output.exit_code == 0 && crate::glm::failed(&output.output) {
+            output.exit_code = 1;
         }
         output
     });
@@ -837,6 +910,9 @@ pub fn lease_active(home: &Path, provider: &str) -> Result<bool> {
     )
 }
 pub fn session_id(output: &str) -> Option<String> {
+    if let Some(id) = crate::glm::session_id(output) {
+        return Some(id);
+    }
     output
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -848,7 +924,7 @@ pub fn session_id(output: &str) -> Option<String> {
             };
             v[key]
                 .as_str()
-                .filter(|s| security::exact_uuid(s))
+                .filter(|s| enginebox_core::providers::recorded_session_id(s))
                 .map(str::to_owned)
         })
 }

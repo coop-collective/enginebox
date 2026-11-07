@@ -7,7 +7,7 @@ Engine Box is in early development; each guide states what is implemented, quali
 - [Installing Engine Box](INSTALL.md): terminal installer, controller and node roles, version pinning.
 - [Local Cloudflare fleet](LOCAL-FLEET.md): run the fleet API, nodes and storage locally with Wrangler and Docker.
 - [Server bootstrap](BOOTSTRAP.md): inspect, plan and prepare a Linux/KVM host and a credential-free workspace base.
-- [Native agent clients](NATIVE-CLIENTS.md): installing and signing into Codex, Claude Code and Cursor Agent.
+- [Native agent clients](NATIVE-CLIENTS.md): installing and signing into Codex, Claude Code, Cursor Agent and GLM (Z.ai).
 - [Portable hosts](PORTABLE-HOSTS.md): which operating systems can operate or contribute resources.
 - [Licensing](LICENSING.md): the Business Source License, per-node pricing, the Change Date and license history.
 

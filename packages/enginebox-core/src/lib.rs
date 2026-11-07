@@ -9,6 +9,7 @@ pub mod model;
 pub mod native_versions;
 pub mod node_protocol;
 pub mod preparation;
+pub mod providers;
 pub mod state;
 pub mod templates;
 pub mod transport;

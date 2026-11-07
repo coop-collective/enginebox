@@ -165,7 +165,7 @@ pub fn normalize(raw: Value) -> Result<Value> {
     for v in clients {
         let v = v.as_str().context("Agent name must be text")?;
         ensure!(
-            ["codex", "claude", "cursor"].contains(&v) && seen.insert(v),
+            crate::providers::known(v) && seen.insert(v),
             "Invalid or duplicate native client"
         );
     }

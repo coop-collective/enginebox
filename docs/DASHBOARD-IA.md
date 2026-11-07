@@ -21,7 +21,7 @@ Everything a person works on belongs to a **Project**.
 | Project | The durable project ID. Owns its LayerFS files, branches and accepted main, optional GitHub or hosted Git links, agent runs, previews and storage. | `/v1/workspaces` (named *workspaces* in the API), `/v1/projects/{id}/…` |
 | Sandbox | One private agent VM cloned from a sandbox template. An agent run happens in a sandbox. It can pause, hibernate (RAM kept) or stop. | Fleet instances (`workspace_name`), pool members |
 | Profile | How and where an agent runs: provider permissions, skills, MCP connections, secret requirements, template, machines and scale. | `/v1/profiles` plus `/v1/pools` (merging planned) |
-| Account | A Codex, Claude or Cursor sign-in, either shared with the organization or personal. | `/v1/agents` (shared) and `/api/credentials` |
+| Account | A Codex, Claude, Cursor or GLM sign-in, either shared with the organization or personal. | `/v1/agents` (shared) and `/api/credentials` |
 | Template | See below. | three registries today |
 | Machine | A registered computer with roles: agent host, CI builder, engine. Sandboxes are shown inside the machine that hosts them. | `/v1/compute`, `/api/contributors`, fleet hosts |
 | Runner pool | GitHub Actions runner group config. Each job gets a disposable VM. | `/v1/github` |

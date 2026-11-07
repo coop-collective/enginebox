@@ -351,31 +351,23 @@ fn runs_without_a_profile_keep_todays_exact_argv() {
         (
             json!({"provider":"cursor","prompt":"hello"}),
             vec![
-                "agent",
+                "cursor-agent",
                 "-p",
+                "hello",
                 "--output-format",
                 "stream-json",
-                "--trust",
-                "--sandbox",
-                "enabled",
-                "--",
-                "hello",
             ],
         ),
         (
             json!({"provider":"cursor","prompt":"hello","resume_id":id}),
             vec![
-                "agent",
+                "cursor-agent",
                 "-p",
+                "hello",
                 "--output-format",
                 "stream-json",
-                "--trust",
-                "--sandbox",
-                "enabled",
                 "--resume",
                 id,
-                "--",
-                "hello",
             ],
         ),
     ];
@@ -488,23 +480,19 @@ fn a_profile_changes_argv_only_through_documented_options() {
     let cursor = block(json!({"permission_profile":"read_only"})).unwrap();
     let mut m = none(root);
     m.plugin_dirs = vec![root.join("plugins/lint")];
-    let args = profile::command(&request("cursor"), "agent", &cursor, &m).unwrap();
+    let args = profile::command(&request("cursor"), "cursor-agent", &cursor, &m).unwrap();
     assert_eq!(
         args,
         [
-            "agent",
+            "cursor-agent",
             "-p",
+            "hello",
             "--output-format",
             "stream-json",
-            "--trust",
-            "--sandbox",
-            "enabled",
             "--mode",
             "ask",
             "--plugin-dir",
             &root.join("plugins/lint").display().to_string(),
-            "--",
-            "hello"
         ]
     );
 }

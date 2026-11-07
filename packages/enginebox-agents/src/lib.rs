@@ -4,6 +4,7 @@ pub mod browser;
 pub mod clients;
 pub mod delegation;
 pub mod detached;
+pub mod glm;
 pub mod launch_events;
 pub mod lifecycle;
 pub mod native;
@@ -41,10 +42,9 @@ pub fn require(condition: bool, message: &str) -> anyhow::Result<()> {
         Err(anyhow::Error::new(Rule(message.to_owned())))
     }
 }
-pub const PROVIDERS: [&str; 3] = ["codex", "claude", "cursor"];
+pub const PROVIDERS: &[&str] = enginebox_core::providers::IDS;
 pub fn provider(value: &str) -> anyhow::Result<&str> {
-    anyhow::ensure!(PROVIDERS.contains(&value), "Unknown native agent provider.");
-    Ok(value)
+    Ok(enginebox_core::providers::require(value)?.id)
 }
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()

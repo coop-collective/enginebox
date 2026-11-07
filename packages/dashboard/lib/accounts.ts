@@ -4,6 +4,7 @@ export const providerLabels: Record<ProviderId, string> = {
   codex: "Codex (ChatGPT)",
   claude: "Claude",
   cursor: "Cursor",
+  glm: "GLM (Z.ai Coding Plan)",
 };
 export const providerIds = Object.keys(providerLabels) as ProviderId[];
 export const activeAuth = (session?: AuthSession | null) =>
@@ -31,7 +32,8 @@ export function officialAuthorizationUrl(
   value?: string | null,
 ) {
   if (!value || value.length > 8192 || /[\x00-\x20]/.test(value)) return null;
-  const endpoints: Record<ProviderId, [string, string]> = {
+  if (provider === "glm") return null;
+  const endpoints: Record<Exclude<ProviderId, "glm">, [string, string]> = {
     codex: ["auth.openai.com", "/codex/device"],
     claude: ["claude.com", "/cai/oauth/authorize"],
     cursor: ["cursor.com", "/loginDeepControl"],
@@ -39,7 +41,7 @@ export function officialAuthorizationUrl(
   try {
     const url = new URL(value);
     const [hostname, pathname] = endpoints[provider];
-    const allowed: Record<ProviderId, string[]> = {
+    const allowed: Record<Exclude<ProviderId, "glm">, string[]> = {
       codex: [],
       claude: [
         "client_id",

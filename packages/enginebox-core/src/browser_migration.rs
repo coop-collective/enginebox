@@ -10,7 +10,7 @@ use std::{
 const LIMIT: u64 = 1024 * 1024;
 const BROWSER: &str = "enginebox-browser";
 const NATIVE: &str = "/usr/local/bin/enginebox-guest";
-const PROVIDERS: [&str; 3] = ["claude", "codex", "cursor"];
+const PROVIDERS: &[&str] = crate::providers::IDS;
 
 fn legacy(entry: &Value, provider: &str) -> bool {
     entry["command"] == "/usr/bin/python3"

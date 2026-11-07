@@ -3,7 +3,8 @@ import type { AgentUsage, ProviderId } from "./types";
 export const providerUsageLinks: Record<ProviderId, string> = {
   codex: "https://chatgpt.com/codex/settings/usage",
   claude: "https://claude.ai/settings/usage",
-  cursor: "https://cursor.com/dashboard/spending",
+  cursor: "https://cursor.com/dashboard",
+  glm: "https://z.ai/manage-apikey/billing",
 };
 
 export function usageObservationCurrent(usage: AgentUsage, now = Date.now()) {

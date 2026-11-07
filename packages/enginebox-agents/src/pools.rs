@@ -502,7 +502,10 @@ impl Pools {
     }
     /// Remember which workspace holds a native session started in a pool.
     pub fn remember_session(&self, session: &str, pool: &str, at: &Placement) -> Result<()> {
-        ensure!(security::exact_uuid(session), "Invalid native session ID.");
+        ensure!(
+            enginebox_core::providers::recorded_session_id(session),
+            "Invalid native session ID."
+        );
         let mut sessions = self.sessions.lock().unwrap();
         sessions.insert(
             session.to_owned(),

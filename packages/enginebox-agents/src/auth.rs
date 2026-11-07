@@ -12,7 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 pub fn provider_status(p: &str, installed: bool) -> Value {
-    json!({"id":p,"label":match p{"codex"=>"Codex","claude"=>"Claude Code",_=>"Cursor Agent"},"installed":installed,"status":if installed{"unknown"}else{"unavailable"},"auth_method":if installed{"unknown"}else{"none"}})
+    let label = enginebox_core::providers::get(p)
+        .map(|s| s.label)
+        .unwrap_or("Unknown");
+    json!({"id":p,"label":label,"installed":installed,"status":if installed{"unknown"}else{"unavailable"},"auth_method":if installed{"unknown"}else{"none"}})
 }
 pub fn parse_status(p: &str, code: i32, output: &str) -> Value {
     let mut v = provider_status(p, true);
@@ -99,6 +102,10 @@ pub fn probe_with_lease(
     env: &BTreeMap<String, String>,
     lease: Option<&security::Lease>,
 ) -> Value {
+    if p == "glm" {
+        let installed = crate::glm::locate_app().is_ok();
+        return crate::glm::status(Path::new(&env["HOME"]), installed);
+    }
     let Some(exe) = exe else {
         return provider_status(p, false);
     };

@@ -5,16 +5,12 @@ pub(crate) fn iso(n: f64) -> Option<String> {
     chrono::DateTime::from_timestamp(n as i64, 0).map(|d| d.to_rfc3339())
 }
 pub fn unavailable(p: &str, detail: Option<&str>) -> Value {
-    let d = match p {
-        "codex" => "Connect a ChatGPT account to read its reported allowance.",
-        "claude" => {
-            "Claude does not provide an on-demand allowance through this integration. Check provider usage."
-        }
-        _ => {
-            "Cursor does not expose personal allowance through the supported CLI. Check provider usage."
-        }
-    };
-    json!({"provider":p,"scope":"controller_account","status":"unavailable","detail":detail.unwrap_or(d),"source":null,"observed_at":null,"freshness":"unknown","plan":null,"billing_cycle":null,"allowance_windows":[],"credits":[],"refresh_after_seconds":60})
+    let spec = enginebox_core::providers::get(p);
+    let d = detail.unwrap_or(
+        spec.map(|s| s.usage_unavailable)
+            .unwrap_or("Usage is unavailable through this integration. Check provider usage."),
+    );
+    json!({"provider":p,"scope":"controller_account","status":"unavailable","detail":d,"usage_url":spec.map(|s| s.usage_url),"source":null,"observed_at":null,"freshness":"unknown","plan":null,"billing_cycle":null,"allowance_windows":[],"credits":[],"refresh_after_seconds":60})
 }
 fn num(v: &Value, min: f64, max: f64) -> Option<f64> {
     v.as_f64()

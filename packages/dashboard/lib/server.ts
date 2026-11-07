@@ -324,11 +324,11 @@ export async function proxy(request: Request, segments: string[]) {
   if (request.method !== "GET") requireOrigin(request);
   const path = segments.join("/");
   const accountRead =
-    /^v1\/agents(?:\/(?:codex|claude|cursor)\/(?:usage|sessions\/[a-f0-9]{32}))?$/.test(
+    /^v1\/agents(?:\/(?:codex|claude|cursor|glm)\/(?:usage|sessions\/[a-f0-9]{32}))?$/.test(
       path,
     );
   const accountWrite =
-    /^v1\/agents\/(?:(?:codex|claude|cursor)\/(?:login|sessions\/[a-f0-9]{32}\/cancel)|claude\/sessions\/[a-f0-9]{32}\/input)$/.test(
+    /^v1\/agents\/(?:(?:codex|claude|cursor|glm)\/(?:login|sessions\/[a-f0-9]{32}\/cancel)|claude\/sessions\/[a-f0-9]{32}\/input)$/.test(
       path,
     );
   const allowed =

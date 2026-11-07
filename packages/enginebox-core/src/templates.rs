@@ -119,7 +119,9 @@ fn source_image() -> String {
     "images:ubuntu/24.04/cloud".into()
 }
 fn clients() -> Vec<String> {
-    vec!["claude".into(), "codex".into(), "cursor".into()]
+    crate::providers::installable()
+        .map(|p| p.id.to_string())
+        .collect()
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,10 +176,7 @@ pub fn validate_manifest(value: Value) -> Result<Value> {
         "Guest computer MCP requires desktop"
     );
     for c in &m.native_clients {
-        ensure!(
-            ["codex", "claude", "cursor"].contains(&c.as_str()),
-            "Unsupported native client"
-        );
+        crate::providers::validate_native_client(c)?;
     }
     m.native_clients.sort();
     ensure!(

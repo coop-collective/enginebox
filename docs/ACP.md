@@ -13,7 +13,7 @@ credential.
 
 ## Connect an ACP client
 
-Connect Claude, Codex or Cursor through the controller's Agents panel first, then
+Connect Claude, Codex, Cursor or GLM through the controller's Agents panel first, then
 allocate a private workspace. Use the controller's private API over an SSH tunnel
 or HTTPS, not a public dashboard URL which may expose only browser routes:
 
@@ -27,7 +27,7 @@ ebox --fleet-host node-one acp \
 ```
 
 Configure that executable and argument list as an external agent in your ACP
-client. `--provider` accepts `claude`, `codex` or `cursor`. `--model` passes a
+client. `--provider` accepts `claude`, `codex`, `cursor` or `glm`. `--model` passes a
 native model identifier to that provider. `--timeout` sets the existing bounded
 native turn limit, from 1 to 300 seconds, default 120. Prompts may consume the
 connected provider's allowance.
@@ -81,7 +81,7 @@ workspaces using the advertised `sessionTarget` extension:
       "enginebox": {
         "hostId": "node-two",
         "workspace": "ebox-other-project",
-        "provider": "cursor"
+        "provider": "glm"
       }
     }
   }
@@ -96,7 +96,8 @@ from a durable queue ([QUEUE.md](QUEUE.md)). ACP allows up to 64 conversation bi
 concurrent requests per connection.
 
 A follow-up prompt uses the exact `native_session_id` returned by the previous
-run. It never substitutes “latest session.” If the provider does not return a
+run. It never substitutes “latest session.” Codex, Claude and Cursor IDs are
+UUIDs; GLM/ZCode IDs are `sess_…`. If the provider does not return a
 usable session ID, or a run's execution is uncertain, the adapter refuses an
 unsafe continuation and directs you to inspect the run. Conversation bindings
 live for the ACP process lifetime: `loadSession` is explicitly false, and

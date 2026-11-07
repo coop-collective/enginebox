@@ -23,7 +23,7 @@ pub struct Options {
     /// Assigned private workspace; ACP does not create or recycle workspaces.
     #[arg(long)]
     pub workspace: String,
-    #[arg(long, value_parser = ["codex", "claude", "cursor"])]
+    #[arg(long, value_parser = enginebox_core::providers::parse_id)]
     pub provider: String,
     /// Absolute workspace root inside the guest.
     #[arg(long, default_value = "/workspace")]
@@ -48,10 +48,7 @@ impl Target {
     fn validate(&self) -> Result<()> {
         enginebox_core::identifier(&self.host, false)?;
         enginebox_core::identifier(&self.workspace, true)?;
-        ensure!(
-            ["codex", "claude", "cursor"].contains(&self.provider.as_str()),
-            "Unsupported provider"
-        );
+        enginebox_core::providers::require(&self.provider)?;
         Ok(())
     }
     fn path(&self) -> String {
@@ -178,6 +175,7 @@ fn text_prompt(params: &Value) -> Result<String> {
 
 fn native_text(output: &str) -> String {
     let mut chunks = Vec::new();
+    let mut deltas = String::new();
     let mut final_text = None;
     for event in output
         .lines()
@@ -197,22 +195,30 @@ fn native_text(output: &str) -> String {
                     }
                 }
             }
+        } else if event["type"] == "part.delta" {
+            if let Some(text) = event["delta"]["text"]
+                .as_str()
+                .or_else(|| event["text"].as_str())
+            {
+                deltas.push_str(text);
+            }
         } else if event["type"] == "result"
             && let Some(text) = event["result"].as_str()
         {
             final_text = Some(text.to_owned());
         }
     }
-    if chunks.is_empty() {
+    if !deltas.is_empty() {
+        deltas
+    } else if chunks.is_empty() {
         final_text.unwrap_or_default()
     } else {
         chunks.join("\n")
     }
 }
 
-fn exact_session(id: &str) -> bool {
-    uuid::Uuid::parse_str(id)
-        .is_ok_and(|uuid| uuid.hyphenated().to_string().eq_ignore_ascii_case(id))
+fn exact_session(provider: &str, id: &str) -> bool {
+    enginebox_core::providers::valid_resume_id(provider, id)
 }
 
 struct Turn {
@@ -332,7 +338,7 @@ fn prompt_turn(
             }
             let native = run["native_session_id"]
                 .as_str()
-                .filter(|s| exact_session(s))
+                .filter(|s| exact_session(&turn.target.provider, s))
                 .map(str::to_owned)
                 .or_else(|| turn.resume_id.clone());
             let metadata = json!({"enginebox":{"runId":id,"provider":turn.target.provider,"elapsedSeconds":run["elapsed_seconds"],"usage":run["usage"],"nativeSessionId":native}});
@@ -670,6 +676,12 @@ mod tests {
         assert_eq!(
             native_text(
                 "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Hello\"}}"
+            ),
+            "Hello"
+        );
+        assert_eq!(
+            native_text(
+                "{\"type\":\"session.created\",\"session_id\":\"sess_abc\"}\n{\"type\":\"part.delta\",\"delta\":{\"text\":\"Hel\"}}\n{\"type\":\"part.delta\",\"text\":\"lo\"}\n{\"type\":\"result\",\"result\":\"Hello\"}"
             ),
             "Hello"
         );

@@ -133,7 +133,8 @@ build outputs and other files the agent creates.
 | --- | --- | --- |
 | Codex | `~/.codex`, user skills in `~/.agents`, project instructions/configuration | `codex exec resume SESSION_ID` |
 | Claude Code | `~/.claude`, `~/.claude.json` when present, project `.claude` and `CLAUDE.md` | `claude -p --resume SESSION_ID` |
-| Cursor Agent | `~/.cursor`, `~/.config/cursor`, project `.cursor` and instructions | `agent -p --resume SESSION_ID` |
+| Cursor Agent | `~/.cursor`, `~/.config/cursor`, project `.cursor` and instructions | `cursor-agent -p <prompt> --output-format stream-json --resume SESSION_ID` |
+| GLM (Z.ai Coding Plan) | `~/.zcode/v2/credentials.json` (or `ZCODE_DATA_BASE_DIR`) | ZCode `zcode.cjs --prompt=… --output-format stream-json --resume sess_…` |
 
 Codex stores its user state under `CODEX_HOME` (normally `~/.codex`). Configuration,
 history and file-backed auth belong there; an OS keychain may separately hold

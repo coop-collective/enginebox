@@ -10,6 +10,9 @@ pub fn qualified_version(provider: &str) -> Result<&'static str> {
         "codex" => Ok(CODEX_VERSION),
         "claude" => Ok(CLAUDE_VERSION),
         "cursor" => Ok(CURSOR_VERSION),
+        "glm" => {
+            bail!("GLM uses ZCode.app (Z.ai Coding Plan); it is not a version-pinned Linux client.")
+        }
         _ => bail!("Unknown native provider."),
     }
 }
