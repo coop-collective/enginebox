@@ -849,8 +849,7 @@ impl AgentService {
         if home.join("pending-adoption.json").exists() {
             return Ok(None);
         }
-        let native =
-            security::read_json(&home, delegation::native_file(p))?.unwrap_or(Value::Null);
+        let native = security::read_json(&home, delegation::native_file(p))?.unwrap_or(Value::Null);
         let saved = security::read_json(&home, delegation::TOKEN_FILE)?.unwrap_or(Value::Null);
         Ok(usage::credential_from_files(p, &native, &saved))
     }
@@ -863,9 +862,9 @@ impl AgentService {
         let _pending = self.pending_guard()?;
         let lease = self.provider_lock(p)?;
         let home = self.home(p)?;
-        let exe = self.inner.binaries[p]
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Install the native Codex client to read account usage."))?;
+        let exe = self.inner.binaries[p].clone().ok_or_else(|| {
+            anyhow::anyhow!("Install the native Codex client to read account usage.")
+        })?;
         let env = auth::controller_environment(&home, &self.inner.binaries)?;
         usage::read_codex_raw_with_lease(&exe, &env, Some(&lease))
     }

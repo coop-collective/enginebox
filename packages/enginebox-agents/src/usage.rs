@@ -171,7 +171,11 @@ pub fn credential_from_files(p: &str, native: &Value, saved: &Value) -> Option<C
             }
             // A `claude setup-token` token (inference scope only).
             is_token(&saved["value"]).then(|| {
-                let mut c = Credential::new(p, "oauth", saved["value"].as_str().unwrap_or_default().into());
+                let mut c = Credential::new(
+                    p,
+                    "oauth",
+                    saved["value"].as_str().unwrap_or_default().into(),
+                );
                 c.expires_at = saved["expires_at"].as_f64();
                 c.meta = json!({"setup_token": true});
                 c
@@ -193,9 +197,16 @@ pub fn credential_from_files(p: &str, native: &Value, saved: &Value) -> Option<C
                 .map(str::to_owned);
             let access = jwt_claims(token).unwrap_or(Value::Null);
             c.expires_at = access["exp"].as_f64();
-            let id = t["id_token"].as_str().and_then(jwt_claims).unwrap_or(Value::Null);
+            let id = t["id_token"]
+                .as_str()
+                .and_then(jwt_claims)
+                .unwrap_or(Value::Null);
             let claim = "https://api.openai.com/auth";
-            let auth = if id[claim].is_object() { &id[claim] } else { &access[claim] };
+            let auth = if id[claim].is_object() {
+                &id[claim]
+            } else {
+                &access[claim]
+            };
             c.meta = json!({"plan_type": auth["chatgpt_plan_type"].as_str()});
             Some(c)
         }

@@ -187,7 +187,9 @@ impl Http for Reqwest {
         }
         // The error never carries the request (it would name the URL only,
         // but a provider's reply could echo headers).
-        let response = builder.send().map_err(|_| anyhow::anyhow!("request failed"))?;
+        let response = builder
+            .send()
+            .map_err(|_| anyhow::anyhow!("request failed"))?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -195,7 +197,9 @@ impl Http for Reqwest {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<i64>().ok())
             .filter(|n| (0..=86400).contains(n));
-        let bytes = response.bytes().map_err(|_| anyhow::anyhow!("read failed"))?;
+        let bytes = response
+            .bytes()
+            .map_err(|_| anyhow::anyhow!("read failed"))?;
         ensure!(bytes.len() <= 1024 * 1024, "reply too large");
         Ok(Response {
             status,
@@ -254,7 +258,9 @@ fn iso(secs: i64) -> Option<String> {
 fn time(v: &Value) -> Option<String> {
     let n = match v {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
+        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            s.parse().ok()
+        }
         Value::String(s) => {
             return chrono::DateTime::parse_from_rfc3339(s)
                 .ok()
@@ -269,7 +275,9 @@ fn time(v: &Value) -> Option<String> {
     (secs < 253402300799.).then(|| iso(secs as i64)).flatten()
 }
 fn seconds(v: &Value) -> Option<i64> {
-    time(v).and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|d| d.timestamp())
+    time(v)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|d| d.timestamp())
 }
 fn number(v: &Value) -> Option<f64> {
     let n = match v {
@@ -292,7 +300,8 @@ fn word(v: &Value) -> Option<String> {
     let s = v.as_str()?.trim();
     let ok = !s.is_empty()
         && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || " _-.:/+".contains(c));
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _-.:/+".contains(c));
     ok.then(|| s.to_owned())
 }
 fn kind_of_minutes(m: f64) -> &'static str {
@@ -334,9 +343,10 @@ fn window(
 }
 /// `ok`, or `limited` when a provider-reported window is used up.
 fn settle(mut v: Value, limited: bool) -> Value {
-    let full = v["windows"]
-        .as_array()
-        .is_some_and(|w| w.iter().any(|w| w["used_pct"].as_f64().is_some_and(|p| p >= 100.)));
+    let full = v["windows"].as_array().is_some_and(|w| {
+        w.iter()
+            .any(|w| w["used_pct"].as_f64().is_some_and(|p| p >= 100.))
+    });
     v["status"] = json!(if limited || full { "limited" } else { "ok" });
     v
 }
@@ -348,7 +358,8 @@ pub fn normalize_claude(usage: &Value, profile: Option<&Value>, meta: &Value, no
     let org = profile.map(|p| &p["organization"]).unwrap_or(&Value::Null);
     let plan_word = word(&org["organization_type"]).or_else(|| word(&meta["subscription_type"]));
     v["plan"]["name"] = json!(plan_word.map(|p| p.trim_start_matches("claude_").to_owned()));
-    v["plan"]["tier"] = json!(word(&org["rate_limit_tier"]).or_else(|| word(&meta["rate_limit_tier"])));
+    v["plan"]["tier"] =
+        json!(word(&org["rate_limit_tier"]).or_else(|| word(&meta["rate_limit_tier"])));
     v["plan"]["status"] = json!(word(&org["subscription_status"]));
     let mut windows = Vec::new();
     let mut models = 0;
@@ -442,7 +453,10 @@ pub fn normalize_claude(usage: &Value, profile: Option<&Value>, meta: &Value, no
         ));
     }
     v["windows"] = json!(windows);
-    settle(v, extra["spend_limit_reached"] == true && enabled == Some(true))
+    settle(
+        v,
+        extra["spend_limit_reached"] == true && enabled == Some(true),
+    )
 }
 
 /// Codex's `wham/usage` reply (+ the plan claim) to the normalized shape.
@@ -456,10 +470,11 @@ pub fn normalize_codex(usage: &Value, meta: &Value, now: i64) -> Value {
             if !w.is_object() {
                 continue;
             }
-            let minutes = number(&w["limit_window_seconds"]).filter(|s| *s > 0.).map(|s| s / 60.);
-            let resets = time(&w["reset_at"]).or_else(|| {
-                number(&w["reset_after_seconds"]).and_then(|s| iso(now + s as i64))
-            });
+            let minutes = number(&w["limit_window_seconds"])
+                .filter(|s| *s > 0.)
+                .map(|s| s / 60.);
+            let resets = time(&w["reset_at"])
+                .or_else(|| number(&w["reset_after_seconds"]).and_then(|s| iso(now + s as i64)));
             windows.push(window(
                 minutes.map(kind_of_minutes).unwrap_or("other"),
                 label.clone(),
@@ -473,8 +488,16 @@ pub fn normalize_codex(usage: &Value, meta: &Value, now: i64) -> Value {
         }
     };
     add(None, &usage["rate_limit"]);
-    for extra in usage["additional_rate_limits"].as_array().into_iter().flatten().take(8) {
-        add(word(&extra["limit_name"]).or_else(|| word(&extra["metered_feature"])), &extra["rate_limit"]);
+    for extra in usage["additional_rate_limits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(8)
+    {
+        add(
+            word(&extra["limit_name"]).or_else(|| word(&extra["metered_feature"])),
+            &extra["rate_limit"],
+        );
     }
     let credits = &usage["credits"];
     v["credits"] = json!({
@@ -489,13 +512,18 @@ pub fn normalize_codex(usage: &Value, meta: &Value, now: i64) -> Value {
         v["credits"]["unlimited"] = json!(true);
     }
     v["windows"] = json!(windows);
-    let limited = usage["rate_limit"]["limit_reached"] == true || usage["rate_limit"]["allowed"] == false;
+    let limited =
+        usage["rate_limit"]["limit_reached"] == true || usage["rate_limit"]["allowed"] == false;
     settle(v, limited)
 }
 
 /// The Codex app-server's `account/rateLimits/read` reply (the fallback).
 pub fn normalize_codex_app_server(raw: &Value, meta: &Value, now: i64) -> Value {
-    let mut v = blank("codex", Some("codex app-server account/rateLimits/read"), now);
+    let mut v = blank(
+        "codex",
+        Some("codex app-server account/rateLimits/read"),
+        now,
+    );
     let mut buckets: Vec<(String, &Value)> = raw["rateLimitsByLimitId"]
         .as_object()
         .map(|m| m.iter().map(|(k, b)| (k.clone(), b)).collect())
@@ -528,7 +556,11 @@ pub fn normalize_codex_app_server(raw: &Value, meta: &Value, now: i64) -> Value 
         }
         let c = &b["credits"];
         if key == "codex" && c.is_object() {
-            v["credits"]["balance"] = json!(if c["unlimited"] == true { None } else { number(&c["balance"]).map(round2) });
+            v["credits"]["balance"] = json!(if c["unlimited"] == true {
+                None
+            } else {
+                number(&c["balance"]).map(round2)
+            });
             v["credits"]["currency"] = json!("credits");
             v["credits"]["extra_usage_enabled"] = json!(c["hasCredits"].as_bool());
             v["credits"]["overage_limit"] = json!(number(&b["individualLimit"]).map(round2));
@@ -542,11 +574,21 @@ pub fn normalize_codex_app_server(raw: &Value, meta: &Value, now: i64) -> Value 
 }
 
 /// Cursor's dashboard replies to the normalized shape. Any may be missing.
-pub fn normalize_cursor(period: Option<&Value>, summary: Option<&Value>, stripe: Option<&Value>, now: i64) -> Value {
+pub fn normalize_cursor(
+    period: Option<&Value>,
+    summary: Option<&Value>,
+    stripe: Option<&Value>,
+    now: i64,
+) -> Value {
     let mut v = blank("cursor", Some(CURSOR_PERIOD_URL), now);
     let null = Value::Null;
-    let (period, summary, stripe) = (period.unwrap_or(&null), summary.unwrap_or(&null), stripe.unwrap_or(&null));
-    v["plan"]["name"] = json!(word(&stripe["membershipType"]).or_else(|| word(&summary["membershipType"])));
+    let (period, summary, stripe) = (
+        period.unwrap_or(&null),
+        summary.unwrap_or(&null),
+        stripe.unwrap_or(&null),
+    );
+    v["plan"]["name"] =
+        json!(word(&stripe["membershipType"]).or_else(|| word(&summary["membershipType"])));
     v["plan"]["tier"] = json!(if stripe["isTeamMember"] == true {
         word(&stripe["teamMembershipType"]).map(|t| format!("team:{}", t.to_lowercase()))
     } else {
@@ -555,9 +597,15 @@ pub fn normalize_cursor(period: Option<&Value>, summary: Option<&Value>, stripe:
     v["plan"]["status"] = json!(word(&stripe["subscriptionStatus"]));
     let mut windows = Vec::new();
     // The current allowance (live: the weekly team allowance).
-    let (start, end) = (seconds(&period["billingCycleStart"]), seconds(&period["billingCycleEnd"]));
+    let (start, end) = (
+        seconds(&period["billingCycleStart"]),
+        seconds(&period["billingCycleEnd"]),
+    );
     if period["planUsage"].is_object() {
-        let minutes = start.zip(end).filter(|(s, e)| e > s).map(|(s, e)| (e - s) as f64 / 60.);
+        let minutes = start
+            .zip(end)
+            .filter(|(s, e)| e > s)
+            .map(|(s, e)| (e - s) as f64 / 60.);
         let plan = &period["planUsage"];
         let (used, limit) = (minor(&plan["totalSpend"], 2), minor(&plan["limit"], 2));
         windows.push(window(
@@ -566,7 +614,11 @@ pub fn normalize_cursor(period: Option<&Value>, summary: Option<&Value>, stripe:
             pct(&plan["totalPercentUsed"]),
             used,
             limit,
-            if used.is_some() || limit.is_some() { "usd" } else { "percent" },
+            if used.is_some() || limit.is_some() {
+                "usd"
+            } else {
+                "percent"
+            },
             time(&period["billingCycleEnd"]),
             minutes,
         ));
@@ -588,8 +640,14 @@ pub fn normalize_cursor(period: Option<&Value>, summary: Option<&Value>, stripe:
     // The billing cycle's included money (cents), when the summary reports it.
     let plan = &summary["individualUsage"]["plan"];
     if plan.is_object() && number(&plan["limit"]).is_some() {
-        let (s, e) = (seconds(&summary["billingCycleStart"]), seconds(&summary["billingCycleEnd"]));
-        let minutes = s.zip(e).filter(|(s, e)| e > s).map(|(s, e)| (e - s) as f64 / 60.);
+        let (s, e) = (
+            seconds(&summary["billingCycleStart"]),
+            seconds(&summary["billingCycleEnd"]),
+        );
+        let minutes = s
+            .zip(e)
+            .filter(|(s, e)| e > s)
+            .map(|(s, e)| (e - s) as f64 / 60.);
         windows.push(window(
             minutes.map(kind_of_minutes).unwrap_or("other"),
             Some("included_usd".into()),
@@ -604,7 +662,11 @@ pub fn normalize_cursor(period: Option<&Value>, summary: Option<&Value>, stripe:
     // On-demand (extra) usage: the member's own, else the team's.
     let own = &summary["individualUsage"]["onDemand"];
     let team = &summary["teamUsage"]["onDemand"];
-    let on_demand = if own["enabled"] == true || !team.is_object() { own } else { team };
+    let on_demand = if own["enabled"] == true || !team.is_object() {
+        own
+    } else {
+        team
+    };
     let customer = number(&stripe["customerBalance"]);
     v["credits"] = json!({
         "balance": customer.map(|c| round2((-c).max(0.) / 100.)),
@@ -622,13 +684,18 @@ pub fn normalize_cursor(period: Option<&Value>, summary: Option<&Value>, stripe:
 pub fn normalize_glm(quota: &Value, source: &str, now: i64) -> Value {
     let mut v = blank("glm", Some(source), now);
     let data = &quota["data"];
-    v["plan"]["name"] = json!(["level", "planName", "plan", "plan_type", "packageName"]
-        .iter()
-        .find_map(|k| word(&data[*k])));
+    v["plan"]["name"] = json!(
+        ["level", "planName", "plan", "plan_type", "packageName"]
+            .iter()
+            .find_map(|k| word(&data[*k]))
+    );
     let mut windows = Vec::new();
     for l in data["limits"].as_array().into_iter().flatten().take(16) {
         let ty = l["type"].as_str().unwrap_or("");
-        let (unit_code, n) = (number(&l["unit"]).unwrap_or(0.) as i64, number(&l["number"]).unwrap_or(1.).max(1.));
+        let (unit_code, n) = (
+            number(&l["unit"]).unwrap_or(0.) as i64,
+            number(&l["number"]).unwrap_or(1.).max(1.),
+        );
         let (kind, minutes) = match (ty, unit_code) {
             (_, 3) if n == 5. => ("5h", Some(300.)),
             (_, 3) => ("other", Some(n * 60.)),
@@ -667,7 +734,10 @@ pub struct Failure {
     pub retry_after: Option<i64>,
 }
 fn fail(detail: impl Into<String>) -> Failure {
-    Failure { detail: detail.into(), retry_after: None }
+    Failure {
+        detail: detail.into(),
+        retry_after: None,
+    }
 }
 /// The poll outcome: a normalized account, or "not readable" (no credential
 /// or an unsupported kind: not an error), or a failure.
@@ -680,7 +750,10 @@ fn check(r: Result<Response>, what: &str) -> std::result::Result<Value, Failure>
     let r = r.map_err(|_| fail(format!("{what} could not be reached")))?;
     match r.status {
         200 => Ok(r.body),
-        401 | 403 => Err(fail(format!("{what} refused the account's credential ({})", r.status))),
+        401 | 403 => Err(fail(format!(
+            "{what} refused the account's credential ({})",
+            r.status
+        ))),
         429 => Err(Failure {
             detail: format!("{what} rate-limited the usage read (429)"),
             retry_after: Some(r.retry_after.unwrap_or(900)),
@@ -705,7 +778,9 @@ impl Poller<'_> {
                     "codex" => self.codex(&c, now),
                     _ => self.cursor(&c, now),
                 },
-                Ok(None) => Outcome::Unavailable(format!("No {p} account is connected on this controller.")),
+                Ok(None) => {
+                    Outcome::Unavailable(format!("No {p} account is connected on this controller."))
+                }
                 Err(_) => Outcome::Failed(fail("The account's credential could not be read")),
             },
         }
@@ -720,21 +795,41 @@ impl Poller<'_> {
             );
         }
         if c.expired(now as f64, 60.) {
-            return Outcome::Failed(fail("The Claude access token has expired; usage is read again after the native refresh"));
+            return Outcome::Failed(fail(
+                "The Claude access token has expired; usage is read again after the native refresh",
+            ));
         }
         let auth = |r: Request| {
             r.header("authorization", format!("Bearer {}", c.secret()))
                 .header("anthropic-beta", "oauth-2025-04-20")
-                .header("user-agent", format!("claude-code/{}", enginebox_core::native_versions::CLAUDE_VERSION))
+                .header(
+                    "user-agent",
+                    format!(
+                        "claude-code/{}",
+                        enginebox_core::native_versions::CLAUDE_VERSION
+                    ),
+                )
         };
-        let usage = match check(self.http.send(&auth(Request::get(CLAUDE_USAGE_URL))), "Anthropic") {
+        let usage = match check(
+            self.http.send(&auth(Request::get(CLAUDE_USAGE_URL))),
+            "Anthropic",
+        ) {
             Ok(u) if u.is_object() => u,
             Ok(_) => return Outcome::Failed(fail("Anthropic's usage reply was not understood")),
             Err(f) => return Outcome::Failed(f),
         };
-        let cached = self.profile.lock().unwrap().clone().filter(|(at, _)| now - at < PROFILE_TTL);
+        let cached = self
+            .profile
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(at, _)| now - at < PROFILE_TTL);
         let profile = cached.map(|(_, p)| p).or_else(|| {
-            let p = check(self.http.send(&auth(Request::get(CLAUDE_PROFILE_URL))), "Anthropic").ok()?;
+            let p = check(
+                self.http.send(&auth(Request::get(CLAUDE_PROFILE_URL))),
+                "Anthropic",
+            )
+            .ok()?;
             // Keep only the plan facts (the reply names the person).
             let keep = json!({"organization": {
                 "organization_type": p["organization"]["organization_type"],
@@ -749,13 +844,25 @@ impl Poller<'_> {
     }
     fn codex(&self, c: &Credential, now: i64) -> Outcome {
         if c.kind == "api_key" {
-            return Outcome::Unavailable("Codex runs on an API key here, which has no ChatGPT plan usage.".into());
+            return Outcome::Unavailable(
+                "Codex runs on an API key here, which has no ChatGPT plan usage.".into(),
+            );
         }
-        if let Some(account) = c.account_id.as_deref().filter(|_| !c.expired(now as f64, 60.)) {
+        if let Some(account) = c
+            .account_id
+            .as_deref()
+            .filter(|_| !c.expired(now as f64, 60.))
+        {
             let request = Request::get(CODEX_USAGE_URL)
                 .header("authorization", format!("Bearer {}", c.secret()))
                 .header("chatgpt-account-id", account)
-                .header("user-agent", format!("codex_cli_rs/{}", enginebox_core::native_versions::CODEX_VERSION))
+                .header(
+                    "user-agent",
+                    format!(
+                        "codex_cli_rs/{}",
+                        enginebox_core::native_versions::CODEX_VERSION
+                    ),
+                )
                 .header("originator", "codex_cli_rs");
             match check(self.http.send(&request), "ChatGPT") {
                 Ok(u) if u.is_object() => return Outcome::Read(normalize_codex(&u, &c.meta, now)),
@@ -765,19 +872,31 @@ impl Poller<'_> {
         }
         // Expired or refused: the native client refreshes and answers itself.
         match self.accounts.codex_rate_limits() {
-            Ok(raw) if raw.is_object() => Outcome::Read(normalize_codex_app_server(&raw, &c.meta, now)),
-            _ => Outcome::Failed(fail("Codex usage could not be read (ChatGPT and the native app-server both failed)")),
+            Ok(raw) if raw.is_object() => {
+                Outcome::Read(normalize_codex_app_server(&raw, &c.meta, now))
+            }
+            _ => Outcome::Failed(fail(
+                "Codex usage could not be read (ChatGPT and the native app-server both failed)",
+            )),
         }
     }
     fn cursor(&self, c: &Credential, now: i64) -> Outcome {
         if c.kind == "api_key" {
-            return Outcome::Unavailable("Cursor runs on an API key here, which cannot read the personal dashboard's usage.".into());
+            return Outcome::Unavailable(
+                "Cursor runs on an API key here, which cannot read the personal dashboard's usage."
+                    .into(),
+            );
         }
         let Some(user) = c.account_id.as_deref() else {
-            return Outcome::Unavailable("The Cursor session does not name its user, so the dashboard cannot be read.".into());
+            return Outcome::Unavailable(
+                "The Cursor session does not name its user, so the dashboard cannot be read."
+                    .into(),
+            );
         };
         if c.expired(now as f64, 60.) {
-            return Outcome::Failed(fail("The Cursor session has expired; sign in to Cursor again on the controller"));
+            return Outcome::Failed(fail(
+                "The Cursor session has expired; sign in to Cursor again on the controller",
+            ));
         }
         let cookie = format!("WorkosCursorSessionToken={user}%3A%3A{}", c.secret());
         let auth = |r: Request| {
@@ -785,18 +904,32 @@ impl Poller<'_> {
                 .header("origin", "https://cursor.com")
                 .header("referer", "https://cursor.com/dashboard")
         };
-        let period = check(self.http.send(&auth(Request::post(CURSOR_PERIOD_URL, json!({})))), "Cursor");
+        let period = check(
+            self.http
+                .send(&auth(Request::post(CURSOR_PERIOD_URL, json!({})))),
+            "Cursor",
+        );
         if let Err(f) = &period
             && f.retry_after.is_some()
         {
             return Outcome::Failed(fail(&f.detail));
         }
-        let summary = check(self.http.send(&auth(Request::get(CURSOR_SUMMARY_URL))), "Cursor");
-        let (period, summary) = (period.ok().filter(Value::is_object), summary.ok().filter(Value::is_object));
+        let summary = check(
+            self.http.send(&auth(Request::get(CURSOR_SUMMARY_URL))),
+            "Cursor",
+        );
+        let (period, summary) = (
+            period.ok().filter(Value::is_object),
+            summary.ok().filter(Value::is_object),
+        );
         if period.is_none() && summary.is_none() {
             return Outcome::Failed(fail("Cursor's dashboard usage could not be read"));
         }
-        let stripe = check(self.http.send(&auth(Request::get(CURSOR_STRIPE_URL))), "Cursor").ok();
+        let stripe = check(
+            self.http.send(&auth(Request::get(CURSOR_STRIPE_URL))),
+            "Cursor",
+        )
+        .ok();
         let mut v = normalize_cursor(period.as_ref(), summary.as_ref(), stripe.as_ref(), now);
         if period.is_none() {
             v["source"] = json!(CURSOR_SUMMARY_URL);
@@ -808,16 +941,24 @@ impl Poller<'_> {
             return Outcome::Unavailable("No GLM Coding Plan key is saved on this controller (POST /v1/usage/accounts/glm/key).".into());
         };
         let Some(key) = saved["key"].as_str().filter(|k| !k.is_empty()) else {
-            return Outcome::Unavailable("No GLM Coding Plan key is saved on this controller.".into());
+            return Outcome::Unavailable(
+                "No GLM Coding Plan key is saved on this controller.".into(),
+            );
         };
-        let base = if saved["region"] == "china" { GLM_CHINA } else { GLM_GLOBAL };
+        let base = if saved["region"] == "china" {
+            GLM_CHINA
+        } else {
+            GLM_GLOBAL
+        };
         let url = format!("{base}{GLM_QUOTA_PATH}");
         let request = Request::get(&url)
             .header("authorization", key)
             .header("accept-language", "en-US,en")
             .header("content-type", "application/json");
         match check(self.http.send(&request), "Z.ai") {
-            Ok(q) if q["success"] == true && number(&q["code"]) == Some(200.) => Outcome::Read(normalize_glm(&q, &url, now)),
+            Ok(q) if q["success"] == true && number(&q["code"]) == Some(200.) => {
+                Outcome::Read(normalize_glm(&q, &url, now))
+            }
             Ok(_) => Outcome::Unavailable("Z.ai reports no Coding Plan for this key.".into()),
             Err(f) => Outcome::Failed(f),
         }
@@ -853,7 +994,9 @@ impl UsageAccounts {
         for p in PROVIDERS {
             let mut slot = Slot::default();
             if let Ok(saved) = state::read_json(&dir.join(format!("{p}.json"))) {
-                slot.account = saved["account"].is_object().then(|| saved["account"].clone());
+                slot.account = saved["account"]
+                    .is_object()
+                    .then(|| saved["account"].clone());
                 slot.last_attempt = saved["last_attempt"].as_i64().unwrap_or(0);
                 slot.failures = saved["failures"].as_u64().unwrap_or(0).min(16) as u32;
                 slot.backoff_until = saved["backoff_until"].as_i64().unwrap_or(0);
@@ -879,7 +1022,11 @@ impl UsageAccounts {
             b["detail"] = json!("Not read yet.");
             b
         });
-        v["checked_at"] = json!((slot.last_attempt > 0).then(|| iso(slot.last_attempt)).flatten());
+        v["checked_at"] = json!(
+            (slot.last_attempt > 0)
+                .then(|| iso(slot.last_attempt))
+                .flatten()
+        );
         v
     }
     /// Every account's last observation (no provider is contacted).
@@ -894,7 +1041,12 @@ impl UsageAccounts {
         Ok(json!({"account": self.view(p, slot)}))
     }
     /// The providers due now (pure apart from the clock it is given).
-    fn due(&self, activity: &BTreeMap<String, (bool, Option<String>)>, now: i64, force: bool) -> Vec<String> {
+    fn due(
+        &self,
+        activity: &BTreeMap<String, (bool, Option<String>)>,
+        now: i64,
+        force: bool,
+    ) -> Vec<String> {
         let slots = self.slots.lock().unwrap();
         PROVIDERS
             .iter()
@@ -911,7 +1063,13 @@ impl UsageAccounts {
                 let ended_since = finished
                     .and_then(|f| chrono::DateTime::parse_from_rfc3339(&f).ok())
                     .is_some_and(|f| f.timestamp() >= s.last_attempt);
-                ended_since || since >= if active { ACTIVE_INTERVAL } else { IDLE_INTERVAL }
+                ended_since
+                    || since
+                        >= if active {
+                            ACTIVE_INTERVAL
+                        } else {
+                            IDLE_INTERVAL
+                        }
             })
             .map(|p| (*p).to_owned())
             .collect()
@@ -921,7 +1079,12 @@ impl UsageAccounts {
         let due = self.due(&accounts.activity(), now, force);
         for p in &due {
             self.slots.lock().unwrap().get_mut(p).unwrap().last_attempt = now;
-            let poller = Poller { http: self.http.as_ref(), accounts, root: &self.root, profile: &self.profile };
+            let poller = Poller {
+                http: self.http.as_ref(),
+                accounts,
+                root: &self.root,
+                profile: &self.profile,
+            };
             let outcome = poller.read(p, now);
             self.record(p, outcome, now);
         }
@@ -949,7 +1112,9 @@ impl UsageAccounts {
                 slot.backoff_until = now + backoff.max(f.retry_after.unwrap_or(0));
                 // The last good observation stays, marked stale; never a guess.
                 let mut v = match slot.account.take() {
-                    Some(prev) if prev["fetched_at"].is_string() && prev["status"] != "unavailable" => {
+                    Some(prev)
+                        if prev["fetched_at"].is_string() && prev["status"] != "unavailable" =>
+                    {
                         let mut prev = prev;
                         prev["status"] = json!("stale");
                         prev
@@ -967,22 +1132,33 @@ impl UsageAccounts {
             }
         }
         let saved = json!({"account": slot.account, "last_attempt": slot.last_attempt, "failures": slot.failures, "backoff_until": slot.backoff_until});
-        if let Err(e) = state::write_json(&self.root.join("usage-accounts").join(format!("{p}.json")), &saved) {
-            eprintln!("{}", json!({"event":"enginebox.usage_accounts.store_failed","provider":p,"reason":e.to_string()}));
+        if let Err(e) = state::write_json(
+            &self.root.join("usage-accounts").join(format!("{p}.json")),
+            &saved,
+        ) {
+            eprintln!(
+                "{}",
+                json!({"event":"enginebox.usage_accounts.store_failed","provider":p,"reason":e.to_string()})
+            );
         }
     }
     /// The background step: start a poll thread when an account is due and
     /// none is running. Never blocks on a provider.
     pub fn tick(&self, accounts: Arc<dyn Accounts>) {
         let now = chrono::Utc::now().timestamp();
-        if self.due(&accounts.activity(), now, false).is_empty() || self.busy.swap(true, Ordering::SeqCst) {
+        if self.due(&accounts.activity(), now, false).is_empty()
+            || self.busy.swap(true, Ordering::SeqCst)
+        {
             return;
         }
         let this = self.clone();
         std::thread::spawn(move || {
             let read = this.poll(accounts.as_ref(), chrono::Utc::now().timestamp(), false);
             if !read.is_empty() {
-                eprintln!("{}", json!({"event":"enginebox.usage_accounts.polled","providers":read}));
+                eprintln!(
+                    "{}",
+                    json!({"event":"enginebox.usage_accounts.polled","providers":read})
+                );
             }
             this.busy.store(false, Ordering::SeqCst);
         });
@@ -999,7 +1175,10 @@ impl UsageAccounts {
             "china" => "china",
             _ => anyhow::bail!("region is global (api.z.ai) or china (open.bigmodel.cn)."),
         };
-        state::write_json(&glm_key_path(&self.root), &json!({"key": key, "region": region}))?;
+        state::write_json(
+            &glm_key_path(&self.root),
+            &json!({"key": key, "region": region}),
+        )?;
         // Read it on the next tick.
         let mut slots = self.slots.lock().unwrap();
         let slot = slots.get_mut("glm").unwrap();
@@ -1026,7 +1205,9 @@ mod tests {
     const NOW: i64 = 1_794_384_000; // 2026-11-11T08:00:00Z
 
     fn fixture(name: &str) -> Value {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/usage").join(name);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/usage")
+            .join(name);
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
     fn win<'a>(v: &'a Value, kind: &str, label: Option<&str>) -> &'a Value {
@@ -1041,12 +1222,20 @@ mod tests {
     #[test]
     fn claude_live_reply_normalizes_windows_plan_and_extra_usage() {
         let meta = json!({"subscription_type": "team", "rate_limit_tier": "default_claude_max_5x", "scopes": ["user:inference", "user:profile"]});
-        let v = normalize_claude(&fixture("claude-oauth-usage.json"), Some(&fixture("claude-oauth-profile.json")), &meta, NOW);
+        let v = normalize_claude(
+            &fixture("claude-oauth-usage.json"),
+            Some(&fixture("claude-oauth-profile.json")),
+            &meta,
+            NOW,
+        );
         assert_eq!(v["provider"], "claude");
         assert_eq!(v["plan"]["name"], "team");
         assert_eq!(v["plan"]["tier"], "default_claude_max_5x");
         assert_eq!(v["plan"]["status"], "active");
-        assert!(v["plan"]["price_usd_month"].is_null(), "no price is reported, none is guessed");
+        assert!(
+            v["plan"]["price_usd_month"].is_null(),
+            "no price is reported, none is guessed"
+        );
         let five = win(&v, "5h", Some("five_hour"));
         assert_eq!(five["used_pct"], 100.0);
         assert_eq!(five["resets_at"], "2026-11-07T09:50:00+00:00");
@@ -1075,26 +1264,41 @@ mod tests {
         let v = normalize_claude(&usage, None, &json!({}), NOW);
         assert_eq!(win(&v, "weekly", Some("seven_day_sonnet"))["used_pct"], 5.0);
         let m = win(&v, "monthly", Some("extra_usage"));
-        assert_eq!((m["used"].as_f64(), m["limit"].as_f64()), (Some(12.34), Some(50.0)));
+        assert_eq!(
+            (m["used"].as_f64(), m["limit"].as_f64()),
+            (Some(12.34), Some(50.0))
+        );
         assert_eq!(v["credits"]["overage_limit"], 50.0);
         assert_eq!(v["status"], "ok");
     }
 
     #[test]
     fn codex_live_reply_normalizes_weekly_window_plan_and_credits() {
-        let v = normalize_codex(&fixture("codex-wham-usage.json"), &json!({"plan_type": "pro"}), NOW);
+        let v = normalize_codex(
+            &fixture("codex-wham-usage.json"),
+            &json!({"plan_type": "pro"}),
+            NOW,
+        );
         assert_eq!(v["plan"]["name"], "pro");
         let week = win(&v, "weekly", None);
         assert_eq!(week["used_pct"], 27.0);
         assert_eq!(week["window_minutes"], 10080.0);
         assert_eq!(week["resets_at"], "2026-11-12T07:01:21+00:00");
-        assert_eq!(v["windows"].as_array().unwrap().len(), 1, "secondary_window is null");
+        assert_eq!(
+            v["windows"].as_array().unwrap().len(),
+            1,
+            "secondary_window is null"
+        );
         assert_eq!(v["credits"]["balance"], 19093.36);
         assert_eq!(v["credits"]["currency"], "credits");
         assert_eq!(v["credits"]["extra_usage_enabled"], true);
         assert!(v["credits"]["overage_limit"].is_null());
         assert_eq!(v["status"], "ok");
-        let limited = normalize_codex(&json!({"plan_type":"plus","rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":1794390000}}}), &json!({}), NOW);
+        let limited = normalize_codex(
+            &json!({"plan_type":"plus","rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":1794390000}}}),
+            &json!({}),
+            NOW,
+        );
         assert_eq!(win(&limited, "5h", None)["used_pct"], 100.0);
         assert_eq!(limited["status"], "limited");
     }
@@ -1106,7 +1310,10 @@ mod tests {
         let v = normalize_codex_app_server(&raw, &json!({}), NOW);
         assert_eq!(v["plan"]["name"], "pro");
         assert_eq!(win(&v, "5h", None)["used_pct"], 15.0);
-        assert_eq!(win(&v, "weekly", None)["resets_at"], "2026-11-12T07:01:21+00:00");
+        assert_eq!(
+            win(&v, "weekly", None)["resets_at"],
+            "2026-11-12T07:01:21+00:00"
+        );
         assert_eq!(v["credits"]["balance"], 150.0);
         assert_eq!(v["credits"]["extra_usage_enabled"], true);
     }
@@ -1127,7 +1334,10 @@ mod tests {
         assert_eq!(week["resets_at"], "2026-11-13T14:59:39+00:00");
         assert_eq!(win(&v, "weekly", Some("auto"))["used_pct"], 8.33);
         let month = win(&v, "monthly", Some("included_usd"));
-        assert_eq!((month["used"].as_f64(), month["limit"].as_f64()), (Some(0.0), Some(553.95)));
+        assert_eq!(
+            (month["used"].as_f64(), month["limit"].as_f64()),
+            (Some(0.0), Some(553.95))
+        );
         assert_eq!(month["resets_at"], "2026-12-01T00:00:00+00:00");
         assert_eq!(v["credits"]["extra_usage_enabled"], false);
         assert_eq!(v["credits"]["overage_spend"], 0.0);
@@ -1151,11 +1361,25 @@ mod tests {
         let v = normalize_glm(&q, "https://api.z.ai/api/monitor/usage/quota/limit", NOW);
         assert_eq!(v["plan"]["name"], "pro");
         let five = win(&v, "5h", Some("tokens_limit"));
-        assert_eq!((five["used_pct"].as_f64(), five["used"].as_f64(), five["limit"].as_f64()), (Some(12.0), Some(96e6), Some(8e8)));
+        assert_eq!(
+            (
+                five["used_pct"].as_f64(),
+                five["used"].as_f64(),
+                five["limit"].as_f64()
+            ),
+            (Some(12.0), Some(96e6), Some(8e8))
+        );
         assert_eq!(five["resets_at"], "2026-11-11T13:00:00+00:00");
         assert_eq!(win(&v, "weekly", Some("tokens_limit"))["used_pct"], 4.0);
         let tools = win(&v, "monthly", Some("time_limit"));
-        assert_eq!((tools["used"].as_f64(), tools["limit"].as_f64(), tools["unit"].as_str()), (Some(37.0), Some(1000.0), Some("tool_calls")));
+        assert_eq!(
+            (
+                tools["used"].as_f64(),
+                tools["limit"].as_f64(),
+                tools["unit"].as_str()
+            ),
+            (Some(37.0), Some(1000.0), Some("tool_calls"))
+        );
         assert!(tools["resets_at"].is_null());
         assert!(v["credits"]["balance"].is_null() && v["credits"]["extra_usage_enabled"].is_null());
     }
@@ -1168,12 +1392,28 @@ mod tests {
             normalize_cursor(None, None, None, NOW),
             normalize_glm(&json!({}), "x", NOW),
         ] {
-            assert!(v["plan"]["name"].is_null() && v["plan"]["tier"].is_null() && v["plan"]["price_usd_month"].is_null(), "{v}");
+            assert!(
+                v["plan"]["name"].is_null()
+                    && v["plan"]["tier"].is_null()
+                    && v["plan"]["price_usd_month"].is_null(),
+                "{v}"
+            );
             assert_eq!(v["windows"], json!([]));
-            assert!(v["credits"].as_object().unwrap().values().all(Value::is_null), "{v}");
+            assert!(
+                v["credits"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(Value::is_null),
+                "{v}"
+            );
         }
         // out-of-range and malformed numbers are dropped, not clamped
-        let v = normalize_codex(&json!({"rate_limit":{"primary_window":{"used_percent":-3,"limit_window_seconds":"x","reset_at":"soon"}}}), &json!({}), NOW);
+        let v = normalize_codex(
+            &json!({"rate_limit":{"primary_window":{"used_percent":-3,"limit_window_seconds":"x","reset_at":"soon"}}}),
+            &json!({}),
+            NOW,
+        );
         assert!(v["windows"][0]["used_pct"].is_null() && v["windows"][0]["resets_at"].is_null());
     }
 
@@ -1186,17 +1426,38 @@ mod tests {
     impl Fake {
         fn new(replies: &[(&str, u16, Value)]) -> Arc<Self> {
             Arc::new(Self {
-                replies: Mutex::new(replies.iter().map(|(u, s, b)| ((*u).to_owned(), (*s, b.clone()))).collect()),
+                replies: Mutex::new(
+                    replies
+                        .iter()
+                        .map(|(u, s, b)| ((*u).to_owned(), (*s, b.clone())))
+                        .collect(),
+                ),
                 seen: Mutex::new(Vec::new()),
             })
         }
     }
     impl Http for Fake {
         fn send(&self, r: &Request) -> Result<Response> {
-            let auth = r.header_value("authorization").or(r.header_value("cookie")).map(str::to_owned);
-            self.seen.lock().unwrap().push((r.url.clone(), r.header_names(), auth));
-            let (status, body) = self.replies.lock().unwrap().get(&r.url).cloned().unwrap_or((404, Value::Null));
-            Ok(Response { status, body, retry_after: (status == 429).then_some(120) })
+            let auth = r
+                .header_value("authorization")
+                .or(r.header_value("cookie"))
+                .map(str::to_owned);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((r.url.clone(), r.header_names(), auth));
+            let (status, body) = self
+                .replies
+                .lock()
+                .unwrap()
+                .get(&r.url)
+                .cloned()
+                .unwrap_or((404, Value::Null));
+            Ok(Response {
+                status,
+                body,
+                retry_after: (status == 429).then_some(120),
+            })
         }
     }
     struct FakeAccounts {
@@ -1228,7 +1489,10 @@ mod tests {
             self.codex_raw.clone().context("no app-server")
         }
         fn activity(&self) -> BTreeMap<String, (bool, Option<String>)> {
-            ["claude", "codex", "cursor"].iter().map(|p| ((*p).to_owned(), (self.active, self.finished.clone()))).collect()
+            ["claude", "codex", "cursor"]
+                .iter()
+                .map(|p| ((*p).to_owned(), (self.active, self.finished.clone())))
+                .collect()
         }
     }
 
@@ -1237,18 +1501,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::new(&[
             (CLAUDE_USAGE_URL, 200, fixture("claude-oauth-usage.json")),
-            (CLAUDE_PROFILE_URL, 200, fixture("claude-oauth-profile.json")),
+            (
+                CLAUDE_PROFILE_URL,
+                200,
+                fixture("claude-oauth-profile.json"),
+            ),
             (CODEX_USAGE_URL, 200, fixture("codex-wham-usage.json")),
-            (CURSOR_PERIOD_URL, 200, fixture("cursor-current-period-usage.json")),
-            (CURSOR_SUMMARY_URL, 200, fixture("cursor-usage-summary.json")),
+            (
+                CURSOR_PERIOD_URL,
+                200,
+                fixture("cursor-current-period-usage.json"),
+            ),
+            (
+                CURSOR_SUMMARY_URL,
+                200,
+                fixture("cursor-usage-summary.json"),
+            ),
             (CURSOR_STRIPE_URL, 200, fixture("cursor-auth-stripe.json")),
         ]);
-        let store = UsageAccounts::open(dir.path()).unwrap().with_http(fake.clone());
-        let accounts = FakeAccounts { active: false, finished: None, codex_raw: None };
+        let store = UsageAccounts::open(dir.path())
+            .unwrap()
+            .with_http(fake.clone());
+        let accounts = FakeAccounts {
+            active: false,
+            finished: None,
+            codex_raw: None,
+        };
         let read = store.poll(&accounts, NOW, false);
         assert_eq!(read, vec!["claude", "codex", "cursor", "glm"]);
         let list = store.list();
-        let by = |p: &str| list["accounts"].as_array().unwrap().iter().find(|a| a["provider"] == p).unwrap().clone();
+        let by = |p: &str| {
+            list["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["provider"] == p)
+                .unwrap()
+                .clone()
+        };
         assert_eq!(by("claude")["status"], "limited");
         assert_eq!(by("codex")["credits"]["balance"], 19093.36);
         assert_eq!(by("cursor")["plan"]["name"], "enterprise");
@@ -1258,50 +1548,135 @@ mod tests {
         let seen = fake.seen.lock().unwrap();
         let auth_of = |u: &str| seen.iter().find(|s| s.0 == u).unwrap().2.clone().unwrap();
         assert_eq!(auth_of(CLAUDE_USAGE_URL), format!("Bearer {SECRET}"));
-        assert!(seen.iter().find(|s| s.0 == CLAUDE_USAGE_URL).unwrap().1.contains(&"anthropic-beta"));
-        assert!(seen.iter().find(|s| s.0 == CODEX_USAGE_URL).unwrap().1.contains(&"chatgpt-account-id"));
-        assert_eq!(auth_of(CURSOR_PERIOD_URL), format!("WorkosCursorSessionToken=user_1%3A%3A{SECRET}"));
-        assert!(seen.iter().find(|s| s.0 == CURSOR_PERIOD_URL).unwrap().1.contains(&"origin"));
+        assert!(
+            seen.iter()
+                .find(|s| s.0 == CLAUDE_USAGE_URL)
+                .unwrap()
+                .1
+                .contains(&"anthropic-beta")
+        );
+        assert!(
+            seen.iter()
+                .find(|s| s.0 == CODEX_USAGE_URL)
+                .unwrap()
+                .1
+                .contains(&"chatgpt-account-id")
+        );
+        assert_eq!(
+            auth_of(CURSOR_PERIOD_URL),
+            format!("WorkosCursorSessionToken=user_1%3A%3A{SECRET}")
+        );
+        assert!(
+            seen.iter()
+                .find(|s| s.0 == CURSOR_PERIOD_URL)
+                .unwrap()
+                .1
+                .contains(&"origin")
+        );
         drop(seen);
         // nothing stored or served carries the token
         assert!(!list.to_string().contains("SECRET"));
         for p in PROVIDERS {
-            let raw = std::fs::read_to_string(dir.path().join("usage-accounts").join(format!("{p}.json"))).unwrap();
+            let raw = std::fs::read_to_string(
+                dir.path().join("usage-accounts").join(format!("{p}.json")),
+            )
+            .unwrap();
             assert!(!raw.contains("SECRET"), "{p}");
         }
-        assert!(!format!("{:?}", accounts.credential("claude").unwrap().unwrap()).contains("SECRET"));
-        assert!(!format!("{:?}", Request::get(CLAUDE_USAGE_URL).header("authorization", SECRET)).contains("SECRET"));
+        assert!(
+            !format!("{:?}", accounts.credential("claude").unwrap().unwrap()).contains("SECRET")
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                Request::get(CLAUDE_USAGE_URL).header("authorization", SECRET)
+            )
+            .contains("SECRET")
+        );
         // a restart serves the stored observation
         let reopened = UsageAccounts::open(dir.path()).unwrap();
-        assert_eq!(reopened.get("codex").unwrap()["account"]["plan"]["name"], "pro");
+        assert_eq!(
+            reopened.get("codex").unwrap()["account"]["plan"]["name"],
+            "pro"
+        );
     }
 
     #[test]
     fn schedule_active_idle_run_end_and_backoff() {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::new(&[(CODEX_USAGE_URL, 200, fixture("codex-wham-usage.json"))]);
-        let store = UsageAccounts::open(dir.path()).unwrap().with_http(fake.clone());
-        let idle = FakeAccounts { active: false, finished: None, codex_raw: None };
+        let store = UsageAccounts::open(dir.path())
+            .unwrap()
+            .with_http(fake.clone());
+        let idle = FakeAccounts {
+            active: false,
+            finished: None,
+            codex_raw: None,
+        };
         store.poll(&idle, NOW, false);
         // idle: not again before 30 minutes
-        assert!(!store.due(&idle.activity(), NOW + ACTIVE_INTERVAL, false).contains(&"codex".to_owned()));
-        assert!(store.due(&idle.activity(), NOW + IDLE_INTERVAL, false).contains(&"codex".to_owned()));
+        assert!(
+            !store
+                .due(&idle.activity(), NOW + ACTIVE_INTERVAL, false)
+                .contains(&"codex".to_owned())
+        );
+        assert!(
+            store
+                .due(&idle.activity(), NOW + IDLE_INTERVAL, false)
+                .contains(&"codex".to_owned())
+        );
         // active runs: every 5 minutes
-        let active = FakeAccounts { active: true, finished: None, codex_raw: None };
-        assert!(store.due(&active.activity(), NOW + ACTIVE_INTERVAL, false).contains(&"codex".to_owned()));
+        let active = FakeAccounts {
+            active: true,
+            finished: None,
+            codex_raw: None,
+        };
+        assert!(
+            store
+                .due(&active.activity(), NOW + ACTIVE_INTERVAL, false)
+                .contains(&"codex".to_owned())
+        );
         // a run that ended after the last poll: right away (after the minimum gap)
-        let ended = FakeAccounts { active: false, finished: iso(NOW + 90), codex_raw: None };
-        assert!(!store.due(&ended.activity(), NOW + 30, false).contains(&"codex".to_owned()));
-        assert!(store.due(&ended.activity(), NOW + 120, false).contains(&"codex".to_owned()));
+        let ended = FakeAccounts {
+            active: false,
+            finished: iso(NOW + 90),
+            codex_raw: None,
+        };
+        assert!(
+            !store
+                .due(&ended.activity(), NOW + 30, false)
+                .contains(&"codex".to_owned())
+        );
+        assert!(
+            store
+                .due(&ended.activity(), NOW + 120, false)
+                .contains(&"codex".to_owned())
+        );
         // claude failed (no fixture: 404) -> error with backoff; cursor too
         let claude = store.get("claude").unwrap()["account"].clone();
         assert_eq!(claude["status"], "error");
         assert!(claude["fetched_at"].is_null());
-        assert!(!store.due(&active.activity(), NOW + ACTIVE_INTERVAL - 1, false).contains(&"claude".to_owned()));
+        assert!(
+            !store
+                .due(&active.activity(), NOW + ACTIVE_INTERVAL - 1, false)
+                .contains(&"claude".to_owned())
+        );
         // a second failure doubles the backoff
         store.poll(&active, NOW + ACTIVE_INTERVAL, false);
-        assert!(!store.due(&active.activity(), NOW + ACTIVE_INTERVAL + 2 * ACTIVE_INTERVAL - 1, false).contains(&"claude".to_owned()));
-        assert!(store.due(&active.activity(), NOW + 3 * ACTIVE_INTERVAL, false).contains(&"claude".to_owned()));
+        assert!(
+            !store
+                .due(
+                    &active.activity(),
+                    NOW + ACTIVE_INTERVAL + 2 * ACTIVE_INTERVAL - 1,
+                    false
+                )
+                .contains(&"claude".to_owned())
+        );
+        assert!(
+            store
+                .due(&active.activity(), NOW + 3 * ACTIVE_INTERVAL, false)
+                .contains(&"claude".to_owned())
+        );
     }
 
     #[test]
@@ -1309,17 +1684,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ok = Fake::new(&[(CODEX_USAGE_URL, 200, fixture("codex-wham-usage.json"))]);
         let store = UsageAccounts::open(dir.path()).unwrap().with_http(ok);
-        let a = FakeAccounts { active: true, finished: None, codex_raw: None };
+        let a = FakeAccounts {
+            active: true,
+            finished: None,
+            codex_raw: None,
+        };
         store.poll(&a, NOW, false);
         let limited = Fake::new(&[(CODEX_USAGE_URL, 429, Value::Null)]);
         let store = store.with_http(limited);
         store.poll(&a, NOW + ACTIVE_INTERVAL, false);
         let codex = store.get("codex").unwrap()["account"].clone();
         assert_eq!(codex["status"], "stale");
-        assert_eq!(codex["windows"][0]["used_pct"], 27.0, "the last good reading, with its fetched_at");
+        assert_eq!(
+            codex["windows"][0]["used_pct"], 27.0,
+            "the last good reading, with its fetched_at"
+        );
         assert!(codex["detail"].as_str().unwrap().contains("429"));
         // 429 without Retry-After in the fake -> 120 s, under the 300 s backoff floor
-        assert!(!store.due(&a.activity(), NOW + 2 * ACTIVE_INTERVAL - 1, false).contains(&"codex".to_owned()));
+        assert!(
+            !store
+                .due(&a.activity(), NOW + 2 * ACTIVE_INTERVAL - 1, false)
+                .contains(&"codex".to_owned())
+        );
     }
 
     #[test]
@@ -1327,7 +1713,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let refused = Fake::new(&[(CODEX_USAGE_URL, 401, Value::Null)]);
         let store = UsageAccounts::open(dir.path()).unwrap().with_http(refused);
-        let a = FakeAccounts { active: false, finished: None, codex_raw: Some(json!({"rateLimits":{"primary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1794466881},"planType":"plus"}})) };
+        let a = FakeAccounts {
+            active: false,
+            finished: None,
+            codex_raw: Some(
+                json!({"rateLimits":{"primary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1794466881},"planType":"plus"}}),
+            ),
+        };
         store.poll(&a, NOW, false);
         let codex = store.get("codex").unwrap()["account"].clone();
         assert_eq!(codex["plan"]["name"], "plus");
@@ -1353,25 +1745,45 @@ mod tests {
                 BTreeMap::new()
             }
         }
-        let store = UsageAccounts::open(dir.path()).unwrap().with_http(fake.clone());
+        let store = UsageAccounts::open(dir.path())
+            .unwrap()
+            .with_http(fake.clone());
         store.poll(&Setup, NOW, false);
-        assert!(fake.seen.lock().unwrap().is_empty(), "no provider request without a usable credential");
+        assert!(
+            fake.seen.lock().unwrap().is_empty(),
+            "no provider request without a usable credential"
+        );
         let c = store.get("claude").unwrap()["account"].clone();
         assert_eq!(c["status"], "unavailable");
         assert!(c["detail"].as_str().unwrap().contains("user:profile"));
-        assert_eq!(store.get("codex").unwrap()["account"]["status"], "unavailable");
+        assert_eq!(
+            store.get("codex").unwrap()["account"]["status"],
+            "unavailable"
+        );
     }
 
     #[test]
     fn glm_key_is_write_only_and_read_with_the_plugin_auth_form() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("{GLM_GLOBAL}{GLM_QUOTA_PATH}");
-        let fake = Fake::new(&[(url.as_str(), 200, json!({"code":200,"success":true,"data":{"level":"lite","limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":100,"nextResetTime":1794402000000_i64}]}}))]);
-        let store = UsageAccounts::open(dir.path()).unwrap().with_http(fake.clone());
+        let fake = Fake::new(&[(
+            url.as_str(),
+            200,
+            json!({"code":200,"success":true,"data":{"level":"lite","limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":100,"nextResetTime":1794402000000_i64}]}}),
+        )]);
+        let store = UsageAccounts::open(dir.path())
+            .unwrap()
+            .with_http(fake.clone());
         assert!(store.set_glm_key(&json!({"key":"short"})).is_err());
-        let saved = store.set_glm_key(&json!({"key":"zai-0123456789abcdef.SECRETKEY"})).unwrap();
+        let saved = store
+            .set_glm_key(&json!({"key":"zai-0123456789abcdef.SECRETKEY"}))
+            .unwrap();
         assert!(!saved.to_string().contains("SECRET"));
-        let none = FakeAccounts { active: false, finished: None, codex_raw: None };
+        let none = FakeAccounts {
+            active: false,
+            finished: None,
+            codex_raw: None,
+        };
         store.poll(&none, NOW, false);
         let g = store.get("glm").unwrap();
         assert!(!g.to_string().contains("SECRET"));
@@ -1379,7 +1791,11 @@ mod tests {
         assert_eq!(g["account"]["status"], "limited");
         let seen = fake.seen.lock().unwrap();
         let glm = seen.iter().find(|s| s.0 == url).unwrap();
-        assert_eq!(glm.2.as_deref(), Some("zai-0123456789abcdef.SECRETKEY"), "no Bearer prefix, as the official plugin sends it");
+        assert_eq!(
+            glm.2.as_deref(),
+            Some("zai-0123456789abcdef.SECRETKEY"),
+            "no Bearer prefix, as the official plugin sends it"
+        );
         drop(seen);
         store.delete_glm_key().unwrap();
         assert!(!glm_key_path(dir.path()).exists());
@@ -1393,6 +1809,9 @@ mod tests {
             {"provider":"codex","status":"failed","finished_at":"2026-11-07T07:30:00+00:00"}]});
         let a = activity_of(&runs);
         assert_eq!(a["claude"], (true, None));
-        assert_eq!(a["codex"], (false, Some("2026-11-07T07:30:00+00:00".into())));
+        assert_eq!(
+            a["codex"],
+            (false, Some("2026-11-07T07:30:00+00:00".into()))
+        );
     }
 }
