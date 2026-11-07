@@ -8116,6 +8116,14 @@ mod tests {
             json!({"provider":"claude","kind":"personal","label":"c","owner_user_id":"usr_cccccccccccccccccccccccc","share_with_org_pools":true}),
         );
         creds.connect_for_test(&carol, &claude_file("sk-ant-oat01-carol-0123456789"));
+        // Bob's own subscription made on the dashboard is not one an app
+        // connected: it is never used for his app runs either.
+        let bobs_dashboard =
+            mk(json!({"provider":"claude","kind":"personal","label":"b","owner_user_id":BOB}));
+        creds.connect_for_test(
+            &bobs_dashboard,
+            &claude_file("sk-ant-oat01-bob-dash-0123456789"),
+        );
         // Bob has none of his own: refused, never another's.
         let (status, refused) = call(&app, bearer(Method::POST, runs, start, &bob)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");

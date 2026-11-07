@@ -1203,7 +1203,10 @@ impl Credentials {
         let own: Vec<String> = self
             .candidates(org, provider, Some(member))
             .into_iter()
-            .filter(|c| c.reason == "own" && c.kind == Kind::Personal)
+            // Only a credential the member connected through an app.
+            .filter(|c| {
+                c.reason == "own" && c.kind == Kind::Personal && self.is_member_connected(&c.id)
+            })
             .map(|c| c.id)
             .collect();
         let chosen = match requested {
@@ -1239,6 +1242,7 @@ impl Credentials {
                 c.kind == Kind::Personal
                     && c.owner_user_id.as_deref() == Some(run.member.as_str())
                     && c.provider == provider
+                    && self.member.lock().unwrap().contains_key(&c.id)
             })
             .context("The run's own credential is gone; reconnect the subscription.")?;
         ensure!(
