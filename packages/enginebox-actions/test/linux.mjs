@@ -7,7 +7,8 @@ const owner = `ebox-preparation-${randomUUID()}`, image = `${owner}:test`, conta
 const root = resolve(import.meta.dirname, '../..');
 function docker(args, capture = false) {
   const result = spawnSync('docker', args, { stdio: capture ? 'pipe' : 'inherit', encoding: 'utf8', timeout: 600_000 });
-  assert(!result.error && result.status === 0, 'Disposable preparation fixture failed');
+  assert(!result.error && result.status === 0,
+    `Disposable preparation fixture failed (docker ${args[0]}): ${result.error?.message ?? (result.signal ? `signal ${result.signal}` : `exit ${result.status}`)}`);
   return result.stdout;
 }
 try {

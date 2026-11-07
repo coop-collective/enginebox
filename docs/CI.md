@@ -348,13 +348,57 @@ The optional [GitHub account and Actions service](GITHUB-ACTIONS.md) adds separa
 
 ## This repository's own CI on Engine Box
 
-The Linux jobs in `verify.yml`, `native-gpu-node.yml` (package and controller
-preview), `release.yml` (x86_64 package) and the Docker jobs (`linux-image`,
-`linux-node`) take their runner from repository variables and fall back to
+The Linux jobs take their runner from repository variables and fall back to
 GitHub-hosted `ubuntu-24.04` when unset:
 
-- `ENGINEBOX_LINUX_RUNNER`: for example `{"group":"enginebox-ci","labels":"enginebox-linux"}`
-- `ENGINEBOX_LINUX_DOCKER_RUNNER`: the same, once the CI template provides Docker
+- `ENGINEBOX_LINUX_RUNNER`: `native-gpu-node.yml` (package and controller preview)
+  and `release.yml` (x86_64 package); for example
+  `{"group":"enginebox-ci","labels":"enginebox-linux"}`.
+- `ENGINEBOX_LINUX_DOCKER_RUNNER`: `verify.yml`, `linux-image` and `linux-node`;
+  set only after the CI template provides Docker and Docker Compose usable by
+  the non-root runner inside its disposable VM. Full verification needs Docker
+  for the protected dependency handoff fixture and Compose for fleet smoke.
+  `verify.yml` checks both prerequisites before installing/building the workspace.
+
+Before enabling full Linux verification, qualify that exact template with the
+complete `verify.yml` Linux job, including preparation proof, toolchain downloads,
+fleet smoke and browser tests. A native runner canary proves registration and its
+own small test suite, not these additional capabilities. Keep the variable unset
+until that full qualification succeeds.
+
+The pinned [Ubuntu 24.04 Docker preparation recipe](../examples/ci/prepare-linux-docker.sh)
+runs as root **inside a new credential-free CI template clone**, never on the
+controller host or an assigned runner. It installs Docker 29.1.3, Compose 2.40.3,
+buildx 0.30.1 and git-lfs 3.4.1 from Ubuntu packages, enables the guest daemon and
+sets the guest Docker socket to mode `0660`, owned by root and the runner's
+primary group. Incus starts the worker with numeric UID/GID and no supplemental
+groups, so adding the account to the Docker group alone is insufficient. It
+refuses a registered Actions installation and verifies Docker/Compose and sudo
+with that same non-root identity and cleared supplemental groups.
+The Docker socket stays inside that disposable VM; do not mount a host socket.
+Record the package versions, then run `pnpm test:preparation:linux` and the full
+Linux workflow in a disposable child before routing production CI to the image.
+Use the worker's `incus exec --user=UID --group=GID` identity for qualification;
+`su` or `runuser` can mask socket permission failures by adding account groups.
+Remove qualification source and credentials, run `enginebox-host clean-base-check`
+and `enginebox-host reset-base-identity`, stop the new base and create its clean,
+stateless snapshot using the normal template procedure. Preserve the previous
+source/snapshot for rollback. Updating this recipe does not update any live image.
+
+Set the clone's root device size while stopped, then verify both
+`blockdev --getsize64 /dev/sda` and `df -h /` after boot. Qualification of a fresh
+60 GiB clone confirmed the expected filesystem capacity. A separately resized,
+already-booted test VM retained a 20 GiB filesystem on a 30 GiB block device until
+explicitly grown; that observation does not establish a production worker clone
+bug. A configured disk allowance alone is not proof of usable filesystem capacity.
+
+This dedicated CI recipe also installs an idempotent, grow-only boot guard for the
+qualified Ubuntu layout (`/dev/sda2`, ext4, with only the EFI and root partitions).
+It verifies the layout and keeps the filesystem expanded if a future prepared
+image or resize path leaves it smaller. It rejects other layouts and never formats
+a disk or re-enables cloud-init. In the fresh 60 GiB qualification its journal
+reported that the partition/filesystem were already expanded; no resizing speed
+or causality claim follows from that successful boot.
 
 Only runs on `main` use Engine Box: the `enginebox-ci` runner group accepts an allow-list of workflows at `refs/heads/main`, so pull-request runs stay on GitHub-hosted runners. Clearing a variable moves those jobs back to GitHub. Publish and deploy jobs stay
 GitHub-hosted. Windows and macOS jobs stay on GitHub because Engine Box has no
