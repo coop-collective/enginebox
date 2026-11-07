@@ -34,7 +34,7 @@
 //! Unity accounts live under `agent-credentials/unity/<id>.json` (a directory
 //! older controllers do not read, so a rollback keeps working), their password
 //! in `agent-credentials/keys/<id>.json`.
-use crate::unity;
+use crate::{sealed, unity};
 use anyhow::{Context, Result, ensure};
 use enginebox_agents::{auth, native, pools, security};
 use enginebox_core::state;
@@ -273,6 +273,9 @@ pub struct Credentials {
     unity: Arc<Mutex<BTreeMap<String, UnityAccount>>>,
     unity_login: unity::Client,
     member: Arc<Mutex<BTreeMap<String, MemberMeta>>>,
+    /// The key-encryption key for members' sealed homes (sealed.rs). Member
+    /// subscriptions are refused without one.
+    kek: Option<sealed::Kek>,
 }
 
 fn valid_user(id: &str) -> bool {
@@ -366,7 +369,7 @@ impl Credentials {
                 eprintln!("credentials: an orphaned member marker could not be removed: {error}");
             }
         }
-        Ok(Self {
+        let this = Self {
             root: records_dir,
             binaries: Arc::new(binaries),
             records: Arc::new(Mutex::new(records)),
@@ -374,6 +377,70 @@ impl Credentials {
             unity: Arc::new(Mutex::new(accounts)),
             unity_login: unity::Client::from_env(),
             member: Arc::new(Mutex::new(member)),
+            kek: match sealed::Kek::from_env(root) {
+                Ok(kek) => kek,
+                Err(error) => {
+                    // Never fatal to activation: member subscriptions are refused instead.
+                    eprintln!("credentials: ENGINEBOX_CREDENTIALS_KEY_FILE is unusable: {error}");
+                    None
+                }
+            },
+        };
+        this.sweep();
+        Ok(this)
+    }
+    /// Crash recovery and migration for members' credentials: an abandoned
+    /// sign-in's staging home is removed, and plaintext left in a home (a
+    /// crash between unsealing and resealing, or a credential connected
+    /// before encryption at rest) is sealed. Without a key it is left for
+    /// the operator, and such credentials are refused.
+    fn sweep(&self) {
+        let ids: Vec<String> = self.member.lock().unwrap().keys().cloned().collect();
+        for id in ids {
+            let staging = self.root.join("signin").join(&id);
+            if staging.exists()
+                && let Err(error) = std::fs::remove_dir_all(&staging)
+            {
+                eprintln!("credentials: an abandoned sign-in could not be removed: {error}");
+            }
+            let Ok(home) = self.home_path(&id) else {
+                continue;
+            };
+            let plaintext = sealed::secret_files()
+                .iter()
+                .any(|f| std::fs::symlink_metadata(home.join(f)).is_ok());
+            if !plaintext {
+                continue;
+            }
+            match &self.kek {
+                Some(kek) => {
+                    if let Err(error) = sealed::seal_home(kek, &id, &home) {
+                        eprintln!(
+                            "credentials: member credential {id} could not be sealed: {error:#}"
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "credentials: member credential {id} holds plaintext and no ENGINEBOX_CREDENTIALS_KEY_FILE is configured; it is refused until one is"
+                ),
+            }
+        }
+    }
+    /// Use this key-encryption key for members' sealed homes (tests, or a
+    /// key the controller was given; otherwise `ENGINEBOX_CREDENTIALS_KEY_FILE`).
+    pub fn with_kek(mut self, kek: Option<sealed::Kek>) -> Self {
+        if kek.is_some() {
+            self.kek = kek;
+            self.sweep();
+        }
+        self
+    }
+    fn require_kek(&self) -> Result<sealed::Kek> {
+        self.kek.clone().ok_or_else(|| {
+            refuse(
+                503,
+                "Member subscriptions need ENGINEBOX_CREDENTIALS_KEY_FILE (encryption at rest) on this Engine Box.",
+            )
         })
     }
     /// Use another Unity login endpoint (tests, or a configured stand-in).
@@ -381,9 +448,13 @@ impl Credentials {
         self.unity_login = client;
         self
     }
-    fn home(&self, id: &str) -> Result<PathBuf> {
+    /// Where credential `id`'s home is (not created).
+    fn home_path(&self, id: &str) -> Result<PathBuf> {
         ensure!(valid_id(id), "Invalid credential");
-        let home = self.root.join("homes").join(id);
+        Ok(self.root.join("homes").join(id))
+    }
+    fn home(&self, id: &str) -> Result<PathBuf> {
+        let home = self.home_path(id)?;
         security::private_dir(&home)?;
         security::private_dir(&home.join(".codex"))?;
         security::private_dir(&home.join(".claude"))?;
@@ -428,7 +499,19 @@ impl Credentials {
                 }
             }
             std::fs::remove_dir_all(&staging)?;
+            // A member's tokens are encrypted at rest the moment they exist;
+            // without a key they are wiped and the sign-in fails (fail closed).
+            let sealed = self
+                .kek
+                .as_ref()
+                .context("No credentials key is configured.")
+                .and_then(|kek| sealed::seal_home(kek, id, &home));
+            if let Err(error) = sealed {
+                let _ = sealed::wipe_plaintext(&home);
+                return Err(error);
+            }
         }
+        // Only once the new login is safely stored.
         auth::clear_refresh_rejected(&home)
     }
     fn key_path(&self, id: &str) -> PathBuf {
@@ -627,9 +710,13 @@ impl Credentials {
         }
         sessions.retain(|_, s| s.credential != id);
         let _ = std::fs::remove_file(self.key_path(id));
-        let home = self.root.join("homes").join(id);
+        let home = self.home_path(id)?;
         if home.exists() {
             std::fs::remove_dir_all(&home)?;
+        }
+        let staging = self.root.join("signin").join(id);
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
         }
         std::fs::remove_file(self.root.join(format!("{id}.json")))?;
         records.remove(id);
@@ -657,6 +744,8 @@ impl Credentials {
         // result into the credential's home only when it completes, so runs
         // keep reading the current login (under the home's lease) meanwhile.
         let home = if self.is_member_connected(id) {
+            // Fail closed: a member's login is never stored unencrypted.
+            self.require_kek()?;
             self.staging_home(id)?
         } else {
             self.home(id)?
@@ -749,6 +838,13 @@ impl Credentials {
                     && let Err(error) = self.complete_sign_in(&s.credential)
                 {
                     eprintln!("credentials: a sign-in could not be stored: {error:#}");
+                    event["reason"] = json!("failed");
+                }
+                // Whatever the outcome, a member's staged login (plaintext)
+                // does not outlive the sign-in.
+                let staging = self.root.join("signin").join(&s.credential);
+                if staging.exists() && std::fs::remove_dir_all(&staging).is_err() {
+                    eprintln!("credentials: a staged sign-in could not be removed");
                     event["reason"] = json!("failed");
                 }
                 let state = match event["reason"].as_str() {
@@ -1125,6 +1221,7 @@ impl Credentials {
                 "Only a member connects their own subscription.",
             ));
         }
+        self.require_kek()?;
         let provider = body["provider"]
             .as_str()
             .filter(|p| MEMBER_PROVIDERS.contains(p))
@@ -1195,6 +1292,7 @@ impl Credentials {
     /// `POST /v1/projects/{p}/me/credentials/{id}/login {}`.
     pub fn member_login(&self, org: &str, member: &str, id: &str) -> Result<Value> {
         self.member_owned(org, member, id)?;
+        self.require_kek()?;
         Ok(json!({"session": Self::member_session_view(&self.start_login(org, id)?)}))
     }
     /// `GET /v1/projects/{p}/me/credentials/{id}/sessions/{session}`.
@@ -1345,6 +1443,7 @@ impl Credentials {
             );
         }
         let home = self.home(&record.id)?;
+        let kek = self.require_kek()?;
         // One reader or refresher per credential at a time: concurrent runs
         // of one member wait for each other (sign-ins stage elsewhere).
         let lease = auth::lease_waiting(&home, provider, std::time::Duration::from_secs(30))
@@ -1353,16 +1452,28 @@ impl Credentials {
                     "Another run is renewing this subscription right now; try again shortly."
                 )
             })?;
-        let delegated = self.read_member_material(&home, provider)?;
+        // Read from the decrypted files in memory: no plaintext on disk.
+        let delegated = self.sealed_material(&kek, &record.id, &home, provider)?;
         let now = chrono::Utc::now().timestamp() as f64;
-        let delegated = if delegated.expires_at.is_some_and(|at| {
-            at <= now + (timeout_seconds as f64 + 300.).max(REFRESH_BEFORE_SECONDS)
-        }) {
+        let delegated = if delegated
+            .expires_at
+            .is_none_or(|at| at > now + (timeout_seconds as f64 + 300.).max(REFRESH_BEFORE_SECONDS))
+        {
+            delegated
+        } else {
             ensure!(
                 !auth::refresh_rejected(&home, None),
                 "The subscription needs to be connected again."
             );
-            match auth::refresh(&home, provider, &self.binaries, &lease) {
+            // A renewal is due: the provider's client needs the files on
+            // disk, from here until they are sealed again just below.
+            sealed::unseal_home(&kek, &record.id, &home)?;
+            let renewed = auth::refresh(&home, provider, &self.binaries, &lease);
+            if sealed::seal_home(&kek, &record.id, &home).is_err() {
+                let _ = sealed::wipe_plaintext(&home);
+                anyhow::bail!("The subscription could not be stored safely; connect it again.");
+            }
+            match renewed {
                 Ok(()) => {}
                 // Only a refused grant means the member must sign in again.
                 Err(auth::RefreshError::Rejected) => {
@@ -1377,9 +1488,7 @@ impl Credentials {
                     )
                 }
             }
-            self.read_member_material(&home, provider)?
-        } else {
-            delegated
+            self.sealed_material(&kek, &record.id, &home, provider)?
         };
         drop(lease);
         // The access must outlast the whole run: a native client keeps the
@@ -1394,17 +1503,43 @@ impl Credentials {
         Ok(delegated)
     }
 
-    /// The access material in a member credential's home: the full login's
-    /// access token (Claude) or ChatGPT tokens (Codex), refresh token removed.
-    /// A setup token only under the operator fallback.
-    fn read_member_material(
+    /// The access material of a member credential's sealed files, decrypted
+    /// in memory: the full login's access token (Claude) or ChatGPT tokens
+    /// (Codex), refresh token removed; a setup token only under the operator
+    /// fallback. A key that cannot decrypt them is reported to the operator.
+    fn sealed_material(
         &self,
+        kek: &sealed::Kek,
+        id: &str,
         home: &Path,
         provider: &str,
     ) -> Result<enginebox_agents::member::Delegated> {
-        // The same reading as the controller's own accounts
-        // (delegation::home_material), with one member rule on top.
-        let read = enginebox_agents::delegation::home_material(home, provider)?;
+        let files = match sealed::open_home(kek, id, home) {
+            Ok(Some(files)) => files,
+            Ok(None) => {
+                anyhow::bail!("The run's own credential has no access; reconnect the subscription.")
+            }
+            Err(error) => {
+                eprintln!(
+                    "credentials: member credential {id} cannot be decrypted with the configured ENGINEBOX_CREDENTIALS_KEY_FILE: {error:#}"
+                );
+                anyhow::bail!(
+                    "The controller cannot decrypt this subscription (its key changed); the operator must restore the key or the member must reconnect."
+                );
+            }
+        };
+        let parse = |relative: &str| -> Result<Option<Value>> {
+            files
+                .get(relative)
+                .map(|b| serde_json::from_slice(b))
+                .transpose()
+                .map_err(Into::into)
+        };
+        let read = enginebox_agents::delegation::material_from(
+            provider,
+            parse(enginebox_agents::delegation::TOKEN_FILE)?,
+            parse(enginebox_agents::delegation::native_file(provider))?,
+        )?;
         ensure!(
             !read.long_lived_token || member_setup_token_fallback(),
             "This Claude subscription was connected with a long-lived token; connect it again."
@@ -1421,11 +1556,25 @@ impl Credentials {
         if auth::refresh_rejected(&home, None) {
             return true;
         }
+        // Only a setup token (sealed or not), no full login.
+        let names: Vec<String> = sealed::sealed_names(&home)
+            .into_iter()
+            .chain(
+                sealed::secret_files()
+                    .into_iter()
+                    .filter(|f| home.join(f).exists())
+                    .map(str::to_owned),
+            )
+            .collect();
         provider == "claude"
             && self.is_member_connected(id)
             && !member_setup_token_fallback()
-            && enginebox_agents::delegation::home_material(&home, provider)
-                .is_ok_and(|m| m.long_lived_token)
+            && names
+                .iter()
+                .any(|n| n == enginebox_agents::delegation::TOKEN_FILE)
+            && !names
+                .iter()
+                .any(|n| n == enginebox_agents::delegation::native_file("claude"))
     }
 
     /// Tests: complete a sign-in by writing the provider's file into the
@@ -1440,6 +1589,9 @@ impl Credentials {
             provider_file,
         )
         .unwrap();
+        if let Some(kek) = &self.kek {
+            sealed::seal_home(kek, id, &home).unwrap();
+        }
         self.records.lock().unwrap().get_mut(id).unwrap().status = Status::Connected;
     }
 
@@ -1500,7 +1652,9 @@ mod tests {
     fn open() -> (tempfile::TempDir, Credentials) {
         let temp = tempfile::tempdir().unwrap();
         // The controller canonicalizes its state root (macOS /var is a symlink).
-        let c = Credentials::open(&temp.path().canonicalize().unwrap(), &BTreeMap::new()).unwrap();
+        let c = Credentials::open(&temp.path().canonicalize().unwrap(), &BTreeMap::new())
+            .unwrap()
+            .with_kek(Some(sealed::Kek::from_bytes([5; 32])));
         (temp, c)
     }
     fn mark_connected(c: &Credentials, id: &str) {
@@ -1707,6 +1861,18 @@ mod tests {
             )
             .0,
             403
+        );
+        // Without a key-encryption key, no member subscription is accepted.
+        let keyless =
+            Credentials::open(&temp.path().canonicalize().unwrap(), &BTreeMap::new()).unwrap();
+        assert_eq!(
+            refusal(
+                keyless
+                    .member_create(ORG, ALICE, &json!({"provider":"codex"}))
+                    .unwrap_err()
+            )
+            .0,
+            503
         );
         // The marker survives a restart, so the sharing lock does too.
         let reopened =
@@ -1943,7 +2109,10 @@ exit 2
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let exe = fake_claude(&root);
-        let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe)])).unwrap();
+        let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe)]))
+            .unwrap()
+            .with_kek(Some(sealed::Kek::from_bytes([5; 32])));
+        let kek = sealed::Kek::from_bytes([5; 32]);
         let id = c
             .member_create(ORG, ALICE, &json!({"provider":"claude"}))
             .unwrap()
@@ -1997,6 +2166,7 @@ exit 2
                 "expiresAt":(chrono::Utc::now().timestamp() + 60) * 1000,"scopes":["user:inference"]}}),
         )
         .unwrap();
+        sealed::seal_home(&kek, &id, &home).unwrap();
         assert!(c.member_material(&run, "claude", 600).is_err());
         assert!(!c.reconnect_needed(&id, "claude"));
         assert_eq!(
@@ -2004,13 +2174,14 @@ exit 2
             "connected"
         );
         // A setup-token-only credential, refused by policy, shows reconnect.
-        std::fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
+        std::fs::remove_file(home.join(sealed::SEALED)).unwrap();
         security::write_json(
             &home,
             enginebox_agents::delegation::TOKEN_FILE,
             &json!({"kind":"setup_token","value":"sk-ant-oat01-year-0123456789","expires_at":4102444800u64}),
         )
         .unwrap();
+        sealed::seal_home(&kek, &id, &home).unwrap();
         assert!(c.reconnect_needed(&id, "claude"));
         assert_eq!(
             c.member_list(ORG, ALICE)["credentials"][0]["status"],
@@ -2022,7 +2193,85 @@ exit 2
             "succeeded"
         );
         assert!(!home.join(enginebox_agents::delegation::TOKEN_FILE).exists());
+        assert!(
+            !sealed::sealed_names(&home)
+                .contains(&enginebox_agents::delegation::TOKEN_FILE.to_owned())
+        );
         assert!(!c.reconnect_needed(&id, "claude"));
+        // No plaintext login is ever left, whatever a sign-in's outcome.
+        for f in sealed::secret_files() {
+            assert!(!home.join(f).exists(), "{f}");
+        }
+        assert!(!root.join(format!("agent-credentials/signin/{id}")).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_credentials_fail_closed_without_the_key_and_leftovers_are_sealed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let exe = fake_claude(&root);
+        let kek = sealed::Kek::from_bytes([5; 32]);
+        let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe.clone())]))
+            .unwrap()
+            .with_kek(Some(kek.clone()));
+        let id = c
+            .member_create(ORG, ALICE, &json!({"provider":"claude"}))
+            .unwrap()
+            .1["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Without the key even the admin path cannot sign a member's credential in.
+        let keyless =
+            Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe.clone())]))
+                .unwrap();
+        assert!(keyless.start_login(ORG, &id).is_err());
+        // Plaintext left by a crash (or a credential from before encryption)
+        // is sealed when the store opens with the key.
+        let home = root.join(format!("agent-credentials/homes/{id}"));
+        security::write_json(
+            &home,
+            ".claude/.credentials.json",
+            &json!({"claudeAiOauth":{"accessToken":"sk-ant-oat01-left-0123456789","refreshToken":"rt-good-0123456789",
+                "expiresAt":4102444800000u64,"scopes":["user:inference"]}}),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(format!("agent-credentials/signin/{id}"))).unwrap();
+        let reopened = Credentials::open(&root, &BTreeMap::new())
+            .unwrap()
+            .with_kek(Some(kek.clone()));
+        assert!(!home.join(".claude/.credentials.json").exists());
+        assert!(!root.join(format!("agent-credentials/signin/{id}")).exists());
+        reopened
+            .records
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .status = Status::Connected;
+        let run = enginebox_agents::queue::MemberRun {
+            member: ALICE.into(),
+            credential_id: id.clone(),
+        };
+        assert_eq!(
+            reopened
+                .member_material(&run, "claude", 600)
+                .unwrap()
+                .content,
+            json!({"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-left-0123456789"})
+        );
+        // Reading never writes plaintext when no renewal is due.
+        assert!(!home.join(".claude/.credentials.json").exists());
+        // Another key: refused with an operator-facing reason, nothing resealed.
+        let before = std::fs::read(home.join(sealed::SEALED)).unwrap();
+        let other = Credentials::open(&root, &BTreeMap::new())
+            .unwrap()
+            .with_kek(Some(sealed::Kek::from_bytes([6; 32])));
+        other.records.lock().unwrap().get_mut(&id).unwrap().status = Status::Connected;
+        let error = other.member_material(&run, "claude", 600).unwrap_err();
+        assert!(error.to_string().contains("cannot decrypt"), "{error}");
+        assert_eq!(std::fs::read(home.join(sealed::SEALED)).unwrap(), before);
     }
 
     #[cfg(unix)]
@@ -2031,7 +2280,9 @@ exit 2
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let exe = fake_claude(&root);
-        let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe)])).unwrap();
+        let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe)]))
+            .unwrap()
+            .with_kek(Some(sealed::Kek::from_bytes([5; 32])));
         let id = c
             .member_create(ORG, ALICE, &json!({"provider":"claude"}))
             .unwrap()
@@ -2079,6 +2330,14 @@ exit 2
             "never a setup token"
         );
         assert!(!home.join(enginebox_agents::delegation::TOKEN_FILE).exists());
+        // Encrypted at rest from the moment the sign-in completed.
+        let at_rest = |home: &Path| {
+            assert!(!home.join(".claude/.credentials.json").exists());
+            let sealed = std::fs::read_to_string(home.join(sealed::SEALED)).unwrap();
+            assert!(!sealed.contains("sk-ant-oat01") && !sealed.contains("rt-good"));
+        };
+        at_rest(&home);
+        let kek = sealed::Kek::from_bytes([5; 32]);
         // The access expires within 30 minutes: reading it renews it centrally,
         // and the run gets only the renewed access token.
         let run = enginebox_agents::queue::MemberRun {
@@ -2094,6 +2353,13 @@ exit 2
         // A run longer than the renewed access is refused rather than
         // running into an expired token.
         assert!(c.member_material(&run, "claude", 36_000).is_err());
+        at_rest(&home);
+        // A controller with another key cannot read it.
+        let other = Credentials::open(&root, &BTreeMap::new())
+            .unwrap()
+            .with_kek(Some(sealed::Kek::from_bytes([6; 32])));
+        assert!(other.member_material(&run, "claude", 600).is_err());
+        at_rest(&home);
         // Bob's run can never read it.
         let bobs = enginebox_agents::queue::MemberRun {
             member: BOB.into(),
@@ -2112,6 +2378,7 @@ exit 2
             &two_hours("sk-ant-oat01-two-hours-0123456789"),
         )
         .unwrap();
+        sealed::seal_home(&kek, &id, &home).unwrap();
         assert_eq!(
             c.member_material(&run, "claude", 600).unwrap().content["CLAUDE_CODE_OAUTH_TOKEN"],
             "sk-ant-oat01-two-hours-0123456789"
@@ -2129,6 +2396,7 @@ exit 2
                 "expiresAt":(chrono::Utc::now().timestamp() + 60) * 1000,"scopes":["user:inference"]}}),
         )
         .unwrap();
+        sealed::seal_home(&kek, &id, &home).unwrap();
         assert!(c.member_material(&run, "claude", 600).is_err());
         assert!(c.reconnect_needed(&id, "claude"));
         assert_eq!(
@@ -2137,13 +2405,14 @@ exit 2
         );
         assert!(c.member_material(&run, "claude", 600).is_err());
         // A setup token alone is refused without the operator fallback.
-        std::fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
+        std::fs::remove_file(home.join(sealed::SEALED)).unwrap();
         security::write_json(
             &home,
             enginebox_agents::delegation::TOKEN_FILE,
             &json!({"kind":"setup_token","value":"sk-ant-oat01-year-0123456789","expires_at":4102444800u64}),
         )
         .unwrap();
+        sealed::seal_home(&kek, &id, &home).unwrap();
         assert!(c.member_material(&run, "claude", 600).is_err());
     }
 

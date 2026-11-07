@@ -332,6 +332,60 @@ until released.
 `credentials::tests`. It still has to be qualified against the real Claude Code
 release with a test account before the feature flag is turned on in production.
 
+## Encryption at rest
+
+Member subscriptions require a key-encryption key (KEK). Without one, connect
+and sign-in answer 503.
+
+**Key file.** `ENGINEBOX_CREDENTIALS_KEY_FILE` names a file readable by its
+owner only (mode 0600), outside the state directory and outside the
+controller's install tree (`<prefix>/releases/…`), both of which are backed up
+and copied. It holds exactly 64 hex characters (one trailing newline allowed)
+or 32 random bytes. A 32-character text key is refused. The variable is on the
+supervisor allowlist.
+
+**What is sealed.**
+- A member credential's provider files are kept in `<home>/sealed.json` and
+  never as plaintext at rest: `.claude/.credentials.json`, `.codex/auth.json`,
+  and a fallback setup token.
+- Each file is AES-256-GCM encrypted under a fresh per-credential data key,
+  with the credential ID and file name as associated data. The data key is
+  wrapped by the KEK, so a blob swapped between credentials fails to decrypt.
+- Sealing replaces the set with exactly the files present, so a file the
+  provider's client removed (an old setup token) is gone from it too.
+
+**When plaintext exists.**
+- **Sign-in:** the provider's own client writes plaintext in the staging home.
+  - On completion it is moved into the credential's home and sealed at once.
+  - Without a key, or if sealing fails, the plaintext is wiped and the sign-in
+    fails (fail closed). The admin `/v1/credentials/{id}/login` path is refused
+    for a member's credential without a key.
+  - Whatever the outcome (failed, unverified, cancelled, expired), the staging
+    home is removed. The refused-renewal marker is cleared only after the new
+    login is sealed.
+- **Run admission:**
+  - The sealed files are decrypted in memory and the access material is read
+    from there; nothing is written.
+  - Only when a renewal is due are the files written for the provider's client,
+    under the credential's lease, and resealed with a new data key right after.
+    If resealing fails, the plaintext is wiped and the run fails.
+- **Wrong or missing key:** the credential cannot be read. Runs fail with
+  `credential_unavailable` and the reason "the controller cannot decrypt this
+  subscription", and the controller log names the credential and the key
+  setting. A failed decryption never reseals anything.
+- **Crash recovery and migration:** when the store opens, an abandoned sign-in's
+  staging home is removed, and plaintext left in a member's home is sealed.
+  That plaintext comes from a crash between unsealing and resealing, or from a
+  credential connected before encryption at rest. Without a key it is left in
+  place, logged, and refused.
+
+**Rotating the KEK** needs members to reconnect; a re-wrap tool is not part of
+this change. Keep a backup of the key file separate from state backups: losing
+it means every member reconnects.
+
+**Scope.** Only members' own subscriptions are sealed. Controller accounts,
+team accounts and API keys keep the existing 0600 files.
+
 ## Not yet in this release
 
-Encryption at rest and usage reporting arrive in the following changes.
+Usage reporting and revocation of running runs arrive in the following change.

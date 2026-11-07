@@ -30,7 +30,20 @@ pub struct HomeMaterial {
     pub long_lived_token: bool,
 }
 pub fn home_material(home: &Path, provider: &str) -> Result<HomeMaterial> {
-    if let Some(v) = security::read_json(home, TOKEN_FILE)?
+    material_from(
+        provider,
+        security::read_json(home, TOKEN_FILE)?,
+        security::read_json(home, native_file(provider))?,
+    )
+}
+/// [`home_material`] from the home's files already read (for example
+/// decrypted in memory): its long-lived token file and its native login.
+pub fn material_from(
+    provider: &str,
+    token_file: Option<Value>,
+    native: Option<Value>,
+) -> Result<HomeMaterial> {
+    if let Some(v) = token_file
         && token(&v["value"])
         && ["claude", "cursor"].contains(&provider)
     {
@@ -45,10 +58,7 @@ pub fn home_material(home: &Path, provider: &str) -> Result<HomeMaterial> {
         });
     }
     Ok(HomeMaterial {
-        material: material(
-            provider,
-            &security::read_json(home, native_file(provider))?.unwrap_or(Value::Null),
-        )?,
+        material: material(provider, &native.unwrap_or(Value::Null))?,
         long_lived_token: false,
     })
 }
