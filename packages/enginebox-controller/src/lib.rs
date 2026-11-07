@@ -654,12 +654,14 @@ fn service_allows(
         |operation, pool: &str| token.allows_pool(operation, pool, project_of(pool).as_deref());
     match (method, parts.as_slice()) {
         (&Method::GET, ["v1", "agent-runs"]) => token.operations.contains(&Operation::List),
-        // Provider-reported usage of the controller's accounts: a token that
-        // may start runs runs on these accounts, so it may read how much of
-        // them is left (numbers only; no credential or person is in it).
+        // Provider-reported usage of the controller's accounts (the platform
+        // org's): a platform-org token that may start runs runs on these
+        // accounts, so it may read how much of them is left (numbers only; no
+        // credential or person is in it). Other orgs' tokens may not.
         (&Method::GET, ["v1", "usage", "accounts"])
         | (&Method::GET, ["v1", "usage", "accounts", _]) => {
             token.operations.contains(&Operation::Start)
+                && token.org() == enginebox_agents::pools::DEFAULT_ORG
         }
         (&Method::GET, ["v1", "hosts", host, "instances", name, "agent-runs", _]) => {
             token.allows(Operation::Get, host, name)
@@ -3762,6 +3764,15 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(one["account"]["provider"], "codex");
         }
+        // Another org's token may not read the platform org's accounts.
+        let (_, tenant) = mint(&app, json!({"label":"tenant","org_id":format!("org_{}", "a".repeat(24)),"scopes":[{"host_id":"worker","name":"ebox-a"}],
+            "operations":["agent_runs.start"]})).await;
+        assert_eq!(
+            call(&app, bearer(Method::GET, "/v1/usage/accounts", "", &tenant))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         // A token without agent_runs.start may not; nor may any token manage
         // the accounts or reach the owner's native usage observation.
         for (method, path, body, token) in [
