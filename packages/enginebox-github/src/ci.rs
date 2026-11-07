@@ -416,6 +416,8 @@ impl GitHub {
             let Some(job) = data.jobs.get_mut(&key) else {
                 continue;
             };
+            job["reconcile_attempted_at"] = json!(now);
+            job.as_object_mut().unwrap().remove("reconcile_error");
             match outcome {
                 Ok(Some(result)) => {
                     job["status"] = json!("finished");
@@ -423,8 +425,15 @@ impl GitHub {
                     job.as_object_mut().unwrap().remove("error");
                     job.as_object_mut().unwrap().remove("reconcile_after");
                 }
-                // Not yet provably over, or the check failed: look again later.
-                Ok(None) | Err(_) => job["reconcile_after"] = json!(now + RECONCILE_INTERVAL),
+                // Still running or busy is an ordinary observation, not a recovery failure.
+                Ok(None) => job["reconcile_after"] = json!(now + RECONCILE_INTERVAL),
+                Err(_) => {
+                    job["reconcile_after"] = json!(now + RECONCILE_INTERVAL);
+                    // API/worker errors may contain credentials or private output.
+                    job["reconcile_error"] = json!(
+                        "Runner reconciliation failed; inspect GitHub access and the configured worker's --reclaim support. Capacity remains reserved until cleanup is proved."
+                    );
+                }
             }
             if self.save(&data).is_err() {
                 job_persistence_failure(&mut data, &key);
@@ -1035,7 +1044,14 @@ mod tests {
             assert_eq!(data.jobs["2-99"]["status"], "uncertain");
             assert!(data.jobs["2-99"]["reconcile_after"].as_u64().unwrap() > api::now());
         }
-        // Over, runner idle: the runner and the VM are removed, the job finished.
+        // A pinned worker lacking --reclaim must be visible, without publishing stderr
+        // or releasing its occupied slot. The original error stays available too.
+        let valid_worker = std::fs::read(&worker).unwrap();
+        std::fs::write(
+            &worker,
+            "#!/bin/sh\necho private-worker-diagnostic >&2\nexit 2\n",
+        )
+        .unwrap();
         g.data
             .lock()
             .unwrap()
@@ -1059,10 +1075,55 @@ mod tests {
         g.api = api;
         g.reconcile_uncertain(&config);
         server.join().unwrap();
+        {
+            let data = g.data.lock().unwrap();
+            let failed = &data.jobs["2-99"];
+            assert_eq!(failed["status"], "uncertain");
+            assert!(
+                failed["reconcile_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--reclaim")
+            );
+            assert!(failed["reconcile_attempted_at"].as_u64().unwrap() <= api::now());
+            assert!(failed["reconcile_after"].as_u64().unwrap() > api::now());
+            assert!(!failed.to_string().contains("private-worker-diagnostic"));
+            assert!(!failed.to_string().contains("fixture-installation-token"));
+        }
+        std::fs::write(&worker, valid_worker).unwrap();
+        // Over, runner idle: the runner and the VM are removed, the job finished.
+        g.data
+            .lock()
+            .unwrap()
+            .jobs
+            .get_mut("2-99")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("reconcile_after");
+        let (api, server) = crate::tests::api_fixture(vec![
+            (
+                "/app/installations/2/access_tokens",
+                json!({"token":"fixture-installation-token"}),
+            ),
+            (
+                "/repos/fixture/private/actions/jobs/99",
+                json!({"id":99,"status":"completed"}),
+            ),
+            (
+                "GET /orgs/fixture/actions/runners/501",
+                json!({"name":name,"busy":false}),
+            ),
+            ("DELETE /orgs/fixture/actions/runners/501", json!({})),
+        ]);
+        g.api = api;
+        g.reconcile_uncertain(&config);
+        server.join().unwrap();
         let data = g.data.lock().unwrap();
         assert_eq!(data.jobs["2-99"]["status"], "finished");
         assert_eq!(data.jobs["2-99"]["reclaimed"], true);
         assert!(data.jobs["2-99"]["error"].is_null());
+        assert!(data.jobs["2-99"]["reconcile_error"].is_null());
     }
     #[test]
     fn a_handed_off_service_stops_writing() {
