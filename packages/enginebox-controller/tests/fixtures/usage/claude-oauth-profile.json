@@ -1,0 +1,34 @@
+{
+ "account": {
+  "created_at": "2025-07-02T02:22:20.311075Z",
+  "display_name": "REDACTED",
+  "email": "REDACTED",
+  "full_name": "REDACTED",
+  "has_claude_max": false,
+  "has_claude_pro": false,
+  "uuid": "REDACTED"
+ },
+ "application": {
+  "name": "REDACTED",
+  "slug": "claude-code",
+  "uuid": "REDACTED"
+ },
+ "enabled_plugins": [],
+ "organization": {
+  "billing_type": "stripe_subscription",
+  "cc_onboarding_flags": {},
+  "claude_ai_completion_feedback_enabled": true,
+  "claude_ai_safety_feedback_enabled": true,
+  "claude_code_trial_duration_days": null,
+  "claude_code_trial_ends_at": null,
+  "has_extra_usage_enabled": true,
+  "name": "REDACTED",
+  "organization_type": "claude_team",
+  "payment_auth_hosted_invoice_url": null,
+  "rate_limit_tier": "default_claude_max_5x",
+  "seat_tier": "team_tier_1",
+  "subscription_created_at": "2026-01-15T04:18:16.075882Z",
+  "subscription_status": "active",
+  "uuid": "REDACTED"
+ }
+}

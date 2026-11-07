@@ -1,0 +1,50 @@
+{
+ "account_id": "REDACTED",
+ "additional_rate_limits": null,
+ "code_review_rate_limit": null,
+ "credits": {
+  "approx_cloud_messages": [
+   764,
+   4773
+  ],
+  "approx_local_messages": [
+   4773,
+   24821
+  ],
+  "balance": "19093.3606490000",
+  "has_credits": true,
+  "overage_limit_reached": false,
+  "unlimited": false
+ },
+ "email": "REDACTED",
+ "model_usage": {
+  "gpt-6-astra": {
+   "available": true,
+   "available_at": null,
+   "credits_would_enable": false
+  }
+ },
+ "plan_type": "pro",
+ "promo": null,
+ "rate_limit": {
+  "allowed": true,
+  "limit_reached": false,
+  "primary_window": {
+   "limit_window_seconds": 604800,
+   "reset_after_seconds": 427360,
+   "reset_at": 1794466881,
+   "used_percent": 27
+  },
+  "secondary_window": null
+ },
+ "rate_limit_reached_type": null,
+ "rate_limit_reset_credits": {
+  "applicable_available_count": 0,
+  "available_count": 2
+ },
+ "spend_control": {
+  "individual_limit": null,
+  "reached": false
+ },
+ "user_id": "REDACTED"
+}
