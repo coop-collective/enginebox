@@ -1978,6 +1978,11 @@ fn member_credential_write(
 ) -> (StatusCode, Value) {
     let credentials = &runtime.credentials;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    // The provider of the credential acted on (known before a delete).
+    let provider = match rest.as_slice() {
+        ["credentials", id, ..] => credentials.get(org, id).map(|c| c.provider),
+        _ => None,
+    };
     let (action, target, result): (&str, String, Result<(StatusCode, Value)>) =
         match rest.as_slice() {
             ["credentials"] => (
@@ -2043,18 +2048,24 @@ fn member_credential_write(
             .unwrap_or(target),
         Err(_) => target,
     };
-    runtime.catalog.audit.record(
+    // A connect that found the member's existing credential changed nothing.
+    let outcome = match &result {
+        Ok((StatusCode::OK, _)) if action == "credential.member_connect" => "existing",
+        Ok(_) => "applied",
+        Err(_) => "refused",
+    };
+    runtime.catalog.audit.record_outcome(
         org,
         member,
         action,
         &target,
-        result.is_ok(),
+        outcome,
         match &result {
             Ok((_, v)) => {
                 let pick = |k: &str| v["credential"].get(k).or(v["session"].get(k)).cloned();
-                json!({"provider": pick("provider"), "status": pick("status")})
+                json!({"provider": pick("provider").or(provider.map(Value::String)), "status": pick("status")})
             }
-            Err(_) => json!({}),
+            Err(_) => json!({"provider": provider}),
         },
     );
     match result {
@@ -7713,6 +7724,13 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{created}");
         let id = created["credential"]["id"].as_str().unwrap().to_owned();
         assert!(created["credential"].get("owner_user_id").is_none());
+        let (status, again) = call(
+            &app,
+            bearer(Method::POST, route, r#"{"provider":"claude"}"#, &alice),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["credential"]["id"], id.as_str());
         // Owned by Alice, never shared, in the token's org.
         let record = c
             .runtime()
@@ -7822,6 +7840,18 @@ mod tests {
         assert!(events.iter().any(|e| e["actor"] == ALICE
             && e["action"] == "credential.member_connect"
             && e["target"] == id.as_str()));
+        // Connecting again finds the same credential: audited as existing.
+        assert!(events.iter().any(|e| e["actor"] == ALICE
+            && e["action"] == "credential.member_connect"
+            && e["outcome"] == "existing"));
+        // The delete names the provider.
+        assert!(
+            events
+                .iter()
+                .any(|e| e["action"] == "credential.member_delete"
+                    && e["outcome"] == "applied"
+                    && e["detail"]["provider"] == "claude")
+        );
         assert!(events.iter().any(|e| e["actor"] == ALICE
             && e["action"] == "credential.member_delete"
             && e["outcome"] == "applied"));

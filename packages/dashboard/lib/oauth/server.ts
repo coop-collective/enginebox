@@ -312,13 +312,16 @@ function render(
  */
 type Grantable = { workspaces: Workspace[]; pools: Pool[]; projects: string[]; engineProjects: string[] };
 /** Engine-session projects `user` may grant as themselves: only a real member, and only when the app asked for the scope. */
-function engineProjectsFor(user: User | null, scope: string | undefined, listed: Grantable) {
-  return user && MEMBER_ID.test(user.id) && hasScope(scope, ENGINE_SCOPE) ? listed.engineProjects : [];
+/**
+ * Projects a member-scoped grant (`engine-sessions`, `agent-credentials`) may name: only for a real member,
+ * only when the app asked for that scope, and for subscriptions only when the Engine Box has them on.
+ */
+function memberProjectsFor(name: string, user: User | null, scope: string | undefined, listed: Grantable) {
+  const enabled = name !== CREDENTIALS_SCOPE || memberCredentialsEnabled();
+  return user && MEMBER_ID.test(user.id) && hasScope(scope, name) && enabled ? listed.engineProjects : [];
 }
-/** Projects whose member subscriptions `user` may grant as themselves: only a real member, only when asked and enabled. */
-function credentialProjectsFor(user: User | null, scope: string | undefined, listed: Grantable) {
-  return user && MEMBER_ID.test(user.id) && hasScope(scope, CREDENTIALS_SCOPE) && memberCredentialsEnabled() ? listed.engineProjects : [];
-}
+const engineProjectsFor = (user: User | null, scope: string | undefined, listed: Grantable) => memberProjectsFor(ENGINE_SCOPE, user, scope, listed);
+const credentialProjectsFor = (user: User | null, scope: string | undefined, listed: Grantable) => memberProjectsFor(CREDENTIALS_SCOPE, user, scope, listed);
 async function grantable(project: string | null | undefined, org: string): Promise<Grantable | null> {
   const [workspaces, pools, view] = await Promise.allSettled([grantableWorkspaces(), grantablePools(), tenancy()]);
   if (workspaces.status === "rejected" && pools.status === "rejected") return null;
@@ -834,15 +837,27 @@ async function exchangeCode(request: Request, form: URLSearchParams) {
  * act as. A member who has left the grant's org (or was removed) is refused, which ends the connection at
  * refresh. Subscriptions also end when the Engine Box turns them off.
  */
-function memberGrant(grant: { engine_sessions?: EngineSessionsGrant[]; agent_credentials?: AgentCredentialsGrant[]; user_id: string; org_id?: string }) {
+function memberGrant(grant: {
+  engine_sessions?: EngineSessionsGrant[];
+  agent_credentials?: AgentCredentialsGrant[];
+  user_id: string;
+  org_id?: string;
+  workspaces?: unknown[];
+  pools?: unknown[];
+  repositories?: unknown[];
+}) {
   const engine = grant.engine_sessions ?? [];
   const credentials = grant.agent_credentials ?? [];
   if (!engine.length && !credentials.length) return {};
   if (!stillMember(grant.user_id, grant.org_id ?? DEFAULT_ORG)) throw new GrantRefused("The member who consented is no longer in this organization.");
-  if (credentials.length && !memberCredentialsEnabled()) throw new GrantRefused("Member subscriptions are not enabled on this Engine Box.");
+  // Subscriptions turned off: the token loses only that part; the rest of the grant keeps working.
+  const subscriptions = memberCredentialsEnabled() ? credentials : [];
+  if (!engine.length && !subscriptions.length && !(grant.workspaces?.length || grant.pools?.length || grant.repositories?.length))
+    throw new GrantRefused("Member subscriptions are not enabled on this Engine Box.");
+  if (!engine.length && !subscriptions.length) return {};
   return {
     ...(engine.length ? { engine_sessions: engine } : {}),
-    ...(credentials.length ? { agent_credentials: credentials } : {}),
+    ...(subscriptions.length ? { agent_credentials: subscriptions } : {}),
     member: grant.user_id,
   };
 }
@@ -984,10 +999,10 @@ const POOL = "[a-z][a-z0-9-]{0,31}";
 /** The controller's project IDs and repository names. */
 const PROJECT_ID = "[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?";
 const REPOSITORY = "[a-z0-9][a-z0-9._-]{0,62}";
-/** The controller's engine-session IDs. */
-const ENGINE_SESSION = "[a-f0-9]{32}";
-/** The controller's credential and sign-in IDs. */
-const CREDENTIAL = "[a-f0-9]{32}";
+/** The controller's 32-hex IDs (engine sessions, credentials, sign-ins, runs). */
+const HEX_ID = "[a-f0-9]{32}";
+const ENGINE_SESSION = HEX_ID;
+const CREDENTIAL = HEX_ID;
 export const RESOURCE_ROUTES: [string, RegExp][] = [
   ["GET", /^v1\/agent-runs$/],
   ["GET", new RegExp(`^v1/hosts/${SEGMENT}/instances/${SEGMENT}/agent-runs/${SEGMENT}$`)],

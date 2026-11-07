@@ -51,8 +51,15 @@ use std::{
     thread,
 };
 
-pub const MAX_CREDENTIALS: usize = 1024;
-const MAX_SESSIONS: usize = 16;
+/// Credentials across all orgs, per org, and per member in an org: one org
+/// (or one member's app) cannot exhaust the others.
+pub const MAX_CREDENTIALS: usize = 4096;
+const MAX_CREDENTIALS_PER_ORG: usize = 512;
+const MAX_CREDENTIALS_PER_MEMBER: usize = 16;
+/// Sign-ins in progress across all orgs, per org, and per member.
+const MAX_SESSIONS: usize = 64;
+const MAX_SESSIONS_PER_ORG: usize = 16;
+const MAX_SESSIONS_PER_MEMBER: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,8 +101,28 @@ pub struct Credential {
     pub connected_at: Option<String>,
 }
 impl Credential {
-    pub fn public(&self, has_key: bool) -> Value {
+    /// A new personal credential of `owner`, pending sign-in, never shared.
+    fn personal(org: &str, provider: &str, label: &str, owner: &str) -> Self {
+        let at = now();
+        Self {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            org_id: org.to_owned(),
+            provider: provider.to_owned(),
+            kind: Kind::Personal,
+            label: label.to_owned(),
+            owner_user_id: Some(owner.to_owned()),
+            share_with_org_pools: false,
+            status: Status::Pending,
+            created_at: at.clone(),
+            updated_at: at,
+            connected_at: None,
+        }
+    }
+    /// `member_connected`: connected through a member's own app grant, so
+    /// never shareable (the dashboard hides Share for it).
+    pub fn public(&self, has_key: bool, member_connected: bool) -> Value {
         json!({
+            "is_member_connected": member_connected,
             "id": self.id,
             "org_id": self.org_id,
             "provider": self.provider,
@@ -206,18 +233,16 @@ pub const MEMBER_PROVIDERS: &[&str] = &["claude", "codex"];
 /// A credential connected through a member's own app grant. Stored beside
 /// the record (`agent-credentials/member/<id>.json`, a directory older
 /// controllers do not read) so the record format is unchanged.
+/// (Only the ID: the record holds the rest. Older marker fields are ignored.)
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MemberMeta {
     pub id: String,
-    pub org_id: String,
-    pub owner_user_id: String,
-    pub provider: String,
-    pub created_at: String,
 }
 
 struct Session {
     credential: String,
+    org: String,
+    owner: Option<String>,
     public: Value,
     control: mpsc::Sender<auth::Control>,
     cancel: Arc<AtomicBool>,
@@ -318,9 +343,11 @@ impl Credentials {
                     && valid_id(&meta.id),
                 "Invalid credential record"
             );
-            // A marker whose record is gone (an interrupted delete) is dropped.
+            // A marker whose record is gone (an interrupted delete) is removed.
             if records.contains_key(&meta.id) {
                 member.insert(meta.id.clone(), meta);
+            } else if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!("credentials: an orphaned member marker could not be removed: {error}");
             }
         }
         Ok(Self {
@@ -373,7 +400,7 @@ impl Credentials {
         let rows: Vec<Value> = records
             .values()
             .filter(|c| c.org_id == org)
-            .map(|c| c.public(self.has_key(&c.id)))
+            .map(|c| c.public(self.has_key(&c.id), self.is_member_connected(&c.id)))
             .collect();
         drop(records);
         let rows = rows
@@ -463,14 +490,35 @@ impl Credentials {
             connected_at: (kind == Kind::ApiKey).then_some(at),
         };
         let mut records = self.records.lock().unwrap();
-        ensure!(records.len() < MAX_CREDENTIALS, "Credential limit reached");
+        Self::check_limits(&records, org, owner)?;
         if let Some(key) = key {
             crate::jobs::write_private(&self.key_path(&record.id), &json!({"key": key}))?;
         }
         self.save(&record)?;
-        let public = record.public(key.is_some());
+        let public = record.public(key.is_some(), false);
         records.insert(record.id.clone(), record);
         Ok(json!({"credential": public}))
+    }
+    /// The global, per-org and per-member credential limits (409 when reached).
+    fn check_limits(
+        records: &BTreeMap<String, Credential>,
+        org: &str,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        let in_org = records.values().filter(|c| c.org_id == org).count();
+        let of_member = owner.map_or(0, |o| {
+            records
+                .values()
+                .filter(|c| c.org_id == org && c.owner_user_id.as_deref() == Some(o))
+                .count()
+        });
+        if records.len() >= MAX_CREDENTIALS
+            || in_org >= MAX_CREDENTIALS_PER_ORG
+            || of_member >= MAX_CREDENTIALS_PER_MEMBER
+        {
+            return Err(refuse(409, "Credential limit reached."));
+        }
+        Ok(())
     }
     /// `POST /v1/credentials/{id}/share {share}`: the owner's sharing choice (personal only).
     pub fn share(&self, org: &str, id: &str, body: &Value) -> Result<Value> {
@@ -496,7 +544,7 @@ impl Credentials {
         next.updated_at = now();
         self.save(&next)?;
         *record = next;
-        Ok(json!({"credential": record.public(self.has_key(id))}))
+        Ok(json!({"credential": record.public(self.has_key(id), false)}))
     }
     /// `POST /v1/credentials/{id}/delete`: the record, its home and its key.
     pub fn delete(&self, org: &str, id: &str) -> Result<Value> {
@@ -528,8 +576,12 @@ impl Credentials {
         std::fs::remove_file(self.root.join(format!("{id}.json")))?;
         records.remove(id);
         drop(sessions);
-        if self.member.lock().unwrap().remove(id).is_some() {
-            remove_if_present(&self.member_path(id))?;
+        // The marker goes last; a failure to remove it is logged and the
+        // orphan is swept when the store next opens.
+        if self.member.lock().unwrap().remove(id).is_some()
+            && let Err(error) = remove_if_present(&self.member_path(id))
+        {
+            eprintln!("credentials: a member marker could not be removed: {error}");
         }
         Ok(json!({"deleted": true}))
     }
@@ -552,10 +604,22 @@ impl Credentials {
             return Ok(s.public.clone());
         }
         sessions.retain(|_, s| active(&s.public));
-        ensure!(
-            sessions.len() < MAX_SESSIONS,
-            "Too many sign-ins are active."
-        );
+        let in_org = sessions.values().filter(|s| s.org == org).count();
+        let of_owner = sessions
+            .values()
+            .filter(|s| {
+                s.org == org && record.owner_user_id.is_some() && s.owner == record.owner_user_id
+            })
+            .count();
+        if sessions.len() >= MAX_SESSIONS
+            || in_org >= MAX_SESSIONS_PER_ORG
+            || of_owner >= MAX_SESSIONS_PER_MEMBER
+        {
+            return Err(refuse(
+                429,
+                "Too many sign-ins are active; finish or cancel one first.",
+            ));
+        }
         let session = uuid::Uuid::new_v4().simple().to_string();
         let public = json!({"id":session,"credential_id":id,"provider":record.provider,"scope":"credential","status":"starting","input_required":false,"message":"Starting native sign-in.","expires_at":(chrono::Utc::now()+chrono::Duration::seconds(600)).to_rfc3339()});
         let (tx, rx) = mpsc::channel();
@@ -564,6 +628,8 @@ impl Credentials {
             session.clone(),
             Session {
                 credential: id.to_owned(),
+                org: org.to_owned(),
+                owner: record.owner_user_id.clone(),
                 public: public.clone(),
                 control: tx,
                 cancel: cancel.clone(),
@@ -921,11 +987,15 @@ impl Credentials {
     /// (another member's, a team account, a key, another org's) is the same
     /// 404, so a member cannot probe what exists.
     pub fn member_owned(&self, org: &str, member: &str, id: &str) -> Result<Credential> {
+        // An app reaches only what it connected: a member-connected
+        // credential of a member provider, never one made on the dashboard.
         self.get(org, id)
             .filter(|c| {
                 valid_user(member)
                     && c.kind == Kind::Personal
                     && c.owner_user_id.as_deref() == Some(member)
+                    && MEMBER_PROVIDERS.contains(&c.provider.as_str())
+                    && self.is_member_connected(id)
             })
             .ok_or_else(|| refuse(404, "Unknown credential."))
     }
@@ -940,6 +1010,7 @@ impl Credentials {
                     && c.kind == Kind::Personal
                     && c.owner_user_id.as_deref() == Some(member)
                     && MEMBER_PROVIDERS.contains(&c.provider.as_str())
+                    && self.is_member_connected(&c.id)
             })
             .map(|c| self.member_view(c))
             .collect();
@@ -986,40 +1057,24 @@ impl Credentials {
                 .to_owned(),
         };
         let mut records = self.records.lock().unwrap();
+        // Reuse only a credential this member connected through an app; a
+        // dashboard-made (or shared) personal one is never adopted.
         if let Some(existing) = records.values().find(|c| {
             c.org_id == org
                 && c.kind == Kind::Personal
                 && c.provider == provider
                 && c.owner_user_id.as_deref() == Some(member)
+                && self.is_member_connected(&c.id)
         }) {
             return Ok((false, json!({"credential": self.member_view(existing)})));
         }
-        if records.len() >= MAX_CREDENTIALS {
-            return Err(refuse(409, "Credential limit reached."));
-        }
-        let at = now();
-        let record = Credential {
-            id: uuid::Uuid::new_v4().simple().to_string(),
-            org_id: org.to_owned(),
-            provider: provider.clone(),
-            kind: Kind::Personal,
-            label,
-            owner_user_id: Some(member.to_owned()),
-            share_with_org_pools: false,
-            status: Status::Pending,
-            created_at: at.clone(),
-            updated_at: at.clone(),
-            connected_at: None,
-        };
+        Self::check_limits(&records, org, Some(member))?;
+        let record = Credential::personal(org, &provider, &label, member);
         let meta = MemberMeta {
             id: record.id.clone(),
-            org_id: org.to_owned(),
-            owner_user_id: member.to_owned(),
-            provider,
-            created_at: at,
         };
         // Marker first: a crash between the two leaves a marker the next
-        // open drops, never a shareable record.
+        // open removes, never a shareable record.
         state::write_json(&self.member_path(&meta.id), &serde_json::to_value(&meta)?)?;
         self.save(&record)?;
         let view = self.member_view(&record);
@@ -1078,15 +1133,33 @@ impl Credentials {
         body: &Value,
     ) -> Result<Value> {
         self.member_owned(org, member, id)?;
-        self.session(org, id, session)
-            .map_err(|_| refuse(404, "Unknown sign-in."))?;
-        let public = self.login_input(org, id, session, body).map_err(|_| {
-            refuse(
+        let text = body
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .and_then(|o| o.get("text"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| refuse(400, "Send {\"text\": <the code the provider showed>}."))?;
+        let sessions = self.sessions.lock().unwrap();
+        let s = sessions
+            .get(session)
+            .filter(|s| s.credential == id)
+            .ok_or_else(|| refuse(404, "Unknown sign-in."))?;
+        if !active(&s.public) {
+            return Err(refuse(410, "This sign-in has ended; start a new sign-in."));
+        }
+        if s.public["provider"] != "claude" || s.public["input_required"] != true {
+            return Err(refuse(409, "This sign-in is not waiting for a code."));
+        }
+        if !auth::valid_input(text) {
+            return Err(refuse(
                 400,
-                "This sign-in is not waiting for a valid authorization code",
-            )
-        })?;
-        Ok(json!({"session": Self::member_session_view(&public)}))
+                "That does not look like the code the provider showed.",
+            ));
+        }
+        s.control
+            .send(auth::Control::Input(text.into()))
+            .map_err(|_| refuse(410, "This sign-in has ended; start a new sign-in."))?;
+        Ok(json!({"session": Self::member_session_view(&s.public)}))
     }
     /// `POST /v1/projects/{p}/me/credentials/{id}/sessions/{session}/cancel {}`.
     pub fn member_login_cancel(
@@ -1390,6 +1463,155 @@ mod tests {
                 .exists()
         );
         assert!(c.get(ORG, &bob).is_some());
+    }
+
+    #[test]
+    fn an_app_reaches_only_what_it_connected_within_limits() {
+        let (temp, c) = open();
+        // Alice's own subscription made on the dashboard (and shared).
+        let dashboard = c
+            .create(
+                ORG,
+                &json!({"provider":"claude","kind":"personal","label":"d","owner_user_id":ALICE}),
+            )
+            .unwrap()["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        c.share(ORG, &dashboard, &json!({"share":true})).unwrap();
+        // The app never adopts it: connecting makes a separate one.
+        let (created, app) = c
+            .member_create(ORG, ALICE, &json!({"provider":"claude"}))
+            .unwrap();
+        assert!(created);
+        let app = app["credential"]["id"].as_str().unwrap().to_owned();
+        assert_ne!(app, dashboard);
+        // Nor can the app list, sign in to or delete the dashboard one.
+        let listed = c.member_list(ORG, ALICE)["credentials"].clone();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"], app.as_str());
+        assert_eq!(
+            refusal(c.member_delete(ORG, ALICE, &dashboard).unwrap_err()).0,
+            404
+        );
+        assert_eq!(
+            refusal(c.member_login(ORG, ALICE, &dashboard).unwrap_err()).0,
+            404
+        );
+        // The listing marks app-connected credentials for the dashboard.
+        let all = c.list(ORG)["credentials"].clone();
+        let flag = |id: &str| {
+            all.as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["id"] == id)
+                .unwrap()["is_member_connected"]
+                .clone()
+        };
+        assert_eq!(flag(&app), true);
+        assert_eq!(flag(&dashboard), false);
+        // Per-member limit: one member cannot exhaust the org.
+        for i in 0..20 {
+            let made = c.create(ORG, &json!({"provider":"codex","kind":"personal","label":format!("x{i}"),"owner_user_id":BOB}));
+            if i < MAX_CREDENTIALS_PER_MEMBER {
+                made.unwrap();
+            } else {
+                assert_eq!(refusal(made.unwrap_err()).0, 409);
+            }
+        }
+        // Alice is not affected by Bob's limit.
+        c.member_create(ORG, ALICE, &json!({"provider":"codex"}))
+            .unwrap();
+        // An orphaned marker (a deleted record) is swept on open.
+        let orphan = temp
+            .path()
+            .join(format!("agent-credentials/member/{}.json", "e".repeat(32)));
+        state::write_json(&orphan, &json!({"id": "e".repeat(32)})).unwrap();
+        Credentials::open(&temp.path().canonicalize().unwrap(), &BTreeMap::new()).unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn sign_in_input_errors_say_what_to_do() {
+        let (_temp, c) = open();
+        let id = c
+            .member_create(ORG, ALICE, &json!({"provider":"claude"}))
+            .unwrap()
+            .1["credential"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let session = "0".repeat(32);
+        // A bad body is a 400 before anything else; an unknown sign-in a 404.
+        assert_eq!(
+            refusal(
+                c.member_login_input(ORG, ALICE, &id, &session, &json!({"code":"x"}))
+                    .unwrap_err()
+            )
+            .0,
+            400
+        );
+        assert_eq!(
+            refusal(
+                c.member_login_input(ORG, ALICE, &id, &session, &json!({"text":"abcdefgh12"}))
+                    .unwrap_err()
+            )
+            .0,
+            404
+        );
+        // An ended sign-in is 410, one not waiting for a code is 409.
+        let (tx, _rx) = mpsc::channel();
+        let add = |status: &str, input: bool| {
+            let key = uuid::Uuid::new_v4().simple().to_string();
+            c.sessions.lock().unwrap().insert(
+                key.clone(),
+                Session {
+                    credential: id.clone(),
+                    org: ORG.into(),
+                    owner: Some(ALICE.into()),
+                    public: json!({"id":key,"provider":"claude","status":status,"input_required":input}),
+                    control: tx.clone(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            key
+        };
+        let expired = add("expired", false);
+        let waiting = add("waiting", false);
+        let asking = add("waiting", true);
+        let text = json!({"text":"abcdefgh12"});
+        assert_eq!(
+            refusal(
+                c.member_login_input(ORG, ALICE, &id, &expired, &text)
+                    .unwrap_err()
+            )
+            .0,
+            410
+        );
+        assert_eq!(
+            refusal(
+                c.member_login_input(ORG, ALICE, &id, &waiting, &text)
+                    .unwrap_err()
+            )
+            .0,
+            409
+        );
+        assert_eq!(
+            refusal(
+                c.member_login_input(
+                    ORG,
+                    ALICE,
+                    &id,
+                    &asking,
+                    &json!({"text":"bad code with spaces"})
+                )
+                .unwrap_err()
+            )
+            .0,
+            400
+        );
+        c.member_login_input(ORG, ALICE, &id, &asking, &text)
+            .unwrap();
     }
 
     fn with_unity() -> (tempfile::TempDir, Credentials, Arc<Mutex<Vec<String>>>) {

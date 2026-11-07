@@ -159,3 +159,24 @@ test("each member saves only their own Unity account; the password is forwarded 
   await assert.rejects(credentials(req(`/api/credentials/${"c".repeat(32)}/update`, "POST", alice, { password: "x" }), ["c".repeat(32), "update"]), (e: unknown) => e instanceof HttpError && e.status === 404);
   assert.equal((await credentials(req(`/api/credentials/${id}/delete`, "POST", owner, {}), [id, "delete"])).status, 200);
 });
+
+test("a subscription connected through an app is never shared from the dashboard", async (t) => {
+  fakeController(t);
+  const owner = await signIn("owner@example.com");
+  await orgAction(req("/api/org/members/import", "POST", owner, { members: [{ email: "a@example.com" }] }), ["members", "import"]);
+  const alice = await signIn("a@example.com");
+  const created = await (await credentials(req("/api/credentials", "POST", alice, { kind: "personal", provider: "claude", label: "Mine" }), [])).json();
+  const id = created.credential.id;
+  // The controller marks app-connected credentials; the dashboard refuses Share for them.
+  t.mock.restoreAll();
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    const path = new URL(url).pathname;
+    if (path === "/v1/credentials")
+      return Response.json({ credentials: [{ ...created.credential, is_member_connected: true }] });
+    return Response.json({ error: "must not be forwarded" }, { status: 500 });
+  });
+  await assert.rejects(
+    credentials(req(`/api/credentials/${id}/share`, "POST", alice, { share: true }), [id, "share"]),
+    (e: unknown) => e instanceof HttpError && e.status === 403,
+  );
+});

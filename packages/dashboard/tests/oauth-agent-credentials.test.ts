@@ -108,3 +108,18 @@ test("turning member subscriptions off ends the connection at refresh", async (t
   assert.equal(refused.status, 400);
   assert.equal((await refused.json()).error, "invalid_grant");
 });
+
+test("turning subscriptions off keeps a grant's engine sessions working at refresh", async (t) => {
+  const controller = fakeController(t);
+  const as = plainMember("both@fixture.example");
+  const { client, verifier, id } = await consent("engine-sessions agent-credentials", as);
+  const ok = await consentPost([["request", id], ["action", "approve"], ["engine_sessions", "alpha"], ["agent_credentials", "alpha"]], { origin, cookie: as });
+  const tokens = await (await exchange(client, new URL(ok.headers.get("location")!).searchParams.get("code")!, verifier)).json();
+  delete process.env.ENGINEBOX_MEMBER_CREDENTIALS;
+  const refreshed = await refreshWith(client, tokens.refresh_token);
+  assert.equal(refreshed.status, 200);
+  const latest = [...controller.tokens.values()].at(-1)!;
+  assert.deepEqual(latest.engine_sessions, [{ project: "alpha" }]);
+  assert.equal(latest.agent_credentials, undefined);
+  assert.ok(!latest.operations.includes("agent_credentials.manage"));
+});

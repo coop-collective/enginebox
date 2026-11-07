@@ -56,13 +56,33 @@ impl Audit {
         ok: bool,
         detail: Value,
     ) {
+        self.record_outcome(
+            org,
+            actor,
+            action,
+            target,
+            if ok { "applied" } else { "refused" },
+            detail,
+        )
+    }
+    /// [`Self::record`] with a named outcome (`applied`, `refused`, or an
+    /// operation's own, such as `existing` for an idempotent connect).
+    pub fn record_outcome(
+        &self,
+        org: &str,
+        actor: &str,
+        action: &str,
+        target: &str,
+        outcome: &str,
+        detail: Value,
+    ) {
         let entry = json!({
             "at": chrono::Utc::now().to_rfc3339(),
             "org_id": org,
             "actor": actor,
             "action": action,
             "target": target,
-            "outcome": if ok { "applied" } else { "refused" },
+            "outcome": outcome,
             "detail": detail,
         });
         let _guard = self.lock.lock().unwrap();

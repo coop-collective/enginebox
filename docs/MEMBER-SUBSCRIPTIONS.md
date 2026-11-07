@@ -61,15 +61,37 @@ message, expires_at, authorization_url?, user_code?}`. `authorization_url` is th
 allowlisted provider page (`auth::authorization_url`); `user_code` is Codex's
 device code. Sign-in sessions expire after 10 minutes.
 
-Another member's credential, a team account, a key or an unknown ID is the same
-`404 {"error":"Unknown credential."}`, so a member cannot probe what exists.
+An app reaches only credentials it connected: those with the member marker, for
+`claude` or `codex`. Connecting never adopts a personal credential the member
+made on the dashboard; it creates a separate one. Another member's credential,
+the member's own dashboard credential, a team account, a key or an unknown ID
+are all the same `404 {"error":"Unknown credential."}`, so a member cannot probe
+what exists.
+
+**Limits.**
+- Credentials: 16 per member per org, 512 per org, 4096 in all (`409`).
+- Sign-ins in progress: 2 per member, 16 per org, 64 in all (`429`).
+
+**Code input errors** (`…/sessions/{s}/input`):
+- `400`: a body that is not `{text}`, or a malformed code;
+- `404`: an unknown sign-in;
+- `409`: the sign-in is not waiting for a code;
+- `410`: the sign-in has ended ("start a new sign-in").
+
+**Dashboard.** The dashboard's credential listing carries `is_member_connected`.
+For those credentials, Share is hidden in the panel and refused by the API.
+
+**Refresh when off.** If member subscriptions are turned off, a grant's
+engine-session part keeps working at refresh; a subscription-only grant ends.
 `share_with_org_pools`, `key` and `owner_user_id` are refused (400), and a
 credential connected through an app can never be shared later, even from the
 dashboard (its marker lives in `agent-credentials/member/<id>.json`).
 
 Every change is audited as `credential.member_connect|login|login_input|login_cancel|delete`
 with the member as actor and only the provider and status as detail: never a
-code, token or link.
+code, token or link. A connect that returns the member's existing credential is
+recorded with outcome `existing`. The member marker is removed last on delete; if
+that fails, the error is logged and the orphan is swept when the store opens.
 
 ## Not yet in this release
 
