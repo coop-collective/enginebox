@@ -449,9 +449,11 @@ pub fn plan(mut input: PlanInput) -> Plan {
                     let mut best: Option<(&Placement, u8, usize)> = None;
                     let mut host_reason = None;
                     let mut fenced = Vec::new();
+                    let mut busy = 0;
                     for m in &state.members {
                         let key = (m.host_id.clone(), m.name.clone());
                         if input.busy_workspaces.contains(&key) {
+                            busy += 1;
                             if let Some(why) = input.uncertain.get(&key) {
                                 fenced.push(format!("{}: {why}", m.name));
                             }
@@ -478,11 +480,23 @@ pub fn plan(mut input: PlanInput) -> Plan {
                         Some((m, _, _)) => Ok(m.clone()),
                         None => {
                             *pool_demand.entry(pool.clone()).or_default() += 1;
+                            let full = state.members.len() + state.creating >= state.max_workspaces;
+                            let saturated =
+                                host_reason.is_none() && full && busy == state.members.len();
                             let mut reason = host_reason.unwrap_or_else(|| {
                                 format!("waiting for a free workspace in pool {pool}")
                             });
                             if !fenced.is_empty() {
                                 reason = format!("{reason} ({})", fenced.join("; "));
+                            }
+                            if saturated {
+                                // Nothing to place on and nothing to create:
+                                // say so, rather than a bare "waiting".
+                                reason = format!(
+                                    "{reason}; all {busy} members are busy and the pool is at \
+                                     its maximum of {} workspaces",
+                                    state.max_workspaces
+                                );
                             }
                             if state.backoff
                                 && let Some(why) = &state.backoff_reason
@@ -807,6 +821,69 @@ mod tests {
             },
         );
         assert_eq!(plan(i).admit[0].1, member("h1", "ebox-frozen"));
+    }
+
+    #[test]
+    fn a_stopped_member_takes_the_run_when_running_ones_are_busy_and_the_pool_is_full() {
+        // The ideator pool: running members all busy, the rest stopped, the
+        // pool at its maximum. The run starts a stopped member; nothing is
+        // created.
+        let c = vec![pool_run("p", 1, None)];
+        let mut i = input(&c, vec![("h1", host(8, 2, Some(roomy())))]);
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![
+                    member("h1", "ebox-warm-a"),
+                    member("h1", "ebox-warm-b"),
+                    member("h1", "ebox-stopped"),
+                    member("h1", "ebox-frozen"),
+                ],
+                max_workspaces: 4,
+                create_hosts: vec!["h1".into()],
+                member_rank: BTreeMap::from([
+                    (("h1".into(), "ebox-stopped".into()), 2),
+                    (("h1".into(), "ebox-frozen".into()), 1),
+                ]),
+                ..Default::default()
+            },
+        );
+        i.busy_workspaces
+            .insert(("h1".into(), "ebox-warm-a".into()));
+        i.busy_workspaces
+            .insert(("h1".into(), "ebox-warm-b".into()));
+        i.busy_workspaces
+            .insert(("h1".into(), "ebox-frozen".into()));
+        let p = plan(i);
+        assert_eq!(
+            p.admit,
+            vec![("p".to_string(), member("h1", "ebox-stopped"))]
+        );
+        assert!(p.create.is_empty());
+    }
+
+    #[test]
+    fn a_run_waiting_on_a_full_pool_of_busy_members_says_so() {
+        let c = vec![pool_run("p", 1, None)];
+        let mut i = input(&c, vec![("h1", host(8, 2, Some(roomy())))]);
+        i.pools.insert(
+            "workers".into(),
+            PoolState {
+                members: vec![member("h1", "ebox-w1"), member("h1", "ebox-w2")],
+                max_workspaces: 2,
+                create_hosts: vec!["h1".into()],
+                ..Default::default()
+            },
+        );
+        i.busy_workspaces.insert(("h1".into(), "ebox-w1".into()));
+        i.busy_workspaces.insert(("h1".into(), "ebox-w2".into()));
+        let p = plan(i);
+        assert!(p.admit.is_empty() && p.create.is_empty());
+        assert_eq!(
+            p.waiting["p"].1,
+            "waiting for a free workspace in pool workers; all 2 members are busy and the \
+             pool is at its maximum of 2 workspaces"
+        );
     }
 
     #[test]

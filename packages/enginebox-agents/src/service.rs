@@ -163,9 +163,13 @@ pub type RepositoryRevoke = Arc<dyn Fn(&str, &repository::Credential) + Send + S
 /// active, `Ok(false)` only on a definite `{"active":false}` (default: the
 /// guest helper's `enginebox-guest lease <provider>`).
 pub type LeaseProbe = Arc<dyn Fn(&Host, &str, &str) -> Result<bool> + Send + Sync>;
+/// Reads a host's instance states, name -> Incus status (default: the host's
+/// inventory through [`Fleet::instance_states`]).
+pub type InstanceStates = Arc<dyn Fn(&str) -> Result<BTreeMap<String, String>> + Send + Sync>;
 #[derive(Default)]
 struct Hooks {
     lease_probe: Mutex<Option<LeaseProbe>>,
+    instance_states: Mutex<Option<InstanceStates>>,
     measure: Mutex<Option<MeasureHook>>,
     create: Mutex<Option<CreateHook>>,
     resolver: Mutex<Option<ProfileResolver>>,
@@ -1349,8 +1353,23 @@ impl AgentService {
     }
     /// One bounded guest lease probe. Only a definite `{"active":false}`
     /// yields `Ok(false)`; anything else is active or an error.
+    ///
+    /// A member that is stopped, or no longer exists, runs no process, so no
+    /// native session can hold its lease: that is a definite inactive lease
+    /// without exec'ing into it (an exec into a stopped VM fails, and used to
+    /// fence the member forever). A frozen member cannot be exec'd into
+    /// either; the lifecycle pass resumes it so the next probe can run.
     fn probe_lease(&self, host_id: &str, name: &str, provider: &str) -> Result<bool> {
         let host = self.inner.fleet.host(host_id)?;
+        if let Ok(states) = self.instance_states(host_id) {
+            match states.get(name).map(String::as_str) {
+                None | Some("Stopped") => return Ok(false),
+                Some("Frozen") => {
+                    anyhow::bail!("workspace is frozen; it is resumed so its lease can be checked")
+                }
+                _ => {}
+            }
+        }
         let hook = self.inner.hooks.lease_probe.lock().unwrap().clone();
         if let Some(probe) = hook {
             return probe(&host, name, provider);
@@ -1849,6 +1868,20 @@ impl AgentService {
         *self.inner.hooks.measure.lock().unwrap() = Some(hook);
         self.inner.measures.lock().unwrap().clear();
         self.kick();
+    }
+    /// Replace the instance-state reader (tests).
+    pub fn set_instance_states(&self, hook: InstanceStates) {
+        *self.inner.hooks.instance_states.lock().unwrap() = Some(hook);
+        self.inner.probes.lock().unwrap().clear();
+        self.kick();
+    }
+    /// A host's instance states (name -> Incus status).
+    fn instance_states(&self, host_id: &str) -> Result<BTreeMap<String, String>> {
+        let hook = self.inner.hooks.instance_states.lock().unwrap().clone();
+        match hook {
+            Some(read) => read(host_id),
+            None => self.inner.fleet.instance_states(host_id),
+        }
     }
     /// Replace the guest lease probe (tests).
     pub fn set_lease_probe(&self, hook: LeaseProbe) {
@@ -2511,7 +2544,7 @@ impl AgentService {
             .collect();
         let mut states: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for host in hosts {
-            if let Ok(s) = self.inner.fleet.instance_states(&host) {
+            if let Ok(s) = self.instance_states(&host) {
                 states.insert(host, s);
             }
         }
@@ -2887,8 +2920,6 @@ impl AgentService {
             return Ok(path);
         }
         let states = self
-            .inner
-            .fleet
             .instance_states(&run.host_id)
             .map_err(|e| LaunchFailure::from_error(Stage::Place, "workspace_unavailable", &e))?;
         let state = states
@@ -3832,29 +3863,92 @@ impl AgentService {
         });
     }
     /// Owner view of a pool: definition, members and their state, queue.
+    ///
+    /// A member is `busy` exactly when the planner will not place on it, and
+    /// `busy_reason` says why: `run` (a run is placed or executing on it),
+    /// `lease` (a writer lease without a run: an owner attach),
+    /// `execution_uncertain` (an interrupted run's lease is not yet resolved;
+    /// `busy_detail` carries the probe's last answer) or `lifecycle_action`
+    /// (a freeze, stop or wake is in flight). Queued runs are listed under
+    /// `waiting` with their position and why they wait, and `at_capacity` is
+    /// true when every member is busy and the pool may not grow.
     pub fn pool_status(&self, name: &str) -> Result<Value> {
         let def = self
             .inner
             .pools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Unknown pool."))?;
+        // Lock order: `sched`, then `leases`, `records`, then `probes`.
         let sched = self.inner.sched.lock().unwrap();
-        let leases = self.inner.leases.lock().unwrap();
+        let leases: BTreeSet<(String, String)> = self
+            .inner
+            .leases
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, n, _)| (h.clone(), n.clone()))
+            .collect();
+        let uncertain: BTreeSet<(String, String)> = self
+            .inner
+            .records
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| v["execution_uncertain"] == true)
+            .map(|v| {
+                (
+                    v["host_id"].as_str().unwrap_or("").to_owned(),
+                    v["name"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        let probe_reasons: BTreeMap<(String, String), String> = self
+            .inner
+            .probes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, p)| (k.clone(), p.reason.clone()))
+            .collect();
+        let running: BTreeSet<(String, String)> = sched
+            .running
+            .values()
+            .map(|p| (p.host_id.clone(), p.name.clone()))
+            .collect();
+        let mut busy_count = 0;
         let members: Vec<Value> = def
             .members()
             .into_iter()
             .map(|m| {
-                let busy = leases
-                    .iter()
-                    .any(|(h, n, _)| *h == m.host_id && *n == m.name);
                 let key = (m.host_id.clone(), m.name.clone());
+                let (busy_reason, busy_detail) = if running.contains(&key) {
+                    (Some("run"), None)
+                } else if leases.contains(&key) {
+                    (Some("lease"), None)
+                } else if uncertain.contains(&key) {
+                    (
+                        Some("execution_uncertain"),
+                        Some(probe_reasons.get(&key).cloned().unwrap_or_else(|| {
+                            "execution uncertain; checking its native session lease".into()
+                        })),
+                    )
+                } else if sched.holding.contains(&key) {
+                    (Some("lifecycle_action"), None)
+                } else {
+                    (None, None)
+                };
+                if busy_reason.is_some() {
+                    busy_count += 1;
+                }
                 let state = sched.vm_states.get(&key).map(|s| s.as_str());
                 let idle_since = sched.idle_since.get(&key).and_then(|at| {
                     chrono::Duration::from_std(at.elapsed())
                         .ok()
                         .map(|ago| (chrono::Utc::now() - ago).to_rfc3339())
                 });
-                json!({"host_id":m.host_id,"name":m.name,"busy":busy,"state":state,"idle_since":idle_since})
+                json!({"host_id":m.host_id,"name":m.name,"busy":busy_reason.is_some(),
+                    "busy_reason":busy_reason,"busy_detail":busy_detail,
+                    "state":state,"idle_since":idle_since})
             })
             .collect();
         let in_pool = |state: EntryState| {
@@ -3864,11 +3958,38 @@ impl AgentService {
                 .filter(|q| q.entry.state == state && q.entry.pool() == Some(name))
                 .count()
         };
+        let mut waiting: Vec<Value> = sched
+            .entries
+            .values()
+            .filter(|q| q.entry.state == EntryState::Queued && q.entry.pool() == Some(name))
+            .map(|q| {
+                let (position, reason) = sched
+                    .waiting
+                    .get(&q.entry.id)
+                    .cloned()
+                    .map_or((Value::Null, Value::Null), |(p, r)| (json!(p), json!(r)));
+                let pinned = match &q.entry.target {
+                    Target::Pool {
+                        pinned: Some(p), ..
+                    } => json!(p.name),
+                    _ => Value::Null,
+                };
+                json!({"id":q.entry.id,"queue_position":position,"waiting_reason":reason,
+                    "pinned_to":pinned})
+            })
+            .collect();
+        waiting.sort_by_key(|w| w["queue_position"].as_u64().unwrap_or(u64::MAX));
+        let creating = sched.creating.get(name).copied().unwrap_or(0);
+        let member_total = def.members().len();
         let mut view = def.public();
         view["member_status"] = json!(members);
         view["queued_runs"] = json!(in_pool(EntryState::Queued));
         view["running_runs"] = json!(in_pool(EntryState::Admitted));
-        view["creating"] = json!(sched.creating.get(name).copied().unwrap_or(0));
+        view["busy_members"] = json!(busy_count);
+        view["at_capacity"] =
+            json!(busy_count == member_total && member_total + creating >= def.max_workspaces());
+        view["waiting"] = json!(waiting);
+        view["creating"] = json!(creating);
         view["last_create_error"] = json!(sched.backoff.get(name).map(|(_, m)| m));
         Ok(json!({"pool":view}))
     }
