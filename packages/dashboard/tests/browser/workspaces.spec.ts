@@ -37,7 +37,8 @@ test("one workspace source list creates hosted sources, links approved GitHub an
     await route.fulfill({ json: { run: { id: "run-1" } }, status: 202 });
   });
   await signIn(page);
-  await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "GitHub", exact: true })).toHaveCount(0);
+  // GitHub lives in Settings; wait for the signed-in navigation to render.
+  await expect(page.getByRole("navigation", { name: "Control plane" }).getByRole("button", { name: "GitHub", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Link fixture/private to a project" }).click();
   await expect(page.getByLabel("Source type")).toHaveValue("github");
   await expect(page.getByLabel("Selected GitHub repository")).toHaveValue("fixture/private");
