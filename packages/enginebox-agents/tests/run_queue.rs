@@ -862,3 +862,158 @@ fn a_failed_lease_probe_keeps_the_fence() {
         .count();
     assert_eq!(probes, 1);
 }
+
+fn member_states(service: &AgentService, state: Arc<Mutex<&'static str>>) {
+    service.set_instance_states(Arc::new(move |host| {
+        assert_eq!(host, "h1");
+        Ok(BTreeMap::from([(
+            "ebox-p1".to_string(),
+            state.lock().unwrap().to_string(),
+        )]))
+    }));
+}
+
+#[test]
+fn an_uncertain_lease_on_a_stopped_member_is_released_without_exec() {
+    // ebox-ideator-2: its run failed at guest launch, then it was stopped.
+    // A lease probe execs into the guest, which fails on a stopped VM, so the
+    // fence (and a resume pinned to it) waited forever. A stopped guest runs
+    // nothing: its lease is inactive.
+    let limits = QueueLimits {
+        uncertain_probe_seconds: 1,
+        ..Default::default()
+    };
+    let (_t, service, first) = uncertain_pool(limits);
+    let answer = Arc::new(Mutex::new(LeaseAnswer::Unreachable));
+    let calls = lease_probe(&service, answer);
+    member_states(&service, Arc::new(Mutex::new("Stopped")));
+    let second = launch_second(&service);
+    wait_for("second run succeeded", || {
+        service.get_pool_run("workers", &second).unwrap()["status"] == "succeeded"
+    });
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no exec into a stopped guest"
+    );
+    assert_eq!(
+        service.get_pool_run("workers", &first).unwrap()["execution_uncertain"],
+        false
+    );
+    let events = service.launch_events(&Default::default());
+    let probe = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "uncertain_lease_probe")
+        .expect("probe event")
+        .clone();
+    assert_eq!(probe["reason"], "lease_inactive");
+}
+
+#[test]
+fn an_uncertain_lease_on_a_frozen_member_waits_for_its_resume_then_clears() {
+    let limits = QueueLimits {
+        uncertain_probe_seconds: 1,
+        ..Default::default()
+    };
+    let (_t, service, first) = uncertain_pool(limits);
+    let answer = Arc::new(Mutex::new(LeaseAnswer::Inactive));
+    let calls = lease_probe(&service, answer);
+    let state = Arc::new(Mutex::new("Frozen"));
+    member_states(&service, state.clone());
+    let second = launch_second(&service);
+    wait_for("frozen reason", || {
+        waiting_reason(&service, &second).contains("workspace is frozen")
+    });
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no exec into a frozen guest"
+    );
+    // Once running (the lifecycle pass resumes it), the probe runs and clears.
+    *state.lock().unwrap() = "Running";
+    wait_for("second run succeeded", || {
+        service.get_pool_run("workers", &second).unwrap()["status"] == "succeeded"
+    });
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        service.get_pool_run("workers", &first).unwrap()["execution_uncertain"],
+        false
+    );
+}
+
+#[test]
+fn pool_status_says_which_members_are_busy_and_why_runs_wait() {
+    let (_t, service, _) = uncertain_pool(QueueLimits::default());
+    let answer = Arc::new(Mutex::new(LeaseAnswer::Active));
+    lease_probe(&service, answer);
+    member_states(&service, Arc::new(Mutex::new("Running")));
+    let second = launch_second(&service);
+    wait_for("lease reason", || {
+        waiting_reason(&service, &second).contains("native session lease is still active")
+    });
+    let status = service.pool_status("workers").unwrap();
+    let pool = &status["pool"];
+    let m = &pool["member_status"][0];
+    assert_eq!(m["name"], "ebox-p1");
+    assert_eq!(m["busy"], true);
+    assert_eq!(m["busy_reason"], "execution_uncertain");
+    assert!(
+        m["busy_detail"]
+            .as_str()
+            .unwrap()
+            .contains("native session lease is still active")
+    );
+    assert_eq!(pool["busy_members"], 1);
+    assert_eq!(pool["at_capacity"], true);
+    assert_eq!(pool["queued_runs"], 1);
+    let w = &pool["waiting"][0];
+    assert_eq!(w["id"], second.as_str());
+    assert_eq!(w["queue_position"], 1);
+    let reason = w["waiting_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("all 1 members are busy and the pool is at its maximum of 1 workspaces"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_finished_or_cancelled_run_leaves_its_member_free() {
+    let (_t, root) = root();
+    let service = service(&root, QueueLimits::default());
+    measure(&service, Some(roomy()));
+    pool(
+        &service,
+        json!({"name":"workers","workspaces":[{"host_id":"h1","name":"ebox-p1"}]}),
+    );
+    member_states(&service, Arc::new(Mutex::new("Running")));
+    let gate = Arc::new(Gate::default());
+    gate.install(&service);
+    let (run, _) = service
+        .launch_pool("workers", body("one"), TOKEN_A, LaunchOptions::default())
+        .unwrap();
+    gate.wait_started(1);
+    let busy = service.pool_status("workers").unwrap();
+    assert_eq!(busy["pool"]["member_status"][0]["busy_reason"], "run");
+    // Queued behind it: cancelled while queued, it never holds the member.
+    let (queued, _) = service
+        .launch_pool("workers", body("two"), TOKEN_A, LaunchOptions::default())
+        .unwrap();
+    service
+        .cancel_pool_run("workers", queued["id"].as_str().unwrap())
+        .unwrap();
+    gate.open();
+    let id = run["id"].as_str().unwrap().to_owned();
+    wait_for("finished", || {
+        service.get_pool_run("workers", &id).unwrap()["status"] == "succeeded"
+    });
+    wait_for("member free", || {
+        service.pool_status("workers").unwrap()["pool"]["member_status"][0]["busy"] == false
+    });
+    let free = service.pool_status("workers").unwrap();
+    assert!(free["pool"]["member_status"][0]["busy_reason"].is_null());
+    assert_eq!(free["pool"]["busy_members"], 0);
+    assert_eq!(free["pool"]["at_capacity"], false);
+    assert_eq!(free["pool"]["waiting"], json!([]));
+}

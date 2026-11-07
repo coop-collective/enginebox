@@ -113,7 +113,8 @@ impl Hold {
 pub struct Decision {
     /// Freeze or stop it.
     pub action: Option<IdleAction>,
-    /// It is busy but frozen (a run would hang): resume it now.
+    /// It is busy but frozen (a run would hang, an unresolved lease could
+    /// never be probed): resume it now.
     pub resume: bool,
     /// Its idle clock after this pass (`None` while busy).
     pub idle_since: Option<Instant>,
@@ -142,9 +143,14 @@ pub fn decide(
         };
     }
     if hold.busy() {
+        // A frozen member under an unresolved lease is resumed too: its lease
+        // can only be probed in a running guest, so left frozen it would stay
+        // fenced (and unusable) forever.
         return Decision {
             action: None,
-            resume: state == VmState::Frozen && (hold.run || hold.lease) && !hold.action,
+            resume: state == VmState::Frozen
+                && (hold.run || hold.lease || hold.uncertain)
+                && !hold.action,
             idle_since: None,
         };
     }
@@ -441,6 +447,15 @@ mod tests {
             ..Hold::default()
         };
         assert!(decide(true, VmState::Frozen, lease, false, None, policy(), t0).resume);
+        // An unresolved lease on a frozen member: its guest must run for the
+        // lease probe to clear the fence (ebox-ideator-2 stayed fenced).
+        let uncertain = Hold {
+            uncertain: true,
+            ..Hold::default()
+        };
+        assert!(decide(true, VmState::Frozen, uncertain, false, None, policy(), t0).resume);
+        // A stopped one is not started for it: a stopped guest holds no lease.
+        assert!(!decide(true, VmState::Stopped, uncertain, false, None, policy(), t0).resume);
         let acting = Hold {
             run: true,
             action: true,
