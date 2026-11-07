@@ -65,6 +65,14 @@ test("a plain member grants their own subscriptions; the token acts only as them
     assert.equal((await call(path, tokens.access_token, "POST", {})).status, 202, path);
   assert.equal((await call(`${base}/${"c".repeat(32)}/sessions/${"d".repeat(32)}/input`, tokens.access_token, "POST", { text: "code" })).status, 202);
   assert.equal((await call(`${base}/${"c".repeat(32)}/sessions/${"d".repeat(32)}`, tokens.access_token)).status, 202);
+  // The member's own runs.
+  const runs = "v1/projects/alpha/me/agent-runs";
+  const started = await call(runs, tokens.access_token, "POST", { provider: "claude", prompt: "jump", credential: { own: true } });
+  assert.equal(started.status, 202);
+  assert.equal((await started.json()).run.member, member);
+  assert.equal((await call(runs, tokens.access_token)).status, 200);
+  assert.equal((await call(`${runs}/${"e".repeat(32)}`, tokens.access_token)).status, 200);
+  assert.equal((await call(`${runs}/${"e".repeat(32)}/cancel`, tokens.access_token, "POST", {})).status, 202);
   for (const c of controller.calls.filter((c) => c.path.includes("/me/"))) {
     assert.equal(c.actor, null);
     assert.equal(c.org, null);

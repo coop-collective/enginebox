@@ -93,8 +93,135 @@ code, token or link. A connect that returns the member's existing credential is
 recorded with outcome `existing`. The member marker is removed last on delete; if
 that fails, the error is logged and the orphan is swept when the store opens.
 
+## Runs (acting as the token's member)
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /v1/projects/{p}/me/agent-runs` | `{provider, prompt, model?, timeout_seconds?, resume_id?, workdir?, env?, idempotency_key?, callback?, profile?, run_kind?, pool?, credential?}` | `202 {run}` (`run.member`, `run.credential_id`), `200` for a replayed key |
+| `GET /v1/projects/{p}/me/agent-runs` | | `200 {runs}`: the member's own runs in the project, newest first |
+| `GET /v1/projects/{p}/me/agent-runs/{id}` | | `200 {run}` |
+| `POST /v1/projects/{p}/me/agent-runs/{id}/cancel` | `{}` | `202 {run}` |
+
+The run view, `callback` and `idempotency_key` are those of
+[pool runs](FLEET.md#agent-runs-v2). Idempotency keys belong to the member, so they
+hold across the app's hourly token renewals. Any other field (`repository`,
+`repo_profile`, …) is refused (400).
+
+**Selection: own only, no fallback.**
+- `credential` is `{"own": true}` (the default) or `{"id": "<one of your own>"}`.
+- The controller takes the member's own connected personal credential for
+  `provider` in the token's org (`Credentials::member_select`).
+- If there is none, the answer is `409 {reason: "credential_required"}`, even
+  when a team account, an API key, another member's shared credential or the
+  controller's own accounts could serve the provider.
+- Naming another person's credential gets the same 409.
+
+**Placement.**
+- The run goes to `pool`, or the project's first **member-runs pool**.
+- The owner designates member-runs pools with
+  `POST /v1/pools/{pool}/member-runs {enabled}`; the designation is kept in
+  `agent-member-pools.json`, so pool records keep their format.
+- With no member-runs pool in the project, the answer is
+  `409 {reason: "no_member_pool"}`.
+- Pool isolation:
+  - Ordinary runs are refused on a member-runs pool.
+  - Member runs are refused anywhere else.
+  - A member-runs pool shares no workspace with another pool.
+  - Its workspaces never receive the controller's own provider accounts:
+    attach and reconcile skip them.
+
+**Switching a pool.** `POST /v1/pools/{pool}/member-runs` is refused while
+the pool has queued or running runs (drain it first). Enabling forgets the
+pool's attachment receipts, so reconciliation never delivers the controller's
+accounts there again.
+
+**Preparation.** A member run never attaches the controller's accounts. The
+workspace is cleared with `enginebox-guest clear-credentials` before its first
+member run after the controller starts or the pool is designated, and again
+whenever an attachment receipt reappears. Clearing removes:
+- delegated provider files;
+- delegation markers and setup tokens;
+- Claude settings overrides (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `AWS_*`,
+  `GOOGLE_*`, `VERTEX_*`, `apiKeyHelper`);
+- `primaryApiKey` in `~/.claude.json`.
+
+The workspace's attachment receipt is dropped. A guest helper that predates
+member runs fails with `member_runs_unsupported`.
+
+**Delivery: per run, short-lived, removed at the end.**
+- **Admission check.** At admission the controller reads the run's own
+  credential again (`Credentials::member_material`). The record must still
+  exist, be connected, belong to the run's member and be for the provider.
+- **Lifetime.** The access must stay valid for the run's whole `timeout_seconds`
+  plus a minute, checked when it is read and again right before dispatch (after
+  any host-lock wait, wake or preparation). A native client keeps the token it started with, so it cannot
+  be re-keyed mid-run; a run whose timeout outlasts the access is refused with
+  `credential_unavailable`.
+- **Access material only, never a refresh token:**
+  - Codex: an `auth.json` with `refresh_token: ""`.
+  - Claude: the access token. Until the full-login change, a credential
+    connected with `claude setup-token` delivers that token.
+- **Transport.** The material goes to the guest on stdin inside a `run-member`
+  envelope, never in argv. A detached run never spools it: the guest helper
+  writes the rest of the request to its spool and passes the material to the
+  worker through a pipe.
+- **Guest checks.** The guest refuses the run if the CLI could authenticate any
+  other way:
+  - a delegated file;
+  - `~/.claude.json` `primaryApiKey`;
+  - an override in user, local, managed (`/etc/claude-code/managed-settings.json`)
+    or project settings (`.claude/settings[.local].json` from the working
+    directory up to the workspace root);
+  - a Codex system or managed configuration (`/etc/codex/config.toml`,
+    `/etc/codex/managed_config.toml`) or any other configuration naming another provider, an API key, a bearer token
+    or a base URL. This covers the run's `CODEX_HOME/config.toml` and every
+    project `.codex/config.toml` from the working directory up to the workspace
+    root. The keys are `model_providers`, `model_provider`,
+    `preferred_auth_method`, `forced_login_method`, `experimental_bearer_token`,
+    `env_key`, `http_headers`, `env_http_headers`, `api_key` and `*base_url`;
+    they are refused at the top level and in `profiles.*`, while MCP server
+    tables (`mcp_servers.*`) keep their own headers, keys and URLs. A
+    configuration that cannot be parsed is also refused.
+- **Where the material lives in the run:**
+  - Codex: only in the run's private `CODEX_HOME`.
+  - Claude: only in the run's environment, with `CLAUDE_CONFIG_DIR` set to the
+    member's own configuration directory.
+- **Template setup.** Member runs keep the workspace template's client setup;
+  copies are bounded and links are skipped.
+  - Codex: `CODEX_HOME` gets `config.toml`, `AGENTS.md`, `prompts`, `skills`,
+    `rules` and `plugins`.
+  - Claude: the member's configuration directory gets `CLAUDE.md`,
+    `settings.json` (with authentication overrides stripped), `skills`,
+    `agents`, `commands`, `plugins`, `output-styles`, and from `~/.claude.json`
+    the user MCP servers and onboarding flags.
+  - Never copied: credentials, sessions, history or project data.
+  - Copies keep execute bits (owner-only) and are refreshed only when the
+    template changes (a digest of paths, sizes and times). Codex links each run
+    to the member's own cached copy. `.claude.json` is read within 16 MiB.
+- **Session history.** Each member's session history is kept apart:
+  `~/.local/state/enginebox/members/<key>/` holds `codex-sessions` and the
+  `claude` directory, where `<key>` is a digest of the member's ID.
+- **Resume.** A session is resumed only by the member whose run started it.
+  Ordinary runs never resume a member's session.
+- **Redaction and cleanup.**
+  - The values are scrubbed from output by the guest, and again by the
+    controller before recording a result or a launch failure.
+  - The run directory is removed on every exit path.
+- **Idempotency.** A member run's idempotency digest includes the member and
+  credential, so a key never replays a run on another credential. Run views
+  name the run's own `member` and `credential_id`.
+- **Designation re-check.** The pool's designation is read under the scheduler
+  lock at acceptance and checked again at admission. A run on the wrong kind of
+  pool fails with `pool_unavailable`.
+- **Callers** still cannot set `ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*` or `CODEX_*`.
+- **Stored state.** Queue entries, run records and details keep only the member
+  and credential IDs. An older controller cannot read a member run's queue entry
+  and sets it aside, so it never runs one on its own accounts.
+- **Named workspaces.** Named-workspace runs (`/v1/hosts/…/agent-runs`) cannot
+  target a member-runs pool's workspace.
+
 ## Not yet in this release
 
-Run selection, per-run delivery, member-isolated placement, Claude full login,
-encryption at rest and usage reporting arrive in the following changes of this
-series; until then, connecting a subscription does not make any run use it.
+Per-member workspace isolation, Claude full login with central refresh,
+encryption at rest, and usage reporting arrive in the following changes of this
+series.

@@ -171,8 +171,13 @@ export function fakeController(t: TestContext, opts: { failRevoke?: boolean; fle
     }
     if (parts[1] === "projects" && parts[3] === "me") {
       // The controller acts as the token's member on their own credentials only.
-      if (!held.member || !held.operations.includes("agent_credentials.manage") || !(held.agent_credentials ?? []).some((c) => c.project === parts[2]))
+      const operation = parts[4] === "agent-runs" ? "agent_credentials.run" : "agent_credentials.manage";
+      if (!held.member || !held.operations.includes(operation) || !(held.agent_credentials ?? []).some((c) => c.project === parts[2]))
         return reply({ error: "This service token is not granted that operation on that workspace." }, 403);
+      if (parts[4] === "agent-runs") {
+        if (method === "GET" && parts.length === 5) return reply({ runs: [] });
+        return reply({ run: { id: "e".repeat(32), status: "queued", member: held.member, credential_id: "c".repeat(32) } }, method === "POST" ? 202 : 200);
+      }
       if (method === "GET" && parts.length === 5) return reply({ credentials: [] });
       if (method === "POST" && parts.length === 5) return reply({ credential: { id: "c".repeat(32), provider: body?.provider, status: "pending" } }, 201);
       return reply({ session: { id: "d".repeat(32), credential_id: parts[5], status: "waiting", input_required: false } }, 202);

@@ -323,6 +323,13 @@ impl Controller {
                 revoker.revoke_run_credential(reference, credential)
             }),
         );
+        // Member runs read only their own member's credential (docs/MEMBER-SUBSCRIPTIONS.md).
+        let member_credentials = runtime.credentials.clone();
+        runtime
+            .agents
+            .set_member_material(Arc::new(move |_run_id, run, provider, timeout| {
+                member_credentials.member_material(run, provider, timeout)
+            }));
         let owner_guard = Arc::downgrade(self);
         self.fleet.set_lifecycle_guard(Arc::new(move |host, name| {
             let owner = owner_guard
@@ -696,6 +703,12 @@ fn member_credential_route<'a>(
                 "input" | "cancel",
             ],
         ) => Some((Operation::CredentialsManage, project)),
+        (&Method::GET, ["v1", "projects", project, "me", "agent-runs"])
+        | (&Method::GET, ["v1", "projects", project, "me", "agent-runs", _])
+        | (&Method::POST, ["v1", "projects", project, "me", "agent-runs"])
+        | (&Method::POST, ["v1", "projects", project, "me", "agent-runs", _, "cancel"]) => {
+            Some((Operation::CredentialsRun, project))
+        }
         _ => None,
     }
 }
@@ -1399,6 +1412,16 @@ fn read(
         }
         ["v1", "agents"] => c.runtime()?.agents.status(),
         ["v1", "tenancy"] => Ok(c.runtime()?.tenancy.view()),
+        ["v1", "projects", project, "me", "agent-runs", rest @ ..] => {
+            let member = subscription_member(principal, &Method::GET, &s)
+                .context("Member subscription routes act only as a member")?;
+            let agents = c.runtime()?.agents;
+            match rest {
+                [] => Ok(agents.list_member_runs(project, &member)),
+                [id] => Ok(json!({"run": agents.get_member_run(project, &member, id)?})),
+                _ => anyhow::bail!("Unknown endpoint"),
+            }
+        }
         ["v1", "projects", _, "me", "credentials", ..] => {
             let member = subscription_member(principal, &Method::GET, &s)
                 .context("Member subscription routes act only as a member")?;
@@ -1792,6 +1815,7 @@ async fn generate_config(
         request,
         principal,
         org,
+        None,
     )
     .await?;
     let Some(run_id) = value["run"]["id"].as_str().filter(|_| status.is_success()) else {
@@ -2588,6 +2612,40 @@ async fn write(
         })
         .await;
     }
+    if let ["v1", "projects", project, "me", "agent-runs", rest @ ..] = routed.as_slice() {
+        let Some(member) = subscription_member(&principal, &Method::POST, &routed) else {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                json!({"error":"Member subscription routes act only as the member who approved the app."}),
+            ));
+        };
+        let runtime = c.runtime()?;
+        let project = project.to_string();
+        return match rest {
+            [] => start_member_run(&runtime, &org, &project, &member, body, &principal).await,
+            [id, "cancel"] => {
+                empty(&body)?;
+                let id = id.to_string();
+                let agents = runtime.agents.clone();
+                Ok(
+                    match blocking(move || agents.cancel_member_run(&project, &member, &id)).await {
+                        Ok(run) => (StatusCode::ACCEPTED, json!({"run": run})),
+                        Err(e) if e.is::<enginebox_agents::service::UnknownRun>() => {
+                            (StatusCode::NOT_FOUND, json!({"error":"Unknown run."}))
+                        }
+                        Err(_) => (
+                            StatusCode::CONFLICT,
+                            json!({"error":"The run could not be cancelled now; read it and retry."}),
+                        ),
+                    },
+                )
+            }
+            _ => Ok((
+                StatusCode::NOT_FOUND,
+                json!({"error":"Unknown member run operation."}),
+            )),
+        };
+    }
     if let ["v1", "projects", _, "me", "credentials", ..] = routed.as_slice() {
         let Some(member) = subscription_member(&principal, &Method::POST, &routed) else {
             return Ok((
@@ -2854,11 +2912,11 @@ async fn write(
             identifier(host, false)?;
             identifier(name, true)?;
             let target = RunTarget::Workspace(host.to_string(), name.to_string());
-            return start_run(&runtime, target, body, &principal, &org).await;
+            return start_run(&runtime, target, body, &principal, &org, None).await;
         }
         ["v1", "pools", pool, "agent-runs"] => {
             let target = RunTarget::Pool(pool.to_string());
-            return start_run(&runtime, target, body, &principal, &org).await;
+            return start_run(&runtime, target, body, &principal, &org, None).await;
         }
         ["v1", "pools", pool, "agent-runs", id, "cancel"] => {
             empty(&body)?;
@@ -2876,6 +2934,13 @@ async fn write(
                 .agents
                 .pools()
                 .put(body, &|h| fleet.hosts().iter().any(|x| x.id == h))?
+        }
+        ["v1", "pools", pool, "member-runs"] => {
+            keys(&body, &["enabled"], &["enabled"])?;
+            let enabled = body["enabled"]
+                .as_bool()
+                .context("enabled must be a boolean")?;
+            runtime.agents.set_member_runs(pool, enabled)?
         }
         ["v1", "pools", pool, "delete"] => {
             empty(&body)?;
@@ -3089,6 +3154,116 @@ enum RunTarget {
     Pool(String),
 }
 
+/// `POST /v1/projects/{p}/me/agent-runs` (docs/MEMBER-SUBSCRIPTIONS.md): a
+/// run for the token's member on a member-runs pool of the project, using
+/// only that member's own credential (`credential: {own: true}` or `{id}` of
+/// one of their own). None: `409 {reason: "credential_required"}`, never a
+/// fallback to anyone else's or the controller's.
+async fn start_member_run(
+    runtime: &Runtime,
+    org: &str,
+    project: &str,
+    member: &str,
+    mut body: Value,
+    principal: &Principal,
+) -> Result<(StatusCode, Value)> {
+    let refuse = |status: StatusCode, reason: &str, message: &str| {
+        Ok((status, json!({"error": message, "reason": reason})))
+    };
+    let object = body.as_object_mut().context("Expected object")?;
+    if let Some(key) = object.keys().find(|k| {
+        ![
+            "provider",
+            "prompt",
+            "model",
+            "timeout_seconds",
+            "resume_id",
+            "workdir",
+            "env",
+            "idempotency_key",
+            "callback",
+            "profile",
+            "run_kind",
+            "pool",
+            "credential",
+        ]
+        .contains(&k.as_str())
+    }) {
+        let message = format!("{key} is not accepted on a member run.");
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request", &message);
+    }
+    let requested = match object.remove("credential") {
+        None | Some(Value::Null) => None,
+        Some(c) if c == json!({"own": true}) => None,
+        Some(c) => match c.as_object() {
+            Some(o) if o.len() == 1 && o.get("id").and_then(Value::as_str).is_some() => {
+                o.get("id").and_then(Value::as_str).map(str::to_owned)
+            }
+            _ => {
+                return refuse(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "credential must be {\"own\": true} or {\"id\": <one of your own>}.",
+                );
+            }
+        },
+    };
+    let pools = runtime.agents.pools().member_pools_in(project);
+    let pool = match object.remove("pool") {
+        None | Some(Value::Null) => pools.first().cloned(),
+        Some(Value::String(p)) => pools.iter().find(|x| **x == p).cloned(),
+        Some(_) => None,
+    };
+    let Some(pool) = pool else {
+        return refuse(
+            StatusCode::CONFLICT,
+            "no_member_pool",
+            "This project has no member-runs pool for that request.",
+        );
+    };
+    let provider = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let credential_id = match runtime.credentials.member_select(
+        org,
+        member,
+        &provider,
+        requested.as_deref(),
+    ) {
+        Ok(id) => id,
+        Err(error) => {
+            return match error.downcast_ref::<credentials::Refusal>() {
+                Some(r) if r.status == 403 => {
+                    refuse(StatusCode::FORBIDDEN, "forbidden", &r.message)
+                }
+                _ => refuse(
+                    StatusCode::CONFLICT,
+                    "credential_required",
+                    "Connect your own subscription for this provider first; runs never use anyone else's.",
+                ),
+            };
+        }
+    };
+    let run = enginebox_agents::queue::MemberRun {
+        member: member.to_owned(),
+        credential_id: credential_id.clone(),
+    };
+    let (status, reply) = start_run(
+        runtime,
+        RunTarget::Pool(pool),
+        body,
+        principal,
+        org,
+        Some(run),
+    )
+    .await?;
+    // The run view names its own member and credential (a replay returns
+    // the original run's, never the one just selected).
+    Ok((status, reply))
+}
+
 /// Accept a native run into the durable queue: HTTP 202 (`queued`), 200 for
 /// a replayed idempotency key, 403/404 for profile or pool refusals, and 429
 /// with `Retry-After` only when a hard queue bound is reached.
@@ -3098,6 +3273,7 @@ async fn start_run(
     mut body: Value,
     principal: &Principal,
     org: &str,
+    member: Option<enginebox_agents::queue::MemberRun>,
 ) -> Result<(StatusCode, Value)> {
     // Tenancy (tenancy.rs): an org runs on its own hosts and pools, or on
     // platform pools under a capacity grant. Everything before orgs is the
@@ -3360,6 +3536,7 @@ async fn start_run(
         repository,
         run_kind,
         repo_profile: repo_record,
+        member: member.clone(),
     };
     let started_by = principal.started_by();
     let metered_by = started_by.clone();
@@ -3382,7 +3559,7 @@ async fn start_run(
                 capacity_org,
                 grant_id,
                 run_id: run["id"].as_str().map(str::to_owned),
-                credential_id: None,
+                credential_id: member.as_ref().map(|m| m.credential_id.clone()),
                 pool: metered_pool,
                 host_id: metered_host,
                 started_by: metered_by,
@@ -7858,5 +8035,237 @@ mod tests {
         assert!(events.iter().any(|e| e["actor"] == BOB
             && e["action"] == "credential.member_delete"
             && e["outcome"] == "refused"));
+    }
+
+    #[tokio::test]
+    async fn a_members_run_uses_only_their_own_subscription_and_never_falls_back() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        const BOB: &str = "usr_bbbbbbbbbbbbbbbbbbbbbbbb";
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.activate().unwrap();
+        c.set_member_credentials(true);
+        let runtime = c.runtime().unwrap();
+        let grant = |member: &str| {
+            json!({"label":"gamejam member","scopes":[],
+                "operations":["agent_credentials.manage","agent_credentials.run"],
+                "agent_credentials":[{"project":"qoh"}],"member":member,"project":"qoh",
+                "callback_secret":"c".repeat(40)})
+        };
+        let (_, alice) = mint(&app, grant(ALICE)).await;
+        let (_, bob) = mint(&app, grant(BOB)).await;
+        let runs = "/v1/projects/qoh/me/agent-runs";
+        let start =
+            r#"{"provider":"claude","prompt":"make the jump higher","credential":{"own":true}}"#;
+        // No member-runs pool yet.
+        let (status, refused) = call(&app, bearer(Method::POST, runs, start, &alice)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["reason"], "no_member_pool");
+        let pool = json!({"name":"jam","project":"qoh","workspaces":[{"host_id":"worker","name":"ebox-m1"}]});
+        assert_eq!(
+            call(
+                &app,
+                request(Method::POST, "/v1/pools", &pool.to_string(), true)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // Only the owner designates a member-runs pool.
+        assert_eq!(
+            call(
+                &app,
+                bearer(
+                    Method::POST,
+                    "/v1/pools/jam/member-runs",
+                    r#"{"enabled":true}"#,
+                    &alice
+                )
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, toggled) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools/jam/member-runs",
+                r#"{"enabled":true}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{toggled}");
+        // Everyone else's subscriptions exist and are connected: a team
+        // account, an API key, another member's shared one, and Alice's own.
+        let creds = &runtime.credentials;
+        let mk = |body: Value| {
+            creds.create("default", &body).unwrap()["credential"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let claude_file = |token: &str| json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"rt-private-0123456789","expiresAt":4102444800000u64,"scopes":["user:inference"]}});
+        let team = mk(json!({"provider":"claude","kind":"team","label":"team"}));
+        creds.connect_for_test(&team, &claude_file("sk-ant-oat01-team-0123456789"));
+        mk(
+            json!({"provider":"claude","kind":"api_key","label":"key","key":"sk-ant-api-0123456789"}),
+        );
+        let carol = mk(
+            json!({"provider":"claude","kind":"personal","label":"c","owner_user_id":"usr_cccccccccccccccccccccccc","share_with_org_pools":true}),
+        );
+        creds.connect_for_test(&carol, &claude_file("sk-ant-oat01-carol-0123456789"));
+        // Bob's own subscription made on the dashboard is not one an app
+        // connected: it is never used for his app runs either.
+        let bobs_dashboard =
+            mk(json!({"provider":"claude","kind":"personal","label":"b","owner_user_id":BOB}));
+        creds.connect_for_test(
+            &bobs_dashboard,
+            &claude_file("sk-ant-oat01-bob-dash-0123456789"),
+        );
+        // Bob has none of his own: refused, never another's.
+        let (status, refused) = call(&app, bearer(Method::POST, runs, start, &bob)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["reason"], "credential_required");
+        // Alice connects hers; Bob cannot name it.
+        let (_, made) = call(
+            &app,
+            bearer(
+                Method::POST,
+                "/v1/projects/qoh/me/credentials",
+                r#"{"provider":"claude"}"#,
+                &alice,
+            ),
+        )
+        .await;
+        let alices = made["credential"]["id"].as_str().unwrap().to_owned();
+        creds.connect_for_test(&alices, &claude_file("sk-ant-oat01-alice-0123456789"));
+        let naming =
+            json!({"provider":"claude","prompt":"x","credential":{"id":alices}}).to_string();
+        let (status, refused) = call(&app, bearer(Method::POST, runs, &naming, &bob)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        for id in [&team, &carol] {
+            let naming =
+                json!({"provider":"claude","prompt":"x","credential":{"id":id}}).to_string();
+            assert_eq!(
+                call(&app, bearer(Method::POST, runs, &naming, &alice))
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
+        // Ordinary routes cannot start runs on the member-runs pool.
+        let (status, refused) = call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools/jam/agent-runs",
+                r#"{"provider":"claude","prompt":"x"}"#,
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused["error"],
+            "This pool runs only members' own subscription runs."
+        );
+        // Admission reads Alice's own material, and only hers.
+        let agents = runtime.agents.clone();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        {
+            let seen = seen.clone();
+            agents.set_run_executor(Arc::new(move |run| {
+                let token = run.member_credential.as_ref().expect("read at admission").content
+                    ["CLAUDE_CODE_OAUTH_TOKEN"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                seen.lock().unwrap().push(token);
+                Ok(json!({"exit_code":0,"output":"{\"type\":\"result\"}","timed_out":false,"output_truncated":false}))
+            }));
+        }
+        agents.set_measure_hook(Arc::new(|_| {
+            Ok(enginebox_agents::queue::HostLoad {
+                cpu_total: 64,
+                reserve_cpu: 2,
+                memory_available_bytes: 1 << 40,
+                reserve_memory_bytes: 1 << 30,
+            })
+        }));
+        let (status, accepted) = call(&app, bearer(Method::POST, runs, start, &alice)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["run"]["credential_id"], alices.as_str());
+        let id = accepted["run"]["id"].as_str().unwrap().to_owned();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let (_, current) = call(
+                &app,
+                bearer(Method::GET, &format!("{runs}/{id}"), "", &alice),
+            )
+            .await;
+            if current["run"]["status"] == "succeeded" {
+                assert_eq!(current["run"]["member"], ALICE);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{current}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["sk-ant-oat01-alice-0123456789"]
+        );
+        // Bob cannot read, list or cancel Alice's run.
+        assert_eq!(
+            call(&app, bearer(Method::GET, &format!("{runs}/{id}"), "", &bob))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let (_, listed) = call(&app, bearer(Method::GET, runs, "", &bob)).await;
+        assert!(listed["runs"].as_array().unwrap().is_empty());
+        assert_eq!(
+            call(
+                &app,
+                bearer(Method::POST, &format!("{runs}/{id}/cancel"), "{}", &bob)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        // The refresh token never reaches a run; nothing secret in run records.
+        for dir in ["agent-run-queue", "agent-run-details", "agent-runs"] {
+            for entry in std::fs::read_dir(c.root.join(dir))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                assert!(
+                    !text.contains("sk-ant-oat01") && !text.contains("rt-private"),
+                    "{}",
+                    entry.path().display()
+                );
+            }
+        }
+        // A one-key credential object without an ID is a 400, never a panic.
+        let odd = r#"{"provider":"claude","prompt":"x","credential":{"own":false}}"#;
+        let (status, refused) = call(&app, bearer(Method::POST, runs, odd, &alice)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["reason"], "invalid_request");
+        let odd = r#"{"provider":"claude","prompt":"x","credential":{"id":7}}"#;
+        assert_eq!(
+            call(&app, bearer(Method::POST, runs, odd, &alice)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        // Unknown fields are refused rather than ignored.
+        let extra = r#"{"provider":"claude","prompt":"x","repository":"qoh/game"}"#;
+        assert_eq!(
+            call(&app, bearer(Method::POST, runs, extra, &alice))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 }

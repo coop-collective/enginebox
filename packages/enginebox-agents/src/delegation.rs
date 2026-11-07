@@ -21,6 +21,37 @@ pub fn expiry(token: &Value) -> Option<f64> {
     let v: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).ok()?).ok()?;
     v["exp"].as_f64().filter(|n| *n > 0. && *n < 253402300799.)
 }
+/// The access material a credential home delivers, and whether it is a
+/// long-lived token (`setup-token` / personal key) rather than a native
+/// login: the controller's accounts and members' own subscriptions read
+/// their homes the same way.
+pub struct HomeMaterial {
+    pub material: Value,
+    pub long_lived_token: bool,
+}
+pub fn home_material(home: &Path, provider: &str) -> Result<HomeMaterial> {
+    if let Some(v) = security::read_json(home, TOKEN_FILE)?
+        && token(&v["value"])
+        && ["claude", "cursor"].contains(&provider)
+    {
+        let key = if provider == "claude" {
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        } else {
+            "CURSOR_API_KEY"
+        };
+        return Ok(HomeMaterial {
+            material: json!({"kind":"environment","content":{key:v["value"]},"expires_at":v["expires_at"]}),
+            long_lived_token: true,
+        });
+    }
+    Ok(HomeMaterial {
+        material: material(
+            provider,
+            &security::read_json(home, native_file(provider))?.unwrap_or(Value::Null),
+        )?,
+        long_lived_token: false,
+    })
+}
 pub fn material(provider: &str, v: &Value) -> Result<Value> {
     crate::provider(provider)?;
     ensure!(

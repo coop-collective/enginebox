@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// Spool root, relative to the guest user's home.
 pub const DIR: &str = ".local/state/enginebox/detached";
 /// Guest modes a detached run may use (the synchronous run modes).
-pub const MODES: &[&str] = &["run", "run-profile", "run-repository"];
+pub const MODES: &[&str] = &["run", "run-profile", "run-repository", "run-member"];
 const INPUT: &str = "input.json";
 const RECEIPT: &str = "receipt.json";
 const RESULT: &str = "result.json";
@@ -55,7 +55,22 @@ pub fn start(
         !dir.join(RECEIPT).exists(),
         "Run already started; collect it instead of starting it again."
     );
-    security::write_bytes(&dir, INPUT, input, native::MAX_OUTPUT * 7)?;
+    // A member run's material never reaches the spool: it goes to the
+    // worker through a pipe, and only the rest of the request is spooled.
+    let (input, material) = if mode == crate::member::GUEST_MODE {
+        let mut value: Value = serde_json::from_slice(input)?;
+        let material = value
+            .as_object_mut()
+            .and_then(|o| o.remove("credential"))
+            .context("Missing member material.")?;
+        (
+            serde_json::to_vec(&value)?,
+            Some(serde_json::to_vec(&material)?),
+        )
+    } else {
+        (input.to_vec(), None)
+    };
+    security::write_bytes(&dir, INPUT, &input, native::MAX_OUTPUT * 7)?;
     let mut receipt =
         json!({"schema":1,"id":id,"mode":mode,"workspace":workspace,"started_at":crate::now()});
     security::write_json(&dir, RECEIPT, &receipt)?;
@@ -63,7 +78,11 @@ pub fn start(
     command
         .args(&worker[1..])
         .args([WORKER_ARG, id])
-        .stdin(std::process::Stdio::null())
+        .stdin(if material.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(unix)]
@@ -79,9 +98,21 @@ pub fn start(
             });
         }
     }
-    let child = command
+    let mut child = command
         .spawn()
         .context("Could not start the detached run.")?;
+    if let Some(material) = material {
+        use std::io::Write;
+        let written = child
+            .stdin
+            .take()
+            .context("No pipe to the worker.")
+            .and_then(|mut pipe| Ok(pipe.write_all(&material)?));
+        if let Err(error) = written {
+            let _ = child.kill();
+            return Err(error);
+        }
+    }
     receipt["pid"] = json!(child.id());
     security::write_json(&dir, RECEIPT, &receipt)?;
     // Not waited for: the worker outlives this helper.
@@ -102,8 +133,16 @@ pub fn run_worker(
         .context("Missing run request.")?;
     // The request can carry run env: gone before the run starts.
     std::fs::remove_file(dir.join(INPUT))?;
-    let input: Value = serde_json::from_slice(&raw)?;
+    let mut input: Value = serde_json::from_slice(&raw)?;
     let mode = receipt["mode"].as_str().unwrap_or("");
+    if mode == crate::member::GUEST_MODE {
+        // The material arrives on stdin, never from the spool.
+        use std::io::Read;
+        let mut material = Vec::new();
+        std::io::stdin().take(65537).read_to_end(&mut material)?;
+        ensure!(material.len() <= 65536, "Member material exceeds bound.");
+        input["credential"] = serde_json::from_slice(&material)?;
+    }
     let workspace = receipt["workspace"].as_str().unwrap_or("");
     match exec(mode, workspace, input) {
         Ok(result) => security::write_bytes(

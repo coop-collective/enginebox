@@ -57,6 +57,10 @@ struct Inner {
     usage: usage::Cache,
     status_cache: Mutex<BTreeMap<String, (std::time::Instant, Value)>>,
     receipt_lock: Mutex<()>,
+    /// Member-runs workspaces cleared of delegated credentials since this
+    /// controller started (or since their pool was designated): cleared again
+    /// only when an attachment receipt reappears.
+    member_cleared: Mutex<BTreeSet<(String, String)>>,
     /// Callback targets and keys of runs still in flight. Memory only: the
     /// key never reaches a record, and a restart ends delivery for that run.
     callbacks: Mutex<BTreeMap<String, Callback>>,
@@ -157,6 +161,15 @@ pub type RunExecutor = Arc<dyn Fn(&AdmittedRun) -> Result<Value> + Send + Sync>;
 /// Mints a run's repository write token at admission: (`<project>/<name>`,
 /// lifetime in seconds).
 pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential> + Send + Sync>;
+/// Reads a member run's access material at admission (docs/MEMBER-SUBSCRIPTIONS.md):
+/// (run ID, the member run, provider, the run's timeout in seconds). Only
+/// that member's own credential, valid for the whole timeout (a native
+/// client cannot be re-keyed mid-run); refused otherwise. (Central renewal
+/// before refusing arrives with the Claude full-login change.) Never
+/// another's, never a controller account.
+pub type MemberMaterial = Arc<
+    dyn Fn(&str, &queue::MemberRun, &str, u64) -> Result<crate::member::Delegated> + Send + Sync,
+>;
 /// Revokes a run's repository token when the run ends (best effort).
 pub type RepositoryRevoke = Arc<dyn Fn(&str, &repository::Credential) + Send + Sync>;
 /// Probes a workspace's native session lease for a provider: `Ok(true)` when
@@ -171,6 +184,7 @@ struct Hooks {
     resolver: Mutex<Option<ProfileResolver>>,
     executor: Mutex<Option<RunExecutor>>,
     repository: Mutex<Option<(RepositoryMint, RepositoryRevoke)>>,
+    member: Mutex<Option<MemberMaterial>>,
 }
 /// A run the scheduler admitted, as handed to its executor.
 #[derive(Debug, Clone)]
@@ -190,6 +204,11 @@ pub struct AdmittedRun {
     /// The repository access minted at admission (set before the executor
     /// runs). `Debug` never prints the token.
     pub repository_access: Option<repository::Access>,
+    /// A member's own-subscription run: whose, and which credential.
+    pub member: Option<queue::MemberRun>,
+    /// That credential's access material, read at admission (set before the
+    /// executor runs). `Debug` never prints it.
+    pub member_credential: Option<crate::member::Delegated>,
 }
 
 /// A profile resolved by the controller for one launch: the provider block and
@@ -235,6 +254,10 @@ pub struct LaunchOptions {
     /// The repository profile the run used and which of its requirements
     /// were met (names only; docs/PROJECT-CONFIG.md). Stored in the details.
     pub repo_profile: Option<Value>,
+    /// A member's own-subscription run (docs/MEMBER-SUBSCRIPTIONS.md): the
+    /// controller already chose the member's own credential. Pool runs only,
+    /// on a member-runs pool, and never on the controller's accounts.
+    pub member: Option<queue::MemberRun>,
 }
 /// Handed to the finish hook once a run with a callback reaches a terminal state.
 #[derive(Debug, Clone)]
@@ -288,6 +311,11 @@ fn idempotency_request_digest(request: &native::RunRequest, options: &LaunchOpti
     // Added only when set, so digests stored before run kinds still match.
     if let Some(kind) = &options.run_kind {
         value["run_kind"] = json!(kind);
+    }
+    // A member run's key never replays a run on another credential.
+    if let Some(member) = &options.member {
+        value["member"] = json!(member.member);
+        value["credential_id"] = json!(member.credential_id);
     }
     security::digest(&value)
 }
@@ -557,6 +585,7 @@ impl AgentService {
                 usage: usage::Cache::default(),
                 status_cache: Mutex::new(BTreeMap::new()),
                 receipt_lock: Mutex::new(()),
+                member_cleared: Mutex::new(BTreeSet::new()),
                 callbacks: Mutex::new(callbacks),
                 finish_hook: Mutex::new(None),
                 queue_root,
@@ -633,23 +662,7 @@ impl AgentService {
             !home.join("pending-adoption.json").exists(),
             "Finish pending controller adoption first."
         );
-        if let Some(v) = security::read_json(&home, delegation::TOKEN_FILE)?
-            && security::token(&v["value"])
-            && ["claude", "cursor"].contains(&p)
-        {
-            let key = if p == "claude" {
-                "CLAUDE_CODE_OAUTH_TOKEN"
-            } else {
-                "CURSOR_API_KEY"
-            };
-            return Ok(
-                json!({"kind":"environment","content":{key:v["value"]},"expires_at":v["expires_at"]}),
-            );
-        }
-        delegation::material(
-            p,
-            &security::read_json(&home, delegation::native_file(p))?.unwrap_or(Value::Null),
-        )
+        Ok(delegation::home_material(&home, p)?.material)
     }
     fn credential_digest(&self, p: &str) -> Result<String> {
         let home = self.home(p)?;
@@ -1093,6 +1106,56 @@ impl AgentService {
         ensure!(value["ok"] == true, "Native credential transfer failed.");
         Ok(value)
     }
+    /// Remove every delegated provider credential and authentication override
+    /// from a workspace's guest home and forget its attachment receipt, so
+    /// reconciliation never delivers the controller's accounts there again.
+    /// The caller holds the host lock.
+    fn clear_workspace(&self, host: &Host, host_id: &str, name: &str) -> Result<()> {
+        let command = guest_command(host, name, &["clear-credentials".into()])?;
+        let cleared: Value =
+            serde_json::from_str(&process::checked(&command, None, None, b"", 30, 65536)?)?;
+        ensure!(cleared["ok"] == true, "The workspace could not be cleared.");
+        let _lock = self.inner.receipt_lock.lock().unwrap();
+        let _ = security::remove(
+            &self.inner.root.join("attachments"),
+            &format!("{}.json", receipt_key(host_id, name)),
+        );
+        Ok(())
+    }
+    /// `POST /v1/pools/{pool}/member-runs {enabled}`: designate a pool for
+    /// members' own-subscription runs, or ordinary runs again. Refused while
+    /// the pool has queued or running runs (drain first). Enabling stops
+    /// reconciliation from delivering the controller's accounts to its
+    /// workspaces; each workspace is cleared of them before its next run.
+    pub fn set_member_runs(&self, pool: &str, enabled: bool) -> Result<Value> {
+        let sched = self.inner.sched.lock().unwrap();
+        crate::require(
+            !sched
+                .entries
+                .values()
+                .any(|q| q.entry.state != EntryState::Finished && q.entry.pool() == Some(pool)),
+            "Drain the pool's queued and running runs before changing member runs.",
+        )?;
+        let changed = self.inner.pools.set_member_runs(pool, enabled)?;
+        drop(sched);
+        if let Some(definition) = self.inner.pools.get(pool) {
+            // A (re)designated pool's workspaces are cleared before their next run.
+            let mut cleared = self.inner.member_cleared.lock().unwrap();
+            for member in definition.members() {
+                cleared.remove(&(member.host_id.clone(), member.name.clone()));
+            }
+        }
+        if enabled && let Some(definition) = self.inner.pools.get(pool) {
+            let _lock = self.inner.receipt_lock.lock().unwrap();
+            for member in definition.members() {
+                let _ = security::remove(
+                    &self.inner.root.join("attachments"),
+                    &format!("{}.json", receipt_key(&member.host_id, &member.name)),
+                );
+            }
+        }
+        Ok(changed)
+    }
     pub fn attach_after_start(&self, host_id: &str, name: &str) -> Result<Value> {
         let _pending = self.pending_guard()?;
         self.attach_locked(host_id, name, None, None, None)
@@ -1118,6 +1181,17 @@ impl AgentService {
         expected_binding: Option<&str>,
     ) -> Result<Value> {
         self.inner.fleet.assert_admission(host_id)?;
+        // A member-runs pool's workspaces never receive the controller's own
+        // accounts: their runs use only each member's own subscription.
+        let placement = Placement {
+            host_id: host_id.to_owned(),
+            name: name.to_owned(),
+        };
+        if let Some(pool) = self.inner.pools.member_pool_of(&placement) {
+            return Ok(
+                json!({"host_id":host_id,"name":name,"providers":[],"skipped":"member_runs_pool","pool":pool}),
+            );
+        }
         let host = self.inner.fleet.account_workspace(host_id, name)?;
         let binding = host_binding(&host)?;
         let key = receipt_key(host_id, name);
@@ -1576,8 +1650,81 @@ impl AgentService {
             }
         };
         view["pool"] = json!(pool);
+        // A member run says whose it is and which credential it uses (IDs).
+        if let Some(member) = detail.get("member") {
+            view["member"] = member.clone();
+            view["credential_id"] = detail["credential_id"].clone();
+        }
         queue::decorate(&mut view, waiting.as_ref());
         Ok(view)
+    }
+    /// The member, pool and credential of a member run in `project` that
+    /// belongs to `member`; anything else is [`UnknownRun`].
+    fn owned_member_run(&self, project: &str, member: &str, id: &str) -> Result<(String, String)> {
+        native::validate_run_id(id).map_err(|_| UnknownRun)?;
+        let (pool, credential) = {
+            let details = self.inner.details.lock().unwrap();
+            let detail = details
+                .get(id)
+                .filter(|d| d["member"] == member)
+                .ok_or(UnknownRun)?;
+            (
+                detail["pool"].as_str().ok_or(UnknownRun)?.to_owned(),
+                detail["credential_id"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        if self.inner.pools.project_of(&pool).as_deref() != Some(project) {
+            return Err(UnknownRun.into());
+        }
+        Ok((pool, credential))
+    }
+    /// A member's own run in `project`: its view with the member and the
+    /// credential it uses (IDs only). Another member's run, or a run of
+    /// another project, is [`UnknownRun`].
+    pub fn get_member_run(&self, project: &str, member: &str, id: &str) -> Result<Value> {
+        let (pool, _) = self.owned_member_run(project, member, id)?;
+        self.get_pool_run(&pool, id)
+    }
+    /// A member's own runs in `project`, newest first (at most 200).
+    pub fn list_member_runs(&self, project: &str, member: &str) -> Value {
+        // One pass over the details; each view then takes its own locks.
+        let ids: Vec<String> = self
+            .inner
+            .details
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, d)| d["member"] == member)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut runs: Vec<Value> = ids
+            .iter()
+            .filter_map(|id| self.get_member_run(project, member, id).ok())
+            .collect();
+        runs.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+        runs.truncate(200);
+        json!({"runs": runs})
+    }
+    /// Cancel a member's own run in `project`.
+    pub fn cancel_member_run(&self, project: &str, member: &str, id: &str) -> Result<Value> {
+        let (pool, _) = self.owned_member_run(project, member, id)?;
+        self.cancel_pool_run(&pool, id)
+    }
+    /// Who started runs on native session `session`: `Some(member)` for a
+    /// member run, `None` for an ordinary one. Empty when no run used it.
+    fn session_members(&self, session: &str) -> BTreeSet<Option<String>> {
+        let records = self.inner.records.lock().unwrap();
+        let details = self.inner.details.lock().unwrap();
+        records
+            .iter()
+            .filter(|(_, r)| r["native_session_id"] == session)
+            .map(|(id, _)| {
+                details
+                    .get(id)
+                    .and_then(|d| d["member"].as_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
     fn waiting_for(&self, id: &str) -> Option<(usize, String)> {
         self.inner.sched.lock().unwrap().waiting.get(id).cloned()
@@ -1869,6 +2016,11 @@ impl AgentService {
     pub fn set_repository_hooks(&self, mint: RepositoryMint, revoke: RepositoryRevoke) {
         *self.inner.hooks.repository.lock().unwrap() = Some((mint, revoke));
     }
+    /// Install the reader of member runs' access material (the controller's
+    /// member credentials). Without one, member runs fail at admission.
+    pub fn set_member_material(&self, hook: MemberMaterial) {
+        *self.inner.hooks.member.lock().unwrap() = Some(hook);
+    }
     pub fn set_run_executor(&self, hook: RunExecutor) {
         *self.inner.hooks.executor.lock().unwrap() = Some(hook);
     }
@@ -2075,13 +2227,66 @@ impl AgentService {
                 "idempotency_key must be 1-128 characters of A-Z a-z 0-9 . _ : -"
             );
         }
+        if let Target::Workspace { host_id, name } = &target {
+            crate::require(
+                self.inner
+                    .pools
+                    .member_pool_of(&Placement {
+                        host_id: host_id.clone(),
+                        name: name.clone(),
+                    })
+                    .is_none(),
+                "This workspace runs only members' own subscription runs.",
+            )?;
+        }
+        // A session belongs to the member whose run started it: only they
+        // resume it, and an ordinary run never resumes a member's.
+        if let Some(session) = &request.resume_id {
+            let owners = self.session_members(session);
+            let mine = options.member.as_ref().map(|m| m.member.as_str());
+            crate::require(
+                owners.iter().all(|o| o.as_deref() == mine),
+                "resume_id is not one of your sessions.",
+            )?;
+            crate::require(
+                mine.is_none() || !owners.is_empty(),
+                "resume_id is not one of your sessions.",
+            )?;
+        }
+        if let Some(member) = &options.member {
+            member.validate()?;
+            crate::require(
+                options.repository.is_none(),
+                "Member runs do not use hosted repositories in this release.",
+            )?;
+        }
         let request_digest = idempotency_request_digest(&request, &options);
         // Acceptance is serialized by the scheduler lock, so two concurrent
         // launches with one key cannot both create a run.
+        // A member's app token is renewed hourly; its keys belong to the member.
+        let key_scope = match &options.member {
+            Some(m) => format!("member:{}", m.member),
+            None => started_by.to_owned(),
+        };
         let mut sched = self.inner.sched.lock().unwrap();
+        // Member runs (docs/MEMBER-SUBSCRIPTIONS.md) only on member-runs
+        // pools, and member-runs pools only for member runs. Read under the
+        // scheduler lock, which a designation change also takes.
+        let member_pool = match &target {
+            Target::Pool { pool, .. } => self.inner.pools.member_runs(pool),
+            Target::Workspace { .. } => false,
+        };
+        crate::require(
+            member_pool == options.member.is_some(),
+            if member_pool {
+                "This pool runs only members' own subscription runs."
+            } else {
+                "Member runs run only on a member-runs pool."
+            },
+        )?;
         if let Some(key) = &options.idempotency_key
             && let Some(id) = self.replay(
-                &scoped_key_digest(started_by, &target, key),
+                &scoped_key_digest(&key_scope, &target, key),
                 &request_digest,
             )?
         {
@@ -2136,10 +2341,14 @@ impl AgentService {
             }
             Target::Pool { .. } => {}
         }
-        ensure!(
-            self.material(&request.provider).is_ok(),
-            "Connect this agent on the controller before launching a session."
-        );
+        // A member run never uses the controller's accounts; its own
+        // credential was chosen by the controller and is read at admission.
+        if options.member.is_none() {
+            ensure!(
+                self.material(&request.provider).is_ok(),
+                "Connect this agent on the controller before launching a session."
+            );
+        }
         let id = uuid::Uuid::new_v4().simple().to_string();
         let seq = sched.next_seq;
         sched.next_seq += 1;
@@ -2161,9 +2370,13 @@ impl AgentService {
         if let Some(r) = &options.repository {
             detail["repository"] = json!(r);
         }
+        if let Some(member) = &options.member {
+            detail["member"] = json!(member.member);
+            detail["credential_id"] = json!(member.credential_id);
+        }
         if let Some(key) = &options.idempotency_key {
             detail["idempotency"] = json!({
-                "key_digest":scoped_key_digest(started_by, &target, key),
+                "key_digest":scoped_key_digest(&key_scope, &target, key),
                 "request_digest":request_digest,
             });
         }
@@ -2199,6 +2412,7 @@ impl AgentService {
             outcome: None,
             repository: options.repository.clone(),
             run_kind: options.run_kind.clone(),
+            member: options.member.clone(),
         };
         // Order: sidecar, record, queue entry. A crash before the entry leaves
         // a queued record that the next start marks failed, never a lost run.
@@ -3135,6 +3349,8 @@ impl AgentService {
             queue_wait_ms,
             repository: queued.entry.repository.clone(),
             repository_access: None,
+            member: queued.entry.member.clone(),
+            member_credential: None,
         };
         let template = queued.entry.template.clone();
         let lease = (
@@ -3222,6 +3438,29 @@ impl AgentService {
         template: Option<String>,
     ) {
         let started = Instant::now();
+        // The pool's member-runs designation is checked again at admission,
+        // in both directions: a run never starts on the wrong kind of pool.
+        let member_pool = run
+            .pool
+            .as_deref()
+            .is_some_and(|p| self.inner.pools.member_runs(p));
+        let member_workspace = self
+            .inner
+            .pools
+            .member_pool_of(&Placement {
+                host_id: run.host_id.clone(),
+                name: run.name.clone(),
+            })
+            .is_some();
+        if member_pool != run.member.is_some() || member_workspace != run.member.is_some() {
+            let failure = LaunchFailure::new(
+                Stage::Place,
+                "pool_unavailable",
+                "The pool's member-runs designation changed; the run did not start.",
+            );
+            self.launch_failed(&run, template.as_deref(), None, &failure, started);
+            return;
+        }
         if let Err(error) = self.inner.fleet.assert_admission(&run.host_id) {
             let failure = LaunchFailure::new(
                 Stage::Place,
@@ -3293,6 +3532,47 @@ impl AgentService {
             },
         };
         run.repository_access = credential.as_ref().map(repository::Credential::access);
+        // A member run's material: only its member's own credential, read now.
+        if let Some(member) = run.member.clone() {
+            let reader = self.inner.hooks.member.lock().unwrap().clone();
+            let material = match reader {
+                None => Err(LaunchFailure::new(
+                    Stage::Delegate,
+                    "credential_unavailable",
+                    "Member subscriptions are not enabled on this controller.",
+                )),
+                Some(read) => read(
+                    &run.id,
+                    &member,
+                    &run.request.provider,
+                    run.request.timeout_seconds,
+                )
+                .and_then(|m| {
+                    m.validate()?;
+                    ensure!(
+                        m.provider == run.request.provider,
+                        "Member material is for another provider."
+                    );
+                    Ok(m)
+                })
+                .map_err(|e| {
+                    LaunchFailure::from_error(Stage::Delegate, "credential_unavailable", &e)
+                }),
+            };
+            match material {
+                Ok(m) => run.member_credential = Some(m),
+                Err(failure) => {
+                    self.launch_failed(
+                        &run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                    return;
+                }
+            }
+        }
         self.execute_admitted(&run, resolved, template, started);
         if let (Some(r), Some(credential)) = (&run.repository, &credential) {
             let revoke = self.inner.hooks.repository.lock().unwrap().clone();
@@ -3373,6 +3653,29 @@ impl AgentService {
             });
         match prepared {
             Ok((host, guest_current)) => {
+                // The host lock, wake and preparation may have taken a while:
+                // the member's access must still cover the whole run.
+                if let Some(credential) = &run.member_credential
+                    && credential.expires_at.is_some_and(|at| {
+                        at <= chrono::Utc::now().timestamp() as f64
+                            + run.request.timeout_seconds as f64
+                            + 60.
+                    })
+                {
+                    let failure = LaunchFailure::new(
+                        Stage::Delegate,
+                        "credential_unavailable",
+                        "The member's access no longer covers the run after preparation.",
+                    );
+                    self.launch_failed(
+                        run,
+                        template.as_deref(),
+                        resolved.as_ref(),
+                        &failure,
+                        started,
+                    );
+                    return;
+                }
                 self.note_start(&run.id, woke, started.elapsed());
                 let request = run.request.clone();
                 // Checkouts need a guest helper from this release; an older
@@ -3391,6 +3694,7 @@ impl AgentService {
                     &run.id,
                     resolved.clone(),
                     run.repository_access.clone().map(|a| (a, checkout)),
+                    run.member.as_ref().zip(run.member_credential.as_ref()),
                     guest_current,
                 ) {
                     self.launch_failed(
@@ -3588,6 +3892,32 @@ impl AgentService {
             ));
         }
         let guest_current = self.ensure_guest(&host, run, template, resolved)?;
+        // A member run never gets the controller's accounts: instead the
+        // workspace is cleared of any delegated credential or override
+        // (docs/MEMBER-SUBSCRIPTIONS.md); its own material travels with the run.
+        if run.member.is_some() {
+            if !guest_current {
+                return Err(LaunchFailure::new(
+                    Stage::Bootstrap,
+                    "member_runs_unsupported",
+                    "The workspace's guest helper predates member runs; update enginebox-guest.",
+                ));
+            }
+            let key = (host_id.to_owned(), name.to_owned());
+            let receipt = self
+                .inner
+                .root
+                .join("attachments")
+                .join(format!("{}.json", receipt_key(host_id, name)))
+                .exists();
+            if receipt || !self.inner.member_cleared.lock().unwrap().contains(&key) {
+                self.clear_workspace(&host, host_id, name).map_err(|e| {
+                    LaunchFailure::from_error(Stage::Delegate, "delegation_failed", &e)
+                })?;
+                self.inner.member_cleared.lock().unwrap().insert(key);
+            }
+            return Ok((host, guest_current));
+        }
         let attached = self
             .attach_locked(
                 host_id,
@@ -3629,6 +3959,9 @@ impl AgentService {
         }
         if let Some(access) = &run.repository_access {
             secrets.insert("ENGINEBOX_REPO_TOKEN".into(), access.token.clone());
+        }
+        if let Some(credential) = &run.member_credential {
+            secrets.extend(member_secrets(credential));
         }
         let profile_name = resolved
             .map(|p| p.name.clone())
@@ -3865,6 +4198,7 @@ impl AgentService {
                 .count()
         };
         let mut view = def.public();
+        view["member_runs"] = json!(self.inner.pools.member_runs(name));
         view["member_status"] = json!(members);
         view["queued_runs"] = json!(in_pool(EntryState::Queued));
         view["running_runs"] = json!(in_pool(EntryState::Admitted));
@@ -3874,16 +4208,16 @@ impl AgentService {
     }
     /// Every pool, plus `projects`: pool names grouped by project.
     pub fn list_pools(&self) -> Value {
-        Self::pool_listing(self.inner.pools.all())
+        self.pool_listing(self.inner.pools.all())
     }
     /// The pools of one project, in the same shape as [`Self::list_pools`].
     pub fn list_project_pools(&self, project: &str) -> Result<Value> {
         ensure!(pools::valid_project(project), "Invalid project.");
-        let mut listing = Self::pool_listing(self.inner.pools.in_project(project));
+        let mut listing = self.pool_listing(self.inner.pools.in_project(project));
         listing["project"] = json!(project);
         Ok(listing)
     }
-    fn pool_listing(all: Vec<pools::Pool>) -> Value {
+    fn pool_listing(&self, all: Vec<pools::Pool>) -> Value {
         let mut projects: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for pool in &all {
             projects
@@ -3892,7 +4226,14 @@ impl AgentService {
                 .push(pool.name.clone());
         }
         json!({
-            "pools":all.iter().map(pools::Pool::public).collect::<Vec<_>>(),
+            "pools":all
+                .iter()
+                .map(|p| {
+                    let mut view = p.public();
+                    view["member_runs"] = json!(self.inner.pools.member_runs(&p.name));
+                    view
+                })
+                .collect::<Vec<_>>(),
             "projects":projects
                 .into_iter()
                 .map(|(project, pools)| json!({"project":project,"pools":pools}))
@@ -4160,7 +4501,7 @@ impl AgentService {
         resolved: Option<ResolvedProfile>,
         repository: Option<(repository::Access, Option<String>)>,
     ) -> std::result::Result<(), LaunchFailure> {
-        self.run_worker_detachable(host, name, request, id, resolved, repository, false)
+        self.run_worker_detachable(host, name, request, id, resolved, repository, None, false)
     }
     #[allow(clippy::too_many_arguments)]
     fn run_worker_detachable(
@@ -4172,6 +4513,9 @@ impl AgentService {
         resolved: Option<ResolvedProfile>,
         // The repository access and the checkout name, for repository runs.
         repository: Option<(repository::Access, Option<String>)>,
+        // A member run's access material: sent on stdin inside a member
+        // envelope, never in argv.
+        member: Option<(&queue::MemberRun, &crate::member::Delegated)>,
         detach: bool,
     ) -> std::result::Result<(), LaunchFailure> {
         let guest = || -> Result<Value> {
@@ -4208,8 +4552,33 @@ impl AgentService {
                     })?,
                 ),
             };
+            let (mode, input) = match member {
+                None => (mode, input),
+                Some((run, credential)) => (
+                    crate::member::GUEST_MODE,
+                    serde_json::to_vec(&crate::member::Envelope {
+                        mode: mode.to_owned(),
+                        input: serde_json::from_slice(&input)?,
+                        member_key: crate::member::member_key(&run.member),
+                        credential: credential.clone(),
+                    })?,
+                ),
+            };
+            // Defence in depth: the guest scrubs the material from output;
+            // the controller scrubs it again before recording anything.
+            let scrub = |mut result: Value| {
+                if let Some((_, credential)) = member
+                    && let Some(output) = result["output"].as_str()
+                {
+                    let output = native::redact(output, &member_secrets(credential));
+                    result["output"] = json!(output);
+                }
+                result
+            };
             if detach {
-                return self.run_detached(&host, name, id, mode, &input, &request);
+                return self
+                    .run_detached(&host, name, id, mode, &input, &request)
+                    .map(scrub);
             }
             let command = guest_command(
                 &host,
@@ -4226,7 +4595,7 @@ impl AgentService {
             )?;
             let result: Value = serde_json::from_str(&output)?;
             native::validate_result(&result)?;
-            Ok(result)
+            Ok(scrub(result))
         };
         self.run_with(id, &request, guest)
     }
@@ -4453,6 +4822,25 @@ pub fn callback_payload(record: &Value, detail: Option<&Value>) -> Value {
         "started_at":run["started_at"],
         "finished_at":run["finished_at"],
     })
+}
+/// A member run that is not the caller's (or does not exist): answered as 404.
+#[derive(Debug)]
+pub struct UnknownRun;
+impl std::fmt::Display for UnknownRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Unknown run.")
+    }
+}
+impl std::error::Error for UnknownRun {}
+
+/// A member run's material as named secrets, for every redaction set.
+fn member_secrets(credential: &crate::member::Delegated) -> BTreeMap<String, String> {
+    credential
+        .secrets()
+        .into_iter()
+        .enumerate()
+        .map(|(i, secret)| (format!("ENGINEBOX_MEMBER_SECRET_{i}"), secret))
+        .collect()
 }
 fn active_session(v: &Value) -> bool {
     ["starting", "waiting"].contains(&v["status"].as_str().unwrap_or(""))
