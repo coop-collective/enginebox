@@ -370,11 +370,16 @@ The pinned [Ubuntu 24.04 Docker preparation recipe](../examples/ci/prepare-linux
 runs as root **inside a new credential-free CI template clone**, never on the
 controller host or an assigned runner. It installs Docker 29.1.3, Compose 2.40.3,
 buildx 0.30.1 and git-lfs 3.4.1 from Ubuntu packages, enables the guest daemon and
-grants the non-root runner access through the guest's Docker group. It refuses a
-registered Actions installation and verifies non-root Docker/Compose and sudo.
+sets the guest Docker socket to mode `0660`, owned by root and the runner's
+primary group. Incus starts the worker with numeric UID/GID and no supplemental
+groups, so adding the account to the Docker group alone is insufficient. It
+refuses a registered Actions installation and verifies Docker/Compose and sudo
+with that same non-root identity and cleared supplemental groups.
 The Docker socket stays inside that disposable VM; do not mount a host socket.
 Record the package versions, then run `pnpm test:preparation:linux` and the full
 Linux workflow in a disposable child before routing production CI to the image.
+Use the worker's `incus exec --user=UID --group=GID` identity for qualification;
+`su` or `runuser` can mask socket permission failures by adding account groups.
 Remove qualification source and credentials, run `enginebox-host clean-base-check`
 and `enginebox-host reset-base-identity`, stop the new base and create its clean,
 stateless snapshot using the normal template procedure. Preserve the previous
