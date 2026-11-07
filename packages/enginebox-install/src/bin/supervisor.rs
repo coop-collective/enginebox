@@ -76,6 +76,7 @@ fn main() -> Result<()> {
                     // Member subscriptions (docs/MEMBER-SUBSCRIPTIONS.md).
                     "ENGINEBOX_MEMBER_CREDENTIALS",
                     "ENGINEBOX_MEMBER_CLAUDE_SETUP_TOKEN",
+                    "ENGINEBOX_CREDENTIALS_KEY_FILE",
                     // Orgs and email sign-in (docs/ORGS.md).
                     "ENGINEBOX_IDENTITY_STATE_DIR",
                     "ENGINEBOX_OWNER_EMAIL",

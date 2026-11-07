@@ -20,6 +20,7 @@ pub mod repo_config;
 pub mod repo_generate;
 pub mod repo_source;
 pub mod repositories;
+pub mod sealed;
 pub mod service_tokens;
 pub mod storage;
 pub mod tenancy;
@@ -124,6 +125,8 @@ pub struct Controller {
     /// Member subscriptions (docs/MEMBER-SUBSCRIPTIONS.md): off unless
     /// `ENGINEBOX_MEMBER_CREDENTIALS=1` at start.
     member_credentials: std::sync::atomic::AtomicBool,
+    /// Tests stand in for `ENGINEBOX_CREDENTIALS_KEY_FILE` (sealed.rs).
+    credentials_key: Mutex<Option<sealed::Kek>>,
 }
 
 struct Admission(Arc<Controller>);
@@ -163,10 +166,17 @@ impl Controller {
             unity_login: Mutex::new(None),
             moq_api: Mutex::new(None),
             turn_api: Mutex::new(None),
+            credentials_key: Mutex::new(None),
             member_credentials: std::sync::atomic::AtomicBool::new(
                 std::env::var("ENGINEBOX_MEMBER_CREDENTIALS").is_ok_and(|v| v == "1"),
             ),
         }))
+    }
+    /// Use this key-encryption key for members' sealed credentials. Takes
+    /// effect at the next activation (tests; production reads
+    /// `ENGINEBOX_CREDENTIALS_KEY_FILE`).
+    pub fn set_credentials_key(&self, kek: sealed::Kek) {
+        *self.credentials_key.lock().unwrap() = Some(kek);
     }
     /// Turn member subscriptions on or off (tests; production reads
     /// `ENGINEBOX_MEMBER_CREDENTIALS` at start).
@@ -276,6 +286,7 @@ impl Controller {
             credentials: {
                 let store =
                     credentials::Credentials::open(&self.root, &std::collections::BTreeMap::new())?;
+                let store = store.with_kek(self.credentials_key.lock().unwrap().clone());
                 match self.unity_login.lock().unwrap().clone() {
                     Some(url) => store.with_unity_login(unity::Client::new(&url)),
                     None => store,
@@ -7872,6 +7883,7 @@ mod tests {
         const BOB: &str = "usr_bbbbbbbbbbbbbbbbbbbbbbbb";
         let (_temp, c) = setup();
         let app = router(c.clone());
+        c.set_credentials_key(sealed::Kek::from_bytes([3; 32]));
         c.activate().unwrap();
         let grant = |member: &str, project: &str| {
             json!({"label":"gamejam member","scopes":[],"operations":["agent_credentials.manage"],
@@ -8055,6 +8067,7 @@ mod tests {
         const BOB: &str = "usr_bbbbbbbbbbbbbbbbbbbbbbbb";
         let (_temp, c) = setup();
         let app = router(c.clone());
+        c.set_credentials_key(sealed::Kek::from_bytes([3; 32]));
         c.activate().unwrap();
         c.set_member_credentials(true);
         let runtime = c.runtime().unwrap();
