@@ -169,9 +169,9 @@ pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential
 /// Reads a member run's access material at admission (docs/MEMBER-SUBSCRIPTIONS.md):
 /// (run ID, the member run, provider, the run's timeout in seconds). Only
 /// that member's own credential, valid for the whole timeout (a native
-/// client cannot be re-keyed mid-run); refused otherwise. (Central renewal
-/// before refusing arrives with the Claude full-login change.) Never
-/// another's, never a controller account.
+/// client cannot be re-keyed mid-run): the controller renews it centrally
+/// first and refuses only when even fresh access cannot cover the run.
+/// Never another's, never a controller account.
 pub type MemberMaterial = Arc<
     dyn Fn(&str, &queue::MemberRun, &str, u64) -> Result<crate::member::Delegated> + Send + Sync,
 >;
@@ -726,18 +726,11 @@ impl AgentService {
         Ok(security::legacy_digest(&v))
     }
     fn refresh_blocked(&self, p: &str) -> Result<bool> {
-        Ok(
-            security::read_json(&self.home(p)?, "refresh-failure.json")?.is_some_and(|v| {
-                v["credential_digest"] == self.credential_digest(p).unwrap_or_default()
-            }),
-        )
+        let digest = self.credential_digest(p).unwrap_or_default();
+        Ok(auth::refresh_rejected(&self.home(p)?, Some(&digest)))
     }
     fn record_refresh_failure(&self, p: &str) -> Result<()> {
-        security::write_json(
-            &self.home(p)?,
-            "refresh-failure.json",
-            &json!({"credential_digest":self.credential_digest(p)?,"failed_at":chrono::Utc::now().timestamp()}),
-        )
+        auth::record_refresh_rejected(&self.home(p)?, Some(&self.credential_digest(p)?))
     }
     pub fn status(&self) -> Result<Value> {
         let _pending = self.pending_guard()?;
@@ -1056,95 +1049,12 @@ impl AgentService {
         Ok(json!({"provider":p,"scope":"controller","status":"saved"}))
     }
     fn refresh(&self, p: &str, lease: &security::Lease) -> Result<()> {
-        let home = self.home(p)?;
-        let native = security::read_json(&home, delegation::native_file(p))?
-            .ok_or_else(|| anyhow::anyhow!("Reconnect provider to renew access."))?;
-        let mut env = auth::controller_environment(&home, &self.inner.binaries)?;
-        let exe = self.inner.binaries[p]
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Install native client to refresh connection."))?;
-        match p {
-            "codex" => {
-                process::native_rpc_with_lease(
-                    &[
-                        exe.clone(),
-                        "-c".into(),
-                        "cli_auth_credentials_store=\"file\"".into(),
-                        "app-server".into(),
-                    ],
-                    &env,
-                    "account/read",
-                    Some(json!({"refreshToken":true})),
-                    20,
-                    65536,
-                    Some(lease),
-                )?;
-            }
-            "claude" => {
-                let oauth = &native["claudeAiOauth"];
-                ensure!(
-                    security::token(&oauth["refreshToken"]),
-                    "Reconnect provider to renew access."
-                );
-                let scopes = oauth["scopes"]
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("Unsupported native scopes."))?;
-                ensure!(
-                    !scopes.is_empty()
-                        && scopes
-                            .iter()
-                            .all(|s| s.as_str().is_some_and(|s| regex::Regex::new(
-                                r"^[a-zA-Z0-9_:.-]{1,128}$"
-                            )
-                            .unwrap()
-                            .is_match(s))),
-                    "Unsupported native scopes."
-                );
-                env.insert(
-                    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN".into(),
-                    oauth["refreshToken"].as_str().unwrap().into(),
-                );
-                env.insert(
-                    "CLAUDE_CODE_OAUTH_SCOPES".into(),
-                    scopes
-                        .iter()
-                        .map(|s| s.as_str().unwrap())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
-                process::checked_with_lease(
-                    &[
-                        exe.clone(),
-                        "auth".into(),
-                        "login".into(),
-                        "--claudeai".into(),
-                    ],
-                    Some(&env),
-                    Some(&home),
-                    b"",
-                    20,
-                    65536,
-                    Some(lease),
-                )?;
-            }
-            _ => {
-                process::checked_with_lease(
-                    &[
-                        exe.clone(),
-                        "status".into(),
-                        "--format".into(),
-                        "json".into(),
-                    ],
-                    Some(&env),
-                    Some(&home),
-                    b"",
-                    15,
-                    65536,
-                    Some(lease),
-                )?;
-            }
-        }
-        Ok(())
+        Ok(auth::refresh(
+            &self.home(p)?,
+            p,
+            &self.inner.binaries,
+            lease,
+        )?)
     }
     fn transfer(&self, host: &Host, name: &str, request: &Value) -> Result<Value> {
         let command = guest_command(host, name, &["transfer".into()])?;

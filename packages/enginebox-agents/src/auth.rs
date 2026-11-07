@@ -133,19 +133,46 @@ pub fn probe_with_lease(
     }
 }
 pub fn authorization_url(p: &str, s: &str) -> Option<String> {
+    authorization_url_for(p, s, ClaudeLogin::SetupToken)
+}
+/// [`authorization_url`] for a Claude login mode: `setup-token` shows
+/// claude.com's page with platform.claude.com's callback; the full login may
+/// also show claude.ai's page with console.anthropic.com's callback. Page
+/// and callback are checked as pairs, never mixed.
+pub fn authorization_url_for(p: &str, s: &str, claude: ClaudeLogin) -> Option<String> {
     if s.len() > 8192 || s.chars().any(|c| c as u32 <= 32) {
         return None;
     }
     let u = url::Url::parse(s).ok()?;
-    let (host, path) = match p {
-        "codex" => ("auth.openai.com", "/codex/device"),
-        "claude" => ("claude.com", "/cai/oauth/authorize"),
-        "cursor" => ("cursor.com", "/loginDeepControl"),
+    // Claude's interactive login (`claude auth login --claudeai`) may use
+    // claude.ai's authorize page; setup-token uses claude.com's.
+    // (host, path, the only callback allowed with it)
+    let pages: &[(&str, &str, Option<&str>)] = match (p, claude) {
+        ("codex", _) => &[("auth.openai.com", "/codex/device", None)],
+        ("claude", ClaudeLogin::SetupToken) => &[(
+            "claude.com",
+            "/cai/oauth/authorize",
+            Some("https://platform.claude.com/oauth/code/callback"),
+        )],
+        ("claude", ClaudeLogin::Full) => &[
+            (
+                "claude.com",
+                "/cai/oauth/authorize",
+                Some("https://platform.claude.com/oauth/code/callback"),
+            ),
+            (
+                "claude.ai",
+                "/oauth/authorize",
+                Some("https://console.anthropic.com/oauth/code/callback"),
+            ),
+        ],
+        ("cursor", _) => &[("cursor.com", "/loginDeepControl", None)],
         _ => return None,
     };
+    let page = pages
+        .iter()
+        .find(|(host, path, _)| u.host_str() == Some(host) && u.path() == *path)?;
     if u.scheme() != "https"
-        || u.host_str() != Some(host)
-        || u.path() != path
         || !u.username().is_empty()
         || u.password().is_some()
         || u.port().is_some_and(|p| p != 443)
@@ -186,10 +213,6 @@ pub fn authorization_url(p: &str, s: &str) -> Option<String> {
             ("code", "true"),
             ("response_type", "code"),
             ("code_challenge_method", "S256"),
-            (
-                "redirect_uri",
-                "https://platform.claude.com/oauth/code/callback",
-            ),
         ]
     } else if p == "cursor" {
         &[
@@ -206,6 +229,14 @@ pub fn authorization_url(p: &str, s: &str) -> Option<String> {
     {
         return None;
     }
+    // Claude's code is shown on Anthropic's own callback page for that page.
+    if let Some(callback) = page.2
+        && query
+            .get("redirect_uri")
+            .is_some_and(|r| r.as_ref() != callback)
+    {
+        return None;
+    }
     Some(s.into())
 }
 pub fn valid_input(s: &str) -> bool {
@@ -216,6 +247,7 @@ pub fn valid_input(s: &str) -> bool {
 }
 pub struct LoginOutput {
     provider: String,
+    claude: ClaudeLogin,
     pub buffer: String,
     state: u8,
     url: Option<String>,
@@ -224,8 +256,12 @@ pub struct LoginOutput {
 }
 impl LoginOutput {
     pub fn new(p: &str) -> Self {
+        Self::with_mode(p, ClaudeLogin::SetupToken)
+    }
+    pub fn with_mode(p: &str, claude: ClaudeLogin) -> Self {
         Self {
             provider: p.into(),
+            claude,
             buffer: String::new(),
             state: 0,
             url: None,
@@ -279,7 +315,7 @@ impl LoginOutput {
             let s = matched
                 .as_str()
                 .trim_end_matches(|c: char| c.is_whitespace() || "<>\"'".contains(c));
-            if let Some(url) = authorization_url(&self.provider, s)
+            if let Some(url) = authorization_url_for(&self.provider, s, self.claude)
                 && self.url.as_ref() != Some(&url)
             {
                 self.url = Some(url.clone());
@@ -301,10 +337,222 @@ impl LoginOutput {
         events
     }
 }
+/// Whether `home` holds Claude's interactive login: an expiring access token
+/// with its refresh token.
+pub fn refreshable_claude_login(home: &Path) -> Result<bool> {
+    Ok(
+        security::read_json(home, delegation::native_file("claude"))?.is_some_and(|v| {
+            let t = &v["claudeAiOauth"];
+            security::token(&t["accessToken"])
+                && security::token(&t["refreshToken"])
+                && t["expiresAt"].as_f64().is_some_and(|n| n > 0.)
+        }),
+    )
+}
+
+/// Renew the native login in `home` centrally with the provider's own client
+/// (Codex: `app-server account/read {refreshToken: true}`; Claude: `auth login
+/// --claudeai` with the stored refresh token in its environment). The caller
+/// holds the home's provider lease. The refresh token never leaves `home`.
+pub fn refresh(
+    home: &Path,
+    p: &str,
+    binaries: &BTreeMap<String, Option<String>>,
+    lease: &security::Lease,
+) -> std::result::Result<(), RefreshError> {
+    let transient = RefreshError::Transient;
+    let native = security::read_json(home, delegation::native_file(p))
+        .map_err(transient)?
+        .ok_or(RefreshError::Rejected)?;
+    let mut env = controller_environment(home, binaries).map_err(transient)?;
+    let exe = binaries.get(p).and_then(Option::as_ref).ok_or_else(|| {
+        transient(anyhow::anyhow!(
+            "Install native client to refresh connection."
+        ))
+    })?;
+    match p {
+        "codex" => {
+            let renewed = process::native_rpc_with_lease(
+                &[
+                    exe.clone(),
+                    "-c".into(),
+                    "cli_auth_credentials_store=\"file\"".into(),
+                    "app-server".into(),
+                ],
+                &env,
+                "account/read",
+                Some(json!({"refreshToken":true})),
+                20,
+                65536,
+                Some(lease),
+            );
+            if let Err(error) = renewed {
+                return Err(classify(&format!("{error:#}"), error));
+            }
+        }
+        "claude" => {
+            let oauth = &native["claudeAiOauth"];
+            if !security::token(&oauth["refreshToken"]) {
+                return Err(RefreshError::Rejected);
+            }
+            let scopes = oauth["scopes"]
+                .as_array()
+                .ok_or_else(|| transient(anyhow::anyhow!("Unsupported native scopes.")))?;
+            let pattern = regex::Regex::new(r"^[a-zA-Z0-9_:.-]{1,128}$").unwrap();
+            if scopes.is_empty()
+                || !scopes
+                    .iter()
+                    .all(|s| s.as_str().is_some_and(|s| pattern.is_match(s)))
+            {
+                return Err(transient(anyhow::anyhow!("Unsupported native scopes.")));
+            }
+            env.insert(
+                "CLAUDE_CODE_OAUTH_REFRESH_TOKEN".into(),
+                oauth["refreshToken"].as_str().unwrap().into(),
+            );
+            env.insert(
+                "CLAUDE_CODE_OAUTH_SCOPES".into(),
+                scopes
+                    .iter()
+                    .map(|s| s.as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            let out = process::bounded(
+                &[
+                    exe.clone(),
+                    "auth".into(),
+                    "login".into(),
+                    "--claudeai".into(),
+                ],
+                Some(&env),
+                Some(home),
+                b"",
+                std::time::Duration::from_secs(20),
+                65536,
+                Some(lease),
+            )
+            .map_err(transient)?;
+            if out.timed_out || out.output_truncated {
+                return Err(transient(anyhow::anyhow!("The renewal did not finish.")));
+            }
+            if out.exit_code != 0 {
+                return Err(classify(
+                    &out.output,
+                    anyhow::anyhow!("The provider client could not renew the login."),
+                ));
+            }
+        }
+        _ => {
+            process::checked_with_lease(
+                &[
+                    exe.clone(),
+                    "status".into(),
+                    "--format".into(),
+                    "json".into(),
+                ],
+                Some(&env),
+                Some(home),
+                b"",
+                15,
+                65536,
+                Some(lease),
+            )
+            .map_err(transient)?;
+        }
+    }
+    Ok(())
+}
+
+/// Why a central renewal failed: the provider refused the refresh token
+/// (the member must sign in again), or anything else (network, rate limit,
+/// timeout, a missing client, a busy lease), which a later attempt may cure.
+#[derive(Debug)]
+pub enum RefreshError {
+    Rejected,
+    Transient(anyhow::Error),
+}
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected => f.write_str("The provider refused the stored login; sign in again."),
+            Self::Transient(e) => write!(f, "The login could not be renewed now: {e:#}"),
+        }
+    }
+}
+impl std::error::Error for RefreshError {}
+/// A failed renewal's client output: a refused grant, or something transient.
+fn classify(output: &str, error: anyhow::Error) -> RefreshError {
+    let o = output.to_ascii_lowercase();
+    let refused = [
+        "invalid_grant",
+        "invalid refresh",
+        "refresh token is invalid",
+        "token has been revoked",
+        "refresh_token_reused",
+        "refresh token expired",
+        "token_expired",
+    ]
+    .iter()
+    .any(|m| o.contains(m));
+    if refused {
+        RefreshError::Rejected
+    } else {
+        RefreshError::Transient(error)
+    }
+}
+
+/// The marker a refused renewal leaves in a credential home: further
+/// renewals and deliveries stop until the next sign-in clears it.
+pub const REFRESH_FAILURE: &str = "refresh-failure.json";
+/// Record a refused renewal (for the login with `digest`, when known).
+pub fn record_refresh_rejected(home: &Path, digest: Option<&str>) -> Result<()> {
+    security::write_json(
+        home,
+        REFRESH_FAILURE,
+        &json!({"credential_digest":digest,"failed_at":chrono::Utc::now().timestamp()}),
+    )
+}
+/// Whether a refused renewal is recorded (for the login with `digest`, when
+/// given: a newer login is not blocked by an older failure).
+pub fn refresh_rejected(home: &Path, digest: Option<&str>) -> bool {
+    security::read_json(home, REFRESH_FAILURE)
+        .ok()
+        .flatten()
+        .is_some_and(|v| digest.is_none_or(|d| v["credential_digest"] == d))
+}
+/// Clear the marker (after a fresh sign-in).
+pub fn clear_refresh_rejected(home: &Path) -> Result<()> {
+    security::remove(home, REFRESH_FAILURE)
+}
+/// The home's provider lease (shared by sign-in, renewal and reading),
+/// waiting up to `wait` for another holder.
+pub fn lease_waiting(home: &Path, p: &str, wait: std::time::Duration) -> Result<security::Lease> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match security::Lease::acquire(home, &format!(".local/state/enginebox/auth-{p}.lock")) {
+            Ok(lease) => return Ok(lease),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Control {
     Input(String),
     Cancel,
+}
+/// How Claude signs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeLogin {
+    /// `claude setup-token`: a one-year token (controller accounts).
+    SetupToken,
+    /// `claude auth login --claudeai`: an access token that expires within
+    /// hours plus a refresh token, both in `~/.claude/.credentials.json`.
+    /// Only the access token is ever delegated; refresh stays here
+    /// (members' own subscriptions, docs/MEMBER-SUBSCRIPTIONS.md).
+    Full,
 }
 /// Native login owns its private lock for the entire PTY and verification lifetime.
 pub fn login<F: FnMut(Value)>(
@@ -314,8 +562,32 @@ pub fn login<F: FnMut(Value)>(
     binaries: &BTreeMap<String, Option<String>>,
     control: mpsc::Receiver<Control>,
     cancelled: &AtomicBool,
+    emit: F,
+) -> Result<()> {
+    login_with(
+        home,
+        p,
+        exe,
+        binaries,
+        control,
+        cancelled,
+        ClaudeLogin::SetupToken,
+        emit,
+    )
+}
+/// [`login`] with a choice of Claude sign-in.
+#[allow(clippy::too_many_arguments)]
+pub fn login_with<F: FnMut(Value)>(
+    home: &Path,
+    p: &str,
+    exe: &str,
+    binaries: &BTreeMap<String, Option<String>>,
+    control: mpsc::Receiver<Control>,
+    cancelled: &AtomicBool,
+    claude: ClaudeLogin,
     mut emit: F,
 ) -> Result<()> {
+    let full = p == "claude" && claude == ClaudeLogin::Full;
     let lease = security::Lease::acquire(home, &format!(".local/state/enginebox/auth-{p}.lock"))?;
     let env = controller_environment(home, binaries)?;
     native::verify_client(exe, p, &env, home)?;
@@ -327,6 +599,7 @@ pub fn login<F: FnMut(Value)>(
             "login",
             "--device-auth",
         ],
+        "claude" if full => vec![exe, "auth", "login", "--claudeai"],
         "claude" => vec![exe, "setup-token"],
         _ => vec![exe, "login"],
     }
@@ -404,7 +677,11 @@ pub fn login<F: FnMut(Value)>(
         }
     };
     let deadline = Instant::now() + Duration::from_secs(600);
-    let mut parser = LoginOutput::new(p);
+    let mut parser = LoginOutput::with_mode(p, claude);
+    // A completed sign-in must have written a new credential.
+    let before = security::legacy_digest(
+        &security::read_json(home, delegation::native_file(p))?.unwrap_or(Value::Null),
+    );
     let mut setup_token = None;
     let mut reason = "failed";
     let token_pattern = regex::Regex::new(r"sk-ant-oat01-[A-Za-z0-9_-]{20,4096}")?;
@@ -445,6 +722,7 @@ pub fn login<F: FnMut(Value)>(
                         emit(e)
                     }
                     if p == "claude"
+                        && !full
                         && let Some(m) = token_pattern.find(&parser.buffer)
                     {
                         setup_token = Some(m.as_str().to_owned());
@@ -475,6 +753,7 @@ pub fn login<F: FnMut(Value)>(
                     }
                 }
                 if p == "claude"
+                    && !full
                     && let Some(m) = token_pattern.find(&parser.buffer)
                 {
                     setup_token = Some(m.as_str().to_owned());
@@ -506,9 +785,25 @@ pub fn login<F: FnMut(Value)>(
         }
         if cancelled.load(Ordering::SeqCst) || matches!(control.try_recv(), Ok(Control::Cancel)) {
             reason = "cancelled";
+        } else if setup_token.is_none()
+            && security::legacy_digest(
+                &security::read_json(home, delegation::native_file(p))?.unwrap_or(Value::Null),
+            ) == before
+        {
+            // The client said it finished but left no new credential.
+            reason = "unverified";
+        } else if full && !refreshable_claude_login(home)? {
+            // A full login must leave a refreshable login behind; otherwise
+            // runs would need a long-lived token, which members never get.
+            reason = "unverified";
         } else if status["status"] == "connected"
             && ["subscription", "account"].contains(&status["auth_method"].as_str().unwrap_or(""))
         {
+            if full {
+                // A full login replaces any earlier setup token in this home.
+                // Never leave an old long-lived token behind a new login.
+                security::remove(home, delegation::TOKEN_FILE)?;
+            }
             if let Some(token) = setup_token {
                 security::write_json(
                     home,
