@@ -1934,6 +1934,26 @@ exit 2
             credential_id: id.clone(),
         };
         assert!(c.member_material(&bobs, "claude", 600).is_err());
+        // Two hours of access left: enough for a 10-minute run, which uses it
+        // as is; a 3-hour run renews it centrally first and is accepted.
+        let two_hours = |token: &str| {
+            json!({"claudeAiOauth":{"accessToken":token,"refreshToken":"rt-good-0123456789",
+                "expiresAt":(chrono::Utc::now().timestamp() + 7200) * 1000,"scopes":["user:inference"]}})
+        };
+        security::write_json(
+            &home,
+            ".claude/.credentials.json",
+            &two_hours("sk-ant-oat01-two-hours-0123456789"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.member_material(&run, "claude", 600).unwrap().content["CLAUDE_CODE_OAUTH_TOKEN"],
+            "sk-ant-oat01-two-hours-0123456789"
+        );
+        assert_eq!(
+            c.member_material(&run, "claude", 10_800).unwrap().content["CLAUDE_CODE_OAUTH_TOKEN"],
+            "sk-ant-oat01-renewed-0123456789"
+        );
         // The provider revokes the refresh token: the run fails, the
         // credential says reconnect, and nothing falls back.
         security::write_json(
