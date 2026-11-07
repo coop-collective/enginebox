@@ -66,6 +66,12 @@ struct Inner {
     personal_host: Mutex<Option<PersonalHost>>,
     /// Replaces deleting a member workspace's VM (tests only).
     delete_vm: Mutex<Option<DeleteHook>>,
+    /// Replaces the guest's `cancel` command (tests only).
+    cancel_hook: Mutex<Option<CancelHook>>,
+    /// Credentials whose runs are being stopped (a removed subscription):
+    /// their runs never start, and running ones are cancelled again until
+    /// they end (`agent-revoked-credentials.json`).
+    revoked: Mutex<BTreeSet<String>>,
     /// Callback targets and keys of runs still in flight. Memory only: the
     /// key never reaches a record, and a restart ends delivery for that run.
     callbacks: Mutex<BTreeMap<String, Callback>>,
@@ -175,6 +181,10 @@ pub type RepositoryMint = Arc<dyn Fn(&str, u64) -> Result<repository::Credential
 pub type MemberMaterial = Arc<
     dyn Fn(&str, &queue::MemberRun, &str, u64) -> Result<crate::member::Delegated> + Send + Sync,
 >;
+/// Asks a running run's guest to cancel it (host, workspace, run): replaces
+/// the guest command in tests.
+pub type CancelHook = Arc<dyn Fn(&str, &str, &str) -> Result<()> + Send + Sync>;
+const REVOKED_FILE: &str = "agent-revoked-credentials.json";
 /// Deletes a workspace VM (host, name): replaces the fleet in tests.
 pub type DeleteHook = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
 /// Whether a host is a personal or contributed machine (docs/MEMBER-SUBSCRIPTIONS.md).
@@ -597,6 +607,13 @@ impl AgentService {
                 member_cleared: Mutex::new(BTreeSet::new()),
                 personal_host: Mutex::new(None),
                 delete_vm: Mutex::new(None),
+                cancel_hook: Mutex::new(None),
+                revoked: Mutex::new(
+                    security::read_json(&controller_root.join("agents"), REVOKED_FILE)?
+                        .map(|v| serde_json::from_value(v["credentials"].clone()))
+                        .transpose()?
+                        .unwrap_or_default(),
+                ),
                 callbacks: Mutex::new(callbacks),
                 finish_hook: Mutex::new(None),
                 queue_root,
@@ -1428,6 +1445,8 @@ impl AgentService {
     }
     pub fn reconcile(&self) -> Result<Value> {
         let _pending = self.pending_guard()?;
+        // Runs of removed subscriptions whose hosts were unreachable.
+        self.retry_revocations();
         let mut results = Vec::new();
         let mut paths = std::fs::read_dir(self.inner.root.join("attachments"))?
             .filter_map(|e| e.ok())
@@ -1788,12 +1807,13 @@ impl AgentService {
         self.cancel_pool_run(&pool, id)
     }
     /// Every unfinished member run of `member` using credential
-    /// `credential_id`: the IDs and pools to cancel when it is removed.
+    /// `credential_id`: (run, pool).
     pub fn active_member_runs(&self, member: &str, credential_id: &str) -> Vec<(String, String)> {
         let sched = self.inner.sched.lock().unwrap();
         sched
             .entries
             .values()
+            .filter(|q| q.entry.state != EntryState::Finished)
             .filter_map(|q| {
                 let m = q.entry.member.as_ref()?;
                 let pool = q.entry.pool()?;
@@ -1801,6 +1821,99 @@ impl AgentService {
                     .then(|| (q.entry.id.clone(), pool.to_owned()))
             })
             .collect()
+    }
+    /// Replace the guest's cancel command (tests).
+    pub fn set_cancel_hook(&self, hook: CancelHook) {
+        *self.inner.cancel_hook.lock().unwrap() = Some(hook);
+    }
+    fn save_revoked(&self, revoked: &BTreeSet<String>) -> Result<()> {
+        security::write_json(
+            &self.inner.root,
+            REVOKED_FILE,
+            &json!({"credentials": revoked}),
+        )
+    }
+    /// Whether runs of `credential_id` are being stopped.
+    pub fn credential_revoked(&self, credential_id: &str) -> bool {
+        self.inner.revoked.lock().unwrap().contains(credential_id)
+    }
+    /// A member's subscription was removed: stop every unfinished run that
+    /// uses it. The credential is recorded as revoked first (durably), so a
+    /// queued run never starts and a running one whose host cannot be
+    /// reached now is cancelled again when it can ([`Self::retry_revocations`]).
+    /// The answer separates runs now `cancelled`, runs asked to stop and
+    /// still `stopping`, runs that had already finished, and runs whose
+    /// cancellation could not be delivered yet (`cancel_failed`).
+    pub fn revoke_credential_runs(&self, member: &str, credential_id: &str) -> Value {
+        {
+            let mut revoked = self.inner.revoked.lock().unwrap();
+            let mut next = revoked.clone();
+            next.insert(credential_id.to_owned());
+            if let Err(error) = self.save_revoked(&next) {
+                eprintln!(
+                    "agents: the revocation of a credential could not be recorded: {error:#}"
+                );
+            }
+            *revoked = next;
+        }
+        let mut out =
+            json!({"cancelled":[],"stopping":[],"already_finished":[],"cancel_failed":[]});
+        for (run, pool) in self.active_member_runs(member, credential_id) {
+            let bucket = match self.cancel_pool_run(&pool, &run) {
+                Ok(view) => match view["status"].as_str().unwrap_or("") {
+                    "cancelled" => "cancelled",
+                    "queued" | "running" => "stopping",
+                    _ => "already_finished",
+                },
+                Err(error) => {
+                    eprintln!(
+                        "agents: run {run} of a removed subscription could not be cancelled yet: {error:#}"
+                    );
+                    "cancel_failed"
+                }
+            };
+            out[bucket].as_array_mut().unwrap().push(json!(run));
+        }
+        out
+    }
+    /// Cancel again the unfinished runs of revoked credentials (a host that
+    /// was unreachable may be back); forget credentials with no runs left.
+    pub fn retry_revocations(&self) {
+        let revoked: Vec<String> = self.inner.revoked.lock().unwrap().iter().cloned().collect();
+        if revoked.is_empty() {
+            return;
+        }
+        let active: Vec<(String, String, String)> = {
+            let sched = self.inner.sched.lock().unwrap();
+            sched
+                .entries
+                .values()
+                .filter(|q| q.entry.state != EntryState::Finished)
+                .filter_map(|q| {
+                    let m = q.entry.member.as_ref()?;
+                    let pool = q.entry.pool()?;
+                    revoked
+                        .contains(&m.credential_id)
+                        .then(|| (q.entry.id.clone(), pool.to_owned(), m.credential_id.clone()))
+                })
+                .collect()
+        };
+        for (run, pool, _) in &active {
+            if let Err(error) = self.cancel_pool_run(pool, run) {
+                eprintln!(
+                    "agents: run {run} of a removed subscription is still unreachable: {error:#}"
+                );
+            }
+        }
+        let mut current = self.inner.revoked.lock().unwrap();
+        let next: BTreeSet<String> = current
+            .iter()
+            .filter(|c| active.iter().any(|(_, _, a)| a == *c))
+            .cloned()
+            .collect();
+        if next != *current && self.save_revoked(&next).is_ok() {
+            *current = next;
+        }
     }
     /// Who started runs on native session `session`: `Some(member)` for a
     /// member run, `None` for an ordinary one. Empty when no run used it.
@@ -1961,6 +2074,11 @@ impl AgentService {
         // launch; a running cancellation may arrive before the remote helper
         // and remains recorded until that exact run observes it.
         if running {
+            let hook = self.inner.cancel_hook.lock().unwrap().clone();
+            if let Some(cancel) = hook {
+                cancel(host_id, name, id)?;
+                return self.get_run(host_id, name, id);
+            }
             let host = self.inner.fleet.account_workspace(host_id, name)?;
             let command = guest_command(&host, name, &["cancel".into(), provider, id.into()])?;
             let output = process::checked(&command, None, None, b"", 20, 4096)?;
@@ -3756,6 +3874,23 @@ impl AgentService {
         };
         run.repository_access = credential.as_ref().map(repository::Credential::access);
         // A member run's material: only its member's own credential, read now.
+        if let Some(member) = run.member.as_ref()
+            && self.credential_revoked(&member.credential_id)
+        {
+            let failure = LaunchFailure::new(
+                Stage::Delegate,
+                "credential_unavailable",
+                "The subscription was removed; the run did not start.",
+            );
+            self.launch_failed(
+                &run,
+                template.as_deref(),
+                resolved.as_ref(),
+                &failure,
+                started,
+            );
+            return;
+        }
         if let Some(member) = run.member.clone() {
             let reader = self.inner.hooks.member.lock().unwrap().clone();
             let material = match reader {

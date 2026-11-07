@@ -277,11 +277,15 @@ pub struct Credentials {
     /// subscriptions are refused without one.
     kek: Option<sealed::Kek>,
     events: Arc<Mutex<Option<EventSink>>>,
+    on_delete: Arc<Mutex<Option<DeleteHook>>>,
 }
 
 /// Where member credential events go (the controller's audit log):
 /// (org, member, action, credential ID, ok, detail without values).
 pub type EventSink = Arc<dyn Fn(&str, &str, &str, &str, bool, Value) + Send + Sync>;
+/// Called after a personal credential is deleted, by every deletion path:
+/// stops the runs that use it and says how (the controller's agent runs).
+pub type DeleteHook = Arc<dyn Fn(&Credential) -> Value + Send + Sync>;
 
 fn valid_user(id: &str) -> bool {
     id.len() == 28
@@ -383,6 +387,7 @@ impl Credentials {
             unity_login: unity::Client::from_env(),
             member: Arc::new(Mutex::new(member)),
             events: Arc::new(Mutex::new(None)),
+            on_delete: Arc::new(Mutex::new(None)),
             kek: match sealed::Kek::from_env(root) {
                 Ok(kek) => kek,
                 Err(error) => {
@@ -445,10 +450,20 @@ impl Credentials {
     pub fn set_event_sink(&self, sink: EventSink) {
         *self.events.lock().unwrap() = Some(sink);
     }
+    /// Stop runs on every deletion of a personal credential.
+    pub fn set_delete_hook(&self, hook: DeleteHook) {
+        *self.on_delete.lock().unwrap() = Some(hook);
+    }
+    /// Call with no lock held: the sink writes the audit log.
     fn event(&self, record: &Credential, action: &str, ok: bool, detail: Value) {
+        if let Some(member) = record.owner_user_id.as_deref() {
+            self.event_as(&record.org_id, member, action, &record.id, ok, detail);
+        }
+    }
+    fn event_as(&self, org: &str, actor: &str, action: &str, id: &str, ok: bool, detail: Value) {
         let sink = self.events.lock().unwrap().clone();
-        if let (Some(sink), Some(member)) = (sink, record.owner_user_id.as_deref()) {
-            sink(&record.org_id, member, action, &record.id, ok, detail);
+        if let Some(sink) = sink {
+            sink(org, actor, action, id, ok, detail);
         }
     }
     /// [`Self::member_material`] for run `run_id`, audited: the credential
@@ -461,20 +476,21 @@ impl Credentials {
         timeout_seconds: u64,
     ) -> Result<enginebox_agents::member::Delegated> {
         let result = self.member_material(run, provider, timeout_seconds);
-        if let Some(record) = self
+        // Every attempt, the credential found or not, as the run's member.
+        let org = self
             .records
             .lock()
             .unwrap()
             .get(&run.credential_id)
-            .cloned()
-        {
-            self.event(
-                &record,
-                "credential.member_used",
-                result.is_ok(),
-                json!({"run_id": run_id, "provider": provider, "run_member": run.member}),
-            );
-        }
+            .map(|c| c.org_id.clone());
+        self.event_as(
+            org.as_deref().unwrap_or(pools::DEFAULT_ORG),
+            &run.member,
+            "credential.member_used",
+            &run.credential_id,
+            result.is_ok(),
+            json!({"run_id": run_id, "provider": provider, "credential_found": org.is_some()}),
+        );
         result
     }
     fn require_kek(&self) -> Result<sealed::Kek> {
@@ -741,10 +757,11 @@ impl Credentials {
             }
         }
         let mut records = self.records.lock().unwrap();
-        ensure!(
-            records.get(id).is_some_and(|c| c.org_id == org),
-            "Unknown credential"
-        );
+        let removed = records
+            .get(id)
+            .filter(|c| c.org_id == org)
+            .cloned()
+            .context("Unknown credential")?;
         let mut sessions = self.sessions.lock().unwrap();
         for s in sessions.values().filter(|s| s.credential == id) {
             s.cancel.store(true, Ordering::SeqCst);
@@ -770,7 +787,14 @@ impl Credentials {
         {
             eprintln!("credentials: a member marker could not be removed: {error}");
         }
-        Ok(json!({"deleted": true}))
+        drop(records);
+        // Every deletion path stops the runs that use the credential.
+        let hook = self.on_delete.lock().unwrap().clone();
+        let revocation = match (hook, removed.kind) {
+            (Some(stop), Kind::Personal) => stop(&removed),
+            _ => Value::Null,
+        };
+        Ok(json!({"deleted": true, "revocation": revocation}))
     }
     /// `POST /v1/credentials/{id}/login`: native sign-in into the credential's own home.
     pub fn start_login(&self, org: &str, id: &str) -> Result<Value> {
@@ -1497,6 +1521,7 @@ impl Credentials {
         // Read from the decrypted files in memory: no plaintext on disk.
         let delegated = self.sealed_material(&kek, &record.id, &home, provider)?;
         let now = chrono::Utc::now().timestamp() as f64;
+        let mut refreshed = false;
         let delegated = if delegated
             .expires_at
             .is_none_or(|at| at > now + (timeout_seconds as f64 + 300.).max(REFRESH_BEFORE_SECONDS))
@@ -1536,12 +1561,7 @@ impl Credentials {
                     )
                 }
             }
-            self.event(
-                &record,
-                "credential.member_refreshed",
-                true,
-                json!({"provider": provider}),
-            );
+            refreshed = true;
             self.sealed_material(&kek, &record.id, &home, provider)?
         };
         drop(lease);
@@ -1554,6 +1574,15 @@ impl Credentials {
                 .is_none_or(|at| at > now + timeout_seconds as f64 + 60.),
             "The subscription's access expires before this run's timeout, even renewed; shorten the timeout."
         );
+        // Only a renewal that produced usable access counts as one.
+        if refreshed {
+            self.event(
+                &record,
+                "credential.member_refreshed",
+                true,
+                json!({"provider": provider}),
+            );
+        }
         Ok(delegated)
     }
 
@@ -2337,6 +2366,25 @@ exit 2
         let c = Credentials::open(&root, &BTreeMap::from([("claude".to_owned(), exe)]))
             .unwrap()
             .with_kek(Some(sealed::Kek::from_bytes([5; 32])));
+        let events: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::default();
+        {
+            let events = events.clone();
+            c.set_event_sink(Arc::new(move |_, actor, action, _, ok, detail| {
+                assert!(!detail.to_string().contains("sk-ant-oat01"));
+                events
+                    .lock()
+                    .unwrap()
+                    .push((action.to_owned(), actor.to_owned(), ok));
+            }));
+        }
+        let count = |action: &str| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(a, _, _)| a == action)
+                .count()
+        };
         let id = c
             .member_create(ORG, ALICE, &json!({"provider":"claude"}))
             .unwrap()
@@ -2468,6 +2516,26 @@ exit 2
         .unwrap();
         sealed::seal_home(&kek, &id, &home).unwrap();
         assert!(c.member_material(&run, "claude", 600).is_err());
+        // Audit: one renewal per usable renewed access, a reconnect when the
+        // provider refused, and every use attempt as the run's member, even
+        // for a credential that no longer exists.
+        assert_eq!(count("credential.member_reconnect_needed"), 1);
+        assert!(count("credential.member_refreshed") >= 1);
+        let gone = enginebox_agents::queue::MemberRun {
+            member: BOB.into(),
+            credential_id: "f".repeat(32),
+        };
+        assert!(
+            c.member_material_for(&"1".repeat(32), &gone, "claude", 600)
+                .is_err()
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(a, actor, ok)| { a == "credential.member_used" && actor == BOB && !ok })
+        );
     }
 
     fn with_unity() -> (tempfile::TempDir, Credentials, Arc<Mutex<Vec<String>>>) {

@@ -392,20 +392,35 @@ team accounts and API keys keep the existing 0600 files.
 actor, the credential ID as target, and no value:
 - `credential.member_connect|login|login_input|login_cancel|delete` (the member's
   own actions);
-- `credential.member_used` (`detail.run_id`, the outcome);
-- `credential.member_refreshed`;
+- `credential.member_used` on every attempt (`detail.run_id`, the outcome),
+  with the run's member as actor, even when the credential no longer exists;
+- `credential.member_refreshed`, only for a renewal that produced usable access;
 - `credential.member_reconnect_needed`.
 
 **Revocation.**
-- When a member removes a subscription, every unfinished run that uses it is
-  cancelled: queued runs never start and running ones are stopped. The reply
-  lists them in `cancelled_runs`. An admin removing it on `/v1/credentials/{id}/delete`
-  does the same.
-- The credential's home (the tokens) is deleted at once.
-- Tell the member to also revoke at the provider: Claude account → sessions, or
-  ChatGPT → Security → sign out of all devices.
-- A member who leaves the org loses the app's token at its next refresh.
-  Their stored credential stays until they or an admin remove it.
+- **Every deletion path.** Deleting a member's subscription stops every
+  unfinished run that uses it. This applies to the member's route, an admin's
+  `/v1/credentials/{id}/delete`, and any other deletion: the credential store
+  calls a delete hook.
+- **Durable record.** The credential is first recorded as revoked
+  (`agents/agent-revoked-credentials.json`). A queued run never starts: it fails
+  with `credential_unavailable`.
+- **Cancellation.** Each run is cancelled, and the reply's `revocation` says
+  what happened to each one:
+  - `cancelled`: it has ended;
+  - `stopping`: it was asked to stop and is still ending;
+  - `already_finished`;
+  - `cancel_failed`: its host could not be reached. It stays recorded, is logged,
+    and is cancelled again on each reconciliation until it ends.
+
+  The deletion itself always succeeds. If confirming the stops fails after the
+  record is gone, the reply still says `deleted: true` and that stopping is
+  retried.
+- **Tokens.** The credential's home (its tokens) is deleted at once.
+- **Provider side.** Tell the member to also revoke at the provider: Claude
+  account → sessions, or ChatGPT → Security → sign out of all devices.
+- **Leaving the org.** A member who leaves the org loses the app's token at its
+  next refresh. Their stored credential stays until they or an admin remove it.
 
 **Usage.** Run callbacks (`agent_run.finished`) now also carry:
 - `usage`: `{tokens_in, tokens_out, tokens_cached, scope}` as the

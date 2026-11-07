@@ -349,6 +349,16 @@ impl Controller {
             .set_member_material(Arc::new(move |run_id, run, provider, timeout| {
                 member_credentials.member_material_for(run_id, run, provider, timeout)
             }));
+        // Deleting a member's subscription, by any path, stops its runs.
+        let revoker = runtime.agents.clone();
+        runtime
+            .credentials
+            .set_delete_hook(Arc::new(move |credential| {
+                match credential.owner_user_id.as_deref() {
+                    Some(member) => revoker.revoke_credential_runs(member, &credential.id),
+                    None => Value::Null,
+                }
+            }));
         // Member credential events (used, refreshed, reconnect needed) reach
         // the audit log keyed by the member, never with values.
         let audit = runtime.catalog.audit.clone();
@@ -2067,13 +2077,11 @@ fn member_credential_write(
             ["credentials", id, "delete"] => (
                 "credential.member_delete",
                 id.to_string(),
+                // Removing a subscription stops every run still using it
+                // (the credentials' delete hook): `revocation` says how.
                 empty(body)
                     .and_then(|()| credentials.member_delete(org, member, id))
-                    .map(|mut v| {
-                        // Removing a subscription stops every run still using it.
-                        v["cancelled_runs"] = json!(cancel_credential_runs(runtime, member, id));
-                        (StatusCode::OK, v)
-                    }),
+                    .map(|v| (StatusCode::OK, v)),
             ),
             ["credentials", id, "sessions", session, "input"] => (
                 "credential.member_login_input",
@@ -3050,19 +3058,24 @@ async fn write(
         ["v1", "credentials", id, "delete"] => {
             empty(&body)?;
             let unity = runtime.credentials.unity_get(&org, id).is_some();
-            let owner = runtime
-                .credentials
-                .get(&org, id)
-                .and_then(|c| c.owner_user_id);
-            let mut deleted = runtime.credentials.delete(&org, id)?;
-            // An admin removing a member's subscription stops its runs too.
-            if let Some(owner) = owner {
-                let (agents_runtime, id) = (runtime.clone(), id.to_string());
-                deleted["cancelled_runs"] = json!(
-                    blocking(move || Ok(cancel_credential_runs(&agents_runtime, &owner, &id)))
-                        .await?
-                );
-            }
+            // Off the async executor; the delete hook stops the runs of a
+            // member's subscription (as on every deletion path).
+            let (credentials, delete_org, delete_id) =
+                (runtime.credentials.clone(), org.clone(), id.to_string());
+            let deleted = match blocking(move || credentials.delete(&delete_org, &delete_id)).await
+            {
+                Ok(v) => v,
+                // The deletion is irreversible: once the record is gone, report
+                // success with what could not be done, never an error.
+                Err(error)
+                    if runtime.credentials.get(&org, id).is_none()
+                        && runtime.credentials.unity_get(&org, id).is_none() =>
+                {
+                    eprintln!("credentials: after deleting a credential: {error:#}");
+                    json!({"deleted": true, "revocation": {"error": "Stopping its runs could not be confirmed; they are retried."}})
+                }
+                Err(error) => return Err(error),
+            };
             if unity {
                 runtime.catalog.audit.record(
                     &org,
@@ -3199,18 +3212,6 @@ fn repository_reply(result: Result<Value>, ok: StatusCode) -> (StatusCode, Value
 enum RunTarget {
     Workspace(String, String),
     Pool(String),
-}
-
-/// Cancel every unfinished member run of `member` that uses credential `id`
-/// (queued runs never start; running ones are stopped). Returns their IDs.
-fn cancel_credential_runs(runtime: &Runtime, member: &str, id: &str) -> Vec<String> {
-    runtime
-        .agents
-        .active_member_runs(member, id)
-        .into_iter()
-        .filter(|(run, pool)| runtime.agents.cancel_pool_run(pool, run).is_ok())
-        .map(|(run, _)| run)
-        .collect()
 }
 
 /// `POST /v1/projects/{p}/me/agent-runs` (docs/MEMBER-SUBSCRIPTIONS.md): a
@@ -8514,7 +8515,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{removed}");
-        assert_eq!(removed["cancelled_runs"], json!([queued]));
+        assert_eq!(removed["revocation"]["cancelled"], json!([queued]));
+        assert_eq!(removed["revocation"]["cancel_failed"], json!([]));
         let (_, current) = call(
             &app,
             bearer(Method::GET, &format!("{runs}/{queued}"), "", &alice),
@@ -8534,5 +8536,157 @@ mod tests {
         assert_eq!(used[0]["target"], id.as_str());
         assert_eq!(used[0]["detail"]["run_id"], done.as_str());
         assert_eq!(used[0]["outcome"], "applied");
+    }
+
+    #[tokio::test]
+    async fn an_admin_removal_stops_running_runs_even_when_their_host_is_away() {
+        const ALICE: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaa";
+        let (_temp, c) = setup();
+        let app = router(c.clone());
+        c.set_credentials_key(sealed::Kek::from_bytes([3; 32]));
+        c.activate().unwrap();
+        c.set_member_credentials(true);
+        let runtime = c.runtime().unwrap();
+        let (_, alice) = mint(
+            &app,
+            json!({"label":"gamejam member","scopes":[],
+                "operations":["agent_credentials.manage","agent_credentials.run"],
+                "agent_credentials":[{"project":"qoh"}],"member":ALICE,"project":"qoh"}),
+        )
+        .await;
+        let pool = json!({"name":"jam","project":"qoh","workspaces":[
+            {"host_id":"worker","name":"ebox-m1"},{"host_id":"worker","name":"ebox-m2"}]});
+        call(
+            &app,
+            request(Method::POST, "/v1/pools", &pool.to_string(), true),
+        )
+        .await;
+        call(
+            &app,
+            request(
+                Method::POST,
+                "/v1/pools/jam/member-runs",
+                r#"{"enabled":true}"#,
+                true,
+            ),
+        )
+        .await;
+        let (_, made) = call(
+            &app,
+            bearer(
+                Method::POST,
+                "/v1/projects/qoh/me/credentials",
+                r#"{"provider":"claude"}"#,
+                &alice,
+            ),
+        )
+        .await;
+        let id = made["credential"]["id"].as_str().unwrap().to_owned();
+        runtime.credentials.connect_for_test(
+            &id,
+            &json!({"claudeAiOauth":{"accessToken":"sk-ant-oat01-alice-0123456789","refreshToken":"rt-0123456789",
+                "expiresAt":4102444800000u64,"scopes":["user:inference"]}}),
+        );
+        // A run that keeps running until its guest is told to cancel.
+        let agents = runtime.agents.clone();
+        let stop = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        {
+            let stop = stop.clone();
+            agents.set_run_executor(Arc::new(move |_| {
+                let (flag, changed) = &*stop;
+                let mut flag = flag.lock().unwrap();
+                while !*flag {
+                    flag = changed.wait(flag).unwrap();
+                }
+                Ok(json!({"exit_code":enginebox_agents::process::CANCELLED_EXIT_CODE,"output":"","timed_out":false,"output_truncated":false}))
+            }));
+        }
+        agents.set_measure_hook(Arc::new(|_| {
+            Ok(enginebox_agents::queue::HostLoad {
+                cpu_total: 64,
+                reserve_cpu: 2,
+                memory_available_bytes: 1 << 40,
+                reserve_memory_bytes: 1 << 30,
+            })
+        }));
+        // The host is away: the guest cannot be told yet.
+        let reachable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (reachable, stop) = (reachable.clone(), stop.clone());
+            agents.set_cancel_hook(Arc::new(move |_, _, _| {
+                anyhow::ensure!(
+                    reachable.load(std::sync::atomic::Ordering::SeqCst),
+                    "host unreachable"
+                );
+                *stop.0.lock().unwrap() = true;
+                stop.1.notify_all();
+                Ok(())
+            }));
+        }
+        let runs = "/v1/projects/qoh/me/agent-runs";
+        let (_, started) = call(
+            &app,
+            bearer(
+                Method::POST,
+                runs,
+                r#"{"provider":"claude","prompt":"long"}"#,
+                &alice,
+            ),
+        )
+        .await;
+        let run = started["run"]["id"].as_str().unwrap().to_owned();
+        let status = || async {
+            call(
+                &app,
+                request(
+                    Method::GET,
+                    &format!("/v1/pools/jam/agent-runs/{run}"),
+                    "",
+                    true,
+                ),
+            )
+            .await
+            .1["run"]["status"]
+                .clone()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while status().await != "running" {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The admin removes it: the deletion succeeds and says the run
+        // could not be stopped yet.
+        let (code, removed) = call(
+            &app,
+            request(
+                Method::POST,
+                &format!("/v1/credentials/{id}/delete"),
+                "{}",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{removed}");
+        assert_eq!(removed["deleted"], true);
+        assert_eq!(removed["revocation"]["cancel_failed"], json!([run]));
+        assert!(agents.credential_revoked(&id));
+        assert_eq!(status().await, "running");
+        // The host is back: the retry stops it, and the revocation is forgotten.
+        reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+        agents.retry_revocations();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while status().await != "cancelled" {
+            assert!(std::time::Instant::now() < deadline, "{}", status().await);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            agents.retry_revocations();
+            if !agents.credential_revoked(&id) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
