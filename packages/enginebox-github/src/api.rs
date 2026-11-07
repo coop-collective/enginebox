@@ -119,6 +119,14 @@ impl Api {
     /// After a worker proves VM deletion, remove only its own leftover JIT
     /// registration. A runner that completed a job may already be gone.
     pub fn cleanup_runner(&self, path: &str, token: &str, expected_name: &str) -> Result<()> {
+        ensure!(
+            self.retire_runner(path, token, expected_name)?,
+            "GitHub still reports the runner busy"
+        );
+        Ok(())
+    }
+    /// Retire only the exact registration; false keeps a busy runner running.
+    pub fn retire_runner(&self, path: &str, token: &str, expected_name: &str) -> Result<bool> {
         let response = self
             .client()?
             .get(format!("{}{path}", self.base))
@@ -127,15 +135,22 @@ impl Api {
             .bearer_auth(token)
             .send()?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
+            return Ok(true);
         }
         let runner = Self::decode(response)?;
         ensure!(
-            runner["name"] == expected_name && runner["busy"] == false,
+            runner["name"] == expected_name,
             "Runner identity changed or GitHub still reports it busy; inspect before removing"
         );
+        if runner["busy"] == true {
+            return Ok(false);
+        }
+        ensure!(
+            runner["busy"] == false,
+            "GitHub runner busy state is unknown"
+        );
         self.call("DELETE", path, token, None)?;
-        Ok(())
+        Ok(true)
     }
 }
 

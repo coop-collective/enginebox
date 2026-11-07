@@ -195,3 +195,24 @@ Runner administration grants the authority needed to register Engine Box runners
 Qualification must exercise the actual App's approval/revocation, private clone/push, branch protection, duplicate/reordered/redelivered events, a successful and failing workflow, cancellation, timeout, capacity rejection, lost JIT response, worker/controller crash, drain/upgrade and diagnostic export. Create unique disposable resources; never use a developer workspace as the fixture. Record REST version **2026-03-10**, actual runner version, guest/Incus/QEMU versions, LayerFS revision, resources and image/cache digests. Offline tests do not establish live GitHub registration or a successful workflow.
 
 Compare the same commit, workflow and CPU/RAM with (a) fresh conventional runner, (b) clean Engine Box VM, (c) cold LayerFS and (d) compatible warm LayerFS. Report queue, provisioning, dependency, build/test and teardown time, p50/p95, failures, transfer bytes, physical storage, cache hit rate and contention alongside an unrelated workspace. Include invalidated lockfiles, no-cache recovery, large/native dependency workloads and cancelled jobs. Model full cost: compute duration plus idle reserves, storage/replication, network, operations and any applicable GitHub charges. Until those measurements exist, lower cost and faster dependency readiness are hypotheses.
+
+## Preconnected CI standby runners
+
+An optional `standby` policy keeps one clean, private, one-job runner connected before demand. It is a live credentialed execution instance, never a reusable template or paused credential checkpoint. Every assignment consumes and eventually destroys that VM. Replenishment starts after assignment while configured capacity permits. The minimum and active jobs share `max_runners`; use at least two slots for one active job plus one waiting runner.
+
+```json
+"standby": {
+  "minimum": 1,
+  "repository_id": 789,
+  "workflows": ["example-org/private-project/.github/workflows/ci.yml@refs/heads/main"],
+  "idle_timeout_seconds": 3600
+}
+```
+
+Standbys require a selected private repository and an organization runner group restricted to exactly that repository and workflow set. Existing pools omit the field and retain their ordinary demand-driven behavior. Protected dependency preparation is independently optional; its existing Docker/sudo restrictions remain intact. A generic Docker-capable standby can use a separately approved, repository-scoped clean image-local pnpm cache. That is not a LayerFS installed-tree hit.
+
+Queued and assignment webhooks wake a coalescing dispatch loop immediately; the periodic reconciler remains for recovery. Receipts record demand, dispatch, GitHub JIT, worker phases and authoritative GitHub runner online/busy observations. Pre-launch timestamps do not establish a connected ready runner.
+
+An idle cutoff requests exact runner-registration retirement; it never terminates a connected native listener. The worker allows a job accepted before its official start hook to run and starts that job's full timeout at the hook. Retirement waits for natural runner exit; ambiguous APIs, live unknown workers or failed cleanup retain their capacity for inspection. Draining disables refill and waits for running/native retirement work. Never delete a VM solely because GitHub's last busy observation was false.
+
+Template, helper or worker-config changes use new immutable paths/identities so old standbys retire. No completed job disk, runner credential, diagnostics directory or job-created cache is promoted into a clean base. Live performance and retirement behavior require qualification; component tests alone do not establish immediate startup.

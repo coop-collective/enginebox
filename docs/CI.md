@@ -359,3 +359,7 @@ GitHub-hosted `ubuntu-24.04` when unset:
 Only runs on `main` use Engine Box: the `enginebox-ci` runner group accepts an allow-list of workflows at `refs/heads/main`, so pull-request runs stay on GitHub-hosted runners. Clearing a variable moves those jobs back to GitHub. Publish and deploy jobs stay
 GitHub-hosted. Windows and macOS jobs stay on GitHub because Engine Box has no
 Windows or macOS CI hosts.
+
+## Startup and cache measurements
+
+See `research/ci-startup-benchmark/` for the exact-revision recorder, comparison analyzer and clean public-registry pnpm seed builder. Report queue-to-first-workflow-step, dependency preparation, actual integration runtime and whole-job duration separately, with raw samples and counts. Match source/tree, lock/workspace configuration, Node/pnpm, image, resources and lifecycle policy across cold/warm controls. Container-backed checks must still execute. Seed reusable cache only in a dedicated credential-free builder; never snapshot a completed CI VM.

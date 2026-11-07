@@ -28,8 +28,19 @@ pub struct Pool {
     pub timeout_seconds: u64,
     /// Administrator-provisioned worker; opaque JIT configuration goes via stdin.
     pub worker: Vec<String>,
+    /// Private, one-job runners connected before demand arrives.
+    #[serde(default)]
+    pub standby: Option<Standby>,
     #[serde(default)]
     pub preparation: Option<Preparation>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Standby {
+    pub minimum: usize,
+    pub repository_id: u64,
+    pub workflows: Vec<String>,
+    pub idle_timeout_seconds: u64,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +99,24 @@ pub fn validate_pools(pools: &[Pool]) -> Result<()> {
                 && p.labels.iter().all(|s| name(s).is_ok()),
             "Each pool needs its own enginebox-<id> label"
         );
-        if let Some(preparation) = &p.preparation {
+        if let Some(standby) = &p.standby {
+            ensure!(
+                standby.minimum == 1 && (60..=21600).contains(&standby.idle_timeout_seconds),
+                "Standby requires one bounded private runner"
+            );
+            if let Some(preparation) = &p.preparation {
+                ensure!(
+                    preparation.repository_id == standby.repository_id
+                        && preparation.workflows == standby.workflows,
+                    "Standby and preparation must share one repository/workflow policy"
+                );
+            }
+        }
+        let standby_policy = p.standby.as_ref().map(|s| Preparation {
+            repository_id: s.repository_id,
+            workflows: s.workflows.clone(),
+        });
+        for preparation in p.preparation.iter().chain(standby_policy.iter()) {
             ensure!(
                 preparation.repository_id > 0 && (1..=16).contains(&preparation.workflows.len()),
                 "Bind preparation to a repository and protected workflows"
@@ -131,6 +159,10 @@ pub fn signature(secret: &str, supplied: &str, body: &[u8]) -> Result<()> {
 fn matches(pool: &Pool, payload: &Value) -> bool {
     payload["installation"]["id"] == pool.installation_id
         && pool
+            .standby
+            .as_ref()
+            .is_none_or(|s| payload["repository"]["id"] == s.repository_id)
+        && pool
             .preparation
             .as_ref()
             .is_none_or(|p| payload["repository"]["id"] == p.repository_id)
@@ -152,6 +184,7 @@ fn matches(pool: &Pool, payload: &Value) -> bool {
 }
 impl GitHub {
     pub fn webhook(&self, kind: &str, event: &str, supplied: &str, body: &[u8]) -> Result<Value> {
+        let received_at_ms = now_ms();
         signature(&self.app(kind)?.webhook_secret, supplied, body)?;
         let payload: Value = serde_json::from_slice(body)?;
         if (kind != "runners" && self.account_kind(kind)? != "github") || event != "workflow_job" {
@@ -178,6 +211,29 @@ impl GitHub {
             return Ok(json!({"accepted":true,"ignored":true}));
         };
         let key = format!("{}-{id}", pool.installation_id);
+        let mut demand_added = false;
+        if action != "queued" {
+            for reserve in data.jobs.values_mut().filter(|j| {
+                j["reserve"] == true
+                    && j["pool"] == pool.id
+                    && j["status"] == "running"
+                    && ((payload["workflow_job"]["runner_id"]
+                        .as_u64()
+                        .is_some_and(|id| id > 0)
+                        && j["runner_id"] == payload["workflow_job"]["runner_id"])
+                        || (payload["workflow_job"]["runner_name"]
+                            .as_str()
+                            .is_some_and(|name| !name.is_empty())
+                            && j["runner_name"] == payload["workflow_job"]["runner_name"]))
+            }) {
+                if reserve["assigned_job_id"].is_null() {
+                    reserve["assigned_job_id"] = json!(id);
+                    reserve["assigned_run_id"] = payload["workflow_job"]["run_id"].clone();
+                    reserve["timings"]["assignment_observed_at_ms"] = json!(received_at_ms);
+                    demand_added = true;
+                }
+            }
+        }
         if let Some(job) = data.jobs.get_mut(&key) {
             ensure!(job["repository_id"] == repo_id, "Job repository mismatch");
             // Events can arrive out of order; terminal and running states never requeue.
@@ -201,24 +257,51 @@ impl GitHub {
                 ) || j["created_at"].as_u64().unwrap_or(0) + 7 * 86400 > api::now()
             });
             ensure!(data.jobs.len() < 256, "CI inbox is full; inspect receipts");
-            data.jobs.insert(key,json!({"id":id,"pool":pool.id,"repository_id":repo_id,"repository":selected.full_name,"run_id":payload["workflow_job"]["run_id"],"status":if action=="queued" {"queued"} else {"claimed_elsewhere"},"github_status":action,"created_at":api::now()}));
+            data.jobs.insert(key,json!({"id":id,"pool":pool.id,"repository_id":repo_id,"repository":selected.full_name,"run_id":payload["workflow_job"]["run_id"],"status":if action=="queued" {"queued"} else {"claimed_elsewhere"},"github_status":action,"created_at":api::now(),"timings":{"demand_received_at_ms":received_at_ms}}));
+            demand_added |= action == "queued";
         }
         self.save(&data)?;
+        drop(data);
+        if demand_added {
+            self.wake_dispatch();
+        }
         Ok(json!({"accepted":true}))
     }
     pub fn set_draining(&self, draining: bool) -> Result<Value> {
         let mut data = self.data.lock().unwrap();
         data.draining = draining;
         self.save(&data)?;
+        drop(data);
+        if draining {
+            self.retire_reserves();
+        } else {
+            self.wake_dispatch();
+        }
         Ok(json!({"draining":draining,"active_runners":self.pending()}))
     }
     /// Called only while the controller is active. Running workers are part of its drain barrier.
     pub fn tick(&self) -> Result<()> {
+        self.dispatch()?;
+        if let Some(config) = &self.config
+            && !self.data.lock().unwrap().draining
+            && !self.handed_off.load(Ordering::SeqCst)
+        {
+            self.retire_reserves();
+            self.reconcile_standby_assignments(config);
+            self.reconcile_uncertain(config);
+        }
+        Ok(())
+    }
+    /// Fast admission only: API and worker operations run on bounded job threads.
+    pub fn dispatch(&self) -> Result<()> {
         let Some(config) = &self.config else {
             return Ok(());
         };
         let mut data = self.data.lock().unwrap();
-        if data.draining {
+        if data.draining
+            || self.admission_paused.load(Ordering::SeqCst)
+            || self.handed_off.load(Ordering::SeqCst)
+        {
             return Ok(());
         }
         for pool in &config.pools {
@@ -226,8 +309,9 @@ impl GitHub {
             // Retain queued jobs without minting a new JIT registration every tick.
             if data.jobs.values().any(|job| {
                 job["pool"] == pool.id
-                    && job["status"] == "queued"
-                    && job["capacity_retry_at"].as_u64().unwrap_or(0) > api::now()
+                    && ((job["status"] == "queued"
+                        && job["capacity_retry_at"].as_u64().unwrap_or(0) > api::now())
+                        || job["reserve_retry_at"].as_u64().unwrap_or(0) > api::now())
             }) {
                 continue;
             }
@@ -239,16 +323,72 @@ impl GitHub {
                         && matches!(j["status"].as_str(), Some("running" | "uncertain"))
                 })
                 .count();
+            if let Some(standby) = &pool.standby
+                && active < pool.max_runners
+                && !data.jobs.values().any(|j| {
+                    j["pool"] == pool.id
+                        && j["reserve"] == true
+                        && matches!(
+                            j["status"].as_str(),
+                            Some("queued" | "running" | "uncertain")
+                        )
+                        && j["assigned_job_id"].is_null()
+                        && j["reserve_busy"] != true
+                })
+            {
+                let selected = data.repositories.get(&standby.repository_id).cloned();
+                if let Some(selected) = selected.filter(|r| r.private) {
+                    data.jobs.retain(|_, j| {
+                        !matches!(
+                            j["status"].as_str(),
+                            Some("finished" | "cancelled" | "claimed_elsewhere")
+                        ) || j["created_at"].as_u64().unwrap_or(0) + 7 * 86400 > api::now()
+                    });
+                    ensure!(data.jobs.len() < 256, "CI inbox is full; inspect receipts");
+                    let key = format!("reserve-{}", uuid::Uuid::new_v4().simple());
+                    data.jobs.insert(key, json!({"id":0,"reserve":true,"pool":pool.id,"repository_id":selected.id,
+                        "repository":selected.full_name,"status":"queued","github_status":"standby","created_at":api::now(),
+                        "timings":{"reserve_requested_at_ms":now_ms()}}));
+                }
+            }
             let keys = data
                 .jobs
                 .iter()
                 .filter(|(_, j)| j["pool"] == pool.id && j["status"] == "queued")
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|(_, j)| pool.standby.is_none() || j["reserve"] == true)
                 .take(pool.max_runners.saturating_sub(active))
                 .map(|(k, _)| k.clone())
                 .collect::<Vec<_>>();
             for key in keys {
                 let job = data.jobs.get_mut(&key).unwrap();
+                // A proved capacity rejection may retry the same demand, but
+                // none of its old runner identity or retirement proof transfers.
+                for field in [
+                    "runner_id",
+                    "runner_name",
+                    "worker_pid",
+                    "worker_program",
+                    "worker_output",
+                    "registration_retired",
+                    "retire_requested",
+                    "retire_error",
+                    "reserve_busy",
+                    "runner_observation",
+                ] {
+                    job.as_object_mut().unwrap().remove(field);
+                }
+                if let Some(timings) = job["timings"].as_object_mut() {
+                    timings.retain(|phase, _| {
+                        matches!(
+                            phase.as_str(),
+                            "demand_received_at_ms" | "reserve_requested_at_ms"
+                        )
+                    });
+                }
                 job["status"] = json!("running");
+                job["timings"]["dispatch_started_at_ms"] = json!(now_ms());
                 job.as_object_mut().unwrap().remove("capacity_retry_at");
                 self.save(&data)?;
                 self.pending.fetch_add(1, Ordering::SeqCst);
@@ -266,6 +406,9 @@ impl GitHub {
                         return;
                     }
                     let mut data = this.data.lock().unwrap();
+                    if this.handed_off.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let job = data.jobs.get_mut(&key).unwrap();
                     match outcome {
                         Ok(result) => {
@@ -282,12 +425,182 @@ impl GitHub {
                     if this.save(&data).is_err() {
                         job_persistence_failure(&mut data, &key);
                     }
+                    drop(data);
+                    this.wake_dispatch();
                 });
             }
         }
-        drop(data);
-        self.reconcile_uncertain(config);
         Ok(())
+    }
+    pub fn pause_admission(&self) {
+        self.admission_paused.store(true, Ordering::SeqCst);
+        self.retire_reserves();
+    }
+    pub fn resume_admission(&self) {
+        self.admission_paused.store(false, Ordering::SeqCst);
+        self.wake_dispatch();
+    }
+    /// Retiring an idle listener requests its normal cleanup. Only the worker's
+    /// terminal proof and registration cleanup release the owner's drain hold.
+    fn retire_reserves(&self) {
+        if !self.data.lock().unwrap().jobs.values().any(|job| {
+            job["reserve"] == true
+                && job["status"] == "running"
+                && job["assigned_job_id"].is_null()
+                && job["reserve_busy"] != true
+        }) {
+            return;
+        }
+        if self.retiring_reserves.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                if this.handed_off.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (jobs, mut provisioning) = {
+                    let data = this.data.lock().unwrap();
+                    let stop_all = data.draining || this.admission_paused.load(Ordering::SeqCst);
+                    let idle = data
+                        .jobs
+                        .iter()
+                        .filter(|(_, j)| {
+                            j["reserve"] == true
+                                && j["status"] == "running"
+                                && j["assigned_job_id"].is_null()
+                                && j["reserve_busy"] != true
+                                && (stop_all
+                                    || j["retire_requested"] == true
+                                    || this.config.as_ref().is_some_and(|config| {
+                                        config
+                                            .pools
+                                            .iter()
+                                            .find(|p| j["pool"] == p.id)
+                                            .and_then(|p| p.standby.as_ref())
+                                            .is_some_and(|policy| {
+                                                j["timings"]["jit_received_at_ms"]
+                                                    .as_u64()
+                                                    .is_some_and(|at| {
+                                                        at + policy.idle_timeout_seconds * 1000
+                                                            <= now_ms()
+                                                    })
+                                            })
+                                    }))
+                        })
+                        .collect::<Vec<_>>();
+                    let provisioning = idle.iter().any(|(_, j)| !j["worker_pid"].is_u64());
+                    let jobs = idle
+                        .into_iter()
+                        .filter(|(_, j)| j["worker_pid"].is_u64())
+                        .map(|(k, j)| (k.clone(), j.clone()))
+                        .collect::<Vec<_>>();
+                    (jobs, provisioning)
+                };
+                for (key, attempt) in jobs {
+                    let result = this.retire_reserve(&key, &attempt);
+                    let mut data = this.data.lock().unwrap();
+                    if let Some(job) = data.jobs.get_mut(&key) {
+                        if job["runner_name"] != attempt["runner_name"]
+                            || job["runner_id"] != attempt["runner_id"]
+                        {
+                            continue;
+                        }
+                        match result {
+                            Ok(Some(true)) => job["reserve_busy"] = json!(true),
+                            Ok(Some(false)) => {
+                                job["retire_requested"] = json!(true);
+                                provisioning = true;
+                            }
+                            Ok(None) => provisioning = true,
+                            Err(_) => {
+                                job["retire_error"] = json!(true);
+                                provisioning = true;
+                            }
+                        }
+                        if this.save(&data).is_err() {
+                            job_persistence_failure(&mut data, &key);
+                        }
+                    }
+                }
+                if !provisioning {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            this.retiring_reserves.store(false, Ordering::SeqCst);
+        });
+    }
+    fn retire_reserve(&self, key: &str, job: &Value) -> Result<Option<bool>> {
+        let pool = self
+            .config
+            .as_ref()
+            .context("GitHub disabled")?
+            .pools
+            .iter()
+            .find(|p| job["pool"] == p.id)
+            .context("Reserve pool vanished")?;
+        let runner_name = text(job, "runner_name")?;
+        if job["registration_retired"] != true {
+            let token = self.api.call(
+                "POST",
+                &format!("/app/installations/{}/access_tokens", pool.installation_id),
+                &api::jwt(self.app("runners")?)?,
+                Some(json!({"permissions":{"organization_self_hosted_runners":"write"}})),
+            )?;
+            if !self.api.retire_runner(
+                &format!(
+                    "/orgs/{}/actions/runners/{}",
+                    pool.organization,
+                    number(job, "runner_id")?
+                ),
+                text(&token, "token")?,
+                runner_name,
+            )? {
+                return Ok(Some(true));
+            }
+            // No VM retirement is authorized until the exact registration has
+            // been removed. A failed/ambiguous delete leaves the worker alone.
+            let mut data = self.data.lock().unwrap();
+            let current = data.jobs.get(key).context("Reserve vanished")?;
+            ensure!(
+                current["runner_id"] == job["runner_id"]
+                    && current["runner_name"] == job["runner_name"],
+                "Reserve attempt changed"
+            );
+            let job = data.jobs.get_mut(key).unwrap();
+            job["registration_retired"] = json!(true);
+            job["timings"]["registration_retired_at_ms"] = json!(now_ms());
+            job.as_object_mut().unwrap().remove("runner_observation");
+            self.save(&data)?;
+        }
+
+        let mut command = std::process::Command::new(&pool.worker[0]);
+        command
+            .args(&pool.worker[1..])
+            .args(["--retire-reserve", runner_name])
+            .env_clear();
+        for key in ["PATH", "HOME", "SSH_AUTH_SOCK"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = run_command(command, None, Duration::from_secs(60))?;
+        let result: Value = serde_json::from_slice(&output)?;
+        ensure!(
+            result["schema"] == 1
+                && result["name"] == runner_name
+                && matches!(
+                    result["reserve_retire"].as_str(),
+                    Some("requested" | "busy" | "gone")
+                ),
+            "Invalid reserve retirement result"
+        );
+        if result["reserve_retire"] == "gone" && worker_alive(job) {
+            return Ok(None);
+        }
+        Ok(Some(result["reserve_retire"] == "busy"))
     }
     /// This owner hands state to the next controller: worker threads stop
     /// writing, and live workers are left for the next owner to adopt.
@@ -327,6 +640,9 @@ impl GitHub {
                     return;
                 }
                 let mut data = this.data.lock().unwrap();
+                if this.handed_off.load(Ordering::SeqCst) {
+                    return;
+                }
                 let Some(job) = data.jobs.get_mut(&key) else {
                     return;
                 };
@@ -343,7 +659,80 @@ impl GitHub {
                 if this.save(&data).is_err() {
                     job_persistence_failure(&mut data, &key);
                 }
+                drop(data);
+                this.wake_dispatch();
             });
+        }
+    }
+    /// Signed assignment events are the fast path. Recover a missed event by
+    /// observing only our exact live runner; an offline/missing one keeps its slot.
+    fn reconcile_standby_assignments(&self, config: &crate::Config) {
+        let candidates = self
+            .data
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|(_, j)| {
+                j["reserve"] == true
+                    && j["status"] == "running"
+                    && j["runner_id"].is_u64()
+                    && j["assigned_job_id"].is_null()
+                    && j["reserve_busy"] != true
+            })
+            .map(|(k, j)| (k.clone(), j.clone()))
+            .collect::<Vec<_>>();
+        for (key, job) in candidates {
+            if self.admission_paused.load(Ordering::SeqCst)
+                || self.handed_off.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            let Some(pool) = config.pools.iter().find(|p| job["pool"] == p.id) else {
+                continue;
+            };
+            let observation = (|| -> Result<Value> {
+                let token = self.api.call(
+                    "POST",
+                    &format!("/app/installations/{}/access_tokens", pool.installation_id),
+                    &api::jwt(self.app("runners")?)?,
+                    Some(json!({"permissions":{"organization_self_hosted_runners":"write"}})),
+                )?;
+                self.api.call(
+                    "GET",
+                    &format!(
+                        "/orgs/{}/actions/runners/{}",
+                        pool.organization,
+                        number(&job, "runner_id")?
+                    ),
+                    text(&token, "token")?,
+                    None,
+                )
+            })();
+            if let Ok(runner) = observation
+                && runner["name"] == job["runner_name"]
+            {
+                let mut data = self.data.lock().unwrap();
+                if let Some(job) = data.jobs.get_mut(&key)
+                    && job["status"] == "running"
+                {
+                    job["runner_observation"] = json!({"online":runner["status"] == "online", "busy":runner["busy"] == true,"observed_at_ms":now_ms()});
+                    if runner["status"] == "online"
+                        && job["timings"]["runner_online_observed_at_ms"].is_null()
+                    {
+                        job["timings"]["runner_online_observed_at_ms"] = json!(now_ms());
+                    }
+                    if runner["busy"] == true {
+                        job["reserve_busy"] = json!(true);
+                        job["timings"]["assignment_observed_at_ms"] = json!(now_ms());
+                    }
+                    if self.save(&data).is_err() {
+                        job_persistence_failure(&mut data, &key);
+                    }
+                }
+                drop(data);
+                self.wake_dispatch();
+            }
         }
     }
     /// Uncertain jobs (a restart lost the worker's report): when GitHub shows
@@ -394,6 +783,14 @@ impl GitHub {
     }
     /// `Some(worker result)` when the job was provably over and its VM reclaimed.
     fn reclaim(&self, pool: &Pool, job: &Value) -> Result<Option<Value>> {
+        let job_id = if job["reserve"] == true {
+            let Some(id) = job["assigned_job_id"].as_u64().filter(|id| *id > 0) else {
+                return Ok(None);
+            };
+            id
+        } else {
+            number(job, "id")?
+        };
         let token = self.api.call(
             "POST",
             &format!("/app/installations/{}/access_tokens", pool.installation_id),
@@ -405,7 +802,7 @@ impl GitHub {
         full_name(repo)?;
         let current = self.api.call(
             "GET",
-            &format!("/repos/{repo}/actions/jobs/{}", number(job, "id")?),
+            &format!("/repos/{repo}/actions/jobs/{job_id}"),
             token,
             None,
         )?;
@@ -440,21 +837,27 @@ impl GitHub {
         Ok(Some(result))
     }
     fn run_job(&self, key: &str, pool: &Pool, released: &AtomicBool) -> Result<Value> {
-        let (job, token) = {
+        let (job, user_token) = {
             let mut data = self.data.lock().unwrap();
-            let installations = self.installations("runners", &mut data)?;
-            ensure!(
-                installations.iter().any(|i| i["id"] == pool.installation_id
-                    && i["account"]["login"]
-                        .as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(&pool.organization))
-                    && i["suspended_at"].is_null()
-                    && i["permissions"]["organization_self_hosted_runners"] == "write"),
-                "Approve organization self-hosted runners permission in the GitHub App installation"
-            );
-            let token=self.api.call("POST",&format!("/app/installations/{}/access_tokens",pool.installation_id),&api::jwt(self.app("runners")?)?,Some(json!({"permissions":{"organization_self_hosted_runners":"write","actions":"read"}})))?;
-            (data.jobs[key].clone(), text(&token, "token")?.to_owned())
+            let user_token = self.user_token("runners", &mut data)?;
+            (data.jobs.get(key).cloned(), user_token)
         };
+        let installations = self
+            .api
+            .pages("/user/installations", "installations", &user_token)?;
+        ensure!(
+            installations.iter().any(|i| i["id"] == pool.installation_id
+                && i["account"]["login"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&pool.organization))
+                && i["suspended_at"].is_null()
+                && i["permissions"]["organization_self_hosted_runners"] == "write"),
+            "Approve organization self-hosted runners permission in the GitHub App installation"
+        );
+        let job = job.context("CI job vanished")?;
+        let token = self.api.call("POST", &format!("/app/installations/{}/access_tokens", pool.installation_id),
+            &api::jwt(self.app("runners")?)?, Some(json!({"permissions":{"organization_self_hosted_runners":"write","actions":"read"}})))?;
+        let token = text(&token, "token")?.to_owned();
         let repo = text(&job, "repository")?;
         full_name(repo)?;
         // User grant and selected installation remain live requirements.
@@ -476,19 +879,46 @@ impl GitHub {
                 .any(|r| r["id"] == selected.id),
             "Repository access revoked"
         );
-        let current = self.api.call(
-            "GET",
-            &format!("/repos/{repo}/actions/jobs/{}", number(&job, "id")?),
-            &token,
-            None,
-        )?;
-        if current["status"] != "queued" {
-            return Ok(json!({"skipped":true,"reason":"Job is no longer queued"}));
+        let reserve = job["reserve"] == true;
+        if !reserve {
+            let current = self.api.call(
+                "GET",
+                &format!("/repos/{repo}/actions/jobs/{}", number(&job, "id")?),
+                &token,
+                None,
+            )?;
+            if current["status"] != "queued" {
+                return Ok(json!({"skipped":true,"reason":"Job is no longer queued"}));
+            }
+            ensure!(
+                current["run_id"] == job["run_id"],
+                "Workflow job identity changed"
+            );
         }
-        ensure!(
-            current["run_id"] == job["run_id"],
-            "Workflow job identity changed"
-        );
+        if let Some(standby) = &pool.standby {
+            ensure!(
+                selected.private && selected.id == standby.repository_id,
+                "Standby repository changed"
+            );
+            let group_path = format!(
+                "/orgs/{}/actions/runner-groups/{}",
+                pool.organization, pool.runner_group_id
+            );
+            let group = self.api.call("GET", &group_path, &token, None)?;
+            let repositories = self.api.pages(
+                &format!("{group_path}/repositories"),
+                "repositories",
+                &token,
+            )?;
+            check_group(
+                &group,
+                &repositories,
+                &Preparation {
+                    repository_id: standby.repository_id,
+                    workflows: standby.workflows.clone(),
+                },
+            )?;
+        }
         let verification_token = if let Some(preparation) = &pool.preparation {
             ensure!(
                 selected.private && selected.id == preparation.repository_id,
@@ -516,17 +946,28 @@ impl GitHub {
             None
         };
         let runner_name = format!("ebox-ci-{}", uuid::Uuid::new_v4().simple());
+        self.record_phase(key, "jit_requested_at_ms")?;
         // JIT is single-use; a lost response is never retried automatically.
         let generated=self.api.call("POST",&format!("/orgs/{}/actions/runners/generate-jitconfig",pool.organization),&token,Some(json!({"name":runner_name,"runner_group_id":pool.runner_group_id,"labels":pool.labels,"work_folder":if pool.preparation.is_some() {"/project/work"} else {"_work"}})))?;
         let runner_id = number(&generated["runner"], "id")?;
         {
             let mut data = self.data.lock().unwrap();
             let job = data.jobs.get_mut(key).unwrap();
+            job["timings"]["jit_received_at_ms"] = json!(now_ms());
             job["runner_id"] = json!(runner_id);
             job["runner_name"] = json!(runner_name);
             self.save(&data)?;
         }
         let mut request = json!({"schema":1,"name":runner_name,"job_id":job["id"],"repository":repo,"jitconfig":text(&generated,"encoded_jit_config")?,"timeout_seconds":pool.timeout_seconds});
+        if reserve {
+            request["reserve"] = json!(true);
+            request["idle_timeout_seconds"] = json!(
+                pool.standby
+                    .as_ref()
+                    .context("Standby policy missing")?
+                    .idle_timeout_seconds
+            );
+        }
         if let Some(preparation) = &pool.preparation {
             request["preparation"] = json!({"repository_id":selected.id,"installation_id":pool.installation_id,"runner_id":runner_id,"workflows":preparation.workflows,"verification_token":verification_token});
         }
@@ -550,6 +991,11 @@ impl GitHub {
         // Cold generation resolution has its own 20-minute bound before VM execution.
         let timeout = Duration::from_secs(
             pool.timeout_seconds
+                + if reserve {
+                    pool.standby.as_ref().unwrap().idle_timeout_seconds
+                } else {
+                    0
+                }
                 + if pool.preparation.is_some() {
                     1800
                 } else {
@@ -559,10 +1005,12 @@ impl GitHub {
         // The worker runs detached (its own process group, output to a private
         // file): a controller handoff neither waits for nor interrupts it.
         let out = self.root.join("workers").join(format!("{key}.out"));
+        self.record_phase(key, "worker_launch_requested_at_ms")?;
         let mut child = spawn_worker(command, &serde_json::to_vec(&request)?, &out)?;
         {
             let mut data = self.data.lock().unwrap();
             let job = data.jobs.get_mut(key).unwrap();
+            job["timings"]["worker_launched_at_ms"] = json!(now_ms());
             job["worker_pid"] = json!(child.id());
             job["worker_program"] = json!(pool.worker[0]);
             job["worker_output"] = json!(out.display().to_string());
@@ -579,7 +1027,7 @@ impl GitHub {
             if child.try_wait()?.is_some() {
                 break;
             }
-            if Instant::now() > deadline {
+            if !reserve && Instant::now() > deadline {
                 kill_group(&mut child);
                 anyhow::bail!("Worker exceeded its bound");
             }
@@ -588,6 +1036,11 @@ impl GitHub {
         let job = self.data.lock().unwrap().jobs[key].clone();
         let output = read_worker_output(&job)?;
         self.complete_job(key, pool, &output)
+    }
+    fn record_phase(&self, key: &str, phase: &str) -> Result<()> {
+        let mut data = self.data.lock().unwrap();
+        data.jobs.get_mut(key).context("CI job vanished")?["timings"][phase] = json!(now_ms());
+        self.save(&data)
     }
     /// Check a finished worker's report, remove its runner registration and
     /// confirm the job's identity (also used for an adopted worker).
@@ -614,7 +1067,10 @@ impl GitHub {
             "Worker did not prove cleanup"
         );
         let capacity_wait = capacity_wait_proof(&result)?;
-        if !capacity_wait && pool.preparation.is_some() {
+        let reserve_expired = job["reserve"] == true
+            && result["status"] == "reserve_expired"
+            && result["assignment"].is_null();
+        if !capacity_wait && !reserve_expired && pool.preparation.is_some() {
             let actual = &result["assignment"];
             ensure!(
                 actual["verified"] == true
@@ -639,21 +1095,53 @@ impl GitHub {
         )?;
         // JIT runners accept any matching job. Only proved cleanup plus a live
         // queued observation permits a new capacity attempt for this demand.
-        let remaining = self.api.call(
-            "GET",
-            &format!("/repos/{repo}/actions/jobs/{}", number(&job, "id")?),
-            text(&cleanup_token, "token")?,
-            None,
-        )?;
-        ensure!(
-            remaining["id"] == job["id"] && remaining["run_id"] == job["run_id"],
-            "Workflow job identity changed"
-        );
+        let demand_pending = if job["reserve"] == true {
+            false
+        } else {
+            let remaining = self.api.call(
+                "GET",
+                &format!("/repos/{repo}/actions/jobs/{}", number(&job, "id")?),
+                text(&cleanup_token, "token")?,
+                None,
+            )?;
+            ensure!(
+                remaining["id"] == job["id"] && remaining["run_id"] == job["run_id"],
+                "Workflow job identity changed"
+            );
+            remaining["status"] == "queued"
+        };
+        let worker_phases = [
+            "worker_started_at_ms",
+            "allocation_started_at_ms",
+            "allocated_at_ms",
+            "preparation_resolved_at_ms",
+            "preparation_attached_at_ms",
+            "boot_started_at_ms",
+            "guest_ready_at_ms",
+            "runner_started_at_ms",
+            "job_started_at_ms",
+            "assignment_verified_at_ms",
+            "runner_exited_at_ms",
+            "destroyed_at_ms",
+        ]
+        .into_iter()
+        .filter_map(|phase| {
+            result["phases"][phase]
+                .as_u64()
+                .map(|at| (phase.to_owned(), json!(at)))
+        })
+        .collect::<serde_json::Map<String, Value>>();
         // Do not publish arbitrary worker stdout (could include JIT or workflow secrets).
         Ok(
-            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":remaining["status"] == "queued", "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64(),"capacity_wait":capacity_wait}),
+            json!({"cleaned":true,"runner_id":runner_id,"runner_version":result["runner_version"],"worker_seconds":result["duration_seconds"],"demand_pending":demand_pending, "prepared":pool.preparation.is_some(),"actual_job_id":result["assignment"]["job_id"].as_u64(),"capacity_wait":capacity_wait,"reserve_expired":reserve_expired,"worker_phases":worker_phases}),
         )
     }
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 /// How long an uncertain job waits between reconciliation attempts.
 const RECONCILE_INTERVAL: u64 = 600;
@@ -753,7 +1241,9 @@ fn capacity_wait_proof(result: &Value) -> Result<bool> {
 fn finish_capacity(job: &mut Value, result: Value) {
     // A newer webhook wins over the earlier API observation.
     job["status"] = json!(
-        if result["demand_pending"] == true && job["github_status"] == "queued" {
+        if (result["demand_pending"] == true && job["github_status"] == "queued")
+            || (job["reserve"] == true && result["capacity_wait"] == true)
+        {
             "queued"
         } else {
             "finished"
@@ -764,6 +1254,12 @@ fn finish_capacity(job: &mut Value, result: Value) {
     } else {
         job.as_object_mut().unwrap().remove("capacity_retry_at");
     }
+    if job["reserve"] == true
+        && result["reserve_expired"] == true
+        && job["assigned_job_id"].is_null()
+    {
+        job["reserve_retry_at"] = json!(api::now() + 60);
+    }
     job["result"] = result;
 }
 fn job_persistence_failure(data: &mut crate::Data, key: &str) {
@@ -773,6 +1269,141 @@ fn job_persistence_failure(data: &mut crate::Data, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn retirement_checks_github_before_invoking_the_worker() {
+        use crate::tests::{api_fixture, shared_service, with_app_key};
+        use std::os::unix::fs::PermissionsExt;
+        for busy in [false, true] {
+            let (root, mut g) = shared_service();
+            with_app_key(&mut g);
+            let marker = root.path().join("retire-called");
+            let worker = root.path().join("retire-fixture");
+            std::fs::write(&worker,format!("#!/bin/sh\ntouch '{}'\nprintf '%s' '{{\"schema\":1,\"name\":\"ebox-ci-fixture\",\"reserve_retire\":\"requested\"}}'\n",marker.display())).unwrap();
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            g.config.as_mut().unwrap().pools[0].worker = vec![worker.display().to_string()];
+            let job = json!({"id":0,"reserve":true,"pool":"linux","status":"running","runner_name":"ebox-ci-fixture","runner_id":501});
+            g.data
+                .lock()
+                .unwrap()
+                .jobs
+                .insert("reserve-test".into(), job.clone());
+            let mut responses = vec![
+                (
+                    "/app/installations/2/access_tokens",
+                    json!({"token":"fixture-retire-token"}),
+                ),
+                (
+                    "GET /orgs/fixture/actions/runners/501",
+                    json!({"name":"ebox-ci-fixture","busy":busy}),
+                ),
+            ];
+            if !busy {
+                responses.push(("DELETE /orgs/fixture/actions/runners/501", json!({})));
+            }
+            let (api, server) = api_fixture(responses);
+            g.api = api;
+            assert_eq!(g.retire_reserve("reserve-test", &job).unwrap(), Some(busy));
+            server.join().unwrap();
+            assert_eq!(marker.exists(), !busy);
+            assert_eq!(
+                g.data.lock().unwrap().jobs["reserve-test"]["registration_retired"] == true,
+                !busy
+            );
+            // No retirement response proves VM deletion or releases its slot.
+            assert_eq!(g.pending(), 1);
+        }
+    }
+    #[test]
+    fn unassigned_uncertain_reserve_does_not_query_a_fictitious_job() {
+        let (_root, g) = crate::tests::service();
+        let result = g
+            .reclaim(
+                &g.config.as_ref().unwrap().pools[0],
+                &json!({"reserve":true,"id":0}),
+            )
+            .unwrap();
+        assert!(result.is_none());
+    }
+    #[test]
+    fn periodic_runner_observation_recovers_missed_assignment() {
+        for busy in [false, true] {
+            let (_root, mut g) = crate::tests::shared_service();
+            crate::tests::with_app_key(&mut g);
+            g.data.lock().unwrap().jobs.insert("reserve-test".into(),json!({"id":0,"reserve":true,"pool":"linux","status":"running","runner_name":"ebox-ci-fixture","runner_id":501}));
+            let (api, server) = crate::tests::api_fixture(vec![
+                (
+                    "/app/installations/2/access_tokens",
+                    json!({"token":"fixture-observe-token"}),
+                ),
+                (
+                    "GET /orgs/fixture/actions/runners/501",
+                    json!({"name":"ebox-ci-fixture","busy":busy,"status":"online"}),
+                ),
+            ]);
+            g.api = api;
+            g.reconcile_standby_assignments(g.config.as_ref().unwrap());
+            server.join().unwrap();
+            let data = g.data.lock().unwrap();
+            let job = &data.jobs["reserve-test"];
+            assert_eq!(job["reserve_busy"] == true, busy);
+            assert!(
+                job["timings"]["runner_online_observed_at_ms"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(job["runner_observation"]["online"], true);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn drain_retires_idle_reserves_but_busy_jobs_keep_running() {
+        use std::os::unix::fs::PermissionsExt;
+        for state in ["requested", "busy"] {
+            let (root, mut g) = crate::tests::service();
+            let worker = root.path().join("retire-fixture");
+            std::fs::write(&worker, format!("#!/bin/sh\ntest \"$1\" = --retire-reserve || exit 2\nprintf '%s' '{{\"schema\":1,\"name\":\"ebox-ci-fixture\",\"reserve_retire\":\"{state}\"}}'\n")).unwrap();
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            g.config.as_mut().unwrap().pools[0].worker = vec![worker.display().to_string()];
+            g.data.lock().unwrap().jobs.insert("reserve-test".into(),json!({"id":0,"reserve":true,"pool":"linux","status":"running","runner_name":"ebox-ci-fixture","worker_pid":1,"registration_retired":true}));
+            assert_eq!(g.pending(), 1);
+            g.pause_admission();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let data = g.data.lock().unwrap();
+                let job = &data.jobs["reserve-test"];
+                if job["retire_requested"] == true || job["reserve_busy"] == true {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "retirement did not reach the worker"
+                );
+                drop(data);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                g.data.lock().unwrap().jobs["reserve-test"]["status"],
+                "running"
+            );
+            if state == "requested" {
+                assert!(g.pending() >= 1);
+            }
+            // Only normal worker completion + exact registration cleanup may
+            // publish finished. A retirement response alone never does so.
+            g.data.lock().unwrap().jobs.get_mut("reserve-test").unwrap()["status"] =
+                json!("finished");
+            while g.retiring_reserves.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!g.retiring_reserves.load(Ordering::SeqCst));
+            assert_eq!(g.pending(), 0);
+            g.data.lock().unwrap().jobs.get_mut("reserve-test").unwrap()["status"] =
+                json!("uncertain");
+            assert_eq!(g.pending(), 1);
+        }
+    }
     #[test]
     fn capacity_wait_never_accepts_an_ambiguous_or_started_allocation() {
         let clean = json!({"status":"waiting_capacity","allocation_started":false,"cleaned":true});
@@ -836,16 +1467,16 @@ mod tests {
     #[test]
     fn jit_worker_cleanup_is_owned_and_worker_output_is_filtered() {
         for shared in [false, true] {
-            jit_fixture(false, shared, false);
-            jit_fixture(true, shared, false);
+            jit_fixture(false, shared, false, false);
+            jit_fixture(true, shared, false, false);
         }
     }
     #[cfg(unix)]
     #[test]
     fn capacity_wait_removes_unused_registration_and_defers_the_pool() {
         for shared in [false, true] {
-            jit_fixture(false, shared, true);
-            jit_fixture(true, shared, true);
+            jit_fixture(false, shared, true, false);
+            jit_fixture(true, shared, true, false);
         }
     }
     #[cfg(unix)]
@@ -857,16 +1488,23 @@ mod tests {
             // This test process stands in for a worker that outlived its controller.
             data.jobs.insert("2-1".into(), json!({"id":1,"status":"running","pool":"linux","worker_pid":std::process::id(),"worker_program":std::env::args().next().unwrap()}));
             data.jobs.insert("2-2".into(), json!({"id":2,"status":"running","pool":"linux","worker_pid":999_999_999u64,"worker_program":"/nonexistent"}));
+            data.jobs.insert("reserve-live".into(), json!({"id":0,"reserve":true,"assigned_job_id":42,"status":"running","pool":"linux","worker_pid":std::process::id(),"worker_program":std::env::args().next().unwrap()}));
+            data.jobs.insert("reserve-dead".into(), json!({"id":0,"reserve":true,"status":"running","pool":"linux","worker_pid":999_999_999u64,"worker_program":"/nonexistent"}));
             g.save(&data).unwrap();
         }
         let reopened = GitHub::open(root.path()).unwrap();
         assert_eq!(
             reopened.adoptable.lock().unwrap().as_slice(),
-            ["2-1".to_owned()]
+            ["2-1".to_owned(), "reserve-live".to_owned()]
         );
         let data = reopened.data.lock().unwrap();
         assert_eq!(data.jobs["2-1"]["status"], "running");
         assert_eq!(data.jobs["2-2"]["status"], "uncertain");
+        assert_eq!(data.jobs["reserve-live"]["assigned_job_id"], 42);
+        assert_eq!(data.jobs["reserve-live"]["status"], "running");
+        assert_eq!(data.jobs["reserve-dead"]["status"], "uncertain");
+        drop(data);
+        assert_eq!(reopened.pending(), 1);
     }
     #[cfg(unix)]
     #[test]
@@ -945,7 +1583,15 @@ mod tests {
         assert!(g.handed_off.load(Ordering::SeqCst));
     }
     #[cfg(unix)]
-    fn jit_fixture(prepared: bool, shared: bool, capacity_wait: bool) {
+    #[test]
+    fn standby_jit_is_scoped_and_cleaned_without_a_fictitious_github_job() {
+        for prepared in [false, true] {
+            jit_fixture(prepared, true, false, true);
+            jit_fixture(prepared, true, true, true);
+        }
+    }
+    #[cfg(unix)]
+    fn jit_fixture(prepared: bool, shared: bool, capacity_wait: bool, reserve: bool) {
         use crate::tests::{account, api_fixture, service, shared_service};
         use std::{
             fs,
@@ -973,7 +1619,8 @@ import json,sys
 waiting=CAPACITY_WAIT
 r=json.load(sys.stdin)
 assert r['jitconfig']=='fixture-jit-config'
-assert set(r)=={'schema','name','job_id','repository','jitconfig','timeout_seconds'} | ({'preparation'} if 'preparation' in r else set())
+assert set(r)=={'schema','name','job_id','repository','jitconfig','timeout_seconds'} | ({'preparation'} if 'preparation' in r else set()) | ({'reserve','idle_timeout_seconds'} if r.get('reserve') else set())
+if r.get('reserve'): assert r['job_id']==0 and r['idle_timeout_seconds']==600
 a=None
 if 'preparation' in r:
  assert r['preparation']['verification_token']=='fixture-verification-token'
@@ -999,6 +1646,16 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
                 },
             );
             data.jobs.insert("2-99".into(),json!({"id":99,"repository":"fixture/private","repository_id":101,"run_id":44,"status":"running"}));
+        }
+        if reserve {
+            g.data.lock().unwrap().jobs.get_mut("2-99").unwrap()["reserve"] = json!(true);
+            g.data.lock().unwrap().jobs.get_mut("2-99").unwrap()["id"] = json!(0);
+            g.config.as_mut().unwrap().pools[0].standby = Some(Standby {
+                minimum: 1,
+                repository_id: 101,
+                workflows: vec!["fixture/private/.github/workflows/ci.yml@refs/heads/main".into()],
+                idle_timeout_seconds: 600,
+            });
         }
         let mut responses = vec![
             (
@@ -1048,6 +1705,15 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
             });
             responses.splice(4..4, vec![("GET /orgs/fixture/actions/runner-groups/1 ", json!({"visibility":"selected","allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":workflows})), ("/runner-groups/1/repositories?",json!({"repositories":[{"id":101}]})), ("/app/installations/2/access_tokens",json!({"token":"fixture-verification-token"}))]);
         }
+        if reserve {
+            responses.retain(|(path, _)| !path.contains("actions/jobs/99"));
+            let workflows = &g.config.as_ref().unwrap().pools[0]
+                .standby
+                .as_ref()
+                .unwrap()
+                .workflows;
+            responses.splice(3..3, vec![("GET /orgs/fixture/actions/runner-groups/1 ", json!({"visibility":"selected","allows_public_repositories":false,"restricted_to_workflows":true,"selected_workflows":workflows})), ("/runner-groups/1/repositories?",json!({"repositories":[{"id":101}]}))]);
+        }
         let (api, server) = api_fixture(responses);
         g.api = api;
         let result = g
@@ -1060,15 +1726,22 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
         server.join().unwrap();
         assert_eq!(result["cleaned"], true);
         assert_eq!(result["runner_id"], 501);
-        assert_eq!(result["demand_pending"], true);
+        assert_eq!(result["demand_pending"], !reserve);
         assert_eq!(result["prepared"], prepared);
         assert_eq!(result["capacity_wait"], capacity_wait);
         if prepared && !capacity_wait {
             assert_eq!(result["actual_job_id"], 1000);
         }
-        let mut demand = json!({"status":"running","github_status":"queued"});
+        let mut demand = json!({"status":"running","github_status":"queued","reserve":reserve});
         finish_capacity(&mut demand, result.clone());
-        assert_eq!(demand["status"], "queued");
+        assert_eq!(
+            demand["status"],
+            if !reserve || capacity_wait {
+                "queued"
+            } else {
+                "finished"
+            }
+        );
         if capacity_wait {
             assert!(demand["capacity_retry_at"].as_u64().unwrap() > api::now());
             demand["pool"] = json!(g.config.as_ref().unwrap().pools[0].id);
@@ -1081,10 +1754,23 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
             assert_eq!(g.pending(), 0);
             assert_eq!(g.data.lock().unwrap().jobs["2-99"]["status"], "queued");
         }
+        demand["reserve"] = json!(false);
         demand["github_status"] = json!("completed");
         finish_capacity(&mut demand, result.clone());
         assert_eq!(demand["status"], "finished");
         assert!(demand["capacity_retry_at"].is_null());
+        if !capacity_wait {
+            let data = g.data.lock().unwrap();
+            let timings = &data.jobs["2-99"]["timings"];
+            let values = [
+                "jit_requested_at_ms",
+                "jit_received_at_ms",
+                "worker_launch_requested_at_ms",
+                "worker_launched_at_ms",
+            ]
+            .map(|key| timings[key].as_u64().unwrap());
+            assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
         for secret in [
             "fixture-jit-config",
             "fixture-installation-token",
@@ -1118,6 +1804,7 @@ print(json.dumps({'schema':1,'name':r['name'],'job_id':r['job_id'],'cleaned':Tru
     #[test]
     fn explicit_pool_label_and_every_requested_label_are_required() {
         let pool = Pool {
+            standby: None,
             id: "linux".into(),
             installation_id: 1,
             organization: "fixture".into(),

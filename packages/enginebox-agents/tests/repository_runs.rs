@@ -146,7 +146,23 @@ fn each_repository_run_gets_a_fresh_checkout_at_a_stable_path() {
     };
     let id = |c: char| c.to_string().repeat(32);
     let run = |c: char, e: repository::Envelope| {
-        native::execute_with_repository(&e, &home, &workspace, &id(c)).unwrap()
+        // Other tests can fork while this test owns its writer lease. Their
+        // CLOEXEC copies briefly outlive our completed run, until exec. Match
+        // native_contract's bounded allowance for that transition; only lease
+        // admission failures are retryable, never an admitted native operation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match native::execute_with_repository(&e, &home, &workspace, &id(c)) {
+                Ok(output) => break output,
+                Err(error)
+                    if error.to_string() == "Native provider already has an active operation."
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("Repository run {c} failed: {error:#}"),
+            }
+        }
     };
     let stable = workspace.join("game");
     // Two runs in a row use the same path (so harness state keyed by cwd

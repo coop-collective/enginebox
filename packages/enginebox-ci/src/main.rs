@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     io::Read,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 mod preparation;
 
@@ -31,8 +31,11 @@ struct Args {
     /// Remove the disposable VM of an earlier request whose controller lost track of it
     /// (`ebox-ci-<uuid>`). Only a VM matching that request's receipt (instance UUID and
     /// allocation) is touched; a cleaned or never-allocated request is reported as is.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "retire_reserve")]
     reclaim: Option<String>,
+    /// Fence an idle preconnected runner for retirement; assigned jobs continue.
+    #[arg(long)]
+    retire_reserve: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +70,12 @@ struct Request {
     schema: u32,
     name: String,
     job_id: u64,
+    /// Explicit controller-created preconnected standby, never a replay of demand.
+    #[serde(default)]
+    reserve: bool,
+    /// Separate idle allowance; the job receives its full timeout after assignment.
+    #[serde(default)]
+    idle_timeout_seconds: Option<u64>,
     repository: String,
     jitconfig: String,
     timeout_seconds: u64,
@@ -75,7 +84,10 @@ struct Request {
 }
 fn validate(request: &Request, config: &Config) -> Result<()> {
     ensure!(
-        request.schema == 1 && config.schema == 1 && request.job_id > 0,
+        request.schema == 1
+            && config.schema == 1
+            && ((request.reserve && request.job_id == 0)
+                || (!request.reserve && request.job_id > 0)),
         "Unsupported worker request"
     );
     enginebox_core::identifier(&request.name, true)?;
@@ -100,6 +112,18 @@ fn validate(request: &Request, config: &Config) -> Result<()> {
                 .all(|p| p.parse::<u32>().is_ok()),
         "Pin an official runner version"
     );
+    ensure!(
+        enginebox_ci::model::repository(&request.repository),
+        "Invalid CI repository"
+    );
+    ensure!(
+        match (request.reserve, request.idle_timeout_seconds) {
+            (true, Some(seconds)) => (60..=21600).contains(&seconds),
+            (false, None) => true,
+            _ => false,
+        },
+        "Only preconnected reserves require a bounded idle timeout"
+    );
     config.resources.validate(None)?;
     match (&config.acceleration, &request.preparation) {
         (Some(profile), Some(admission)) => {
@@ -123,11 +147,11 @@ fn run(config: Config, request: Request) -> Result<Value> {
     let receipts = config.state_root.join("ci-receipts");
     state::private_dir(&receipts)?;
     let receipt_path = receipts.join(format!("{}.json", request.name));
+    let _lease = state::lock(&receipts.join(format!("{}.lock", request.name)), false)?;
     ensure!(
         !receipt_path.try_exists()?,
         "Worker request already has a receipt; inspect instead of replaying"
     );
-    let _lease = state::lock(&receipts.join(format!("{}.lock", request.name)), false)?;
     let fleet = Fleet::load(&config.fleet, &config.state_root)?;
     let host = fleet.host(&config.host_id)?;
     ensure!(
@@ -140,10 +164,17 @@ fn run(config: Config, request: Request) -> Result<Value> {
     );
     let bx = host.engine_box();
     let started = Instant::now();
-    let mut receipt = json!({"schema":1,"name":request.name,"job_id":request.job_id,"repository":request.repository,"status":"preparing","runner_version":config.runner_version,"cleaned":false});
+    let mut receipt = json!({"schema":1,"name":request.name,"job_id":request.job_id,"repository":request.repository,"status":"preparing","runner_version":config.runner_version,"cleaned":false,"reserve":request.reserve,"phases":{"worker_started_at_ms":timestamp()}});
     state::write_json(&receipt_path, &receipt)?;
     let mut waiting_for_capacity = false;
+    let mut reserve_expired = false;
     let outcome = (|| -> Result<()> {
+        if request.reserve && retirement_requested(&config, &request.name)? {
+            reserve_expired = true;
+            receipt["allocation_started"] = json!(false);
+            receipt["cleaned"] = json!(true);
+            return Ok(());
+        }
         {
             let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
             let facts = inventory(&host)?;
@@ -170,6 +201,7 @@ fn run(config: Config, request: Request) -> Result<Value> {
                 "Preparation image must match the installed registered template manifest"
             );
         }
+        phase(&receipt_path, &mut receipt, "allocation_started_at_ms")?;
         let prepared = enginebox_core::preparation::prepare(
             &fleet,
             &host.id,
@@ -188,7 +220,11 @@ fn run(config: Config, request: Request) -> Result<Value> {
             .to_owned();
         receipt["allocation_id"] = prepared["allocation"]["id"].clone();
         receipt["instance_uuid"] = json!(uuid);
-        state::write_json(&receipt_path, &receipt)?;
+        receipt["template"] = prepared["workspace"]["template"].clone();
+        receipt["source_snapshot_digest"] = prepared["workspace"]["source_snapshot_digest"].clone();
+        receipt["host_binding_digest"] = json!(state::digest(&host.binding()));
+        receipt["resources"] = json!(config.resources);
+        phase(&receipt_path, &mut receipt, "allocated_at_ms")?;
         let checkout = format!("ci-{}", &request.name[8..]);
         let layer = if let Some(path) = &config.layerfs {
             let project = config
@@ -233,6 +269,7 @@ fn run(config: Config, request: Request) -> Result<Value> {
             }
             receipt["checkout"] = json!(checkout);
             state::write_json(&receipt_path, &receipt)?;
+            phase(&receipt_path, &mut receipt, "preparation_resolved_at_ms")?;
             runtime.fork(&project.project, &checkout, project.from.as_deref())?;
             runtime.incus_attach(
                 &checkout,
@@ -244,6 +281,7 @@ fn run(config: Config, request: Request) -> Result<Value> {
                     gid: host.guest.gid,
                 },
             )?;
+            phase(&receipt_path, &mut receipt, "preparation_attached_at_ms")?;
             Some(runtime)
         } else {
             None
@@ -253,14 +291,17 @@ fn run(config: Config, request: Request) -> Result<Value> {
             owned(&bx.instance(&request.name)?, &receipt)?;
             let room = capacity(&host, &inventory(&host)?)?;
             ensure!(
-                room["cpu_available"].as_u64().unwrap_or(0) >= config.resources.cpu
+                room["instance_slots_available"].as_u64().unwrap_or(0) >= 1
+                    && room["cpu_available"].as_u64().unwrap_or(0) >= config.resources.cpu
                     && room["memory_budget_available_bytes"].as_u64().unwrap_or(0)
                         >= config.resources.memory_gib * enginebox_core::GIB,
                 "Insufficient capacity to start CI clone"
             );
+            phase(&receipt_path, &mut receipt, "boot_started_at_ms")?;
             bx.call(&["start", &request.name])?;
         }
         enginebox_core::fleet::wait_ready_unlocked(&bx, &request.name)?;
+        phase(&receipt_path, &mut receipt, "guest_ready_at_ms")?;
         if let (Some(profile), Some(admission)) = (&config.acceleration, &request.preparation) {
             preparation::bootstrap(
                 &bx,
@@ -268,11 +309,15 @@ fn run(config: Config, request: Request) -> Result<Value> {
                 &request.repository,
                 admission,
                 profile,
-                request.timeout_seconds,
+                if request.reserve {
+                    0
+                } else {
+                    request.timeout_seconds
+                },
             )?;
         }
         receipt["status"] = json!("running");
-        state::write_json(&receipt_path, &receipt)?;
+        phase(&receipt_path, &mut receipt, "runner_started_at_ms")?;
         // Tokens never enter host command arguments, environment, logs or a reusable image.
         // The official runner requires the opaque JIT value on its own guest argv.
         let script = format!(
@@ -284,10 +329,10 @@ cd ci-runner
 test "$(./bin/Runner.Listener --version)" = {version}
 IFS= read -r jit
 set +e
-{guard}timeout --signal=TERM --kill-after=30s {seconds}s ./run.sh --jitconfig "$jit" > runner.log 2>&1
+{launch}
 code=$?
 unset jit
-printf '%s\n' "$code" > exit-code
+test -e exit-code || printf '%s\n' "$code" > exit-code
 exit 0
 "#,
             version = shell_quote(&config.runner_version),
@@ -296,12 +341,30 @@ exit 0
             } else {
                 "test ! -e ci-runner\nfor file in /opt/actions-runner/.runner /opt/actions-runner/.credentials /opt/actions-runner/.credentials_rsaparams; do test ! -e \"$file\"; done\ncp -a /opt/actions-runner ci-runner\n".into()
             },
-            guard = if config.acceleration.is_some() {
-                "setpriv --no-new-privs "
+            launch = if let Some(idle) = request.idle_timeout_seconds {
+                format!(
+                    "printf '%s\\n' \"$jit\" | {}python3 -c {} {} {} {}",
+                    if config.acceleration.is_some() {
+                        "setpriv --no-new-privs "
+                    } else {
+                        ""
+                    },
+                    shell_quote(include_str!("runner_supervisor.py")),
+                    idle,
+                    request.timeout_seconds,
+                    retirement_requested(&config, &request.name)?
+                )
             } else {
-                ""
-            },
-            seconds = request.timeout_seconds
+                format!(
+                    "{}timeout --signal=TERM --kill-after=30s {}s ./run.sh --jitconfig \"$jit\" > runner.log 2>&1",
+                    if config.acceleration.is_some() {
+                        "setpriv --no-new-privs "
+                    } else {
+                        ""
+                    },
+                    request.timeout_seconds
+                )
+            }
         );
         let command = bx.exec_args(&request.name, &["bash".into(), "-c".into(), script])?;
         let stopped = std::sync::atomic::AtomicBool::new(false);
@@ -315,14 +378,19 @@ exit 0
                         &request.repository,
                         admission,
                         &stopped,
+                        if request.reserve { 0 } else { 120 },
                     )
                 })
             });
-            let outcome = bx.run_input(
-                &command,
-                format!("{}\n", request.jitconfig).as_bytes(),
-                Duration::from_secs(request.timeout_seconds + 90),
-            );
+            let outcome = if request.reserve {
+                run_connected(&bx, &command, format!("{}\n", request.jitconfig).as_bytes())
+            } else {
+                bx.run_input(
+                    &command,
+                    format!("{}\n", request.jitconfig).as_bytes(),
+                    Duration::from_secs(request.timeout_seconds + 90),
+                )
+            };
             stopped.store(true, std::sync::atomic::Ordering::SeqCst);
             let verified = verifier
                 .map(|handle| {
@@ -332,11 +400,57 @@ exit 0
                 })
                 .transpose()?;
             outcome?;
-            verified.transpose()
+            let assignment = verified.transpose()?.flatten();
+            ensure!(
+                request.reserve || request.preparation.is_none() || assignment.is_some(),
+                "Demand runner exited without verifying its assigned job"
+            );
+            Ok(assignment)
         });
+        phase(&receipt_path, &mut receipt, "runner_exited_at_ms")?;
+        let assignment = if request.reserve {
+            let lifecycle = bx
+                .execute(
+                    &request.name,
+                    &[
+                        "cat".into(),
+                        format!(
+                            "{}/ci-runner/.enginebox-lifetime/result.json",
+                            host.guest.home
+                        ),
+                    ],
+                    Duration::from_secs(10),
+                )
+                .and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?));
+            match lifecycle {
+                Ok(value) => {
+                    reserve_expired = value["outcome"] == "idle_timeout";
+                    receipt["phases"]["job_started_at_ms"] = value["job_started_at_ms"].clone();
+                    receipt["runner_lifecycle"] = value.clone();
+                    if value["outcome"] == "listener_exited" {
+                        Err(anyhow::anyhow!(
+                            "Standby listener exited without assignment or idle expiry"
+                        ))
+                    } else if !reserve_expired
+                        && request.preparation.is_some()
+                        && matches!(assignment, Ok(None))
+                    {
+                        Err(anyhow::anyhow!(
+                            "Prepared standby job has no verified assignment"
+                        ))
+                    } else {
+                        assignment
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            assignment
+        };
         // Cleanup still runs for a failed preparation; its error is reported after exact owned deletion.
         if let Ok(Some(value)) = &assignment {
             receipt["assignment"] = value.clone();
+            receipt["phases"]["assignment_verified_at_ms"] = value["verified_at_ms"].clone();
         }
         owned(&bx.instance(&request.name)?, &receipt)?;
         // Export private diagnostics before deleting the disposable VM. Never return logs to the API.
@@ -389,12 +503,15 @@ exit 0
         );
         bx.call(&["delete", &request.name])?;
         receipt["cleaned"] = json!(true);
+        phase(&receipt_path, &mut receipt, "destroyed_at_ms")?;
         assignment?;
         Ok(())
     })();
     receipt["duration_seconds"] = json!(started.elapsed().as_secs_f64());
     receipt["status"] = json!(if waiting_for_capacity {
         "waiting_capacity"
+    } else if outcome.is_ok() && reserve_expired {
+        "reserve_expired"
     } else if outcome.is_ok() {
         "finished"
     } else {
@@ -409,6 +526,62 @@ exit 0
     outcome?;
     Ok(receipt)
 }
+/// Retirement never deletes an active worker VM or releases controller capacity.
+/// The official started hook and this operation share the guest supervisor fence.
+fn retire_reserve(config: Config, name: &str) -> Result<Value> {
+    enginebox_core::identifier(name, true)?;
+    ensure!(
+        name.starts_with("ebox-ci-") && uuid::Uuid::parse_str(&name[8..]).is_ok(),
+        "Not a disposable CI name"
+    );
+    let directory = config.state_root.join("ci-receipts");
+    state::private_dir(&directory)?;
+    state::write_json(
+        &directory.join(format!("{name}.retire.json")),
+        &json!({"schema":1,"name":name,"requested_at_ms":timestamp()}),
+    )?;
+    let path = directory.join(format!("{name}.json"));
+    if !path.try_exists()? {
+        return Ok(json!({"schema":1,"name":name,"reserve_retire":"requested"}));
+    }
+    let receipt = state::read_json(&path)?;
+    ensure!(
+        receipt["reserve"] == true && receipt["name"] == name,
+        "Only a recorded standby can be retired"
+    );
+    if receipt["cleaned"] == true {
+        return Ok(json!({"schema":1,"name":name,"reserve_retire":"gone"}));
+    }
+    if receipt["status"] == "preparing" {
+        return Ok(json!({"schema":1,"name":name,"reserve_retire":"requested"}));
+    }
+    let fleet = Fleet::load(&config.fleet, &config.state_root)?;
+    let host = fleet.host(&config.host_id)?;
+    ensure!(
+        host.project.starts_with("enginebox-ci-") && host.target == "local",
+        "Dedicated local CI project required"
+    );
+    let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
+    let bx = host.engine_box();
+    owned(&bx.instance(name)?, &receipt)?;
+    let output = bx.execute(
+        name,
+        &[
+            "python3".into(),
+            "-c".into(),
+            include_str!("runner_retire.py").into(),
+            format!("{}/ci-runner/.enginebox-lifetime", host.guest.home),
+        ],
+        Duration::from_secs(10),
+    )?;
+    let value: Value = serde_json::from_slice(&output)?;
+    ensure!(
+        value["reserve_retire"] == "busy" || value["reserve_retire"] == "requested",
+        "Invalid standby retirement response"
+    );
+    Ok(json!({"schema":1,"name":name,"reserve_retire":value["reserve_retire"]}))
+}
+
 /// Reclaim one earlier request's VM: the controller found its GitHub job finished and its
 /// runner gone, but no worker reported cleanup (a restart interrupted the report).
 fn reclaim(config: Config, name: &str) -> Result<Value> {
@@ -434,7 +607,18 @@ fn reclaim(config: Config, name: &str) -> Result<Value> {
     );
     let bx = host.engine_box();
     let _host_lock = operation_lock_wait(&host, Duration::from_secs(30))?;
-    let existing = bx.instance(name).ok();
+    // A failed Incus query is uncertainty, not proof of absence.
+    let facts = inventory(&host)?;
+    let exists = facts["instances"]
+        .as_array()
+        .context("Host inventory lacks instances")?
+        .iter()
+        .any(|vm| vm["project"] == host.project && vm["name"] == name);
+    let existing = if exists {
+        Some(bx.instance(name)?)
+    } else {
+        None
+    };
     let reclaimed = if let Some(vm) = existing {
         owned(&vm, &receipt)?;
         if vm["status"] != "Stopped" {
@@ -450,6 +634,61 @@ fn reclaim(config: Config, name: &str) -> Result<Value> {
     receipt["status"] = json!("reclaimed");
     state::write_json(&receipt_path, &receipt)?;
     Ok(json!({"schema":1,"name":name,"reclaimed":reclaimed,"cleaned":true}))
+}
+/// Connected standbys have no wall-clock kill: a controller outage may leave an
+/// idle registration that accepts a late job. The native supervisor bounds each
+/// actual job; trusted controller retirement removes registration, then waits
+/// for natural listener exit. Unknown liveness retains capacity.
+fn run_connected(bx: &enginebox_core::EngineBox, args: &[String], input: &[u8]) -> Result<Vec<u8>> {
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        process::{Command, Stdio},
+    };
+    let argv = bx.command(args);
+    let mut stdin = tempfile::tempfile()?;
+    stdin.write_all(input)?;
+    stdin.seek(SeekFrom::Start(0))?;
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(stdin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    ensure!(
+        command.spawn()?.wait()?.success(),
+        "Connected runner transport ended uncertainly"
+    );
+    Ok(vec![])
+}
+fn retirement_requested(config: &Config, name: &str) -> Result<bool> {
+    let path = config
+        .state_root
+        .join("ci-receipts")
+        .join(format!("{name}.retire.json"));
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let request = state::read_json(&path)?;
+    ensure!(
+        request["schema"] == 1 && request["name"] == name,
+        "Retirement intent identity changed"
+    );
+    Ok(true)
+}
+fn timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+fn phase(path: &std::path::Path, receipt: &mut Value, name: &str) -> Result<()> {
+    receipt["phases"][name] = json!(timestamp());
+    state::write_json(path, receipt)
 }
 fn allocation_request(name: &str, template: &str, resources: Resources) -> Value {
     json!({"name":name,"template":template,"resources":resources})
@@ -480,6 +719,9 @@ fn main() {
         if let Some(name) = &args.reclaim {
             return reclaim(config, name);
         }
+        if let Some(name) = &args.retire_reserve {
+            return retire_reserve(config, name);
+        }
         let mut input = vec![];
         std::io::stdin()
             .take(128 * 1024 + 1)
@@ -500,6 +742,56 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn worker_fixture() -> (Config, Request) {
+        let config = serde_json::from_value(json!({"schema":1,"fleet":"/fixture/fleet.toml","state_root":"/fixture/state","host_id":"ci-local","template":"ci-linux","resources":{"cpu":4,"memory_gib":4,"disk_gib":20},"runner_version":"2.338.2"})).unwrap();
+        let request = serde_json::from_value(json!({"schema":1,"name":"ebox-ci-11111111111141118111111111111111","job_id":42,"repository":"fixture/repo","jitconfig":"opaque","timeout_seconds":60})).unwrap();
+        (config, request)
+    }
+    #[test]
+    fn standby_requires_explicit_sentinel_and_separate_bounded_idle_deadline() {
+        let (config, mut request) = worker_fixture();
+        validate(&request, &config).unwrap();
+        request.job_id = 0;
+        assert!(validate(&request, &config).is_err());
+        request.reserve = true;
+        assert!(validate(&request, &config).is_err());
+        request.idle_timeout_seconds = Some(60);
+        validate(&request, &config).unwrap();
+        request.job_id = 42;
+        assert!(validate(&request, &config).is_err());
+        request.reserve = false;
+        assert!(validate(&request, &config).is_err());
+        request.idle_timeout_seconds = None;
+        request.repository = "../other".into();
+        assert!(validate(&request, &config).is_err());
+    }
+    #[test]
+    fn standby_cannot_bypass_prepared_worker_admission() {
+        let (mut config, mut request) = worker_fixture();
+        request.reserve = true;
+        request.job_id = 0;
+        request.idle_timeout_seconds = Some(60);
+        config.layerfs = Some("/fixture/layerfs.json".into());
+        assert!(validate(&request, &config).is_err());
+    }
+    #[test]
+    fn retirement_intent_survives_before_the_worker_receipt_exists() {
+        let (mut config, request) = worker_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        config.state_root = directory.path().join("state");
+        let name = request.name;
+        let result = retire_reserve(config, &name).unwrap();
+        assert_eq!(result["reserve_retire"], "requested");
+        let intent = state::read_json(
+            &directory
+                .path()
+                .join("state/ci-receipts")
+                .join(format!("{name}.retire.json")),
+        )
+        .unwrap();
+        assert_eq!(intent["name"], name);
+        assert_eq!(intent["schema"], 1);
+    }
     #[test]
     fn worker_allocation_is_accepted_by_fleet_admission() {
         use enginebox_core::model::{Host, StaticTemplate};

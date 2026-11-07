@@ -38,9 +38,12 @@ def serve(control, seconds):
     mount = next(line.split() for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines() if line.split()[4] == str(root / 'prepared'))
     assert 'ro' in mount[5].split(',')
     assert os.getuid() == 0 and (control / 'private').stat().st_mode & 0o077 == 0
-    deadline = time.monotonic() + seconds
+    # A preconnected standby may outlive its intended idle period while the
+    # controller cannot safely fence registration. Zero waits for this VM's
+    # one assignment; owned VM deletion still terminates the helper.
+    deadline = None if seconds == 0 else time.monotonic() + seconds
     request = None
-    while time.monotonic() < deadline:
+    while deadline is None or time.monotonic() < deadline:
         if (control / 'requests/restore.json').exists() and (control / 'verified.json').exists():
             request = read_json(control / 'requests/restore.json')
             break
@@ -90,4 +93,6 @@ def serve(control, seconds):
 
 
 if __name__ == '__main__':
-    serve(sys.argv[1], min(21800, max(1, int(sys.argv[2]))))
+    seconds = int(sys.argv[2])
+    assert seconds >= 0
+    serve(sys.argv[1], 0 if seconds == 0 else min(21800, seconds))
