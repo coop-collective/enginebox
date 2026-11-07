@@ -1419,9 +1419,11 @@ mod tests {
 
     // ---------------------------------------------------------------- poller
 
+    /// (url, header names, the auth header or cookie)
+    type Seen = (String, Vec<&'static str>, Option<String>);
     struct Fake {
         replies: Mutex<BTreeMap<String, (u16, Value)>>,
-        seen: Mutex<Vec<(String, Vec<&'static str>, Option<String>)>>,
+        seen: Mutex<Vec<Seen>>,
     }
     impl Fake {
         fn new(replies: &[(&str, u16, Value)]) -> Arc<Self> {
